@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "project": {
+    "id": "iroh-room",
+    "name": "Iroh Rooms"
+  },
+  "prompts": {
+    "defaultRoot": ".adw/prompts",
+    "runnerRoots": {}
+  },
+  "phases": [
+    "classify",
+    "plan",
+    "implement",
+    "tests",
+    "resolve",
+    "e2e",
+    "review",
+    "patch",
+    "document"
+  ],
+  "providers": {
+    "cli": {
+      "type": "github"
+    },
+    "workItems": {
+      "type": "github",
+      "closedStates": ["CLOSED"],
+      "inProgressStatus": "In Progress",
+      "statusFieldName": "Status"
+    },
+    "vcs": {
+      "type": "git"
+    },
+    "changeRequests": {
+      "type": "github"
+    }
+  },
+  "progress": {
+    "tag": "[IROH-ROOM-ADW]"
+  },
+  "branching": {
+    "defaultPrefix": "feat",
+    "labelPrefixes": {
+      "type/feature": "feat",
+      "type/spike": "spike",
+      "type/test": "test",
+      "type/docs": "docs",
+      "type/security": "security",
+      "type/decision": "docs",
+      "area/dx": "chore",
+      "area/protocol": "protocol",
+      "area/transport": "transport",
+      "area/storage": "storage",
+      "area/blob": "blob",
+      "area/pipe": "pipe",
+      "area/agent": "agent"
+    },
+    "slug": {
+      "maxLength": 48,
+      "stripDiacritics": true,
+      "stripPhaseIssuePrefix": true
+    }
+  },
+  "gates": {
+    "e2e": {
+      "hints": [
+        "iroh",
+        "quic",
+        "nat",
+        "sync",
+        "membership",
+        "signature",
+        "signed",
+        "canonical",
+        "cbor",
+        "sqlite",
+        "blob",
+        "pipe",
+        "agent",
+        "security",
+        "auth",
+        "authorization"
+      ]
+    },
+    "documentation": {
+      "hints": [
+        "cli",
+        "protocol",
+        "schema",
+        "serialization",
+        "event",
+        "membership",
+        "security",
+        "privacy",
+        "config",
+        "command",
+        "flag",
+        "developer",
+        "contributor"
+      ],
+      "exactFiles": [
+        "README.md",
+        "CONTRIBUTING.md",
+        "PHASE-0-SPIKE.md",
+        "PRD.v0.3.md"
+      ],
+      "pathPrefixes": [
+        "docs/",
+        "specs/",
+        ".adw/"
+      ],
+      "fileExtensions": [".md"]
+    }
+  },
+  "models": {
+    "classifyModel": "claude-haiku-4-5",
+    "defaultTier": "mid",
+    "phaseTiers": {
+      "classify": "cheap",
+      "plan": "capable",
+      "implement": "capable",
+      "tests": "mid",
+      "resolve": "mid",
+      "e2e": "mid",
+      "review": "capable",
+      "patch": "capable",
+      "document": "mid"
+    },
+    "tiers": {
+      "cheap": {
+        "claude": "claude-haiku-4-5",
+        "pi": "haiku",
+        "codex": "gpt-5.4-mini",
+        "opencode": "anthropic/claude-haiku-4-5"
+      },
+      "mid": {
+        "claude": "claude-sonnet-4-6",
+        "pi": "sonnet",
+        "codex": "gpt-5.4",
+        "opencode": "anthropic/claude-sonnet-4-6"
+      },
+      "capable": {
+        "claude": "claude-opus-4-8",
+        "pi": "opus",
+        "codex": "gpt-5.5",
+        "opencode": "anthropic/claude-opus-4-8"
+      }
+    }
+  },
+  "commands": {
+    "defaultTestCommand": "scripts/verify.sh",
+    "defaultFinalizeGates": ["scripts/verify.sh"]
+  }
+}
+

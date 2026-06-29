@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# Local runtime state
+/agents/
+/.adw/runs/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets and databases
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
