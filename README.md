@@ -111,6 +111,25 @@ rooms without full decentralized reconciliation:
   partition, disconnect/reconnect); 37 tests prove arrival-order-independent convergence
   and anti-amplification bounds (Spike Plan Gate D).
 
+The **local identity and device CLI** has landed in `crates/iroh-rooms-cli` (issue #16 /
+IR-0101). This is the first real subcommand group in the binary, establishing the
+data-directory model and key-persistence layer every later CLI command will reuse:
+
+- `iroh-rooms identity create --name <NAME> [--force]` — generates a participant identity
+  keypair (`sender_id`) and a device keypair (`device_id`) from the OS CSPRNG, persists
+  them under the resolved data directory with owner-only file permissions (`0600` files,
+  `0700` directory on Unix), and refuses to clobber an existing identity without `--force`.
+- `iroh-rooms identity show [--json]` — prints `name`, `identity_id`, and `device_id` in a
+  script-friendly format (labeled `key: value` lines by default; single-line JSON with
+  `--json`). Never reads or prints secret key material.
+- Data directory resolution: `--data-dir <PATH>` flag > `IROH_ROOMS_HOME` env >
+  platform default (`~/.local/share/iroh-rooms` on Linux,
+  `~/Library/Application Support/iroh-rooms` on macOS, `%APPDATA%\iroh-rooms` on Windows).
+- Keys are split across two files: `identity.json` (public profile, safe for `show`) and
+  `identity.secret` (the only secret-bearing file; `show` never opens it).
+- 40+ tests (unit + CLI integration) covering all acceptance criteria, security invariants
+  (no secret bytes in any output stream), and Unix file-permission guarantees.
+
 Remaining Room Event Plane targets:
 
 1. Full-mesh iroh QUIC event transport — the real iroh adapter (`crates/iroh-rooms-net`,
@@ -121,7 +140,7 @@ Remaining Room Event Plane targets:
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary scaffold
+crates/iroh-rooms-cli/    CLI binary (identity subcommand; scaffold for room, file, pipe, agent)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate

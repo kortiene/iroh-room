@@ -19,6 +19,7 @@ use core::fmt;
 use core::str::FromStr;
 
 use ed25519_dalek::{Signature as DalekSignature, Signer, VerifyingKey};
+use zeroize::Zeroizing;
 
 use super::constants::{PUBLIC_KEY_LEN, SIGNATURE_LEN};
 
@@ -233,6 +234,36 @@ impl SigningKey {
         }
     }
 
+    /// Generate a fresh signing key from the operating-system CSPRNG.
+    ///
+    /// Fills a 32-byte seed from the OS RNG (`getrandom`, the same entropy source
+    /// `ed25519-dalek`'s own `generate` draws from), constructs the key through
+    /// the sole [`from_seed`](Self::from_seed) constructor, then zeroizes the
+    /// transient seed buffer so no plaintext copy of the secret lingers in memory.
+    ///
+    /// # Panics
+    /// Panics only if the OS CSPRNG is unavailable (`getrandom` returns an error).
+    /// On supported platforms that indicates a serious system fault, and there is
+    /// no safe fallback for cryptographic key generation, so failing loudly is the
+    /// correct behavior.
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut seed = Zeroizing::new([0u8; PUBLIC_KEY_LEN]);
+        getrandom::fill(seed.as_mut_slice()).expect("OS CSPRNG (getrandom) must be available");
+        Self::from_seed(&seed)
+    }
+
+    /// The 32-byte secret seed backing this key, for **secure on-disk
+    /// persistence only**.
+    ///
+    /// Returned inside a [`Zeroizing`] buffer so the copy is wiped on drop. This
+    /// is the only way secret bytes leave the wrapper; callers MUST treat the
+    /// result as secret — never log, `Display`, or otherwise expose it.
+    #[must_use]
+    pub fn to_seed(&self) -> Zeroizing<[u8; PUBLIC_KEY_LEN]> {
+        Zeroizing::new(self.inner.to_bytes())
+    }
+
     /// The raw public-key bytes of this signing key.
     #[must_use]
     pub fn public_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
@@ -262,5 +293,47 @@ impl fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never print secret bytes.
         f.write_str("SigningKey(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IdentityKey, SigningKey};
+    use crate::event::constants::PUBLIC_KEY_LEN;
+
+    #[test]
+    fn generate_produces_distinct_keys() {
+        let a = SigningKey::generate();
+        let b = SigningKey::generate();
+        // Two fresh CSPRNG draws must not collide.
+        assert_ne!(a.public_bytes(), b.public_bytes());
+        // A separately generated identity key and device key are distinct keys
+        // (spike §1: `sender_id` and `device_id` are different Ed25519 keys).
+        assert_ne!(
+            a.identity_key(),
+            IdentityKey::from_bytes(b.device_key().as_bytes().to_owned())
+        );
+    }
+
+    #[test]
+    fn generated_key_round_trips_sign_and_verify() {
+        let key = SigningKey::generate();
+        let message = b"iroh-rooms generate() round-trip";
+        let sig = key.sign(message);
+        // Event signatures verify under the device-key view of the public half.
+        key.device_key()
+            .verify(message, &sig)
+            .expect("a freshly generated key must verify its own signature");
+    }
+
+    #[test]
+    fn to_seed_round_trips_through_from_seed() {
+        let key = SigningKey::generate();
+        let seed = key.to_seed();
+        assert_eq!(seed.len(), PUBLIC_KEY_LEN);
+        // Reconstructing from the persisted seed yields the same public key —
+        // this is exactly what the CLI relies on to store and reload an identity.
+        let restored = SigningKey::from_seed(&seed);
+        assert_eq!(key.public_bytes(), restored.public_bytes());
     }
 }
