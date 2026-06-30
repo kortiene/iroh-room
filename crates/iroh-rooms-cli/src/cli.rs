@@ -7,6 +7,7 @@
 //! iroh-rooms [--data-dir <PATH>] identity show [--json]
 //! iroh-rooms [--data-dir <PATH>] room create <NAME>
 //! iroh-rooms [--data-dir <PATH>] room members <ROOM_ID>
+//! iroh-rooms [--data-dir <PATH>] room invite <ROOM_ID> --invitee <IDENTITY_ID> [--role <ROLE>] [--expires <DURATION>]
 //! ```
 
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
-use crate::{identity, paths, room};
+use crate::{identity, invite, paths, room};
 
 /// Local-first rooms over iroh — local identity and device management.
 #[derive(Debug, Parser)]
@@ -80,6 +81,27 @@ enum RoomAction {
         /// The room id printed by `room create` (blake3:<hex>).
         room_id: String,
     },
+    /// Mint a key-bound invite ticket for a known invitee identity.
+    Invite {
+        // Backticks would render literally in clap `--help`, so the id format is
+        // described in bare prose here.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The invitee's identity id (64-char lowercase hex from `identity show`).
+        #[arg(long)]
+        invitee: String,
+        /// Invited role: `member` (default) or `agent`.
+        #[arg(long, default_value = "member")]
+        role: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Optional expiry as <int>{s|m|h|d}, e.g. 24h.
+        #[arg(long)]
+        expires: Option<String>,
+    },
 }
 
 /// Parse arguments and execute the selected command.
@@ -123,6 +145,20 @@ pub fn run() -> Result<()> {
                     .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
                 let view = room::members(&home, &room_id)?;
                 room::print_members(&view);
+            }
+            RoomAction::Invite {
+                room_id,
+                invitee,
+                role,
+                expires,
+            } => {
+                let room_id: RoomId = room_id
+                    .parse()
+                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
+                // `invite` validates --invitee/--role/--expires before any IO, so a
+                // bad invocation leaves the store untouched.
+                let summary = invite::invite(&home, &room_id, &invitee, &role, expires.as_deref())?;
+                invite::print_invite(&summary);
             }
         },
     }

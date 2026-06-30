@@ -799,3 +799,387 @@ impl MembershipOracle for AncestorView {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Ingest, RoomMembership};
+    use crate::event::binding::DeviceBinding;
+    use crate::event::capability_hash;
+    use crate::event::content::{Content, EventType, MemberInvited, MemberJoined, RoomCreated};
+    use crate::event::ids::RoomId;
+    use crate::event::keys::SigningKey;
+    use crate::event::reject::RejectReason;
+    use crate::event::signed::{self, SignedEvent};
+    use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
+    use crate::event::wire::WireEvent;
+    use crate::membership::Status;
+
+    const NONCE: [u8; 16] = [0xaa; 16];
+    const T0: u64 = 1_750_000_000_000;
+    const INVITE_ID: [u8; 16] = [0xda; 16];
+    const SECRET: [u8; 16] = [0x5e; 16];
+
+    fn sk(seed: u8) -> SigningKey {
+        SigningKey::from_seed(&[seed; 32])
+    }
+
+    fn ctx(room: RoomId) -> ValidationContext {
+        ValidationContext::for_room(room)
+    }
+
+    fn seal(ev: &SignedEvent, dev: &SigningKey) -> Vec<u8> {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        WireEvent::seal(csb, sig).to_bytes()
+    }
+
+    fn make_genesis(admin_id: &SigningKey, admin_dev: &SigningKey) -> (ValidatedEvent, RoomId) {
+        let id_key = admin_id.identity_key();
+        let dev_key = admin_dev.device_key();
+        let room = signed::derive_room_id(&id_key, &NONCE, T0);
+        let binding = DeviceBinding::create(&room, admin_id, dev_key);
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: id_key,
+            device_id: dev_key,
+            event_type: EventType::RoomCreated,
+            created_at: T0,
+            prev_events: vec![],
+            content: Content::RoomCreated(RoomCreated {
+                room_name: "Room".to_owned(),
+                room_nonce: NONCE,
+                admins: vec![id_key],
+                device_binding: binding,
+            }),
+        };
+        let v = validate_wire_bytes(&seal(&ev, admin_dev), &ctx(room)).expect("genesis valid");
+        (v, room)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_invite(
+        admin_id: &SigningKey,
+        admin_dev: &SigningKey,
+        room: RoomId,
+        invitee: &SigningKey,
+        invite_id: [u8; 16],
+        cap_hash: [u8; 32],
+        expires_at: Option<u64>,
+        prev: crate::event::ids::EventId,
+        t: u64,
+    ) -> ValidatedEvent {
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin_id.identity_key(),
+            device_id: admin_dev.device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: t,
+            prev_events: vec![prev],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: cap_hash,
+                role: "member".to_owned(),
+                invitee_key: invitee.identity_key(),
+                expires_at,
+                invitee_hint: None,
+            }),
+        };
+        validate_wire_bytes(&seal(&ev, admin_dev), &ctx(room)).expect("invite stateless-valid")
+    }
+
+    fn make_join(
+        invitee: &SigningKey,
+        invitee_dev: &SigningKey,
+        room: RoomId,
+        invite_id: [u8; 16],
+        secret: [u8; 16],
+        prev: crate::event::ids::EventId,
+        t: u64,
+    ) -> ValidatedEvent {
+        let id_key = invitee.identity_key();
+        let dev_key = invitee_dev.device_key();
+        let binding = DeviceBinding::create(&room, invitee, dev_key);
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: id_key,
+            device_id: dev_key,
+            event_type: EventType::MemberJoined,
+            created_at: t,
+            prev_events: vec![prev],
+            content: Content::MemberJoined(MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: secret,
+                role: "member".to_owned(),
+                device_binding: binding,
+                display_name: None,
+            }),
+        };
+        validate_wire_bytes(&seal(&ev, invitee_dev), &ctx(room)).expect("join stateless-valid")
+    }
+
+    // AC1 (positive): valid admin invite is accepted by the fold and marks the
+    // invitee as Invited.
+    #[test]
+    fn admin_invite_accepted_and_invitee_status_is_invited() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let invitee = sk(4);
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        let invite = make_invite(
+            &admin_id,
+            &admin_dev,
+            room,
+            &invitee,
+            INVITE_ID,
+            cap_hash,
+            None,
+            genesis.event_id,
+            T0 + 1,
+        );
+        let invite_outcome = {
+            let mut m = RoomMembership::new(room);
+            m.ingest(genesis.clone());
+            m.ingest(invite.clone())
+        };
+        assert!(
+            matches!(invite_outcome, Ingest::Accepted { .. }),
+            "admin invite must be accepted by the fold; got {invite_outcome:?}"
+        );
+        let snap = RoomMembership::from_events(room, [genesis, invite]).snapshot();
+        assert_eq!(
+            snap.status(&invitee.identity_key()),
+            Some(Status::Invited),
+            "invitee must be Invited in the snapshot after admin invite"
+        );
+    }
+
+    // AC1 (negative): a member.invited signed by a non-admin is rejected by the
+    // fold with InsufficientRole. The stateless layer passes it (no admin check
+    // there); the fold's gate_admin_action is the enforcement point.
+    #[test]
+    fn non_admin_invite_rejected_with_insufficient_role() {
+        let (alice_id, alice_dev) = (sk(1), sk(2)); // admin
+        let (bob_id, bob_dev) = (sk(3), sk(4)); // non-admin, tries to invite
+        let invitee = sk(5);
+        let (genesis, room) = make_genesis(&alice_id, &alice_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        // Build the invite signed by bob (not the room admin).
+        let non_admin_invite = {
+            let ev = SignedEvent {
+                schema_version: 1,
+                room_id: room,
+                sender_id: bob_id.identity_key(),
+                device_id: bob_dev.device_key(),
+                event_type: EventType::MemberInvited,
+                created_at: T0 + 1,
+                prev_events: vec![genesis.event_id],
+                content: Content::MemberInvited(MemberInvited {
+                    invite_id: INVITE_ID,
+                    capability_hash: cap_hash,
+                    role: "member".to_owned(),
+                    invitee_key: invitee.identity_key(),
+                    expires_at: None,
+                    invitee_hint: None,
+                }),
+            };
+            validate_wire_bytes(&seal(&ev, &bob_dev), &ctx(room))
+                .expect("passes stateless validation")
+        };
+        let mut membership = RoomMembership::new(room);
+        membership.ingest(genesis);
+        let outcome = membership.ingest(non_admin_invite);
+        assert!(
+            matches!(
+                outcome,
+                Ingest::Rejected {
+                    reason: RejectReason::InsufficientRole,
+                    ..
+                }
+            ),
+            "non-admin invite must be rejected with InsufficientRole; got {outcome:?}"
+        );
+        // The would-be invitee must have no membership entry.
+        assert_eq!(
+            membership.snapshot().status(&invitee.identity_key()),
+            None,
+            "invitee must have no status after a rejected invite"
+        );
+    }
+
+    // AC5 (expiry): a member.joined whose created_at exceeds the invite's
+    // expires_at is rejected by the fold with ExpiredInvite.
+    #[test]
+    fn join_after_invite_expiry_rejected() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (invitee, invitee_dev) = (sk(4), sk(5));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        let expiry = T0 + 1_000; // expires 1 s after genesis
+        let invite = make_invite(
+            &admin_id,
+            &admin_dev,
+            room,
+            &invitee,
+            INVITE_ID,
+            cap_hash,
+            Some(expiry),
+            genesis.event_id,
+            T0 + 1,
+        );
+        // Join at T0 + 2_000: strictly after the expiry (T0 + 1_000).
+        let join = make_join(
+            &invitee,
+            &invitee_dev,
+            room,
+            INVITE_ID,
+            SECRET,
+            invite.event_id,
+            T0 + 2_000,
+        );
+        let mut membership = RoomMembership::new(room);
+        membership.ingest(genesis);
+        membership.ingest(invite);
+        let outcome = membership.ingest(join);
+        assert!(
+            matches!(
+                outcome,
+                Ingest::Rejected {
+                    reason: RejectReason::ExpiredInvite,
+                    ..
+                }
+            ),
+            "join after invite expiry must be rejected with ExpiredInvite; got {outcome:?}"
+        );
+    }
+
+    // AC4: join with a wrong capability secret is rejected with BadCapability
+    // (the recomputed hash does not match the invite's capability_hash).
+    #[test]
+    fn join_with_wrong_capability_secret_rejected() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (invitee, invitee_dev) = (sk(4), sk(5));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        let invite = make_invite(
+            &admin_id,
+            &admin_dev,
+            room,
+            &invitee,
+            INVITE_ID,
+            cap_hash,
+            None,
+            genesis.event_id,
+            T0 + 1,
+        );
+        // Use a different secret in the join — the hash won't match.
+        let wrong_secret: [u8; 16] = [0xff; 16];
+        let join = make_join(
+            &invitee,
+            &invitee_dev,
+            room,
+            INVITE_ID,
+            wrong_secret,
+            invite.event_id,
+            T0 + 2,
+        );
+        let mut membership = RoomMembership::new(room);
+        membership.ingest(genesis);
+        membership.ingest(invite);
+        let outcome = membership.ingest(join);
+        assert!(
+            matches!(
+                outcome,
+                Ingest::Rejected {
+                    reason: RejectReason::BadCapability,
+                    ..
+                }
+            ),
+            "join with wrong secret must be rejected with BadCapability; got {outcome:?}"
+        );
+    }
+
+    // AC2 (positive): a valid join (correct key + secret + unexpired invite)
+    // transitions the invitee to Active.
+    #[test]
+    fn valid_join_transitions_invitee_to_active() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (invitee, invitee_dev) = (sk(4), sk(5));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        let invite = make_invite(
+            &admin_id,
+            &admin_dev,
+            room,
+            &invitee,
+            INVITE_ID,
+            cap_hash,
+            None,
+            genesis.event_id,
+            T0 + 1,
+        );
+        let join = make_join(
+            &invitee,
+            &invitee_dev,
+            room,
+            INVITE_ID,
+            SECRET,
+            invite.event_id,
+            T0 + 2,
+        );
+        let snap = RoomMembership::from_events(room, [genesis, invite, join]).snapshot();
+        assert_eq!(
+            snap.status(&invitee.identity_key()),
+            Some(Status::Active),
+            "invitee must be Active after a valid join"
+        );
+    }
+
+    // AC2 (negative): a join that cites the correct invite but uses the wrong
+    // identity key (different sender_id) is rejected — the invite is key-bound.
+    #[test]
+    fn join_by_wrong_identity_rejected() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let invitee = sk(4);
+        let (impersonator, impersonator_dev) = (sk(6), sk(7)); // not the invited key
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        let invite = make_invite(
+            &admin_id,
+            &admin_dev,
+            room,
+            &invitee, // bound to invitee's key
+            INVITE_ID,
+            cap_hash,
+            None,
+            genesis.event_id,
+            T0 + 1,
+        );
+        // Impersonator tries to join using the same invite_id + correct secret.
+        let join = make_join(
+            &impersonator,
+            &impersonator_dev,
+            room,
+            INVITE_ID,
+            SECRET,
+            invite.event_id,
+            T0 + 2,
+        );
+        let mut membership = RoomMembership::new(room);
+        membership.ingest(genesis);
+        membership.ingest(invite);
+        let outcome = membership.ingest(join);
+        assert!(
+            matches!(
+                outcome,
+                Ingest::Rejected {
+                    reason: RejectReason::BadCapability,
+                    ..
+                }
+            ),
+            "join by wrong identity must be rejected; got {outcome:?}"
+        );
+    }
+}

@@ -20,6 +20,8 @@
 //! * [`binding`] — self-contained `device_binding` certificate verification (§1).
 //! * [`genesis`] — pure assembly of a signed genesis [`content::RoomCreated`]
 //!   event ([`genesis::build_room_created`], §5/§6/§7).
+//! * [`invite`] — pure assembly of a signed admin [`content::MemberInvited`]
+//!   event ([`invite::build_member_invited`], §7).
 //! * [`validate`] — the stateless [`validate::validate_wire_bytes`] pipeline
 //!   (§6) returning a [`validate::ValidatedEvent`] or a typed [`RejectReason`].
 //! * [`reject`] — the [`RejectReason`] / [`Flag`] taxonomy (§8) and the deferred
@@ -36,6 +38,7 @@ pub mod constants;
 pub mod content;
 pub mod genesis;
 pub mod ids;
+pub mod invite;
 pub mod keys;
 pub mod reject;
 pub mod signed;
@@ -44,9 +47,10 @@ pub mod wire;
 
 // Convenience re-exports of the most-used types.
 pub use binding::DeviceBinding;
-pub use content::{Content, EventType};
+pub use content::{capability_hash, Content, EventType};
 pub use genesis::build_room_created;
 pub use ids::{EventId, HashRef, RoomId};
+pub use invite::build_member_invited;
 pub use keys::{DeviceKey, IdentityKey, Signature, SigningKey};
 pub use reject::{Flag, MembershipOracle, RejectReason};
 pub use signed::SignedEvent;

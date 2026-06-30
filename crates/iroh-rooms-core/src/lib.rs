@@ -13,6 +13,13 @@
 
 pub mod event;
 
+/// The out-of-band room invite ticket (IR-0103): the copy-pasteable, versioned,
+/// checksummed secret carrier that travels alongside an on-log `member.invited`
+/// event. Reuses the landed [`event::cbor`] codec for its body and re-derives the
+/// capability hash via [`event::capability_hash`], so the joiner side can decode a
+/// ticket without duplicating either. See spec `key-bound-invite-ticket-generation.md`.
+pub mod ticket;
+
 /// The deterministic membership fold and authorization layer (IR-0008): the
 /// second stateful layer of the Room Event Plane, downstream of the stateless
 /// [`event`] validator. Turns a set of
