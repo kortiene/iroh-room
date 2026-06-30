@@ -13,6 +13,16 @@
 
 pub mod event;
 
+/// The deterministic membership fold and authorization layer (IR-0008): the
+/// second stateful layer of the Room Event Plane, downstream of the stateless
+/// [`event`] validator. Turns a set of
+/// [`ValidatedEvent`](event::ValidatedEvent)s into a per-event ancestor-stable
+/// log-validity verdict and a convergent
+/// [`MembershipSnapshot`](membership::MembershipSnapshot) that the pipe/blob
+/// access decisions consult. Pure in-memory, no `store` dependency (spec D1).
+/// See `PHASE-0-SPIKE.md` Membership & Ordering §3/§5/§6/§7.
+pub mod membership;
+
 /// The local `SQLite` event store (IR-0004): idempotent persistence of validated
 /// events, derived query indexes, and a deterministic rebuild. Behind the `store`
 /// cargo feature so validate-only consumers keep a lean dependency tree.

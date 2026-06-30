@@ -17,7 +17,7 @@ use super::cbor;
 use super::constants::{CLOCK_SKEW_FUTURE_MS, MAX_PREV_EVENTS};
 use super::content::{self, Content};
 use super::ids::{EventId, RoomId};
-use super::reject::{Flag, RejectReason};
+use super::reject::{Flag, MembershipOracle, RejectReason};
 use super::signed::{self, SignedEvent};
 use super::wire::WireEvent;
 
@@ -165,4 +165,56 @@ pub fn validate_wire_bytes(
         wire,
         flags,
     })
+}
+
+/// Run the stateless pipeline and then the **stateful** §6 steps 7–8 against a
+/// [`MembershipOracle`] (Event Protocol §6; spec D3 / scope item 10).
+///
+/// This is the frozen-surface entry named in the [`MembershipOracle`] doc: it
+/// completes [`validate_wire_bytes`] with the membership/role authorization
+/// (step 8) and the membership-derived device binding (step 7) for the event
+/// types that carry no self-contained binding
+/// ([`EventType::requires_membership_device_binding`](super::content::EventType::requires_membership_device_binding)).
+///
+/// The `oracle` is expected to be an **ancestor-scoped** view of the event's
+/// causal ancestors (the membership layer's `AncestorView`), so the verdict is
+/// ancestor-stable and identical on every peer regardless of arrival order.
+///
+/// Authorization (step 8) is evaluated **before** the membership-derived device
+/// binding (step 7) so a non-member yields the more specific `not_a_member`
+/// rather than `unbound_device`; both are rejections, so the verdict is
+/// unaffected (spec D3 / vector §13).
+///
+/// The `member.joined` capability check (key-bound invite liveness, log-only
+/// expiry, sticky departure) **cannot** be expressed through the content-free
+/// [`MembershipOracle::authorize`] signature and is therefore performed by the
+/// membership fold's ingest path, not here (spec Open Q1 / R7).
+///
+/// # Errors
+/// Returns any [`RejectReason`] from [`validate_wire_bytes`], or the deferred
+/// `not_a_member` / `insufficient_role` (step 8) or `unbound_device` (step 7).
+pub fn validate_with_membership(
+    bytes: &[u8],
+    ctx: &ValidationContext,
+    oracle: &impl MembershipOracle,
+) -> Result<ValidatedEvent, RejectReason> {
+    let validated = validate_wire_bytes(bytes, ctx)?;
+    let event = &validated.event;
+
+    // Step 8 — membership & role authorization in the ancestor view.
+    oracle.authorize(&event.room_id, &event.sender_id, event.event_type.as_str())?;
+
+    // Step 7 — device binding from membership state, for the types that carry no
+    // self-contained binding. A `None` bound device means the sender has no
+    // membership-bound device (e.g. an inert `member.left` from a non-member);
+    // such events are accepted (they grant nothing).
+    if event.event_type.requires_membership_device_binding() {
+        if let Some(bound) = oracle.bound_device(&event.room_id, &event.sender_id) {
+            if &bound != event.device_id.as_bytes() {
+                return Err(RejectReason::UnboundDevice);
+            }
+        }
+    }
+
+    Ok(validated)
 }

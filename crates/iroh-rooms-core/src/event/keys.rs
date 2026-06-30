@@ -74,7 +74,13 @@ fn parse_fixed<const N: usize>(s: &str) -> Result<[u8; N], KeyParseError> {
 macro_rules! public_key_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        ///
+        /// `Ord` is the bytewise order of the raw public-key bytes. It carries no
+        /// protocol meaning (timeline position is untrusted) and exists only so
+        /// the membership layer can key deterministic `BTreeMap`s on identities
+        /// and devices (spec §4) and apply the lowest-`event_id`-style stable
+        /// tie-breaks over identities.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name([u8; PUBLIC_KEY_LEN]);
 
         impl $name {
