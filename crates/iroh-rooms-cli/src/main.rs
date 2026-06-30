@@ -6,8 +6,10 @@
 use std::process::ExitCode;
 
 mod cli;
+mod clock;
 mod identity;
 mod paths;
+mod room;
 
 fn main() -> ExitCode {
     match cli::run() {

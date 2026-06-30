@@ -26,25 +26,28 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 
 > **Partially runnable — read this first.**
 >
-> `iroh-rooms identity create` and `iroh-rooms identity show` (Step 1) are implemented and
-> runnable as of issue #16 / IR-0101. All other commands (`room`, `file`, `pipe`, `agent`)
-> are scaffold — the binary does not recognise them yet.
+> - **Step 1** (`iroh-rooms identity create` / `iroh-rooms identity show`) is implemented
+>   and runnable as of issue #16 / IR-0101. Output blocks are reconciled against the shipped
+>   binary and show the actual format.
+> - **Step 2** (`iroh-rooms room create` / `iroh-rooms room members`) is implemented and
+>   runnable as of issue #17 / IR-0102. Output blocks are reconciled against the shipped
+>   binary and show the actual format.
+> - **Steps 3–7** (`room invite`, `room join`, `room send`, `file`, `pipe`, `agent`) are
+>   scaffold — the binary does not recognise them yet. **Expected output** blocks for those
+>   steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet captured from
+>   a real run).
 >
-> Consequently:
+> General notes:
 >
-> - **Step 1** output blocks are reconciled against the shipped binary and show the actual
->   format. For all other steps, **Expected output** blocks are *illustrative* (consistent
->   with `PRD.v0.3.md` §16 but not yet captured from a real run). **The merged binary is
->   the source of truth**; where the guide diverges, the binary wins and the divergence
->   should be filed.
 > - The data-directory override (`--data-dir` flag and `IROH_ROOMS_HOME` env var) is
 >   confirmed by the shipped binary — use these exactly as documented.
 > - A few details for later commands are still pending and are flagged inline as
 >   **[reconcile]**: the exact `agent invite`/join syntax and the verbatim `pipe expose`
 >   security-warning text.
->
-> If you are running this against the real binary and an output differs, trust the binary and
-> file the divergence — that is expected and useful.
+> - **The merged binary is the source of truth.** If you are running against the real
+>   binary and an output differs from any block in this guide, trust the binary and file
+>   the divergence.
+
 
 ---
 
@@ -209,25 +212,29 @@ Then list members:
 iroh-rooms room members <ROOM_ID>
 ```
 
-**Expected output** (illustrative):
+**Expected output** (`room create`):
 
 ```text
-Created room "Getting Started Room"
-  room id: room_7Q3…f0
-  admin:   Alice (9a02…11bd)
-
-Stored room.created (signed) in .demo/alice. Invite a peer with:
-  iroh-rooms room invite room_7Q3…f0 --expires 24h
+created room "Getting Started Room"
+room_id: blake3:…(64 hex chars)…
+admin: …(Alice's identity_id, 64 hex chars)…
+next: run `iroh-rooms room members blake3:…`
 ```
+
+**Expected output** (`room members <ROOM_ID>`):
 
 ```text
-Members of room_7Q3…f0:
-  Alice   9a02…11bd   admin   active
+room: blake3:…(64 hex chars)…
+admin: …(Alice's identity_id, 64 hex chars)…
+member: …(Alice's identity_id)… role=admin status=active (admin)
 ```
 
-**What this proves / verify:** **copy `<ROOM_ID>` from the output.** Alice is the single,
-immutable admin (spike §3.1 — exactly the genesis signer, no co-admins, no transfer); the
-genesis `room.created` event is signed and stored in Alice's local log.
+**What this proves / verify:** **copy the full `blake3:…` value from the `room_id:` line
+as `<ROOM_ID>`.** Alice is the single immutable admin (spike §3.1 — exactly the genesis
+signer; no co-admins, no transfer); the genesis `room.created` event is signed by Alice's
+device key and stored in Alice's local SQLite event log. The `members` command re-derives
+the admin and membership entirely from the persisted event log — there is no separate
+`rooms` table.
 
 ---
 

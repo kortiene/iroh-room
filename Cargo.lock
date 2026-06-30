@@ -2033,6 +2033,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "directories",
+ "getrandom 0.4.3",
  "hex",
  "iroh-rooms-core",
  "predicates",

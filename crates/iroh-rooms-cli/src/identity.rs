@@ -22,9 +22,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use iroh_rooms_core::event::keys::SigningKey;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// File name of the public identity profile.
 pub const IDENTITY_FILE: &str = "identity.json";
@@ -36,6 +36,8 @@ const PROFILE_VERSION: u32 = 1;
 /// Maximum profile-name length, in UTF-8 bytes (spec OQ-5; reconciled with the
 /// future `member.joined.display_name` when membership events are wired).
 const MAX_NAME_BYTES: usize = 64;
+/// Length in bytes of an Ed25519 secret seed (the hex-encoded form is twice this).
+const SEED_LEN: usize = 32;
 
 /// The public identity profile, persisted as `identity.json` and printed by
 /// `identity show`. Contains no secret bytes — safe to read, serialize, and log.
@@ -82,6 +84,128 @@ impl Profile {
             )
         })
     }
+}
+
+/// The two secret signing keys backing the local identity, loaded for an
+/// authoring command (`room create` and later flows).
+///
+/// The seeds live **only** inside the [`SigningKey`] wrappers (and the
+/// `Zeroizing` buffers used to build them, which are wiped). There is
+/// deliberately no `Debug`/`Display`/`Serialize`, so a stray `{:?}` or log call
+/// cannot leak a seed (spec D4 / §9).
+pub struct SecretKeys {
+    /// Signs the device binding — authorizes `device_id` under `sender_id`.
+    pub identity: SigningKey,
+    /// Signs the event itself; the signature verifies under `device_id`.
+    pub device: SigningKey,
+}
+
+/// On-disk shape of `identity.secret`. Holds the seed hex transiently; both
+/// strings are zeroized before this struct is dropped. No derived `Debug`, so
+/// the seeds cannot be printed by accident.
+#[derive(serde::Deserialize)]
+struct SecretFile {
+    version: u32,
+    identity_secret: String,
+    device_secret: String,
+}
+
+impl Zeroize for SecretFile {
+    fn zeroize(&mut self) {
+        self.identity_secret.zeroize();
+        self.device_secret.zeroize();
+    }
+}
+
+impl SecretKeys {
+    /// Load the secret seeds from `<home>/identity.secret` and reconstruct the
+    /// signing keys.
+    ///
+    /// After decoding, the keys are cross-checked against the public profile
+    /// (`identity.json`): the derived public keys MUST equal the stored
+    /// `identity_id` / `device_id`. A mismatch (tamper or partial corruption) is
+    /// a hard error — the same guard the public side applies (#16 §8).
+    ///
+    /// # Errors
+    /// Returns an actionable error if no identity exists in `home` (pointing at
+    /// `iroh-rooms identity create`), if the secret file is unreadable, or if it
+    /// is corrupt / inconsistent with the public profile. No secret bytes ever
+    /// appear in an error message.
+    pub fn load(home: &Path) -> Result<Self> {
+        let path = home.join(SECRET_FILE);
+        let mut bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                bail!(
+                    "no identity in {}; run `iroh-rooms identity create --name <name>`",
+                    home.display()
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+
+        // Parse, then wipe the raw file bytes (they hold the seed hex).
+        let parsed: Result<SecretFile> = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "identity files are inconsistent or corrupt: {}",
+                path.display()
+            )
+        });
+        bytes.zeroize();
+        let mut parsed = parsed?;
+
+        let keys = Self::from_secret_file(&parsed).with_context(|| {
+            format!(
+                "identity files are inconsistent or corrupt: {}",
+                path.display()
+            )
+        });
+        parsed.zeroize();
+        let keys = keys?;
+
+        // Consistency guard: the secret seeds must reproduce the public profile.
+        let profile = Profile::load(home)?;
+        if keys.identity.identity_key().to_string() != profile.identity_id
+            || keys.device.device_key().to_string() != profile.device_id
+        {
+            bail!(
+                "identity files are inconsistent or corrupt: {} (secret keys do not match \
+                 identity.json)",
+                home.display()
+            );
+        }
+        Ok(keys)
+    }
+
+    /// Decode both seeds into signing keys, validating the file version. Secret
+    /// intermediates are held in `Zeroizing` and wiped on drop.
+    fn from_secret_file(file: &SecretFile) -> Result<Self> {
+        if file.version != PROFILE_VERSION {
+            bail!("unsupported identity.secret version {}", file.version);
+        }
+        Ok(Self {
+            identity: signing_key_from_seed_hex(&file.identity_secret)?,
+            device: signing_key_from_seed_hex(&file.device_secret)?,
+        })
+    }
+}
+
+/// Decode a 32-byte secret seed from lowercase hex into a [`SigningKey`]. The
+/// decoded seed bytes are held in a `Zeroizing` buffer and wiped before return;
+/// no secret bytes appear in any error.
+fn signing_key_from_seed_hex(seed_hex: &str) -> Result<SigningKey> {
+    let mut raw = hex::decode(seed_hex).map_err(|_| anyhow!("secret seed is not valid hex"))?;
+    let key = if let Ok(seed) = <[u8; SEED_LEN]>::try_from(raw.as_slice()) {
+        let seed = Zeroizing::new(seed);
+        SigningKey::from_seed(&seed)
+    } else {
+        raw.zeroize();
+        bail!("secret seed has the wrong length (expected {SEED_LEN} bytes)");
+    };
+    raw.zeroize();
+    Ok(key)
 }
 
 /// Create a new identity (and device) keypair under `home`, persisting both the
@@ -141,7 +265,7 @@ pub fn create(home: &Path, name: &str, force: bool) -> Result<Profile> {
         name: name.to_owned(),
         identity_id: identity_key.identity_key().to_string(),
         device_id: device_key.device_key().to_string(),
-        created_at_ms: now_ms(),
+        created_at_ms: crate::clock::now_ms(),
     };
     let profile_json = serde_json::to_vec(&profile).context("could not encode identity.json")?;
 
@@ -215,14 +339,6 @@ fn secret_file_contents(identity_key: &SigningKey, device_key: &SigningKey) -> S
     identity_hex.zeroize();
     device_hex.zeroize();
     contents
-}
-
-/// Milliseconds since the Unix epoch (saturating; `0` if the clock predates it).
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Create `path` exclusively (failing if it exists) with owner-only permissions,
@@ -584,6 +700,140 @@ mod tests {
         assert!(
             secret.contains("device_secret"),
             "identity.secret must contain device_secret field"
+        );
+    }
+
+    // ── SecretKeys::load ────────────────────────────────────────────────────
+
+    #[test]
+    fn secret_keys_load_missing_secret_file_returns_actionable_error() {
+        let dir = tempdir().unwrap();
+        let err = SecretKeys::load(dir.path())
+            .err()
+            .expect("expected load to fail when no identity exists");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity create") || msg.contains("no identity"),
+            "error must hint at the create command: {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_keys_load_roundtrips_keys_written_by_create() {
+        let dir = tempdir().unwrap();
+        let profile = create(dir.path(), "Alice", false).unwrap();
+        let secret = SecretKeys::load(dir.path()).unwrap();
+        assert_eq!(
+            secret.identity.identity_key().to_string(),
+            profile.identity_id,
+            "loaded identity key must reproduce the profile identity_id"
+        );
+        assert_eq!(
+            secret.device.device_key().to_string(),
+            profile.device_id,
+            "loaded device key must reproduce the profile device_id"
+        );
+    }
+
+    #[test]
+    fn secret_keys_load_corrupt_json_returns_error() {
+        let dir = tempdir().unwrap();
+        crate::paths::ensure_dir(dir.path()).unwrap();
+        // Write identity.json first so Profile::load won't short-circuit on
+        // a missing file before we get to the secret-file parse error.
+        create(dir.path(), "Alice", false).unwrap();
+        // Overwrite the secret file with invalid JSON.
+        std::fs::write(dir.path().join(SECRET_FILE), b"not valid json").unwrap();
+        let err = SecretKeys::load(dir.path())
+            .err()
+            .expect("expected load to fail with corrupt JSON");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inconsistent or corrupt") || msg.contains("not valid"),
+            "corrupt JSON must produce an error: {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_keys_load_invalid_hex_seed_returns_error() {
+        let dir = tempdir().unwrap();
+        create(dir.path(), "Alice", false).unwrap();
+        // Overwrite with a structurally valid JSON but non-hex seeds.
+        std::fs::write(
+            dir.path().join(SECRET_FILE),
+            b"{\"version\":1,\"identity_secret\":\"gggg\",\"device_secret\":\"hhhh\"}\n",
+        )
+        .unwrap();
+        let err = SecretKeys::load(dir.path())
+            .err()
+            .expect("expected load to fail with non-hex seeds");
+        assert!(
+            err.to_string().contains("inconsistent or corrupt") || err.to_string().contains("hex"),
+            "bad hex must produce an error: {err}"
+        );
+    }
+
+    #[test]
+    fn secret_keys_load_wrong_seed_length_returns_error() {
+        let dir = tempdir().unwrap();
+        create(dir.path(), "Alice", false).unwrap();
+        // 31-byte seed (62 hex chars) — one byte short.
+        let short_seed = "ab".repeat(31);
+        let body = format!(
+            "{{\"version\":1,\"identity_secret\":\"{short_seed}\",\
+             \"device_secret\":\"{short_seed}\"}}\n"
+        );
+        std::fs::write(dir.path().join(SECRET_FILE), body.as_bytes()).unwrap();
+        let err = SecretKeys::load(dir.path())
+            .err()
+            .expect("expected load to fail with too-short seed");
+        assert!(
+            err.to_string().contains("inconsistent or corrupt")
+                || err.to_string().contains("wrong length"),
+            "short seed must produce an error: {err}"
+        );
+    }
+
+    #[test]
+    fn secret_keys_load_mismatch_against_public_profile_returns_error() {
+        // Write Alice's identity in dir_a, then overwrite dir_a's identity.json
+        // with Bob's public keys while keeping Alice's secret file. The
+        // consistency guard must catch the mismatch.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        create(dir_a.path(), "Alice", false).unwrap();
+        let profile_b = create(dir_b.path(), "Bob", false).unwrap();
+
+        // Replace Alice's identity.json with Bob's public profile.
+        let bob_json = serde_json::to_string(&profile_b).unwrap();
+        std::fs::write(dir_a.path().join(IDENTITY_FILE), bob_json.as_bytes()).unwrap();
+
+        // Alice's secret file + Bob's public profile — keys won't match.
+        let err = SecretKeys::load(dir_a.path())
+            .err()
+            .expect("expected load to fail when secret/public keys mismatch");
+        assert!(
+            err.to_string().contains("inconsistent or corrupt"),
+            "key mismatch must be caught by the consistency guard: {err}"
+        );
+    }
+
+    #[test]
+    fn secret_keys_load_unsupported_version_returns_error() {
+        let dir = tempdir().unwrap();
+        create(dir.path(), "Alice", false).unwrap();
+        let valid_seed = "01".repeat(32);
+        let body = format!(
+            "{{\"version\":99,\"identity_secret\":\"{valid_seed}\",\
+             \"device_secret\":\"{valid_seed}\"}}\n"
+        );
+        std::fs::write(dir.path().join(SECRET_FILE), body.as_bytes()).unwrap();
+        let err = SecretKeys::load(dir.path())
+            .err()
+            .expect("expected load to fail with unsupported version");
+        assert!(
+            err.to_string().contains("unsupported") || err.to_string().contains("inconsistent"),
+            "unknown version must produce an error: {err}"
         );
     }
 
