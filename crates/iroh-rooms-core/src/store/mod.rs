@@ -162,6 +162,35 @@ impl EventStore {
         u64::try_from(n).map_err(|_| StoreError::integrity("negative row count"))
     }
 
+    /// Every stored `event_id` in a room, as a deterministic [`BTreeSet`] — the
+    /// read-only set-equality oracle the sync layer's convergence assertion is
+    /// built on (spec `bounded-recent-sync-prototype.md` D8).
+    ///
+    /// Returns **all** stored events regardless of causal completeness; the store
+    /// holds exactly the fold-accepted set (sync spec D5), so this is precisely the
+    /// convergent validated set two peers compare after a sync round. Additive and
+    /// read-only — no schema or `user_version` change.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] if a
+    /// stored id is not 32 bytes.
+    pub fn room_event_ids(
+        &self,
+        room: &RoomId,
+    ) -> Result<std::collections::BTreeSet<EventId>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT event_id FROM events WHERE room_id = ?1")?;
+        let rows = stmt.query_map(params![&room.as_bytes()[..]], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut out = std::collections::BTreeSet::new();
+        for r in rows {
+            out.insert(EventId::from_bytes(to_raw_id(&r?)?));
+        }
+        Ok(out)
+    }
+
     // -- parent lookup (both directions) --------------------------------------
 
     /// The declared `prev_events` of an event, in signed order (`ordinal`).

@@ -19,6 +19,13 @@ workspace = true
 # exercised (spec D1).
 store = ["dep:rusqlite"]
 
+# The deterministic, sans-IO bounded recent-sync engine + in-memory simulation
+# harness (IR-0007). Enables `store` (the engine reconciles over the SQLite event
+# store and membership fold). Off by default so validate-only consumers stay lean;
+# CI `--all-features` always exercises it (spec `bounded-recent-sync-prototype.md`
+# §2.3 / D1).
+sync = ["store"]
+
 [dependencies]
 # Ed25519 signing/verification. Pinned EXACTLY to the version `iroh 1.0` resolves
 # (`3.0.0-rc.0`, recorded in PHASE-0-SPIKE.md Event Protocol §1 / spec D2 / R6) so

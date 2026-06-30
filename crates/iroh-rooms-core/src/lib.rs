@@ -29,6 +29,19 @@ pub mod membership;
 #[cfg(feature = "store")]
 pub mod store;
 
+/// The bounded recent-sync engine (IR-0007): a deterministic, sans-IO protocol
+/// state machine that moves opaque signed [`WireEvent`](event::WireEvent)s between
+/// peers and reconciles them over the landed [`store`] + [`membership`] fold —
+/// pull missing events by id, pull bounded recent chat, always reconcile the
+/// never-windowed membership sub-DAG + admin chain, and exchange admin tips with a
+/// fail-closed incompleteness detector. Ships with an in-memory simulation harness
+/// ([`sync::sim`]) that proves arrival-order-independent convergence (Spike Plan
+/// Day 6 / Gate D). Behind the `sync` cargo feature (which enables `store`).
+/// See `PHASE-0-SPIKE.md` ADR-2 / Membership & Ordering §0/§4 and the spec
+/// `bounded-recent-sync-prototype.md`.
+#[cfg(feature = "sync")]
+pub mod sync;
+
 /// Current crate-level protocol version.
 ///
 /// Matches the on-wire `schema_version` and `WireEvent.v` for MVP
