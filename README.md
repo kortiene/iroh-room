@@ -130,6 +130,29 @@ data-directory model and key-persistence layer every later CLI command will reus
 - 40+ tests (unit + CLI integration) covering all acceptance criteria, security invariants
   (no secret bytes in any output stream), and Unix file-permission guarantees.
 
+**Room creation** has landed in `crates/iroh-rooms-cli` (issue #17 / IR-0102), wiring the
+second subcommand group and completing the genesis-event flow end-to-end:
+
+- `iroh-rooms room create <NAME>` — loads the local identity secrets, draws a 16-byte
+  CSPRNG nonce, derives the `room_id` via the §5 `BLAKE3` derivation, assembles and signs
+  a `room.created` genesis event (Event Protocol §7), self-validates it through the full
+  stateless §6 pipeline, and persists the verbatim wire bytes into `<HOME>/rooms.db`.
+  The creator becomes the room's **single immutable admin**. Prints `room_id`,
+  `admin` (`identity_id`), and a next-step hint; exits non-zero and writes nothing on any
+  error (name validation runs before any IO).
+- `iroh-rooms room members <ROOM_ID>` — re-derives the room's membership by re-validating
+  and folding the persisted event log; prints `room`, `admin`, and each `member` row with
+  `role` and `status`. For a freshly created room this is one row: the creator, `admin`,
+  `active`. Room state is **derived from the append-only event log** (no separate
+  `rooms`/`members` table), so a room survives CLI restart by design.
+- A `build_room_created` pure genesis builder lives in `iroh-rooms-core::event::genesis`,
+  deterministic in its inputs (the caller injects the nonce and clock), golden-tested
+  against the §5 `room_id` vector, and reusable by future flows.
+- Secret hygiene: signing secrets are held in `Zeroizing` buffers and never appear in any
+  output or error path.
+- 30+ tests (core unit tests including the §5 golden `room_id` vector, CLI integration
+  tests via `assert_cmd`) covering all five acceptance criteria.
+
 The **full-mesh QUIC event transport prototype** has landed in
 `crates/iroh-rooms-net` (issue #9 / IR-0005). This is the real iroh adapter — the
 shipping carrier behind the landed, sans-IO `SyncEngine` — proving the
@@ -155,16 +178,16 @@ shipping carrier behind the landed, sans-IO `SyncEngine` — proving the
   Gate A; see `crates/iroh-rooms-net/NOTES.md`.
 
 With this prototype the Phase-0 Room Event Plane targets (event model, store,
-membership fold, sync engine, identity CLI, and the iroh transport) are all landed
-as prototypes; the remaining work is CLI/runtime wiring, the `MembershipSnapshot`
-re-point of admission, and the Gate-A real-network confirmation (all tracked
-separately).
+membership fold, sync engine, identity CLI, room creation, and the iroh transport)
+are all landed as prototypes; the remaining work is room invite/join, messaging,
+file sharing, live pipe, agent status, the `MembershipSnapshot` re-point of
+admission, and the Gate-A real-network confirmation (all tracked separately).
 
 ## Repository Layout
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity subcommand; scaffold for room, file, pipe, agent)
+crates/iroh-rooms-cli/    CLI binary (identity + room subcommands; scaffold for file, pipe, agent)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC event transport (IR-0005; ALPN /iroh-rooms/event/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 .adw/                     Switchyard / ADW project pack
