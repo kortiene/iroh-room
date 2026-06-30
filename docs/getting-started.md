@@ -32,10 +32,13 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 > - **Step 2** (`iroh-rooms room create` / `iroh-rooms room members`) is implemented and
 >   runnable as of issue #17 / IR-0102. Output blocks are reconciled against the shipped
 >   binary and show the actual format.
-> - **Steps 3–7** (`room invite`, `room join`, `room send`, `file`, `pipe`, `agent`) are
->   scaffold — the binary does not recognise them yet. **Expected output** blocks for those
->   steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet captured from
->   a real run).
+> - **Step 3 (invite half)** — `iroh-rooms room invite` is implemented and runnable as of
+>   issue #18 / IR-0103. The output block for that command is reconciled against the shipped
+>   binary and shows the actual format. `room join` and the rest of Step 3 remain scaffold.
+> - **Steps 3–7** (except `room invite`) — `room join`, `room send`, `file`, `pipe`, `agent`
+>   are scaffold — the binary does not recognise them yet. **Expected output** blocks for
+>   those steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet captured
+>   from a real run).
 >
 > General notes:
 >
@@ -253,19 +256,26 @@ expires can attempt to join as the named key. Handle it like a password.
 **Command** (Terminal A — Alice):
 
 ```bash
-# Substitute <ROOM_ID> from Step 2.
-iroh-rooms room invite <ROOM_ID> --expires 24h
+# Substitute <ROOM_ID> from Step 2 and <BOB_ID> from Bob's `identity show` (Step 1).
+# Invites are key-bound: --invitee names the exact identity allowed to redeem the ticket.
+iroh-rooms room invite <ROOM_ID> --invitee <BOB_ID> --expires 24h
 ```
 
-**Expected output** (illustrative):
+**Expected output**:
 
 ```text
-Invite ticket (expires in 24h) — share over a private channel:
-
+invite_id: da7e…da7e
+room: blake3:…(64 hex chars)…
+invitee: 9f12…4ac1
+role: member
+expires: 2026-07-01T12:00:00Z (in 24h)
+ticket:
   roomtkt1q…9z
-
-This ticket carries a secret. Treat it like a password.
+warning: this ticket carries a secret — share it over a private channel and treat it like a password.
+next: the invitee runs `iroh-rooms room join <ticket>`
 ```
+
+Copy the `roomtkt1…` token as `<BOB_TICKET>`.
 
 **Command** (Terminal B — Bob):
 
@@ -287,20 +297,25 @@ Syncing recent history from online peers…
 
 ```bash
 # Substitute <ROOM_ID> from Step 2 and <AGENT_ID> from the agent's identity show (Step 1).
-# [reconcile] exact agent-invite syntax against the binary; PRD §16 shows `agent invite`.
-# An alternative the binary may expose is: iroh-rooms room invite <ROOM_ID> --role agent
-iroh-rooms agent invite <ROOM_ID> <AGENT_ID>
+# --role agent grants the agent role; omit --expires for a non-expiring invite.
+iroh-rooms room invite <ROOM_ID> --invitee <AGENT_ID> --role agent
 ```
 
-**Expected output** (illustrative):
+**Expected output**:
 
 ```text
-Agent invite for 7c5e…d1a0 (role = agent), expires in 24h:
-
+invite_id: ab12…ab12
+room: blake3:…(64 hex chars)…
+invitee: 7c5e…d1a0
+role: agent
+expires: never
+ticket:
   roomtkt1q…ag
-
-Hand this to the agent process; it joins with `room join`.
+warning: this ticket carries a secret — share it over a private channel and treat it like a password.
+next: the invitee runs `iroh-rooms room join <ticket>`
 ```
+
+Copy the `roomtkt1…` token as `<AGENT_TICKET>`.
 
 **Command** (Terminal C — Agent):
 

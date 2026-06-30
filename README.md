@@ -177,9 +177,37 @@ shipping carrier behind the landed, sans-IO `SyncEngine` — proving the
 - **Gate A (real-NAT run) is still owed** before MVP go — the loopback suite is not
   Gate A; see `crates/iroh-rooms-net/NOTES.md`.
 
+**Key-bound room invite** has landed in `crates/iroh-rooms-cli` (issue #18 / IR-0103),
+adding the second authoring command and the first out-of-band capability artifact:
+
+- `iroh-rooms room invite <ROOM_ID> --invitee <IDENTITY_ID> [--role member|agent] [--expires <DURATION>]`
+  — admin-only; confirms the caller is the room's single immutable admin via the membership
+  fold, draws a fresh `invite_id` and capability **secret** from the OS CSPRNG, computes
+  `capability_hash = BLAKE3-256(INVITE_CONTEXT ‖ room_id ‖ invite_id ‖ secret)`, assembles
+  and signs a `member.invited` event (carrying the hash, **never** the secret), self-validates
+  and fold-checks the event before persisting, then emits an out-of-band `RoomInviteTicket`
+  token (`roomtkt1…`) carrying the room id, invite id, capability secret, bound invitee key,
+  role, optional expiry, and a discovery hint (admin `device_id`).
+- `RoomInviteTicket` lives in `iroh-rooms-core::ticket`: a canonical, round-trippable text
+  token (`roomtkt1<base32-lowercase-nopad(version ‖ CBOR ‖ BLAKE3-checksum)>`) with a
+  redacted `Debug` (secret masked) and a `capability_hash()` method that recomputes the
+  on-log hash from the ticket secret (AC4). Placed in `core` so the sibling `room join`
+  flow can decode it without duplicating the codec.
+- `--expires <DURATION>` supports `<int>{s|m|h|d}` (e.g. `24h`, `7d`); expiry is encoded
+  as `expires_at` (ms since Unix epoch) in the event content, log-only and advisory-clock-free
+  — enforcement lives in the landed `gate_join`, not the local clock. `expires: never` when
+  absent.
+- `--role admin` is rejected at the CLI (single immutable admin; the fold has no second-admin
+  semantics). `agent` and `member` are accepted.
+- Tickets are key-bound to the named `--invitee`; open/bearer tickets are out of scope for MVP.
+- Output is script-friendly labeled lines, ending with the ticket token and a password-grade warning.
+- 20+ tests (core unit: deterministic builder, golden event id, secret-absent-from-log AC3,
+  capability-hash AC4, ticket round-trip + corruption rejection; CLI integration: admin path,
+  non-admin rejection, bad args, secret-not-in-output).
+
 With this prototype the Phase-0 Room Event Plane targets (event model, store,
-membership fold, sync engine, identity CLI, room creation, and the iroh transport)
-are all landed as prototypes; the remaining work is room invite/join, messaging,
+membership fold, sync engine, identity CLI, room creation, room invite, and the iroh
+transport) are all landed as prototypes; the remaining work is room join, messaging,
 file sharing, live pipe, agent status, the `MembershipSnapshot` re-point of
 admission, and the Gate-A real-network confirmation (all tracked separately).
 

@@ -35,6 +35,10 @@ sync = ["store"]
 ed25519-dalek = "=3.0.0-rc.0"
 # BLAKE3-256 — the same content hash the Blob Plane uses (Event Protocol §4).
 blake3 = "1"
+# RFC 4648 base32 for the copy-paste invite ticket token (IR-0103 D4). Already
+# resolves in the workspace `Cargo.lock` (pulled in transitively by the iroh
+# ecosystem), so this direct dependency adds no new build artifact.
+data-encoding = "2"
 # Lowercase hex presentation of keys/ids on the wire (no `0x`, no uppercase).
 hex = "0.4"
 # OS CSPRNG entropy source for `SigningKey::generate()` (spec IR-0101 D1). Draws

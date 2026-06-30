@@ -8,6 +8,7 @@ use std::process::ExitCode;
 mod cli;
 mod clock;
 mod identity;
+mod invite;
 mod paths;
 mod room;
 
