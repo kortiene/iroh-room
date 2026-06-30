@@ -12,3 +12,13 @@ Run ADW only from a clean working tree, and do not use automatic merge flags on
 `priority/p0`, `risk/high`, `area/protocol`, `area/transport`, `area/pipe`, or
 `type/security` issues.
 
+External Switchyard runs must pass this repository as the project root:
+
+```bash
+cd /path/to/switchyard/adw_sdlc
+npm run issue -- <issue-number> \
+  --repo kortiene/iroh-room \
+  --project-root /path/to/iroh-room \
+  --runner claude \
+  --dry-run
+```

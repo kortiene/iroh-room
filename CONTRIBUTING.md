@@ -37,21 +37,27 @@ Recommended dry run:
 
 ```bash
 cd /path/to/switchyard/adw_sdlc
-npm run issue -- 5 --repo kortiene/iroh-room --runner claude --dry-run
+npm run issue -- 35 \
+  --repo kortiene/iroh-room \
+  --project-root /path/to/iroh-room \
+  --runner claude \
+  --dry-run
 ```
 
 Recommended human-reviewed execution:
 
 ```bash
 cd /path/to/switchyard/adw_sdlc
-npm run issue -- 5 --repo kortiene/iroh-room --runner claude
+npm run issue -- 35 \
+  --repo kortiene/iroh-room \
+  --project-root /path/to/iroh-room \
+  --runner claude
 ```
 
-Important: Switchyard's current standalone kernel resolves its repository root
-from the installed package location. If it does not load this repository's
-`.adw/config.json` when run externally, use the dry-run output only and track a
-Switchyard follow-up to support explicit external project roots before relying
-on full automation.
+The `--project-root` flag is required when Switchyard is run from a separate
+checkout. It tells the ADW kernel where to load this repository's `.adw` pack,
+where to write `agents/{adw_id}` state, which worktree the agent may edit, and
+where to execute `scripts/verify.sh`.
 
 ## Safety Rules
 
@@ -80,4 +86,3 @@ The gate currently runs:
 1. `cargo fmt --all --check`
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace --all-targets --all-features`
-

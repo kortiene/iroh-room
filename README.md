@@ -53,6 +53,7 @@ The execution backlog lives in GitHub Issues:
 This repository includes an `.adw` project pack so Switchyard can be used as an
 optional contribution orchestrator. Switchyard remains an external tool; it is
 not vendored into this repository and is not a runtime dependency of Iroh Rooms.
+When Switchyard is run from another checkout, pass `--project-root` pointing at
+this repository so it loads `.adw/config.json` and runs `scripts/verify.sh`.
 
 See `CONTRIBUTING.md` for the recommended workflow.
-
