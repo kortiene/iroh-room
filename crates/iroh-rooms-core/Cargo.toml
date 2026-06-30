@@ -37,6 +37,16 @@ ed25519-dalek = "=3.0.0-rc.0"
 blake3 = "1"
 # Lowercase hex presentation of keys/ids on the wire (no `0x`, no uppercase).
 hex = "0.4"
+# OS CSPRNG entropy source for `SigningKey::generate()` (spec IR-0101 D1). Draws
+# from the same operating-system RNG `ed25519-dalek`'s own `generate` uses, but
+# keeps `generate()` parameter-free so the public surface is not coupled to an
+# `ed25519-dalek`/`rand_core` version. Pinned to the workspace-resolved 0.4 line
+# (already in `Cargo.lock`); its `fill` API is the entropy entry point.
+getrandom = "0.4"
+# Wipe the transient 32-byte seed buffer in `SigningKey::generate()` and the seed
+# returned by `to_seed()` so secret material is zeroed on drop (spec IR-0101 D8).
+# Already in `Cargo.lock`.
+zeroize = "1"
 # Synchronous SQLite for the local event store (IR-0004, spec D2). `bundled`
 # compiles a hermetic, version-pinned SQLite from vendored C source — no system
 # `libsqlite3`, reproducible CI. Its FFI lives in `libsqlite3-sys`, a separate

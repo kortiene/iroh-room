@@ -24,25 +24,24 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 
 ## Status of this guide (read first)
 
-> **This guide is drafted ahead of the CLI it documents.**
+> **Partially runnable — read this first.**
 >
-> The CLI binary in this repository is currently a scaffold — `iroh-rooms` prints a version
-> string and nothing else. The full command surface below is the **intended** surface from
-> `PRD.v0.3.md` §16, delivered under issue **#34** and the other Phase 1B issues (identity,
-> room, invite/join, message, file share/fetch, pipe, agent status).
+> `iroh-rooms identity create` and `iroh-rooms identity show` (Step 1) are implemented and
+> runnable as of issue #16 / IR-0101. All other commands (`room`, `file`, `pipe`, `agent`)
+> are scaffold — the binary does not recognise them yet.
 >
 > Consequently:
 >
-> - Every **command** matches `PRD.v0.3.md` §16, but exact flags may be reconciled against
->   the shipped binary when it lands. **The merged binary is the source of truth**, not this
->   guide or the PRD; where they diverge, the binary wins and the divergence is reported back.
-> - Every **Expected output** block shows an *illustrative shape* consistent with PRD §16,
->   with volatile bytes elided as `…`. These are **not** captured from a real run yet. Before
->   this guide's acceptance can be claimed, each block must be re-captured verbatim from the
->   merged binary (spec §2, §8, §9; PRD §17.2.4).
-> - A few details are pending confirmation against the binary and are flagged inline as
->   **[reconcile]**: the data-directory override name, the exact `agent invite`/join syntax,
->   and the verbatim `pipe expose` security-warning text.
+> - **Step 1** output blocks are reconciled against the shipped binary and show the actual
+>   format. For all other steps, **Expected output** blocks are *illustrative* (consistent
+>   with `PRD.v0.3.md` §16 but not yet captured from a real run). **The merged binary is
+>   the source of truth**; where the guide diverges, the binary wins and the divergence
+>   should be filed.
+> - The data-directory override (`--data-dir` flag and `IROH_ROOMS_HOME` env var) is
+>   confirmed by the shipped binary — use these exactly as documented.
+> - A few details for later commands are still pending and are flagged inline as
+>   **[reconcile]**: the exact `agent invite`/join syntax and the verbatim `pipe expose`
+>   security-warning text.
 >
 > If you are running this against the real binary and an output differs, trust the binary and
 > file the divergence — that is expected and useful.
@@ -106,11 +105,10 @@ The demo needs **two humans (Alice, Bob) and one agent**, each a separate identi
 own local store. On a single machine they must not share state, so each runs the CLI against
 a **distinct data directory**, in **its own terminal**.
 
-Point the CLI at a per-participant data directory with `IROH_ROOMS_HOME`. **[reconcile]** the
-exact override name against the merged binary — it is expected to be an environment variable
-(`IROH_ROOMS_HOME`) and/or a `--data-dir` global flag. If the merged CLI offers **no**
-data-directory override, this single-host three-identity demo is not possible and that is a
-CLI blocker, not a documentation gap.
+Point the CLI at a per-participant data directory with `IROH_ROOMS_HOME`. The confirmed
+data-directory override options are: the `IROH_ROOMS_HOME` environment variable (used here)
+and the `--data-dir <PATH>` global flag, which takes precedence over the env var when both
+are set.
 
 Open three terminals at the repo root and create one fresh data directory per participant:
 
@@ -168,21 +166,29 @@ iroh-rooms identity create --name "build-agent"
 iroh-rooms identity show
 ```
 
-**Expected output** (illustrative; Bob's terminal shown):
+**Expected output** (Bob's terminal; volatile bytes abbreviated as `…`):
+
+`iroh-rooms identity create --name "Bob"`:
 
 ```text
-Created identity "Bob"
-  identity key: 9f12…4ac1
-  device key:   3b77…0e2a
-  stored in:    .demo/bob
+created identity "Bob"
+identity_id: 9f12…4ac1
+device_id: 3b77…0e2a
+next: run `iroh-rooms identity show`
+```
 
-No central account required — this identity lives only in IROH_ROOMS_HOME.
+`iroh-rooms identity show`:
+
+```text
+name: Bob
+identity_id: 9f12…4ac1
+device_id: 3b77…0e2a
 ```
 
 **What this proves / verify:** each participant has an Ed25519 identity key plus a device key
 (spike §1), generated locally with no central account, persisted under their
-`IROH_ROOMS_HOME`. From `identity show`, **copy Bob's identity key as `<BOB_ID>` and the
-agent's as `<AGENT_ID>`** — you will authorize them by key later.
+`IROH_ROOMS_HOME`. From `identity show`, **copy the `identity_id` value as `<BOB_ID>` and
+the agent's `identity_id` as `<AGENT_ID>`** — you will authorize them by key later.
 
 ---
 
