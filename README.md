@@ -233,18 +233,43 @@ and drive the `iroh-rooms-net` carrier from the binary:
   an active member; until that lands the commands run but the round trip is gated on #19. Real-NAT
   delivery inherits the open Gate-A risk from the transport prototype (#9).
 
+The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
+`crates/iroh-rooms-cli` (issue #14 / IR-0010). This is the PRD's most differentiated feature
+— authenticated TCP-over-QUIC forwarding that exposes a local loopback service to an
+**explicitly authorized** room peer, and only to that peer:
+
+- `/iroh-rooms/pipe/1` ALPN chained as the second `.accept()` on the shared `Router`
+  (one `Endpoint`, two planes: event + pipe).
+- **Two-stage connect gate**: stage 1 closes a non-member / non-Active device before
+  `accept_bi()` — no handshake byte is read; stage 2 reads `PipeHello{pipe_id}`, runs
+  `pipe_connect_allowed` + `pipe.closed`-known + expiry, and only on `Accept` splices
+  QUIC↔loopback TCP. Every lookup fails closed.
+- **Tear-down-on-learn** watcher re-evaluates each live session every tick and severs any
+  that no longer pass the gate (membership removal, explicit close, or expiry).
+- **Loopback-only binds** (PRD §13.2.3): non-loopback `--tcp` targets are refused; the
+  connector's local listener binds `127.0.0.1` only.
+- Stable, greppable audit vocabulary: `pipe.opened` / `pipe.closed` /
+  `pipe.connect.accepted` / `pipe.connect.rejected:<cause>` / `pipe.torndown:<cause>`.
+- `iroh-rooms pipe expose | connect | close | list` CLI subcommands with the PRD §13.2
+  security warning, loopback enforcement, non-empty `--allow`, active-member pre-check,
+  and §16.3 failure-mode distinction.
+- `crates/iroh-rooms-net/tests/pipe_e2e.rs` proves P1–P6 (AC1–AC5 + expiry) on
+  in-process loopback nodes with an in-test echo server; every await is timeout-bounded.
+- **Gate A (real-NAT run for the pipe ALPN) is still owed** before MVP go, inheriting the
+  open Gate-A risk from the transport prototype (#9); see `crates/iroh-rooms-net/NOTES.md`.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
-engine, identity CLI, room creation, room invite, signed messaging, and the iroh transport)
-are all landed as prototypes; the remaining work is room join, file sharing, live pipe, agent
-status, the `MembershipSnapshot` re-point of admission, and the Gate-A real-network
+engine, identity CLI, room creation, room invite, signed messaging, the iroh transport, and
+the live pipe) are all landed as prototypes; the remaining work is room join, file sharing,
+agent status, the `MembershipSnapshot` re-point of admission, and the Gate-A real-network
 confirmation (all tracked separately).
 
 ## Repository Layout
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity + room subcommands; scaffold for file, pipe, agent)
-crates/iroh-rooms-net/    Full-mesh iroh QUIC event transport (IR-0005; ALPN /iroh-rooms/event/1)
+crates/iroh-rooms-cli/    CLI binary (identity, room, pipe subcommands; scaffold for file, agent)
+crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate

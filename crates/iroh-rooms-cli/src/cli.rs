@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
-use crate::{identity, invite, message, paths, room};
+use crate::{identity, invite, message, paths, pipe, room};
 
 /// Local-first rooms over iroh — local identity and device management.
 #[derive(Debug, Parser)]
@@ -44,6 +44,90 @@ enum Command {
     Room {
         #[command(subcommand)]
         action: RoomAction,
+    },
+    /// Expose, connect to, close, and list authenticated live TCP pipes.
+    Pipe {
+        #[command(subcommand)]
+        action: PipeAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PipeAction {
+    /// Expose a local loopback TCP service to explicitly allowed members.
+    Expose {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// Local loopback forward target as ip:port, e.g. 127.0.0.1:3000.
+        #[arg(long)]
+        tcp: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Allowed member identity id, repeatable (64-char hex). Required, no default-all.
+        #[arg(long = "allow", required = true)]
+        allow: Vec<String>,
+        /// Human-readable label for the pipe.
+        #[arg(long)]
+        label: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Optional expiry as <int>{s|m|h|d}, e.g. 24h.
+        #[arg(long)]
+        expires: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+    /// Connect to an open pipe: forward a local loopback port to the owner.
+    Connect {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// The pipe id printed by `pipe expose` (32-char hex).
+        pipe_id: String,
+        /// Local loopback port to bind (0 ⇒ OS-assigned).
+        #[arg(long)]
+        local: u16,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+    /// Close a pipe you own (or any pipe, as the room admin).
+    Close {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// The pipe id to close (32-char hex).
+        pipe_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+    /// List the room's currently-open pipes (offline).
+    List {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
     },
 }
 
@@ -246,8 +330,68 @@ pub fn run() -> Result<()> {
                 runtime()?.block_on(message::tail(&home, &room_id, &peers, limit, loopback))?;
             }
         },
+        Command::Pipe { action } => dispatch_pipe(&home, action)?,
     }
     Ok(())
+}
+
+/// Parse a room-id argument or fail with the shared, actionable message.
+fn parse_room_id(s: &str) -> Result<RoomId> {
+    s.parse()
+        .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))
+}
+
+/// Dispatch the `pipe` subcommands (kept out of [`run`] so each dispatcher stays
+/// small and readable).
+fn dispatch_pipe(home: &std::path::Path, action: PipeAction) -> Result<()> {
+    match action {
+        PipeAction::Expose {
+            room_id,
+            tcp,
+            allow,
+            label,
+            expires,
+            peers,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            runtime()?.block_on(pipe::expose(
+                home,
+                &room_id,
+                &tcp,
+                &allow,
+                label.as_deref(),
+                expires.as_deref(),
+                &peers,
+                loopback,
+            ))
+        }
+        PipeAction::Connect {
+            room_id,
+            pipe_id,
+            local,
+            peers,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            runtime()?.block_on(pipe::connect(
+                home, &room_id, &pipe_id, local, &peers, loopback,
+            ))
+        }
+        PipeAction::Close {
+            room_id,
+            pipe_id,
+            peers,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            runtime()?.block_on(pipe::close(home, &room_id, &pipe_id, &peers, loopback))
+        }
+        PipeAction::List { room_id } => {
+            let room_id = parse_room_id(&room_id)?;
+            pipe::list(home, &room_id)
+        }
+    }
 }
 
 /// Build the scoped multi-thread Tokio runtime that hosts the two online commands

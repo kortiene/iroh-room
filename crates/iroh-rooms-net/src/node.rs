@@ -16,12 +16,17 @@
 //! connection state); the pump keeps the engine accessible without ever sharing a
 //! `&mut SyncEngine` across tasks.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::ids::EventId;
+use anyhow::{anyhow, bail, Result};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms_core::event::content::{Content, PipeOpened};
+use iroh_rooms_core::event::ids::{EventId, RoomId};
+use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+use iroh_rooms_core::event::signed::SignedEvent;
+use iroh_rooms_core::event::{build_pipe_closed, build_pipe_opened};
 use iroh_rooms_core::membership::MembershipSnapshot;
 use iroh_rooms_core::store::StoredEvent;
 use iroh_rooms_core::sync::{Completeness, Outgoing, SyncEngine, SyncMessage};
@@ -32,6 +37,13 @@ use tokio::time::MissedTickBehavior;
 use crate::admission::Admission;
 use crate::audit::AuditSink;
 use crate::peer::peer_id;
+use crate::pipe::alpn::{PIPE_ALPN, PIPE_ALPN_STR};
+use crate::pipe::registry::is_loopback_target;
+use crate::pipe::runtime::PipeQueryMsg;
+use crate::pipe::{
+    connector, new_pipe_id, watcher, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder,
+    PipeHandlerState, PipeProtocolHandler, PipeQuery, PipeRegistry, PipeSessions, TracingPipeAudit,
+};
 use crate::state::{ConnEvent, PeerConnState};
 use crate::transport::{Inbound, NetConfig, NetTransport, Shared};
 
@@ -43,16 +55,27 @@ enum Cmd {
     Publish(Vec<u8>, oneshot::Sender<Result<(), String>>),
     Contains(EventId, oneshot::Sender<Result<bool, String>>),
     Tail(u32, oneshot::Sender<Result<Vec<StoredEvent>, String>>),
+    Heads(oneshot::Sender<Result<Vec<EventId>, String>>),
     Snapshot(oneshot::Sender<MembershipSnapshot>),
     Completeness(oneshot::Sender<Completeness>),
     Shutdown(oneshot::Sender<()>),
 }
 
 /// A running event-transport node: a [`NetTransport`] carrier + an engine pump.
+///
+/// The node also drives the **Live Pipe Plane** (IR-0010): its `Router` serves the
+/// pipe ALPN alongside events, the [`PipeRegistry`] holds locally-open pipes, the
+/// [`PipeSessions`] table tracks live forwarded sessions, and a teardown
+/// [`watcher`](crate::pipe::watcher) severs revoked sessions each tick.
 pub struct Node {
     transport: NetTransport,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     pump: JoinHandle<()>,
+    pipe_query: PipeQuery,
+    pipe_registry: Arc<PipeRegistry>,
+    pipe_sessions: Arc<PipeSessions>,
+    pipe_audit: Arc<dyn PipeAuditSink>,
+    pipe_watcher: JoinHandle<()>,
 }
 
 impl Node {
@@ -69,20 +92,63 @@ impl Node {
         cfg: NetConfig,
         tick: Duration,
     ) -> Result<Self> {
-        let mut transport = NetTransport::bind(secret, admission, audit, cfg).await?;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        // A dedicated channel for the Pipe plane's reads against the single-owner
+        // engine (handler + watcher), drained by the same pump (spec §6.5 / D5).
+        let (pipe_query_tx, pipe_query_rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let pipe_query = PipeQuery::new(pipe_query_tx);
+
+        let pipe_registry = Arc::new(PipeRegistry::new());
+        let pipe_sessions = Arc::new(PipeSessions::new());
+        let pipe_audit: Arc<dyn PipeAuditSink> = Arc::new(TracingPipeAudit);
+
+        // The pipe accept-gate handler, registered as the second ALPN on the shared
+        // Router (one Endpoint serves both planes, spec §6.5.1).
+        let handler_state = Arc::new(PipeHandlerState {
+            query: pipe_query.clone(),
+            registry: pipe_registry.clone(),
+            sessions: pipe_sessions.clone(),
+            audit: pipe_audit.clone(),
+        });
+        let pipe_handler = PipeProtocolHandler::new(handler_state);
+
+        let mut transport =
+            NetTransport::bind(secret, admission, audit, cfg, Some(pipe_handler)).await?;
         let inbound_rx = transport
             .take_inbound()
             .ok_or_else(|| anyhow!("inbound receiver already taken"))?;
         let conn_rx = transport.conn_events();
         let shared = transport.shared();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        let pump = tokio::spawn(pump(engine, inbound_rx, conn_rx, shared, cmd_rx, tick));
+        let pump = tokio::spawn(pump(
+            engine,
+            inbound_rx,
+            conn_rx,
+            shared,
+            cmd_rx,
+            pipe_query_rx,
+            tick,
+        ));
+
+        // The teardown-on-learn watcher (spec §4.5/D5): re-evaluates every live pipe
+        // session each tick and severs any that no longer passes the gate.
+        let pipe_watcher = tokio::spawn(watcher::watch(
+            pipe_query.clone(),
+            pipe_registry.clone(),
+            pipe_sessions.clone(),
+            pipe_audit.clone(),
+            tick,
+        ));
 
         Ok(Self {
             transport,
             cmd_tx,
             pump,
+            pipe_query,
+            pipe_registry,
+            pipe_sessions,
+            pipe_audit,
+            pipe_watcher,
         })
     }
 
@@ -234,7 +300,187 @@ impl Node {
         .map_err(|_| anyhow!("timed out waiting for event {id} to reach the store"))
     }
 
-    /// Gracefully stop: drain the pump and shut the transport's router down.
+    // ------------------------------------------------------------------
+    // Live Pipe Plane (IR-0010)
+    // ------------------------------------------------------------------
+
+    /// The current DAG heads of the room — the `prev_events` a freshly authored
+    /// event must cite. Routed through the pump so the engine stays single-owner.
+    ///
+    /// # Errors
+    /// Returns an error on a store read failure or if the pump is gone.
+    pub async fn heads(&self) -> Result<Vec<EventId>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Heads(tx))
+            .map_err(|_| anyhow!("pump task is gone"))?;
+        rx.await
+            .map_err(|_| anyhow!("pump dropped the reply"))?
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// The governing `pipe.opened` for `pipe_id` from this node's validated set, or
+    /// `None` if it has not synced the announcement yet (spec §6.5.2 / R4).
+    pub async fn pipe_opened(&self, pipe_id: [u8; 16]) -> Option<PipeOpened> {
+        self.pipe_query.pipe_opened(pipe_id).await
+    }
+
+    /// **Expose** a local TCP service as a pipe (spec §6.5.1): validate the loopback
+    /// target (D6) and non-empty allow-list (no default-all), draw a CSPRNG
+    /// `pipe_id`, register the real target locally, author + publish the signed
+    /// `pipe.opened`, and start gating connections. Returns the new `pipe_id`.
+    ///
+    /// `owner_identity_secret` provides both `sender_id` and `owner_id`;
+    /// `owner_device_secret` signs. `created_at` is a caller-injected clock read.
+    ///
+    /// # Errors
+    /// A non-loopback `target`, an empty `allowed_members`, or a publish/heads
+    /// failure. Nothing is registered or published on the error paths that precede
+    /// the publish.
+    #[allow(clippy::too_many_arguments)] // each arg is a distinct signed/registry input
+    pub async fn pipe_expose(
+        &self,
+        owner_identity_secret: &SigningKey,
+        owner_device_secret: &SigningKey,
+        room_id: &RoomId,
+        target: SocketAddr,
+        label: &str,
+        target_hint: &str,
+        allowed_members: &[IdentityKey],
+        expires_at: Option<u64>,
+        created_at: u64,
+    ) -> Result<[u8; 16]> {
+        if !is_loopback_target(&target) {
+            bail!("{}", PipeError::NonLoopbackTarget(target));
+        }
+        if allowed_members.is_empty() {
+            bail!("{}", PipeError::EmptyAllowList);
+        }
+
+        let pipe_id = new_pipe_id();
+        let owner_endpoint = owner_device_secret.device_key();
+        let heads = self.heads().await?;
+        let wire = build_pipe_opened(
+            owner_identity_secret,
+            owner_device_secret,
+            room_id,
+            pipe_id,
+            &owner_endpoint,
+            label,
+            target_hint,
+            PIPE_ALPN_STR,
+            allowed_members,
+            expires_at,
+            &heads,
+            created_at,
+        );
+
+        // Register the real loopback target before publishing so a connector that
+        // races in on the freshly-synced announcement finds it (the registry
+        // re-validates the loopback rule).
+        let event = SignedEvent::decode(&wire.signed)
+            .map_err(|r| anyhow!("freshly built pipe.opened failed to decode: {r:?}"))?;
+        let Content::PipeOpened(opened) = event.content else {
+            bail!("freshly built event is not a pipe.opened");
+        };
+        self.pipe_registry
+            .insert(opened, target)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        if let Err(err) = self.publish(wire.to_bytes()).await {
+            // Roll back the local registration so a failed publish leaves no
+            // dangling open pipe.
+            self.pipe_registry.remove(&pipe_id);
+            return Err(err.context("could not publish pipe.opened"));
+        }
+        self.pipe_audit.opened(&pipe_id, allowed_members.len());
+        Ok(pipe_id)
+    }
+
+    /// **Close** a pipe (spec §6.5.1): author + publish a signed `pipe.closed`,
+    /// remove the local target, and tear down every live session for it. The signer
+    /// must be the pipe owner or the room admin (folded downstream).
+    ///
+    /// # Errors
+    /// A heads/publish failure (the local teardown still runs best-effort after a
+    /// successful publish).
+    pub async fn pipe_close(
+        &self,
+        signer_identity_secret: &SigningKey,
+        signer_device_secret: &SigningKey,
+        room_id: &RoomId,
+        pipe_id: [u8; 16],
+        reason: Option<&str>,
+        created_at: u64,
+    ) -> Result<()> {
+        let heads = self.heads().await?;
+        let wire = build_pipe_closed(
+            signer_identity_secret,
+            signer_device_secret,
+            room_id,
+            pipe_id,
+            reason,
+            &heads,
+            created_at,
+        );
+        self.publish(wire.to_bytes())
+            .await
+            .map_err(|e| e.context("could not publish pipe.closed"))?;
+
+        self.pipe_registry.remove(&pipe_id);
+        for (device, pid) in self.pipe_sessions.teardown_pipe(&pipe_id) {
+            self.pipe_audit
+                .torndown(device, &pid, PipeDenyCause::Closed);
+        }
+        self.pipe_audit.closed(&pipe_id, reason.unwrap_or("closed"));
+        Ok(())
+    }
+
+    /// **Connect** to a pipe (spec §6.5.2): resolve the synced `pipe.opened`, verify
+    /// the dialable owner address matches its `owner_endpoint`, bind a loopback
+    /// listener on `127.0.0.1:local_port` (`0` ⇒ OS-assigned), and forward each
+    /// local TCP connection over the pipe ALPN. Returns a [`PipeForwarder`] carrying
+    /// the bound local address.
+    ///
+    /// # Errors
+    /// [`PipeError::UnknownPipe`] if the announcement is not synced yet,
+    /// [`PipeError::OwnerEndpointMismatch`] if the address does not match the signed
+    /// `owner_endpoint`, or a listener-bind / owner-dial failure.
+    pub async fn pipe_connect(
+        &self,
+        owner_addr: EndpointAddr,
+        pipe_id: [u8; 16],
+        local_port: u16,
+    ) -> Result<PipeForwarder> {
+        let Some(opened) = self.pipe_opened(pipe_id).await else {
+            bail!("{}", PipeError::UnknownPipe(pipe_id));
+        };
+        if owner_addr.id.as_bytes() != opened.owner_endpoint.as_bytes() {
+            bail!("{}", PipeError::OwnerEndpointMismatch);
+        }
+        let endpoint = self.transport.endpoint();
+        let forwarder = connector::connect(&endpoint, owner_addr, pipe_id, PIPE_ALPN, local_port)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(forwarder)
+    }
+
+    /// A clone of the underlying iroh [`Endpoint`] (for an out-of-band pipe dial in
+    /// tests / tooling that drive the connector directly).
+    #[must_use]
+    pub fn endpoint(&self) -> Endpoint {
+        self.transport.endpoint()
+    }
+
+    /// The number of live pipe sessions currently being forwarded (observability /
+    /// tests for the teardown path).
+    #[must_use]
+    pub fn live_pipe_sessions(&self) -> usize {
+        self.pipe_sessions.len()
+    }
+
+    /// Gracefully stop: drain the pump, stop the pipe watcher, and shut the
+    /// transport's router down.
     ///
     /// # Errors
     /// Propagates [`NetTransport::shutdown`].
@@ -243,13 +489,32 @@ impl Node {
             transport,
             cmd_tx,
             pump,
+            pipe_watcher,
+            ..
         } = self;
         let (tx, rx) = oneshot::channel();
         if cmd_tx.send(Cmd::Shutdown(tx)).is_ok() {
             let _ = rx.await;
         }
         pump.abort();
+        pipe_watcher.abort();
         transport.shutdown().await
+    }
+}
+
+/// Serve one Pipe-plane read against the engine (snapshot / governing pipe.opened /
+/// pipe.closed-known). Fail-closed: a store/decode error answers `None` / `closed`.
+fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
+    match query {
+        PipeQueryMsg::Snapshot(reply) => {
+            let _ = reply.send(engine.snapshot());
+        }
+        PipeQueryMsg::Opened(pipe_id, reply) => {
+            let _ = reply.send(engine.pipe_opened(&pipe_id).ok().flatten());
+        }
+        PipeQueryMsg::IsClosed(pipe_id, reply) => {
+            let _ = reply.send(engine.pipe_is_closed(&pipe_id).unwrap_or(true));
+        }
     }
 }
 
@@ -260,6 +525,7 @@ async fn pump(
     mut conn_rx: broadcast::Receiver<ConnEvent>,
     shared: Arc<Shared>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    mut pipe_query_rx: mpsc::UnboundedReceiver<PipeQueryMsg>,
     tick: Duration,
 ) {
     let mut ticker = tokio::time::interval(tick);
@@ -271,6 +537,14 @@ async fn pump(
                 let Some(cmd) = cmd else { break };
                 if handle_cmd(&mut engine, &shared, cmd) {
                     break;
+                }
+            }
+            query = pipe_query_rx.recv() => {
+                // Pipe-plane reads against the single-owner engine (snapshot /
+                // governing pipe.opened / pipe.closed-known). A closed channel just
+                // means no pipe plane is active; keep pumping.
+                if let Some(query) = query {
+                    serve_pipe_query(&engine, query);
                 }
             }
             inbound = inbound_rx.recv() => {
@@ -330,6 +604,11 @@ fn handle_cmd(engine: &mut SyncEngine, shared: &Arc<Shared>, cmd: Cmd) -> bool {
         }
         Cmd::Tail(limit, reply) => {
             let result = engine.room_tail(limit).map_err(|e| e.to_string());
+            let _ = reply.send(result);
+            false
+        }
+        Cmd::Heads(reply) => {
+            let result = engine.heads().map_err(|e| e.to_string());
             let _ = reply.send(result);
             false
         }
