@@ -12,6 +12,13 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# The local SQLite event store (IR-0004). Off by default so validate-only
+# consumers keep a lean dependency tree; enables the vendored `rusqlite`. CI runs
+# `scripts/verify.sh` with `--all-features`, so the store is always fmt/clippy/test
+# exercised (spec D1).
+store = ["dep:rusqlite"]
+
 [dependencies]
 # Ed25519 signing/verification. Pinned EXACTLY to the version `iroh 1.0` resolves
 # (`3.0.0-rc.0`, recorded in PHASE-0-SPIKE.md Event Protocol §1 / spec D2 / R6) so
@@ -23,4 +30,14 @@ ed25519-dalek = "=3.0.0-rc.0"
 blake3 = "1"
 # Lowercase hex presentation of keys/ids on the wire (no `0x`, no uppercase).
 hex = "0.4"
+# Synchronous SQLite for the local event store (IR-0004, spec D2). `bundled`
+# compiles a hermetic, version-pinned SQLite from vendored C source — no system
+# `libsqlite3`, reproducible CI. Its FFI lives in `libsqlite3-sys`, a separate
+# crate, so the workspace `unsafe_code = "forbid"` lint (which targets our code) is
+# unaffected. Optional + behind the `store` feature.
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+# Temporary directory / file creation for file-backed store e2e tests.
+tempfile = "3"
 

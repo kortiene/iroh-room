@@ -34,11 +34,29 @@ Room Event Plane builds on:
 - 70 conformance tests including byte-exact golden vectors (242-byte CSB, `event_id`,
   signature, `room_id_A/B`).
 
+The **SQLite event store** has landed in `iroh-rooms-core::store` behind the
+`store` cargo feature (issue #8 / IR-0004). It provides the persistence layer
+the membership fold and sync layers will build on:
+
+- `events` table (`STRICT`, WAL, `user_version = 1`): authoritative
+  `(event_id, wire)` columns + a denormalized derived cache (`room_id`,
+  `sender_id`, `device_id`, `event_type`, `created_at`, `lamport`, `admin_seq`).
+- `event_parents` edge table modelling `prev_events` with dangling-parent
+  tolerance (out-of-order delivery records the edge; `lamport` stays `NULL` until
+  the parent arrives — no error).
+- Idempotent insert (`InsertOutcome::Inserted | Duplicate`) with an integrity
+  guard re-deriving `BLAKE3(wire.signed)` against the supplied `event_id`.
+- Query surface for the sibling fold/sync layers: `contains` / `get` / `count`,
+  `parents_of` / `children_of` / `missing_parents`, `room_tail`, `by_type` /
+  `by_sender`, `heads`, `admin_chain_tip`.
+- `rebuild()`: clears all derived state and recomputes it purely from the
+  authoritative `(event_id, wire)` rows — the restart-determinism oracle.
+- 24 tests (19 in-module + 5 file-backed e2e) covering all acceptance criteria.
+
 Remaining Room Event Plane targets:
 
-1. SQLite event store,
-2. full-mesh iroh QUIC event transport,
-3. bounded recent sync and membership fold.
+1. Full-mesh iroh QUIC event transport,
+2. bounded recent sync and membership fold.
 
 ## Repository Layout
 

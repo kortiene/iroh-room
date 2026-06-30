@@ -13,6 +13,12 @@
 
 pub mod event;
 
+/// The local `SQLite` event store (IR-0004): idempotent persistence of validated
+/// events, derived query indexes, and a deterministic rebuild. Behind the `store`
+/// cargo feature so validate-only consumers keep a lean dependency tree.
+#[cfg(feature = "store")]
+pub mod store;
+
 /// Current crate-level protocol version.
 ///
 /// Matches the on-wire `schema_version` and `WireEvent.v` for MVP
