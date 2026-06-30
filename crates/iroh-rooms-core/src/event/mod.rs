@@ -23,9 +23,10 @@
 //! * [`reject`] — the [`RejectReason`] / [`Flag`] taxonomy (§8) and the deferred
 //!   [`reject::MembershipOracle`] boundary (§6 steps 7–8).
 //!
-//! Out of scope here (sibling issues under epic #1): membership fold and
-//! authorization, causal ordering, transitive genesis-descent, sync/transport,
-//! and the `SQLite` store. This layer defines the bytes those layers consume.
+//! Out of scope here (sibling issues under epic #1): causal ordering, transitive
+//! genesis-descent, sync/transport, and the `SQLite` store. The membership fold
+//! and authorization layer lives in [`crate::membership`]. This layer defines the
+//! bytes those layers consume.
 
 pub mod binding;
 pub mod cbor;
@@ -45,5 +46,7 @@ pub use ids::{EventId, HashRef, RoomId};
 pub use keys::{DeviceKey, IdentityKey, Signature, SigningKey};
 pub use reject::{Flag, MembershipOracle, RejectReason};
 pub use signed::SignedEvent;
-pub use validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
+pub use validate::{
+    validate_wire_bytes, validate_with_membership, ValidatedEvent, ValidationContext,
+};
 pub use wire::WireEvent;

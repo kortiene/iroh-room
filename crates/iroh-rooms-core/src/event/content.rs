@@ -77,6 +77,31 @@ impl EventType {
         }
     }
 
+    /// Whether an event of this type must resolve its `device_id` from
+    /// membership state (Event Protocol §6 step 7 / spec scope item 11).
+    ///
+    /// `true` for the types that carry **no** self-contained `device_binding`
+    /// (`message.text`, `file.shared`, `pipe.opened`, `pipe.closed`,
+    /// `agent.status`, `member.invited`, `member.left`): their signing device
+    /// must equal the device bound to `sender_id` in the membership view.
+    /// `false` for the self-contained-binding types (`room.created`,
+    /// `member.joined`, and `member.removed` whose binding is optional and
+    /// verified statelessly when present), which the stateless layer already
+    /// checks ([`verify_bindings`]).
+    #[must_use]
+    pub fn requires_membership_device_binding(&self) -> bool {
+        matches!(
+            self,
+            Self::MessageText
+                | Self::FileShared
+                | Self::PipeOpened
+                | Self::PipeClosed
+                | Self::AgentStatus
+                | Self::MemberInvited
+                | Self::MemberLeft
+        )
+    }
+
     /// Parse a registry string, or `None` for an unknown type.
     #[must_use]
     pub fn from_registry(s: &str) -> Option<Self> {

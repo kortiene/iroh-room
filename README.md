@@ -53,10 +53,43 @@ the membership fold and sync layers will build on:
   authoritative `(event_id, wire)` rows — the restart-determinism oracle.
 - 24 tests (19 in-module + 5 file-backed e2e) covering all acceptance criteria.
 
+The **deterministic membership fold and authorization layer** has landed in
+`iroh-rooms-core::membership` (issue #12 / IR-0008). This is the second stateful
+layer of the Room Event Plane, downstream of the stateless validator:
+
+- `RoomMembership`: ingests `ValidatedEvent`s in any order; buffers causally-
+  incomplete events (no error — out-of-order tolerance); re-evaluates when
+  missing parents arrive.
+- **Ancestor-stable authorization**: every event's log-validity is judged only
+  against its own causal ancestors, so any two peers holding the identical
+  validated set compute a byte-identical verdict regardless of arrival order
+  (the §0 same-set convergence guarantee).
+- **Removed-dominates causal fold**: per-subject status derived from causal heads
+  (`Invited < Active < Removed` lattice max); least-privilege role merge
+  (`Agent < Member < Admin` lattice min) tie-broken by lowest `event_id`.
+- **Sticky departure**: `member.removed` and `member.left` both consume prior
+  invitations; re-admission requires a fresh post-departure `member.invited`.
+- **Key-bound invite capabilities only**: a join under a key with no naming
+  invite fails the gate, so ban-evasion under a fresh key is blocked.
+- `MembershipSnapshot`: the deterministic fold result — per-identity `status`,
+  `role`, and bound device; device → identity reverse map for QUIC identity
+  resolution (§5).
+- **Access-decision predicates** (`blob_serve_allowed`, `pipe_connect_allowed`):
+  pure functions the Blob/Pipe planes call; consult the **current snapshot**,
+  not the ancestor view — a since-removed member's log-valid events grant zero
+  capabilities.
+- `validate_with_membership`: completes Event Protocol §6 steps 7–8 on top of
+  the stateless `validate_wire_bytes`, via the `MembershipOracle` trait;
+  re-exported at `event::validate_with_membership`.
+- No `store` feature dependency — the fold is pure in-memory over `ValidatedEvent`s.
+- Conformance tests in `tests/membership_fold.rs` covering all six acceptance
+  criteria: admin invite/remove, non-admin rejection, key-bound join gate,
+  sticky departure, concurrent join/kick convergence to Removed, and
+  current-snapshot access decisions.
+
 Remaining Room Event Plane targets:
 
-1. Full-mesh iroh QUIC event transport,
-2. bounded recent sync and membership fold.
+1. Full-mesh iroh QUIC event transport and bounded recent sync.
 
 ## Repository Layout
 
