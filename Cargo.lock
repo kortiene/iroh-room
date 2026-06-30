@@ -1841,6 +1841,11 @@ dependencies = [
 [[package]]
 name = "iroh-rooms-core"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+]
 
 [[package]]
 name = "iroh-tickets"
