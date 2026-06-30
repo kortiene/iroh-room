@@ -881,11 +881,15 @@ The genuinely hard primitive is range-based set reconciliation on reconnect. Log
 
 ### Day 8 — Blob Plane ACL confirmation (near-free win)
 
-- `iroh-blobs 0.103` `provider::events`: `EventMask` with `get`/`get_many = RequestMode::Intercept`, deny by `AbortReason::Permission` on `RequestReceived` when `request.hash` ∉ allowed set; `ConnectMode`/`ClientConnected` to allowlist by TLS-authenticated `remote_node_id` (= `device_id`, resolved to identity). Wire `file.shared` (§7) → fetch → recompute BLAKE3 == `blob_hash`.
+- `iroh-blobs 0.103` `provider::events`: `EventMask` with `get`/`get_many = RequestMode::Intercept`, deny by `AbortReason::Permission` on `RequestReceived` when `request.hash` ∉ allowed set; `ConnectMode`/`ClientConnected` to allowlist by TLS-authenticated `endpoint_id` (= `device_id`, resolved to identity; the field is `ClientConnected.endpoint_id: Option<EndpointId>` in 0.103.0 — the spike-doc name `remote_node_id` was a recon alias). Wire `file.shared` (§7) → fetch → recompute BLAKE3 == `blob_hash`.
 - **Production-readiness fork (record, don't decide yet):** 0.103 (modern events ACL, on iroh 1.0, officially pre-production) vs. 0.35 (maintainer-"production", on iroh 0.35, **no** events ACL). Default 0.103 to keep iroh 1.0 + per-hash/per-node gating.
 - **Deliverable:** `spike-blobs` — member fetches, non-member denied at connect, wrong/unreferenced hash denied (Test Vectors §16).
 
 **GATE (soft):** GO iff per-hash and per-node gating both deny correctly.
+
+> **COMPLETE (IR-0009):** GATE GO — 49 tests pass (38 unit + 11 integration).
+> Confirmed `iroh-blobs 0.103.0` / `iroh 1.0.1`. Full findings in
+> `crates/spike-blobs/NOTES.md`.
 
 ### Day 9 — Live Pipe Plane confirmation (near-free win)
 
@@ -950,8 +954,8 @@ Pin a **single known-good set** (these are *not* in lockstep — note blobs `0.1
 
 | Crate | Pinned version | Stability | Role in spike |
 |---|---|---|---|
-| `iroh` | `=1.0.0` | **stable 1.x** (wire-proto + public API committed) | Endpoint, Router, ALPN `ProtocolHandler`, discovery, relay, `SecretKey::sign` |
-| `iroh-base` | `=1.0.0` (`^1`) | **stable 1.x** | `EndpointId` (= `device_id`), `EndpointAddr`, `EndpointTicket`/`NodeTicket`, key types |
+| `iroh` | `=1.0.1` | **stable 1.x** (wire-proto + public API committed) | Endpoint, Router, ALPN `ProtocolHandler`, discovery, relay, `SecretKey::sign`. *(Confirmed `1.0.1` via crates.io sparse index 2026-06-29; original recon said `1.0.0`.)* |
+| `iroh-base` | `=1.0.1` (`^1`) | **stable 1.x** | `EndpointId` (= `device_id`), `EndpointAddr`, `EndpointTicket`/`NodeTicket`, key types |
 | `iroh-gossip` | `=0.101.0` | 0.x (no API-stability promise) | D1 candidate transport / optional liveness + admin-tip notify |
 | `iroh-docs` | `=0.101.0` | 0.x (actively maintained, "not yet ready for 1.0", **not** deprecated) | D2 candidate sync substrate (whole-history RBSR); pulls blobs+gossip+redb |
 | `iroh-blobs` | `=0.103.0` | 0.x, **maintainer-labeled pre-production** | Blob Plane ACL via `provider::events`; alt `=0.35.0` is "production" but on `iroh ^0.35` and lacks events ACL |

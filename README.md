@@ -35,6 +35,7 @@ The first implementation target is the Room Event Plane:
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
 crates/iroh-rooms-cli/    CLI binary scaffold
+crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate
 specs/                    Implementation specs produced during planning

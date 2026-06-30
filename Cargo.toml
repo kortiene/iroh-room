@@ -2,6 +2,9 @@
 members = [
   "crates/iroh-rooms-core",
   "crates/iroh-rooms-cli",
+  # Throwaway spike (IR-0009): isolated from the shipping crates' dep tree.
+  # Kept in the workspace so CI proves it builds (spec OQ-1, recommended option).
+  "crates/spike-blobs",
 ]
 resolver = "2"
 

@@ -1,0 +1,43 @@
+# Throwaway spike crate (IR-0009). Confirms the Blob Plane ACL path against real
+# `iroh-blobs`. It MUST NOT be depended on by the shipping crates
+# (`iroh-rooms-core` / `iroh-rooms-cli`). See `NOTES.md` for the findings.
+[package]
+name = "spike-blobs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack has a higher
+# MSRV than the shipping crates, and this is a throwaway spike, so we make no
+# MSRV claim here rather than relaxing the workspace value.
+publish = false
+
+[lib]
+name = "spike_blobs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spike-blobs"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Versions confirmed against the crates.io sparse index on 2026-06-29 (Step 0).
+# `iroh-blobs 0.103.0` is the only published line carrying the per-node /
+# per-hash `provider::events` ACL; it pins `iroh ^1.0`. See NOTES.md §1.
+iroh = "=1.0.1"
+iroh-blobs = "=0.103.0"
+blake3 = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
