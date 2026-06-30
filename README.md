@@ -130,17 +130,42 @@ data-directory model and key-persistence layer every later CLI command will reus
 - 40+ tests (unit + CLI integration) covering all acceptance criteria, security invariants
   (no secret bytes in any output stream), and Unix file-permission guarantees.
 
-Remaining Room Event Plane targets:
+The **full-mesh QUIC event transport prototype** has landed in
+`crates/iroh-rooms-net` (issue #9 / IR-0005). This is the real iroh adapter — the
+shipping carrier behind the landed, sans-IO `SyncEngine` — proving the
+`PHASE-0-SPIKE.md` ADR-1 path (full-mesh direct QUIC over the custom ALPN):
 
-1. Full-mesh iroh QUIC event transport — the real iroh adapter (`crates/iroh-rooms-net`,
-   ALPN `/iroh-rooms/event/1`), deferred from IR-0007 (OQ-1) to keep the deterministic
-   conformance path iroh-free.
+- `NetTransport`: an `iroh::Endpoint` keyed by the node's `device_id` secret
+  (`endpoint.id() == device_id == EndpointId`) + a `Router` carrying ALPN
+  `/iroh-rooms/event/1`, implementing `iroh_rooms_core::sync::SyncTransport` so the
+  deterministic engine drives it unchanged.
+- **Admission before bytes**: the `ProtocolHandler` authorizes the QUIC/TLS-proven
+  remote `EndpointId` against a `device → identity → Active?` allowlist (the
+  `MembershipSnapshot` shape) and closes the connection **before** `accept_bi()` for
+  any non-member — an unauthorized peer's event bytes are never read.
+- **Observable connection state** (`PeerConnState`): the PRD §16.3 trichotomy —
+  connected / offline / unauthorized — as a snapshot + a live `ConnEvent` stream.
+- **Per-peer bidi-stream framing** (length-prefixed canonical-CBOR `SyncMessage`
+  frames; live `WireEvent` push = `SyncMessage::Events`) + a dial-with-backoff
+  reconnect loop.
+- 85 tests: 67 unit tests, a 9-test frame-codec integration suite (`tests/frame.rs`,
+  real QUIC loopback), and a 9-test loopback integration suite (`tests/loopback.rs`,
+  T1–T9) covering all four acceptance criteria (deterministic, no relay/network).
+- **Gate A (real-NAT run) is still owed** before MVP go — the loopback suite is not
+  Gate A; see `crates/iroh-rooms-net/NOTES.md`.
+
+With this prototype the Phase-0 Room Event Plane targets (event model, store,
+membership fold, sync engine, identity CLI, and the iroh transport) are all landed
+as prototypes; the remaining work is CLI/runtime wiring, the `MembershipSnapshot`
+re-point of admission, and the Gate-A real-network confirmation (all tracked
+separately).
 
 ## Repository Layout
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
 crates/iroh-rooms-cli/    CLI binary (identity subcommand; scaffold for room, file, pipe, agent)
+crates/iroh-rooms-net/    Full-mesh iroh QUIC event transport (IR-0005; ALPN /iroh-rooms/event/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate

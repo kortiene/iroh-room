@@ -2,6 +2,9 @@
 members = [
   "crates/iroh-rooms-core",
   "crates/iroh-rooms-cli",
+  # The real full-mesh iroh QUIC event-transport adapter (IR-0005). A shipping
+  # crate (the CLI will depend on it), unlike the throwaway spike below.
+  "crates/iroh-rooms-net",
   # Throwaway spike (IR-0009): isolated from the shipping crates' dep tree.
   # Kept in the workspace so CI proves it builds (spec OQ-1, recommended option).
   "crates/spike-blobs",

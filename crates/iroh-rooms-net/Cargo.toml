@@ -1,0 +1,44 @@
+# The real full-mesh iroh QUIC event-transport adapter (IR-0005). Unlike
+# `spike-blobs` (a throwaway), this is the SHIPPING `crates/iroh-rooms-net` the
+# README and the `SyncTransport` doc both name as the Room Event Plane carrier.
+# It is the concrete `iroh_rooms_core::sync::SyncTransport` behind the landed,
+# sans-IO `SyncEngine`. See `NOTES.md` for the spike findings (Gate-A status).
+[package]
+name = "iroh-rooms-net"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack has a higher
+# MSRV than the workspace-declared `1.80`. The shipping crypto deps already force
+# >= 1.85, so this raises only the *declared* floor, not the real one (spec OQ-1 /
+# A5). Reconciling the workspace `rust-version` is tracked as a follow-up.
+# Keep `publish` gated until the CLI (N1) wires the adapter into a runtime.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true            # inherits `unsafe_code = "forbid"` (our code only;
+                            # iroh's internal unsafe lives in its dependencies).
+
+[[bin]]
+name = "net-smoke"
+path = "src/bin/net_smoke.rs"
+
+[dependencies]
+# `sync` transitively enables `store`, so `SyncEngine` + `EventStore` are both
+# available to the driver/binary from this single feature.
+iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
+# Same pin proven by `spike-blobs` (crates.io index 2026-06-29). Only the iroh 1.0
+# stable core (`Endpoint`/`Router`/`ProtocolHandler`/`Connection`/`EndpointId`) is
+# used — zero 0.x crates on the event critical path (ADR-1 churn argument / D5).
+iroh = "=1.0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+anyhow = "1"               # binary/edge error context only
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
