@@ -40,8 +40,13 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   blocks below are reconciled to its actual format. The *full two-human* exchange in this
 >   step additionally needs `room join` (#19) so a second participant is an active member;
 >   until that lands, the commands run but you cannot complete the round trip end-to-end.
-> - **Steps 3, 5–7** (except `room invite`/`room send`/`room tail`) — `room join`, `file`,
->   `pipe`, `agent` are scaffold — the binary does not recognise them yet. **Expected output**
+> - **Step 6** (`iroh-rooms pipe expose | connect | close | list`) is implemented and runnable
+>   as of issue #14 / IR-0010. Output blocks are reconciled against the shipped binary and show
+>   the actual format. Two format notes: `--tcp` requires an IP address (`127.0.0.1:3000`, not
+>   `localhost:3000`), and `pipe close` takes both `<ROOM_ID>` and `<PIPE_ID>` as positional
+>   arguments.
+> - **Steps 3, 5, 7** (except `room invite`/`room send`/`room tail`) — `room join`, `file`,
+>   `agent` are scaffold — the binary does not recognise them yet. **Expected output**
 >   blocks for those steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
 >   captured from a real run).
 >
@@ -493,24 +498,28 @@ to Bob only:
 
 ```bash
 # Substitute <ROOM_ID> and <BOB_ID> (Bob's identity key from Step 1).
-iroh-rooms pipe expose <ROOM_ID> --tcp localhost:3000 --allow <BOB_ID>
+# --tcp requires an IP address; use 127.0.0.1, not the hostname "localhost".
+iroh-rooms pipe expose <ROOM_ID> --tcp 127.0.0.1:3000 --allow <BOB_ID>
 ```
 
-**Expected output** — the CLI must print a prominent security warning showing the exposed
-target, the authorized member, the loopback bind, the pipe id, and the close command
-(PRD §13.2). **[reconcile]** the exact wording verbatim against the binary; this is the
-required shape (illustrative):
+**Expected output** (`pipe expose`; the two security lines go to stderr, the rest to stdout):
 
 ```text
-⚠  SECURITY: exposing a LOCAL service over a peer-to-peer pipe.
-     target:        localhost:3000  (loopback)
-     authorized:    Bob (9f12…4ac1)  — only this member may connect
-     pipe id:       pipe_8Hd…b3
-     close with:    iroh-rooms pipe close pipe_8Hd…b3
-
-   The pipe also closes automatically when this process exits.
-   Anyone you authorize can reach this service while the pipe is open.
+⚠  SECURITY: exposing a local service to named room members.
+   Anyone you allow can reach 127.0.0.1:3000 through this pipe while it is open.
+room: blake3:…(64 hex chars)…
+target: 127.0.0.1:3000
+label: pipe
+allow: 9f12…4ac1
+listening: <ENDPOINT_ID>@<ip:port>
+tip: share this address with connectors via --peer
+pipe_id: 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
+connectors run: iroh-rooms pipe connect blake3:… 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f --local <PORT>
+close it with: iroh-rooms pipe close blake3:… 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
+serving the pipe; press Ctrl-C to close it...
 ```
+
+Copy the `pipe_id:` value (32 lowercase hex chars) as `<PIPE_ID>`.
 
 **Command** (Terminal B — Bob) — connect the pipe to a local port:
 
@@ -536,8 +545,8 @@ listing), carried over the authenticated P2P pipe (illustrative):
 **Command** (Terminal A — Alice) — close the pipe when done:
 
 ```bash
-# Substitute <PIPE_ID>.
-iroh-rooms pipe close <PIPE_ID>
+# Substitute <ROOM_ID> and <PIPE_ID>.
+iroh-rooms pipe close <ROOM_ID> <PIPE_ID>
 ```
 
 Then stop the `http.server` with `Ctrl-C` in its shell.
@@ -693,7 +702,7 @@ events (spike §5, PRD §13.2) — inspect it to see exactly why a connection wa
 
 Return to a clean state so the demo is repeatable (and matches the Test Plan):
 
-1. Close any open pipes (`iroh-rooms pipe close <PIPE_ID>`) and stop the `http.server`.
+1. Close any open pipes (`iroh-rooms pipe close <ROOM_ID> <PIPE_ID>`) and stop the `http.server`.
 2. Stop any running `room tail` and the participant processes (`Ctrl-C` in each terminal).
 3. Remove the per-participant data directories and the sample file:
 

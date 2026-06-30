@@ -35,7 +35,10 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # stable core (`Endpoint`/`Router`/`ProtocolHandler`/`Connection`/`EndpointId`) is
 # used — zero 0.x crates on the event critical path (ADR-1 churn argument / D5).
 iroh = "=1.0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `net` adds `TcpStream`/`TcpListener` for the Live Pipe Plane's loopback
+# forwarding splice (IR-0010); `signal` lets the CLI publish `pipe.closed` on
+# Ctrl-C (owner-exit). No new external crate — only extra tokio features.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "io-util"] }
 anyhow = "1"               # binary/edge error context only
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

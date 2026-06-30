@@ -132,3 +132,261 @@ pub fn pipe_connect_allowed(
     }
     PipeDecision::Accept
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{pipe_connect_allowed, DenyReason, PipeDecision};
+    use crate::event::content::PipeOpened;
+    use crate::event::ids::RoomId;
+    use crate::event::keys::{DeviceKey, IdentityKey};
+    use crate::membership::model::{Member, MembershipSnapshot, Role, Status};
+
+    fn room_id() -> RoomId {
+        RoomId::from_bytes([0xab; 32])
+    }
+
+    fn identity(seed: u8) -> IdentityKey {
+        IdentityKey::from_bytes([seed; 32])
+    }
+
+    fn device(seed: u8) -> DeviceKey {
+        DeviceKey::from_bytes([seed; 32])
+    }
+
+    /// Build a minimal two-member snapshot: `connector` (bound to `connector_dev`)
+    /// with `connector_status`, and `owner` with `owner_status`. The two seeds MUST
+    /// differ so they don't clobber each other in the members map.
+    fn snapshot(
+        connector_id: IdentityKey,
+        connector_dev: DeviceKey,
+        connector_status: Status,
+        owner_id: IdentityKey,
+        owner_status: Status,
+    ) -> MembershipSnapshot {
+        let mut members = BTreeMap::new();
+        members.insert(
+            connector_id,
+            Member {
+                identity: connector_id,
+                device: Some(connector_dev),
+                status: connector_status,
+                role: Role::Member,
+            },
+        );
+        members.insert(
+            owner_id,
+            Member {
+                identity: owner_id,
+                device: None,
+                status: owner_status,
+                role: Role::Admin,
+            },
+        );
+        let mut by_device = BTreeMap::new();
+        by_device.insert(connector_dev, connector_id);
+        MembershipSnapshot::new(room_id(), Some(owner_id), members, by_device)
+    }
+
+    fn opened(
+        owner_id: IdentityKey,
+        allowed: Vec<IdentityKey>,
+        expires_at: Option<u64>,
+    ) -> PipeOpened {
+        PipeOpened {
+            pipe_id: [0x01; 16],
+            owner_id,
+            owner_endpoint: device(0x81),
+            kind: "tcp".to_owned(),
+            label: "test".to_owned(),
+            target_hint: "localhost:9000".to_owned(),
+            alpn: "/iroh-rooms/pipe/1".to_owned(),
+            allowed_members: allowed,
+            expires_at,
+        }
+    }
+
+    const CONNECTOR_SEED: u8 = 0x10;
+    const OWNER_SEED: u8 = 0x01;
+
+    #[test]
+    fn accepts_when_all_conditions_are_met() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let pipe = opened(oid, vec![cid], None);
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Accept
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_device() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let pipe = opened(oid, vec![cid], None);
+        let stranger = device(0xfe); // not in `by_device`
+        assert_eq!(
+            pipe_connect_allowed(&snap, &stranger, &pipe, None),
+            PipeDecision::Reject(DenyReason::UnknownDevice)
+        );
+    }
+
+    #[test]
+    fn rejects_removed_connector() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Removed, oid, Status::Active);
+        let pipe = opened(oid, vec![cid], None);
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Reject(DenyReason::NotActive)
+        );
+    }
+
+    #[test]
+    fn rejects_invited_connector() {
+        // Invited is not Active — the gate must deny even with a valid device binding.
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Invited, oid, Status::Active);
+        let pipe = opened(oid, vec![cid], None);
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Reject(DenyReason::NotActive)
+        );
+    }
+
+    #[test]
+    fn rejects_active_member_not_in_allowed_members() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let other = identity(0x20); // an entirely different principal
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let pipe = opened(oid, vec![other], None); // connector is not listed
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Reject(DenyReason::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn rejects_inactive_owner() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Removed);
+        let pipe = opened(oid, vec![cid], None);
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Reject(DenyReason::OwnerInactive)
+        );
+    }
+
+    #[test]
+    fn rejects_expired_pipe() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let expiry = 1_000_000u64;
+        let pipe = opened(oid, vec![cid], Some(expiry));
+        // now is strictly after expiry
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, Some(expiry + 1)),
+            PipeDecision::Reject(DenyReason::Expired)
+        );
+    }
+
+    #[test]
+    fn accepts_pipe_not_yet_expired() {
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let expiry = 1_000_000u64;
+        let pipe = opened(oid, vec![cid], Some(expiry));
+        // now is strictly before expiry
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, Some(expiry - 1)),
+            PipeDecision::Accept
+        );
+    }
+
+    #[test]
+    fn accepts_at_exact_expiry_boundary() {
+        // The predicate is `now > expiry` (strict), so `now == expiry` still accepts.
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let expiry = 1_000_000u64;
+        let pipe = opened(oid, vec![cid], Some(expiry));
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, Some(expiry)),
+            PipeDecision::Accept
+        );
+    }
+
+    #[test]
+    fn accepts_when_no_clock_and_pipe_has_past_expiry() {
+        // `now_ms = None` → the expiry branch is skipped entirely (fail-open on
+        // absent clock, because the *Pipe plane* owns the clock and always supplies
+        // `Some(now_ms)`; `None` in this pure predicate means "caller chose not to
+        // consult the clock" — acceptable in tests or offline evaluation).
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        let pipe = opened(oid, vec![cid], Some(1)); // expires_at = 1 ms epoch
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Accept
+        );
+    }
+
+    #[test]
+    fn accepts_when_connector_is_one_of_several_allowed_members() {
+        // The gate uses `any()` — verify it accepts when the connector appears
+        // anywhere in a longer `allowed_members` list, not just when it is the
+        // only entry.
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let other_a = identity(0x30);
+        let other_b = identity(0x31);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        // Connector is last in a 3-element list.
+        let pipe = opened(oid, vec![other_a, other_b, cid], None);
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Accept
+        );
+    }
+
+    #[test]
+    fn rejects_when_connector_is_absent_from_larger_allowed_members_list() {
+        // No default-all (PRD §13.2): having more than one `allowed_members`
+        // entry must not accidentally widen access — only exact matches grant it.
+        let cid = identity(CONNECTOR_SEED);
+        let cdev = device(CONNECTOR_SEED);
+        let oid = identity(OWNER_SEED);
+        let other_a = identity(0x30);
+        let other_b = identity(0x31);
+        let snap = snapshot(cid, cdev, Status::Active, oid, Status::Active);
+        // Connector is NOT in this list.
+        let pipe = opened(oid, vec![other_a, other_b], None);
+        assert_eq!(
+            pipe_connect_allowed(&snap, &cdev, &pipe, None),
+            PipeDecision::Reject(DenyReason::NotAllowed)
+        );
+    }
+}

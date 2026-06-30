@@ -426,6 +426,68 @@ impl SyncEngine {
         Ok(self.store.room_tail(&self.room_id, limit)?)
     }
 
+    /// The current DAG heads of the room — the `prev_events` a freshly authored
+    /// event must cite. A thin read passthrough to
+    /// [`EventStore::heads`](crate::store::EventStore::heads) so a running node can
+    /// author a follow-on event (e.g. a `pipe.opened`) without a second store handle.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read failure.
+    pub fn heads(&self) -> Result<Vec<EventId>, SyncError> {
+        Ok(self.store.heads(&self.room_id)?)
+    }
+
+    /// The governing `pipe.opened` for `pipe_id` from the **validated** set, or
+    /// `None` if no such pipe is known locally (the Pipe plane's stage-2 lookup,
+    /// spec §6.5.1). Read-only over the store, like [`room_tail`](Self::room_tail);
+    /// the access decision against the **current** snapshot belongs to the caller.
+    ///
+    /// On the (cryptographically improbable) event of two `pipe.opened` sharing a
+    /// `pipe_id`, the lowest-`event_id` one is returned for determinism.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read or decode failure.
+    pub fn pipe_opened(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+    ) -> Result<Option<crate::event::content::PipeOpened>, SyncError> {
+        // `by_type` is ordered `(lamport, event_id)`, so the first match is the
+        // deterministic governing event.
+        for se in self.store.by_type(&self.room_id, EventType::PipeOpened)? {
+            let event = crate::event::signed::SignedEvent::decode(&se.wire.signed)
+                .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            if let Content::PipeOpened(opened) = event.content {
+                if &opened.pipe_id == pipe_id {
+                    return Ok(Some(opened));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether a `pipe.closed` for `pipe_id` is present in the validated set (the
+    /// `pipe.closed`-causally-known check the Pipe plane composes with the gate,
+    /// spec §5). Fail-closed: any decode failure surfaces as an error the caller
+    /// treats as "closed".
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read or decode failure.
+    pub fn pipe_is_closed(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+    ) -> Result<bool, SyncError> {
+        for se in self.store.by_type(&self.room_id, EventType::PipeClosed)? {
+            let event = crate::event::signed::SignedEvent::decode(&se.wire.signed)
+                .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            if let Content::PipeClosed(closed) = event.content {
+                if &closed.pipe_id == pipe_id {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// The admin-completeness verdict the access planes consult (spec D6).
     #[must_use]
     pub fn completeness(&self) -> Completeness {

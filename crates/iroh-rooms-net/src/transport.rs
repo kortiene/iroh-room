@@ -27,6 +27,8 @@ use crate::alpn::EVENT_ALPN;
 use crate::audit::AuditSink;
 use crate::handler::EventProtocolHandler;
 use crate::peer::{dial_loop, peer_id};
+use crate::pipe::alpn::PIPE_ALPN;
+use crate::pipe::PipeProtocolHandler;
 use crate::state::{ConnEvent, PeerConnState, PeerTable};
 
 /// Normal application close code for a locally-initiated disconnect (distinct from
@@ -190,6 +192,7 @@ impl NetTransport {
         admission: Arc<dyn Admission>,
         audit: Arc<dyn AuditSink>,
         cfg: NetConfig,
+        pipe_handler: Option<PipeProtocolHandler>,
     ) -> Result<Self> {
         let endpoint = match cfg.mode {
             NetMode::Loopback => Endpoint::builder(presets::Minimal)
@@ -217,11 +220,16 @@ impl NetTransport {
             inbound_tx,
         });
 
-        // One Endpoint, one Router; the blob/pipe ALPNs chain `.accept()` here
-        // later (ADR-1). The endpoint is cloned so we retain it for dialing.
-        let router = Router::builder(endpoint.clone())
-            .accept(EVENT_ALPN, EventProtocolHandler::new(shared.clone()))
-            .spawn();
+        // One Endpoint, one Router serving both planes (ADR-1): the event ALPN is
+        // the first `.accept()` chain; the Live Pipe Plane (IR-0010) chains the pipe
+        // ALPN as the second when a handler is supplied. The endpoint is cloned so we
+        // retain it for dialing (events and pipes both).
+        let mut builder = Router::builder(endpoint.clone())
+            .accept(EVENT_ALPN, EventProtocolHandler::new(shared.clone()));
+        if let Some(pipe_handler) = pipe_handler {
+            builder = builder.accept(PIPE_ALPN, pipe_handler);
+        }
+        let router = builder.spawn();
 
         Ok(Self {
             shared,
@@ -237,6 +245,14 @@ impl NetTransport {
     #[must_use]
     pub fn id(&self) -> EndpointId {
         self.shared.me
+    }
+
+    /// A clone of the underlying iroh [`Endpoint`], so the Live Pipe Plane connector
+    /// can dial the owner over [`PIPE_ALPN`](crate::pipe::alpn::PIPE_ALPN) on the
+    /// **same** endpoint that serves events (one `Endpoint`, two planes).
+    #[must_use]
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
     }
 
     /// A dialable address for this node, exchanged out-of-band in lieu of an invite

@@ -41,6 +41,7 @@ pub mod ids;
 pub mod invite;
 pub mod keys;
 pub mod message;
+pub mod pipe;
 pub mod reject;
 pub mod signed;
 pub mod validate;
@@ -54,6 +55,7 @@ pub use ids::{EventId, HashRef, RoomId};
 pub use invite::build_member_invited;
 pub use keys::{DeviceKey, IdentityKey, Signature, SigningKey};
 pub use message::build_message_text;
+pub use pipe::{build_pipe_closed, build_pipe_opened};
 pub use reject::{Flag, MembershipOracle, RejectReason};
 pub use signed::SignedEvent;
 pub use validate::{

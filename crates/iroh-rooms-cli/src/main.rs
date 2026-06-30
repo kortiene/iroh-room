@@ -11,6 +11,7 @@ mod identity;
 mod invite;
 mod message;
 mod paths;
+mod pipe;
 mod room;
 
 fn main() -> ExitCode {

@@ -49,7 +49,7 @@ use iroh_rooms_net::{
 use crate::{clock, identity};
 
 /// The single event-store database file under the data-directory home (spec D3).
-const DB_FILE: &str = "rooms.db";
+pub(crate) const DB_FILE: &str = "rooms.db";
 /// Accepted `--format` values (spec §5; the §7 content enum). `None` ⇒ omit
 /// (defaults to `plain` on read).
 const MESSAGE_FORMATS: &[&str] = &["plain", "markdown"];
@@ -417,7 +417,7 @@ fn connected_count(node: &Node, ids: &[EndpointId]) -> usize {
 /// Build the carrier admission gate from the current membership snapshot (D7):
 /// bind every active member's device → identity and mark each Active. This is the
 /// production shape the net crate documents (`AllowlistAdmission`).
-fn build_admission(snapshot: &MembershipSnapshot) -> AllowlistAdmission {
+pub(crate) fn build_admission(snapshot: &MembershipSnapshot) -> AllowlistAdmission {
     let mut auth = AllowlistAdmission::new();
     for m in snapshot.active_members() {
         if let Some(dev) = m.device {
@@ -432,7 +432,7 @@ fn build_admission(snapshot: &MembershipSnapshot) -> AllowlistAdmission {
 /// The dial set: every active member's device minus our own, addressed by an
 /// explicit `--peer` when one matches (deterministic LAN/loopback) else by a bare
 /// `EndpointId` resolved through iroh discovery (D5).
-fn build_dial_set(
+pub(crate) fn build_dial_set(
     snapshot: &MembershipSnapshot,
     self_device: EndpointId,
     peer_addrs: &[EndpointAddr],
@@ -461,13 +461,13 @@ fn build_dial_set(
 
 /// Convert a core [`DeviceKey`] (`device_id`) into an iroh [`EndpointId`]; they are
 /// the same raw 32 bytes (Membership §1 / spec A2).
-fn endpoint_id_of(dev: DeviceKey) -> Result<EndpointId> {
+pub(crate) fn endpoint_id_of(dev: DeviceKey) -> Result<EndpointId> {
     EndpointId::from_bytes(dev.as_bytes()).map_err(|err| anyhow!("invalid device id: {err}"))
 }
 
 /// Map the loopback flag to a [`NetMode`]: `--loopback` (deterministic CI/LAN
 /// tests) vs the default real-network n0 discovery + relay stack (D5).
-fn net_mode(loopback: bool) -> NetMode {
+pub(crate) fn net_mode(loopback: bool) -> NetMode {
     if loopback {
         NetMode::Loopback
     } else {
@@ -481,7 +481,7 @@ fn net_mode(loopback: bool) -> NetMode {
 
 /// Re-fold a room's persisted log into a membership view, re-validating each stored
 /// event through the full §6 pipeline first (mirrors [`crate::room::members`]).
-fn fold_room(
+pub(crate) fn fold_room(
     store: &EventStore,
     home: &Path,
     room_id: &RoomId,
@@ -515,7 +515,7 @@ fn fold_room(
 
 /// Current DAG heads for `prev_events`, truncated deterministically to
 /// `MAX_PREV_EVENTS` (identical to the landed `invite.rs` head selection, D8).
-fn select_heads(store: &EventStore, room_id: &RoomId) -> Result<Vec<EventId>> {
+pub(crate) fn select_heads(store: &EventStore, room_id: &RoomId) -> Result<Vec<EventId>> {
     let mut heads = store
         .heads(room_id)
         .with_context(|| format!("could not read DAG heads for room {room_id}"))?;
@@ -654,7 +654,7 @@ pub fn parse_timeout(spec: &str) -> Result<Duration> {
 }
 
 /// Parse every `--peer` value into an [`EndpointAddr`].
-fn parse_peers(peers: &[String]) -> Result<Vec<EndpointAddr>> {
+pub(crate) fn parse_peers(peers: &[String]) -> Result<Vec<EndpointAddr>> {
     peers.iter().map(|s| parse_peer(s)).collect()
 }
 
@@ -686,7 +686,7 @@ fn parse_peer(s: &str) -> Result<EndpointAddr> {
 
 /// Render an [`EndpointAddr`] as the `--peer` wire form
 /// `<ENDPOINT_ID>[@<ip:port>,...]` so a second terminal can dial deterministically.
-fn render_endpoint_addr(addr: &EndpointAddr) -> String {
+pub(crate) fn render_endpoint_addr(addr: &EndpointAddr) -> String {
     let socks: Vec<String> = addr.ip_addrs().map(ToString::to_string).collect();
     if socks.is_empty() {
         addr.id.to_string()
