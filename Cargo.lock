@@ -2035,11 +2035,14 @@ dependencies = [
  "directories",
  "getrandom 0.4.3",
  "hex",
+ "iroh",
  "iroh-rooms-core",
+ "iroh-rooms-net",
  "predicates",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "zeroize",
 ]
 

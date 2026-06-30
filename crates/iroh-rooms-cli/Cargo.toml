@@ -10,14 +10,33 @@ rust-version.workspace = true
 name = "iroh-rooms"
 path = "src/main.rs"
 
+# MSRV note (spec IR-0105 D2 / OQ-1): adding `iroh-rooms-net` (and transitively the
+# iroh 1.0 stack) raises this crate's *effective* MSRV above the workspace-declared
+# `rust-version = 1.80`. The shipping crypto deps already forced rustc >= 1.85, so
+# this only raises the declared floor, mirroring `iroh-rooms-net/Cargo.toml`.
+
 [lints]
 workspace = true
 
 [dependencies]
-# `store` compiles the SQLite `EventStore` into the binary so `room create` can
-# persist the genesis `room.created` event (spec IR-0102 D2). The membership fold
-# is always compiled (no feature), so `room members` needs nothing further.
-iroh-rooms-core = { path = "../iroh-rooms-core", features = ["store"] }
+# `sync` compiles the bounded recent-sync engine (and, transitively, the SQLite
+# `EventStore` via `store`) into the binary: `room create`/`room members`/`room
+# invite` persist and fold the log, while `room send`/`room tail` drive a live
+# `SyncEngine` through `iroh-rooms-net` (spec IR-0105 D2). The membership fold is
+# always compiled (no feature).
+iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
+# The shipping full-mesh QUIC event-transport carrier (IR-0005): `room send` and
+# `room tail` bring up a `Node` over it to push/receive `message.text` frames
+# (spec IR-0105 D2).
+iroh-rooms-net = { path = "../iroh-rooms-net" }
+# Async runtime for the two online commands (`room send`, `room tail`). The offline
+# commands stay synchronous; each online command enters a scoped runtime (D2).
+# `signal` powers `room tail`'s Ctrl-C shutdown.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+# `SecretKey` / `EndpointId` / `EndpointAddr` types crossed at the CLI boundary
+# when wiring the device key into the carrier and parsing `--peer` addresses. Pin
+# identical to `iroh-rooms-net` (spec IR-0105 D2).
+iroh = "=1.0.1"
 # Argument parsing for the subcommand tree (PRD §16 CLI surface). `derive` gives
 # the declarative `Cli`/subcommand structs. Caret 4.x; the exact patch is pinned
 # in Cargo.lock. (CI builds on the latest stable toolchain — the landed crypto

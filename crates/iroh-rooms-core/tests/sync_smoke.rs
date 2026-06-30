@@ -659,6 +659,41 @@ fn foreign_room_message_is_silently_dropped() {
 }
 
 // ---------------------------------------------------------------------------
+// IR-0105 AC2 — duplicate message.text delivery is silently ignored
+// ---------------------------------------------------------------------------
+
+#[test]
+fn message_text_duplicate_delivery_is_silently_ignored() {
+    // build_log(1, false): 5 membership events + 1 MessageText from bob (events[5]).
+    let built = build_log(1, false);
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
+
+    // Seed all events so the first delivery of the chat frame is accepted.
+    seed(&mut net, NODE_A, &built.events);
+
+    let chat_frame = built.events.last().expect("has chat event");
+    let accepted_before = net.engine(NODE_A).counters().accepted;
+
+    // Deliver the same message.text frame a second time as if from NODE_B.
+    let outs = net.engine_mut(NODE_A).ingest_frame(NODE_B, chat_frame);
+
+    let rebroadcast: Vec<_> = outs
+        .iter()
+        .filter(|o| matches!(&o.msg, SyncMessage::Events { .. }))
+        .collect();
+    assert!(
+        rebroadcast.is_empty(),
+        "duplicate message.text must not produce an Events fan-out"
+    );
+    assert_eq!(
+        net.engine(NODE_A).counters().accepted,
+        accepted_before,
+        "duplicate message.text delivery must not increment the accepted counter"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Idempotency — duplicate frame must not trigger a re-broadcast storm
 // ---------------------------------------------------------------------------
 
@@ -1219,4 +1254,72 @@ fn want_recent_chat_since_ms_advisory_filters_events() {
     if let SyncMessage::Events { frames, .. } = &events_msgs[0].msg {
         assert_eq!(frames.len(), 2, "both chat events returned when since_ms=0");
     }
+}
+
+// ---------------------------------------------------------------------------
+// SyncEngine::room_tail passthrough — ordering, limit enforcement, empty store
+// ---------------------------------------------------------------------------
+
+#[test]
+fn room_tail_returns_all_events_in_order_when_no_limit() {
+    // build_log(3, false): genesis + 4 membership events + 3 chat = 8 events.
+    let built = build_log(3, false);
+    let store = EventStore::open_in_memory().expect("store");
+    let mut engine = SyncEngine::open(store, built.room, SyncConfig::default()).expect("engine");
+    for frame in &built.events {
+        engine.publish(frame).expect("seed");
+    }
+    let tail = engine.room_tail(u32::MAX).expect("room_tail must succeed");
+    assert_eq!(
+        tail.len(),
+        built.events.len(),
+        "room_tail(MAX) must return all {} seeded events",
+        built.events.len()
+    );
+    // Verify ascending (lamport, event_id) order that store guarantees.
+    for pair in tail.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let la = a.lamport.unwrap_or(u64::MAX);
+        let lb = b.lamport.unwrap_or(u64::MAX);
+        assert!(
+            la < lb || (la == lb && a.event_id <= b.event_id),
+            "tail must be ascending by (lamport, event_id): ({la}, {:?}) then ({lb}, {:?})",
+            a.event_id,
+            b.event_id
+        );
+    }
+}
+
+#[test]
+fn room_tail_truncates_to_limit() {
+    // build_log(4, false): 5 membership + 4 chat = 9 events.
+    let built = build_log(4, false);
+    let store = EventStore::open_in_memory().expect("store");
+    let mut engine = SyncEngine::open(store, built.room, SyncConfig::default()).expect("engine");
+    for frame in &built.events {
+        engine.publish(frame).expect("seed");
+    }
+    // Limit smaller than total: must return exactly `limit` events.
+    let tail = engine.room_tail(3).expect("room_tail must succeed");
+    assert_eq!(
+        tail.len(),
+        3,
+        "room_tail(3) must return exactly 3 of the 9 events"
+    );
+    // Limit larger than total: must return all events.
+    let tail_all = engine.room_tail(u32::MAX).expect("room_tail must succeed");
+    assert_eq!(tail_all.len(), 9, "room_tail(MAX) must return all 9 events");
+}
+
+#[test]
+fn room_tail_returns_empty_on_fresh_engine() {
+    // An engine opened over an empty store must return an empty tail.
+    let built = build_log(0, false);
+    let store = EventStore::open_in_memory().expect("store");
+    let engine = SyncEngine::open(store, built.room, SyncConfig::default()).expect("engine");
+    let tail = engine.room_tail(u32::MAX).expect("room_tail must succeed");
+    assert!(
+        tail.is_empty(),
+        "fresh engine with no seeded events must return an empty tail"
+    );
 }

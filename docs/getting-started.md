@@ -35,10 +35,15 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 > - **Step 3 (invite half)** — `iroh-rooms room invite` is implemented and runnable as of
 >   issue #18 / IR-0103. The output block for that command is reconciled against the shipped
 >   binary and shows the actual format. `room join` and the rest of Step 3 remain scaffold.
-> - **Steps 3–7** (except `room invite`) — `room join`, `room send`, `file`, `pipe`, `agent`
->   are scaffold — the binary does not recognise them yet. **Expected output** blocks for
->   those steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet captured
->   from a real run).
+> - **Step 4** (`iroh-rooms room send` / `iroh-rooms room tail`) is implemented and runnable
+>   as of issue #20 / IR-0105. Both commands work against the shipped binary and the output
+>   blocks below are reconciled to its actual format. The *full two-human* exchange in this
+>   step additionally needs `room join` (#19) so a second participant is an active member;
+>   until that lands, the commands run but you cannot complete the round trip end-to-end.
+> - **Steps 3, 5–7** (except `room invite`/`room send`/`room tail`) — `room join`, `file`,
+>   `pipe`, `agent` are scaffold — the binary does not recognise them yet. **Expected output**
+>   blocks for those steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
+>   captured from a real run).
 >
 > General notes:
 >
@@ -359,30 +364,53 @@ so this step never stages a "send while offline, receive later" flow.
 **Command** (Terminal A — Alice) — start tailing first:
 
 ```bash
-# Substitute <ROOM_ID>. This streams; leave it running.
+# Substitute <ROOM_ID>. This streams; leave it running (stop with Ctrl-C).
 iroh-rooms room tail <ROOM_ID>
+```
+
+On startup `room tail` prints its own dialable address as a `listening:` line. On a real
+network the peers find each other by iroh discovery, so you can ignore it. On a LAN or in CI
+(no discovery), copy that address and pass it to the sender as `--peer` (and vice versa).
+
+**Expected output** — Alice's `room tail` on startup, then Bob's message once it arrives
+(reconciled to the binary; `<author>` is the sender's `member.joined` display name if known,
+else a short identity id):
+
+```text
+listening: <ENDPOINT_ID>@<ip:port>
+tip: share this address with the other peer via --peer
+room: <ROOM_ID>
+[2026-06-30T12:01:04Z] bob1a2b3c: I pushed the first prototype.
 ```
 
 **Command** (Terminal B — Bob) — send a message:
 
 ```bash
-# Substitute <ROOM_ID>.
+# Substitute <ROOM_ID>. Add --peer <ALICE_LISTENING_ADDR> on a LAN / in CI (no discovery).
 iroh-rooms room send <ROOM_ID> "I pushed the first prototype."
 ```
 
-**Expected output** — Alice's `room tail` prints Bob's message (illustrative):
+**Expected output** — Bob's `room send` (reconciled to the binary):
 
 ```text
-[12:01:04] Bob: I pushed the first prototype.
+sent: <EVENT_ID>
+room: <ROOM_ID>
+from: <BOB_IDENTITY_ID>
+stored: yes
+delivered: 1 connected peer(s)
 ```
 
-Optionally reverse it: Bob runs `room tail <ROOM_ID>` and Alice runs
-`room send <ROOM_ID> "Nice — pulling it now."`
+`room send` is **offline-first**: it always stores the message locally, then best-effort
+pushes it to connected peers. With no peer online it still exits 0 and reports
+`delivered: 0 (no peers online — stored locally only)` — there is no queue and no guaranteed
+offline delivery (PRD §14). Optionally reverse it: Bob runs `room tail <ROOM_ID>` and Alice
+runs `room send <ROOM_ID> "Nice — pulling it now."`
 
 **What this proves / verify:** the message is a signed `message.text` event (spike §7),
-delivered to the connected peer in under 2 seconds (PRD §17.1.3) and stored locally.
-Duplicates are ignored; events with invalid signatures or from non-members are rejected and
-logged — see [Troubleshooting](#troubleshooting) for the reason codes.
+delivered to the connected peer in under 2 seconds (PRD §17.1.3) and stored locally in
+deterministic `(lamport, event_id)` timeline order. Duplicates are ignored; events with
+invalid signatures or from non-members are rejected and logged — see
+[Troubleshooting](#troubleshooting) for the reason codes.
 
 ---
 

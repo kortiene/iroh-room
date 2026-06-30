@@ -205,11 +205,39 @@ adding the second authoring command and the first out-of-band capability artifac
   capability-hash AC4, ticket round-trip + corruption rejection; CLI integration: admin path,
   non-admin rejection, bad args, secret-not-in-output).
 
-With this prototype the Phase-0 Room Event Plane targets (event model, store,
-membership fold, sync engine, identity CLI, room creation, room invite, and the iroh
-transport) are all landed as prototypes; the remaining work is room join, messaging,
-file sharing, live pipe, agent status, the `MembershipSnapshot` re-point of
-admission, and the Gate-A real-network confirmation (all tracked separately).
+**Signed message send and receive** has landed in `crates/iroh-rooms-cli` (issue #20 /
+IR-0105), adding the first **online** commands — the first that leave the local filesystem
+and drive the `iroh-rooms-net` carrier from the binary:
+
+- `iroh-rooms room send <ROOM_ID> <MESSAGE> [--format plain|markdown] [--reply-to <EVENT_ID>]
+  [--peer <ENDPOINT_ADDR>]… [--timeout <DUR>]` — offline-first, online-best-effort: confirms
+  the caller is an active member via the membership fold, selects `prev_events = heads`,
+  assembles and signs a `message.text` through the new pure `build_message_text` core builder,
+  self-validates it, then brings up an ephemeral `Node`, dials the room's other active members,
+  and lets the engine `publish` persist and fan the frame out to connected peers. The message
+  is **always** stored locally (the guarantee); reaching zero peers is reported, not an error
+  (no queue, no guaranteed offline delivery — PRD §14).
+- `iroh-rooms room tail <ROOM_ID> [--peer <ENDPOINT_ADDR>]… [--limit <N>]` — the long-running
+  receiver/session: brings up a `Node`, prints its dialable `listening:` address (so a LAN/CI
+  peer can dial it via `--peer` without discovery), accepts inbound frames (validated, deduped,
+  persisted by the landed engine), and renders the timeline in deterministic `(lamport,
+  event_id)` order until interrupted (Ctrl-C).
+- A pure `build_message_text` (the byte-exact assembly point, golden-tested) lands in
+  `iroh-rooms-core::event`, plus thin additive read passthroughs (`SyncEngine::room_tail` →
+  `Node::room_tail`) so a running node can surface its timeline for display.
+- Every message-correctness criterion — signed by the device key, duplicate event ids ignored,
+  invalid signatures rejected, non-member messages rejected, deterministic timeline order — is
+  enforced by the landed, conformance-tested validator / membership fold / store / sync engine;
+  this issue is the integration and the two new commands, not new correctness logic.
+- The full two-human exchange additionally needs `room join` (#19) to make a second participant
+  an active member; until that lands the commands run but the round trip is gated on #19. Real-NAT
+  delivery inherits the open Gate-A risk from the transport prototype (#9).
+
+With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
+engine, identity CLI, room creation, room invite, signed messaging, and the iroh transport)
+are all landed as prototypes; the remaining work is room join, file sharing, live pipe, agent
+status, the `MembershipSnapshot` re-point of admission, and the Gate-A real-network
+confirmation (all tracked separately).
 
 ## Repository Layout
 
