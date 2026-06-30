@@ -13,4 +13,14 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+# Ed25519 signing/verification. Pinned EXACTLY to the version `iroh 1.0` resolves
+# (`3.0.0-rc.0`, recorded in PHASE-0-SPIKE.md Event Protocol §1 / spec D2 / R6) so
+# that `device_id` stays byte-for-byte the iroh `EndpointId` when the transport
+# issue adds `iroh`. Ed25519 itself is RFC 8032, so the golden signature bytes are
+# version-independent; the pin is about future type/byte compatibility.
+ed25519-dalek = "=3.0.0-rc.0"
+# BLAKE3-256 — the same content hash the Blob Plane uses (Event Protocol §4).
+blake3 = "1"
+# Lowercase hex presentation of keys/ids on the wire (no `0x`, no uppercase).
+hex = "0.4"
 

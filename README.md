@@ -21,14 +21,24 @@ troubleshooting guide and the availability model. It is drafted against the plan
 
 ## Current Status
 
-The Rust workspace is scaffolded but the protocol implementation is not started.
-The first implementation target is the Room Event Plane:
+The **canonical signed event model** has landed in `iroh-rooms-core::event`
+(issue #6 / IR-0002). This is the byte-for-byte trust boundary the rest of the
+Room Event Plane builds on:
 
-1. deterministic signed event model,
-2. protocol conformance vectors,
-3. SQLite event store,
-4. full-mesh iroh QUIC event transport,
-5. bounded recent sync and membership fold.
+- Deterministic-CBOR encoding (RFC 8949 §4.2.1 canonical profile, purpose-built codec).
+- BLAKE3-256 event-ID derivation and Ed25519 sign/verify under `device_id`.
+- `WireEvent` envelope with verbatim signed-byte preservation for storage and forwarding.
+- Strict per-type content validation: unknown-key rejection, length/enum bounds.
+- Stateless `validate_wire_bytes` pipeline (Event Protocol §6 stateless subset)
+  returning a `ValidatedEvent` or a typed `RejectReason`.
+- 70 conformance tests including byte-exact golden vectors (242-byte CSB, `event_id`,
+  signature, `room_id_A/B`).
+
+Remaining Room Event Plane targets:
+
+1. SQLite event store,
+2. full-mesh iroh QUIC event transport,
+3. bounded recent sync and membership fold.
 
 ## Repository Layout
 
