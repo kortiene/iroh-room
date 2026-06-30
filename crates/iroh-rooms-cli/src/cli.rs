@@ -12,11 +12,11 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
-use crate::{identity, invite, paths, room};
+use crate::{identity, invite, message, paths, room};
 
 /// Local-first rooms over iroh — local identity and device management.
 #[derive(Debug, Parser)]
@@ -102,6 +102,52 @@ enum RoomAction {
         #[arg(long)]
         expires: Option<String>,
     },
+    /// Send a signed text message to the room and push it to connected peers.
+    Send {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// The message body (1..=16384 UTF-8 bytes).
+        message: String,
+        /// Message format: `plain` (default) or `markdown`.
+        #[arg(long)]
+        format: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Reply target event id (blake3:<hex>).
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Best-effort connect timeout as <int>{ms|s|m}, e.g. 5s.
+        #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
+        timeout: String,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+    /// Stream the room timeline, receiving and displaying signed messages live.
+    Tail {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Historical rows to render on startup.
+        #[arg(long, default_value_t = crate::message::DEFAULT_TAIL_LIMIT)]
+        limit: u32,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
 }
 
 /// Parse arguments and execute the selected command.
@@ -160,7 +206,55 @@ pub fn run() -> Result<()> {
                 let summary = invite::invite(&home, &room_id, &invitee, &role, expires.as_deref())?;
                 invite::print_invite(&summary);
             }
+            RoomAction::Send {
+                room_id,
+                message,
+                format,
+                reply_to,
+                peers,
+                timeout,
+                loopback,
+            } => {
+                let room_id: RoomId = room_id
+                    .parse()
+                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
+                // Parse the timeout before any IO so a bad value writes nothing.
+                let timeout = message::parse_timeout(&timeout)?;
+                // The online command runs in a scoped runtime; the rest of `run`
+                // stays synchronous (spec IR-0105 D2).
+                let summary = runtime()?.block_on(message::send(
+                    &home,
+                    &room_id,
+                    &message,
+                    format.as_deref(),
+                    reply_to.as_deref(),
+                    &peers,
+                    timeout,
+                    loopback,
+                ))?;
+                message::print_send(&summary);
+            }
+            RoomAction::Tail {
+                room_id,
+                peers,
+                limit,
+                loopback,
+            } => {
+                let room_id: RoomId = room_id
+                    .parse()
+                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
+                runtime()?.block_on(message::tail(&home, &room_id, &peers, limit, loopback))?;
+            }
         },
     }
     Ok(())
+}
+
+/// Build the scoped multi-thread Tokio runtime that hosts the two online commands
+/// (`room send`, `room tail`). The offline commands never touch it (spec D2).
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the async runtime for an online command")
 }

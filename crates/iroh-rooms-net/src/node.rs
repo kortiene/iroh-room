@@ -23,6 +23,7 @@ use anyhow::{anyhow, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::ids::EventId;
 use iroh_rooms_core::membership::MembershipSnapshot;
+use iroh_rooms_core::store::StoredEvent;
 use iroh_rooms_core::sync::{Completeness, Outgoing, SyncEngine, SyncMessage};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -41,6 +42,7 @@ pub const DEFAULT_TICK: Duration = Duration::from_millis(250);
 enum Cmd {
     Publish(Vec<u8>, oneshot::Sender<Result<(), String>>),
     Contains(EventId, oneshot::Sender<Result<bool, String>>),
+    Tail(u32, oneshot::Sender<Result<Vec<StoredEvent>, String>>),
     Snapshot(oneshot::Sender<MembershipSnapshot>),
     Completeness(oneshot::Sender<Completeness>),
     Shutdown(oneshot::Sender<()>),
@@ -150,6 +152,22 @@ impl Node {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Cmd::Contains(id, tx))
+            .map_err(|_| anyhow!("pump task is gone"))?;
+        rx.await
+            .map_err(|_| anyhow!("pump dropped the reply"))?
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// The current room timeline — the most-recent `limit` events in canonical
+    /// `(lamport, event_id)` order — for display. Routed through the pump so the
+    /// engine stays single-owner (no second store handle racing its WAL writes).
+    ///
+    /// # Errors
+    /// Returns an error on a store read failure or if the pump is gone.
+    pub async fn room_tail(&self, limit: u32) -> Result<Vec<StoredEvent>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Tail(limit, tx))
             .map_err(|_| anyhow!("pump task is gone"))?;
         rx.await
             .map_err(|_| anyhow!("pump dropped the reply"))?
@@ -307,6 +325,11 @@ fn handle_cmd(engine: &mut SyncEngine, shared: &Arc<Shared>, cmd: Cmd) -> bool {
                 .digest()
                 .map(|d| d.event_ids.contains(&id))
                 .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+            false
+        }
+        Cmd::Tail(limit, reply) => {
+            let result = engine.room_tail(limit).map_err(|e| e.to_string());
             let _ = reply.send(result);
             false
         }

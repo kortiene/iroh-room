@@ -26,7 +26,7 @@ use crate::event::ids::{EventId, RoomId};
 use crate::event::keys::IdentityKey;
 use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
 use crate::membership::{MembershipSnapshot, RoomMembership, Status};
-use crate::store::{EventStore, InsertOutcome, StoreError};
+use crate::store::{EventStore, InsertOutcome, StoreError, StoredEvent};
 
 use super::config::SyncConfig;
 use super::message::{id_set, Outgoing, PeerId, SyncMessage, Window};
@@ -412,6 +412,18 @@ impl SyncEngine {
     #[must_use]
     pub fn snapshot(&self) -> MembershipSnapshot {
         self.fold.snapshot()
+    }
+
+    /// The most-recent `limit` causally-placed events in canonical
+    /// `(lamport, event_id)` order — the deterministic display timeline
+    /// (Membership §2). A thin read passthrough to
+    /// [`EventStore::room_tail`](crate::store::EventStore::room_tail) so a running
+    /// node can surface its room timeline for display without a second store handle.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read failure.
+    pub fn room_tail(&self, limit: u32) -> Result<Vec<StoredEvent>, SyncError> {
+        Ok(self.store.room_tail(&self.room_id, limit)?)
     }
 
     /// The admin-completeness verdict the access planes consult (spec D6).
