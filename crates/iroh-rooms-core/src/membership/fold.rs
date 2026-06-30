@@ -111,6 +111,15 @@ impl RoomMembership {
         &self.room_id
     }
 
+    /// The number of events currently tracked in the causal DAG — accepted,
+    /// buffered, or rejected. An observability/test helper for the sync layer's
+    /// anti-amplification bound: a frame dropped before [`ingest`](Self::ingest)
+    /// never grows this, so a non-member flood must leave it unchanged.
+    #[must_use]
+    pub fn tracked_event_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Fold a whole set in one call (used by tests and the store adapter). Order
     /// is irrelevant — buffering and re-evaluation make the result identical to
     /// any other ingest order over the same set.

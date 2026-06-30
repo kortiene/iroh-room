@@ -87,9 +87,35 @@ layer of the Room Event Plane, downstream of the stateless validator:
   sticky departure, concurrent join/kick convergence to Removed, and
   current-snapshot access decisions.
 
+The **bounded recent-sync engine** has landed in `iroh-rooms-core::sync` behind the
+`sync` cargo feature (issue #11 / IR-0007). This is the sync layer over the landed
+event/store/membership stack, proving the ADR-2 bounded recent-sync path for MVP-sized
+rooms without full decentralized reconciliation:
+
+- `SyncEngine`: a deterministic, sans-IO state machine consuming inbound `SyncMessage`s
+  and emitting `Vec<Outgoing>` frames; no async, no clocks beyond an advisory `now_ms`.
+- **Never-windowed membership/admin pull** (`WantMembership`): the membership sub-DAG and
+  full admin chain are always fully reconciled regardless of chat window size.
+- **Bounded recent chat pull** (`WantRecentChat`, `Window { max_count, since_ms }`):
+  count-bounded via canonical `(lamport, event_id)` order (trustworthy); `since_ms` is
+  advisory only and not a trust input.
+- **By-id backfill** (`WantEvents`/`Events`) driven by `Ingest::Buffered.missing` and
+  `EventStore::missing_parents`, with §4 anti-amplification bounds (per-author park cap,
+  backfill token bucket, depth bound).
+- **Admin-tip incompleteness detector + fail-closed** (`AdminTip`, `Completeness`): a node
+  whose admin view may be behind a removal **fails closed** on removal-sensitive decisions
+  for affected subjects; an admin fork raises a CRITICAL `equivocation` trust decision.
+- **`SyncDigest` / `room_event_ids`**: a read-only, additive store helper (no schema
+  change) plus the engine's `digest()` — the set-equality oracle the tests assert.
+- **`SimNet` harness**: deterministic in-memory multi-peer simulation (seeded shuffle,
+  partition, disconnect/reconnect); 37 tests prove arrival-order-independent convergence
+  and anti-amplification bounds (Spike Plan Gate D).
+
 Remaining Room Event Plane targets:
 
-1. Full-mesh iroh QUIC event transport and bounded recent sync.
+1. Full-mesh iroh QUIC event transport — the real iroh adapter (`crates/iroh-rooms-net`,
+   ALPN `/iroh-rooms/event/1`), deferred from IR-0007 (OQ-1) to keep the deterministic
+   conformance path iroh-free.
 
 ## Repository Layout
 
