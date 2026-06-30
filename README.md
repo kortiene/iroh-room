@@ -12,6 +12,13 @@ The product and protocol source-of-truth documents are:
 - `PHASE-0-SPIKE.md` — protocol design, ADRs, spike plan, and residual risks.
 - `PRD.md` — historical v0.2 context.
 
+## Getting Started
+
+[`docs/getting-started.md`](docs/getting-started.md) is the copy-pasteable demo walkthrough:
+identity → room → invite/join → message → file → live pipe → agent status, with a
+troubleshooting guide and the availability model. It is drafted against the planned CLI MVP
+(see issue #34) and becomes runnable end-to-end once that CLI lands.
+
 ## Current Status
 
 The Rust workspace is scaffolded but the protocol implementation is not started.
