@@ -115,6 +115,19 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                         conn.close(REJECT_CODE, b"unauthorized-remote");
                         return; // not a member: stop dialing
                     }
+                    AdmissionDecision::AdmitProvisional => {
+                        // The dialer never bootstraps a join: a joiner dials an
+                        // *Active* admin (its gate admits the admin normally), so a
+                        // provisional verdict here only arises if a join-hosting node
+                        // dials an unknown device. Treat it as not-yet-reachable —
+                        // do not establish a link — and back off rather than opening
+                        // a stream to a peer we cannot place as a member.
+                        tracing::debug!(
+                            peer = %remote,
+                            "dial: remote only provisionally admissible; backing off without establishing"
+                        );
+                        shared.table.set(remote, PeerConnState::Offline, None);
+                    }
                     AdmissionDecision::Admit { identity } => {
                         match establish_outbound(&shared, &conn, remote, identity).await {
                             Established::Up => {

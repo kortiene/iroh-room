@@ -22,6 +22,14 @@ pub enum AdmissionDecision {
         /// The membership identity (`sender_id`) the device is bound to.
         identity: IdentityKey,
     },
+    /// Admit the connection **provisionally** for the join bootstrap (IR-0104,
+    /// Approach A): the device is **not** a known Active member, but the local node
+    /// is hosting joins and an invite is open, so a first-time invitee is allowed to
+    /// pull the (secret-free) membership sub-DAG and push a single `member.joined`.
+    /// The connection is served membership events only and grants **no** membership
+    /// by itself — every peer's `gate_join` remains the authorization authority. See
+    /// [`JoinBootstrapAdmission`].
+    AdmitProvisional,
     /// Reject the connection (close before `accept_bi()`); no bytes are read.
     Reject(RejectCause),
 }
@@ -137,9 +145,74 @@ impl Admission for AllowlistAdmission {
     }
 }
 
+/// A provisional-aware admission gate for an admin hosting joins (IR-0104,
+/// Approach A — the join bootstrap seam).
+///
+/// It wraps an inner [`AllowlistAdmission`] (which already admits Active members
+/// and default-denies everyone else) and changes exactly **one** outcome: when
+/// `accept_joins` is set, a genuinely **unknown** device — one bound to no member,
+/// i.e. a first-time invitee whose device the room has never seen — is
+/// [`AdmitProvisional`](AdmissionDecision::AdmitProvisional) instead of rejected, so
+/// it can pull the secret-free membership sub-DAG and push its `member.joined`.
+///
+/// Every other outcome is the inner gate's verbatim:
+/// * an **Active** member is admitted normally ([`Admit`](AdmissionDecision::Admit));
+/// * a **bound-but-inactive** device (a removed/left member, or an invitee whose
+///   device is already known) is still rejected with `NotActive` — sticky departure
+///   and the single-join bootstrap are preserved;
+/// * a **fail-closed** identity is still rejected.
+///
+/// With `accept_joins` unset (a non-hosting node, or one with no open invites) the
+/// gate is byte-for-byte its inner [`AllowlistAdmission`], so a quiescent room
+/// admits no strangers. The provisional admission is a **liveness + privacy**
+/// mechanism, never an authorization one: `gate_join` still decides membership on
+/// every peer, so a provisional peer that fails the capability/key/expiry/role gate
+/// grants nothing anywhere.
+#[derive(Debug, Clone)]
+pub struct JoinBootstrapAdmission {
+    inner: AllowlistAdmission,
+    accept_joins: bool,
+}
+
+impl JoinBootstrapAdmission {
+    /// Wrap `inner` with the provisional join-bootstrap overlay. `accept_joins`
+    /// should be set by the admin's join-hosting session **only** while at least one
+    /// invite is open; the caller computes that policy (caller-is-admin +
+    /// pending-invite) and passes the result here.
+    #[must_use]
+    pub fn new(inner: AllowlistAdmission, accept_joins: bool) -> Self {
+        Self {
+            inner,
+            accept_joins,
+        }
+    }
+
+    /// Whether this gate currently admits first-time invitees provisionally.
+    #[must_use]
+    pub fn accepts_joins(&self) -> bool {
+        self.accept_joins
+    }
+}
+
+impl Admission for JoinBootstrapAdmission {
+    fn authorize(&self, device: EndpointId) -> AdmissionDecision {
+        match self.inner.authorize(device) {
+            // An unknown device + an open join window ⇒ provisional bootstrap admit.
+            AdmissionDecision::Reject(RejectCause::UnknownDevice) if self.accept_joins => {
+                AdmissionDecision::AdmitProvisional
+            }
+            // Active member, bound-but-inactive, fail-closed, or unknown-with-no-open
+            // -invites: the inner gate's verdict is authoritative and unchanged.
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Admission, AdmissionDecision, AllowlistAdmission, RejectCause};
+    use super::{
+        Admission, AdmissionDecision, AllowlistAdmission, JoinBootstrapAdmission, RejectCause,
+    };
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
 
@@ -360,6 +433,123 @@ mod tests {
         assert_eq!(
             auth.authorize(device(4)),
             AdmissionDecision::Reject(RejectCause::FailClosed)
+        );
+    }
+
+    // ── JoinBootstrapAdmission (IR-0104, Approach A) — the provisional overlay ──
+
+    #[test]
+    fn bootstrap_unknown_device_with_open_window_is_provisional() {
+        // The first-time invitee: bound to no member, hosting joins ⇒ provisional.
+        let gate = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::AdmitProvisional
+        );
+        assert!(gate.accepts_joins());
+    }
+
+    #[test]
+    fn bootstrap_unknown_device_without_open_window_is_rejected() {
+        // Not hosting joins (quiescent / non-admin) ⇒ a stranger is admitted nothing,
+        // exactly the inner gate's verdict.
+        let gate = JoinBootstrapAdmission::new(AllowlistAdmission::new(), false);
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        );
+        assert!(!gate.accepts_joins());
+    }
+
+    #[test]
+    fn bootstrap_active_member_is_admitted_normally() {
+        // An Active member is admitted in full even while hosting joins — provisional
+        // applies only to genuinely-unknown devices.
+        let id = identity(0xA1);
+        let inner = AllowlistAdmission::new()
+            .bind_device(device(1), id)
+            .set_active(id);
+        let gate = JoinBootstrapAdmission::new(inner, true);
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Admit { identity: id }
+        );
+    }
+
+    #[test]
+    fn bootstrap_bound_but_inactive_device_is_still_rejected() {
+        // A removed/left member (bound, not Active) is NOT provisional — sticky
+        // departure and the single-join bootstrap are preserved.
+        let id = identity(0xB2);
+        let inner = AllowlistAdmission::new().bind_device(device(2), id);
+        let gate = JoinBootstrapAdmission::new(inner, true);
+        assert_eq!(
+            gate.authorize(device(2)),
+            AdmissionDecision::Reject(RejectCause::NotActive)
+        );
+    }
+
+    #[test]
+    fn bootstrap_fail_closed_identity_is_still_rejected() {
+        let id = identity(0xC3);
+        let inner = AllowlistAdmission::new()
+            .bind_device(device(3), id)
+            .set_active(id)
+            .set_fail_closed(id);
+        let gate = JoinBootstrapAdmission::new(inner, true);
+        assert_eq!(
+            gate.authorize(device(3)),
+            AdmissionDecision::Reject(RejectCause::FailClosed)
+        );
+    }
+
+    #[test]
+    fn bootstrap_active_member_admitted_normally_when_not_accepting_joins() {
+        // accept_joins=false + Active member: the "other => other" arm in
+        // JoinBootstrapAdmission must fall through to the inner gate's Admit —
+        // quiescing the join window must not block already-Active members.
+        let id = identity(0xD4);
+        let inner = AllowlistAdmission::new()
+            .bind_device(device(6), id)
+            .set_active(id);
+        let gate = JoinBootstrapAdmission::new(inner, false);
+        assert_eq!(
+            gate.authorize(device(6)),
+            AdmissionDecision::Admit { identity: id },
+            "Active member must be admitted even when accept_joins is false"
+        );
+    }
+
+    #[test]
+    fn bootstrap_two_unknown_devices_both_admitted_provisionally() {
+        // Two independent first-time invitees: both must receive AdmitProvisional.
+        // The provisional path is not one-time or device-count-limited.
+        let gate = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
+        assert_eq!(
+            gate.authorize(device(20)),
+            AdmissionDecision::AdmitProvisional,
+            "first unknown device must be AdmitProvisional"
+        );
+        assert_eq!(
+            gate.authorize(device(21)),
+            AdmissionDecision::AdmitProvisional,
+            "second independent unknown device must also be AdmitProvisional"
+        );
+    }
+
+    #[test]
+    fn bootstrap_unknown_device_not_active_member_stays_rejected_when_joins_closed() {
+        // A device that was previously bound but is now not Active (e.g. Removed)
+        // must still be rejected even if accept_joins is toggled. The "sticky
+        // departure" guarantee must not be bypassed by a re-open of the join window.
+        let id = identity(0xE5);
+        let inner = AllowlistAdmission::new().bind_device(device(7), id);
+        // id is bound but not Active (Removed / Invited-only).
+        let gate = JoinBootstrapAdmission::new(inner, true);
+        assert_eq!(
+            gate.authorize(device(7)),
+            AdmissionDecision::Reject(RejectCause::NotActive),
+            "bound-but-inactive device must be rejected even with accept_joins=true"
         );
     }
 }

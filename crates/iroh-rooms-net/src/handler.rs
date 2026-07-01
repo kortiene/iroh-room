@@ -80,6 +80,32 @@ impl ProtocolHandler for EventProtocolHandler {
                 self.shared.audit.disconnected(device);
                 Ok(())
             }
+            AdmissionDecision::AdmitProvisional => {
+                // The join-bootstrap seam (IR-0104, Approach A): a not-yet-Active
+                // invitee is admitted *provisionally* so it can pull the secret-free
+                // membership sub-DAG and push a single `member.joined`. We accept the
+                // stream like a member, but mark the connection provisional **before**
+                // it flips to Connected so the engine driver serves it membership
+                // events only (the engine's `gate_join` still decides membership on
+                // every peer — provisional admission grants nothing). The mark is
+                // cleared on upgrade-on-learn (its join was accepted) or here on
+                // disconnect.
+                self.shared.audit.bootstrap_admitted(device);
+                let (send, recv) = conn.accept_bi().await?;
+                self.shared.mark_provisional(device);
+                register_connection(self.shared.clone(), device, conn.clone(), send, recv);
+                self.shared
+                    .table
+                    .set(device, PeerConnState::Connected, None);
+                self.shared.audit.connected(device);
+
+                conn.closed().await;
+                self.shared.clear_provisional(device);
+                self.shared.unregister(device);
+                self.shared.table.set(device, PeerConnState::Offline, None);
+                self.shared.audit.disconnected(device);
+                Ok(())
+            }
         }
     }
 }

@@ -50,7 +50,9 @@ pub mod transport;
 
 mod peer;
 
-pub use admission::{Admission, AdmissionDecision, AllowlistAdmission, RejectCause};
+pub use admission::{
+    Admission, AdmissionDecision, AllowlistAdmission, JoinBootstrapAdmission, RejectCause,
+};
 pub use alpn::EVENT_ALPN;
 pub use audit::{AuditSink, TracingAudit};
 pub use frame::{FrameError, MAX_FRAME_BYTES};

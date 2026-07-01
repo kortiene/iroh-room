@@ -43,7 +43,8 @@ use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, RoomMembership, St
 use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
-    AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, TracingAudit, DEFAULT_TICK,
+    AllowlistAdmission, JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState,
+    TracingAudit, DEFAULT_TICK,
 };
 
 use crate::{clock, identity};
@@ -228,6 +229,12 @@ pub fn print_send(summary: &SendSummary) {
 /// interrupted (Ctrl-C). Brings up a [`Node`], dials the room's other active
 /// members, and renders newly-arrived `message.text` rows in canonical order (D4).
 ///
+/// When `accept_joins` is set **and** the caller is the room admin with at least one
+/// open invite, the node hosts joins (IR-0104): its admission gate admits a
+/// not-yet-`Active` invitee *provisionally* so the invitee can pull the membership
+/// sub-DAG and push its `member.joined`. A non-admin caller, or a quiescent room with
+/// no open invites, ignores the flag and admits no strangers.
+///
 /// # Errors
 /// Fails before bring-up if no local identity exists, the room is unknown, the
 /// caller is not an active member, an option is invalid, or the store / node cannot
@@ -237,6 +244,7 @@ pub async fn tail(
     room_id: &RoomId,
     peers: &[String],
     limit: u32,
+    accept_joins: bool,
     loopback: bool,
 ) -> Result<()> {
     let peer_addrs = parse_peers(peers)?;
@@ -261,7 +269,15 @@ pub async fn tail(
 
     let self_device = endpoint_id_of(secret.device.device_key())?;
     let dial_set = build_dial_set(&snapshot, self_device, &peer_addrs);
-    let admission = build_admission(&snapshot);
+
+    // Build the admission gate. With `--accept-joins` and a real open-invite window,
+    // wrap it in the provisional join-bootstrap overlay (IR-0104 Approach A); else it
+    // is the normal Active-only allowlist (no strangers admitted).
+    let host_joins = accept_joins && hosting_joins_effective(&snapshot, &self_id);
+    if accept_joins {
+        report_accept_joins(&snapshot, &self_id, host_joins);
+    }
+    let admission = JoinBootstrapAdmission::new(build_admission(&snapshot), host_joins);
 
     // Hand the store to the engine and bring up the node.
     let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
@@ -413,6 +429,29 @@ fn connected_count(node: &Node, ids: &[EndpointId]) -> usize {
 // ---------------------------------------------------------------------------
 // Membership → carrier glue (D5/D7)
 // ---------------------------------------------------------------------------
+
+/// Whether a `--accept-joins` request is actually effective: only the room's single
+/// immutable admin may host joins, and only while at least one invite is open (a
+/// subject still `Invited`). With no open invite the room is quiescent and admits no
+/// strangers (IR-0104 Approach A; the "quiescent room admits no strangers" property).
+fn hosting_joins_effective(snapshot: &MembershipSnapshot, self_id: &IdentityKey) -> bool {
+    snapshot.admin() == Some(self_id) && snapshot.members().any(|m| m.status == Status::Invited)
+}
+
+/// Print a short, actionable notice explaining whether `--accept-joins` took effect.
+fn report_accept_joins(snapshot: &MembershipSnapshot, self_id: &IdentityKey, host_joins: bool) {
+    if host_joins {
+        let pending = snapshot
+            .members()
+            .filter(|m| m.status == Status::Invited)
+            .count();
+        println!("accepting joins: yes ({pending} open invite(s); provisional bootstrap enabled)");
+    } else if snapshot.admin() != Some(self_id) {
+        eprintln!("note: --accept-joins ignored — only the room admin can host joins");
+    } else {
+        eprintln!("note: --accept-joins is a no-op right now — no open invites to bootstrap");
+    }
+}
 
 /// Build the carrier admission gate from the current membership snapshot (D7):
 /// bind every active member's device → identity and mark each Active. This is the
