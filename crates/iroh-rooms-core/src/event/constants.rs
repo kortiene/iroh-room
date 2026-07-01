@@ -27,6 +27,15 @@ pub const MAX_PREV_EVENTS: usize = 20;
 /// Maximum UTF-8 byte length of a `message.text` body (Event Protocol §7).
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16_384;
 
+/// Maximum byte length of a file importable via `iroh-rooms file share`
+/// (spec IR-0202 §5.7 / OQ-1). A deliberate MVP policy bound — **100 MiB** —
+/// enforced against the file's metadata length *before* import, so an over-cap
+/// file is rejected without being read. Import streams by path, so memory is not
+/// the binding constraint; this cap protects the local blob store and keeps
+/// `file list` / sync bounded. It is a `u64` to compare directly against
+/// `std::fs::Metadata::len`.
+pub const MAX_SHARED_FILE_BYTES: u64 = 104_857_600;
+
 /// The only accepted logical `schema_version` for MVP (Event Protocol §2).
 pub const SCHEMA_VERSION: u64 = 1;
 

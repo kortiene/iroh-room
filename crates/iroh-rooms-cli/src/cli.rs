@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
-use crate::{identity, invite, join, message, paths, pipe, room};
+use crate::{file, identity, invite, join, message, paths, pipe, room};
 
 /// Local-first rooms over iroh — local identity and device management.
 #[derive(Debug, Parser)]
@@ -49,6 +49,43 @@ enum Command {
     Pipe {
         #[command(subcommand)]
         action: PipeAction,
+    },
+    /// Import files into the blob store and list a room's shared files.
+    File {
+        #[command(subcommand)]
+        action: FileAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FileAction {
+    /// Import a local file into the blob store and author its `file.shared`
+    /// reference on the room log (offline; peers fetch it once serve/fetch lands).
+    Share {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// Path to the local file to import.
+        path: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Override the derived MIME type (default: guessed from the extension).
+        #[arg(long)]
+        mime: Option<String>,
+        /// Override the stored display name (default: the path's file name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List the room's shared files with provider status (offline read).
+    List {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// Emit a single JSON array instead of labeled lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -319,6 +356,39 @@ pub fn run() -> Result<()> {
         },
         Command::Room { action } => dispatch_room(&home, action)?,
         Command::Pipe { action } => dispatch_pipe(&home, action)?,
+        Command::File { action } => dispatch_file(&home, action)?,
+    }
+    Ok(())
+}
+
+/// Dispatch the `file` subcommands (kept out of [`run`] so each dispatcher stays
+/// small and readable, mirroring [`dispatch_pipe`]).
+fn dispatch_file(home: &std::path::Path, action: FileAction) -> Result<()> {
+    match action {
+        FileAction::Share {
+            room_id,
+            path,
+            mime,
+            name,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            // The blob-store API is async, so the import runs in a scoped runtime
+            // (mirrors `room send`); no network is contacted (spec §5.1).
+            let summary = runtime()?.block_on(file::share(
+                home,
+                &room_id,
+                &path,
+                mime.as_deref(),
+                name.as_deref(),
+            ))?;
+            file::print_share(&summary);
+        }
+        FileAction::List { room_id, json } => {
+            let room_id = parse_room_id(&room_id)?;
+            // Offline read; the scoped runtime only hosts the local blob-presence
+            // query, not any network.
+            runtime()?.block_on(file::list(home, &room_id, json))?;
+        }
     }
     Ok(())
 }

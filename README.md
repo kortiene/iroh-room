@@ -551,21 +551,63 @@ non-rebuildable in-flight state across process restarts:
   and reconnecting converges to the same steady state), and the shuffled-delivery-after-restart
   scenario.
 
+**File import into the blob store** has landed in `crates/iroh-rooms-cli` and
+`crates/iroh-rooms-net` (issue #27 / IR-0202), completing the producer/import half of the
+Blob Plane and making `iroh-rooms file share` operational:
+
+- `iroh-rooms file share <ROOM_ID> <PATH> [--name <NAME>] [--mime <MIME>]` — active-member
+  gate (confirmed via the membership fold before any write); classifies the path against the
+  §7 error taxonomy (missing, directory, over-cap at 100 MiB, unreadable — all before any
+  write); canonicalizes the path (relative paths such as `./f.txt` are supported); imports the
+  file into a durable content-addressed `<home>/blobs/` store (`iroh-blobs` `FsStore`, Copy
+  mode — the store holds an independent snapshot, so the original file may change or vanish
+  afterwards); independently recomputes BLAKE3-256 over the file and asserts it matches the
+  store import hash; draws a random 16-byte `file_id` from the OS CSPRNG; assembles and signs
+  a `file.shared` event (carrying the handle, display name, MIME type, byte length, content
+  hash, blob format, and asserted providers); self-validates it through the full §6 stateless
+  pipeline; fold-checks it; and persists it to the local log. Fully offline — no network is
+  contacted.
+- `iroh-rooms file list <ROOM_ID> [--json]` — offline read: lists every `file.shared` event in
+  the room log with `file_id`, name, size, content hash, and provider status (`you (local)` if
+  this node holds the blob, `reference-only` otherwise). No membership requirement. `--json`
+  emits a stable `[{"file_id", "name", "size_bytes", "blob_hash", "provider"}]` array.
+- `BlobStore` in `iroh-rooms-net::blob` — a thin, dependency-isolating wrapper over the
+  `iroh-blobs` filesystem store; all `iroh-blobs` types are confined behind it so a version
+  bump touches one file. The `FsStore` holds an exclusive on-disk lock while open;
+  `BlobStore::close` (which calls `store.shutdown()`) must be called before the same process
+  reopens the same directory (the same-process `file share` → `file list` analogue, and the
+  protection described in `FsStore exclusive lock needs shutdown` project memory).
+- A pure `build_file_shared` assembler lands in `iroh-rooms-core::event`, the sibling of
+  `build_message_text` / `build_pipe_opened`: deterministic, clock-/RNG-free, golden-tested
+  with a pinned `event_id` regression lock.
+- 35+ tests: CLI integration tests (`file_cli.rs`: small file, missing file, unreadable file,
+  hash verification, JSON contract, membership gate, size cap); `cli/src/file.rs` unit tests
+  (MIME guessing, path classification, provider labels, name validation, handle encoding,
+  env-var test seam); `BlobStore` tests (import hash matches independent BLAKE3, `has` after
+  import, durability across reopen, empty file, error codes); `build_file_shared` tests
+  (determinism, all-field round-trip, stateless validation, golden event id, signature verifies
+  under device key).
+- **The serve/fetch half** — `file fetch`, the `iroh-blobs` serve ALPN with the spike's
+  two-gate ACL, live broadcast of the `file.shared` frame at share time, and honest
+  "no-provider" unavailability — is **deliberately out of scope** and tracked separately.
+  Until it lands a shared blob is held locally and shown as `provider: you (local)` in
+  `file list`; peers that have not yet imported it see `provider: reference-only`.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
-Phase 1A two-peer integration test, and the hardened recent-history sync) are all landed;
-the sync engine is now at MVP grade with process-restart durability.
+Phase 1A two-peer integration test, the hardened recent-history sync, and file import) are
+all landed.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
-Gate E memo (#15). The remaining feature work is file sharing and agent status (both
-tracked separately).
+Gate E memo (#15). The remaining feature work is the file serve/fetch half (`file fetch`,
+blob serving ALPN, and peer delivery) and agent status (both tracked separately).
 
 ## Repository Layout
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity, room, pipe subcommands; scaffold for file, agent)
+crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe subcommands; scaffold for agent)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)

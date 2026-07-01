@@ -35,13 +35,29 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # stable core (`Endpoint`/`Router`/`ProtocolHandler`/`Connection`/`EndpointId`) is
 # used — zero 0.x crates on the event critical path (ADR-1 churn argument / D5).
 iroh = "=1.0.1"
+# The Blob Plane's durable local store (IR-0202). The exact pin `spike-blobs`
+# confirmed against the crates.io index (NOTES.md §1); it resolves `iroh ^1.0`
+# (1.0.1), matching the pin above — no new iroh-version divergence. The default
+# `fs-store` feature provides the persistent `store::fs::FsStore` used by
+# `crate::blob::BlobStore`. Only the local producer/import half is wired here; the
+# serve ALPN + two-gate ACL (spike `src/net.rs`) is the follow-up serve/fetch issue.
+iroh-blobs = "=0.103.0"
+# Independent BLAKE3-256 recompute cross-checked against the store's own import
+# hash (spike NOTES.md §4 belt-and-suspenders — an internal-bug guard). Same 1.x
+# line `iroh-rooms-core` already resolves.
+blake3 = "1"
 # `net` adds `TcpStream`/`TcpListener` for the Live Pipe Plane's loopback
 # forwarding splice (IR-0010); `signal` lets the CLI publish `pipe.closed` on
 # Ctrl-C (owner-exit). No new external crate — only extra tokio features.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "io-util"] }
 anyhow = "1"               # binary/edge error context only
+# Lowercase-hex rendering of blob hashes in `BlobError` diagnostics only. Same 0.4
+# line `iroh-rooms-core` already resolves; in `Cargo.lock`.
+hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+# Per-test temp directory rooting the durable blob store in `blob.rs` unit tests.
+tempfile = "3"

@@ -28,6 +28,8 @@
 //!   event ([`left::build_member_left`], §7).
 //! * [`removed`] — pure assembly of a signed admin [`content::MemberRemoved`]
 //!   removal event ([`removed::build_member_removed`], §7).
+//! * [`file`] — pure assembly of a signed member [`content::FileShared`] blob
+//!   reference event ([`file::build_file_shared`], §7).
 //! * [`validate`] — the stateless [`validate::validate_wire_bytes`] pipeline
 //!   (§6) returning a [`validate::ValidatedEvent`] or a typed [`RejectReason`].
 //! * [`reject`] — the [`RejectReason`] / [`Flag`] taxonomy (§8) and the deferred
@@ -42,6 +44,7 @@ pub mod binding;
 pub mod cbor;
 pub mod constants;
 pub mod content;
+pub mod file;
 pub mod genesis;
 pub mod ids;
 pub mod invite;
@@ -59,6 +62,7 @@ pub mod wire;
 // Convenience re-exports of the most-used types.
 pub use binding::DeviceBinding;
 pub use content::{capability_hash, Content, EventType};
+pub use file::build_file_shared;
 pub use genesis::build_room_created;
 pub use ids::{EventId, HashRef, RoomId};
 pub use invite::build_member_invited;
