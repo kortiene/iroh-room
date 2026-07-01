@@ -164,6 +164,10 @@ enum RoomAction {
         #[allow(clippy::doc_markdown)]
         /// The room id printed by `room create` (blake3:<hex>).
         room_id: String,
+        /// Emit a single-line JSON object instead of labeled lines (offline read;
+        /// conflicts with --status, whose live view is an online path).
+        #[arg(long, conflicts_with = "status")]
+        json: bool,
         /// Also bring up a node and show each member's live connection state
         /// (connected / offline+reason / unauthorized) alongside membership.
         #[arg(long)]
@@ -230,18 +234,26 @@ enum RoomAction {
         #[arg(long, hide = true)]
         loopback: bool,
     },
-    /// Stream the room timeline, receiving and displaying signed messages live.
+    /// Stream the room timeline live, or read it offline with --offline.
     Tail {
         // Backticks would render literally in clap `--help`.
         #[allow(clippy::doc_markdown)]
         /// The room id printed by `room create` (blake3:<hex>).
         room_id: String,
+        /// Offline, deterministic one-shot read of the local log (all validated
+        /// event types, canonical order); exits 0. No network, no membership
+        /// required. Conflicts with the online-session flags.
+        #[arg(long, conflicts_with_all = ["peers", "accept_joins", "loopback"])]
+        offline: bool,
+        /// Emit a single JSON array instead of text lines (offline read only).
+        #[arg(long, requires = "offline")]
+        json: bool,
         // Backticks would render literally in clap `--help`.
         #[allow(clippy::doc_markdown)]
         /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
         #[arg(long = "peer")]
         peers: Vec<String>,
-        /// Historical rows to render on startup.
+        /// Historical rows to render (online startup, or offline read limit).
         #[arg(long, default_value_t = crate::message::DEFAULT_TAIL_LIMIT)]
         limit: u32,
         /// Host joins: admit invited peers to bootstrap their join (admin only,
@@ -308,6 +320,7 @@ pub fn run() -> Result<()> {
 
 /// Dispatch the `room` subcommands (kept out of [`run`] so the dispatcher stays
 /// small and readable, mirroring [`dispatch_pipe`]).
+#[allow(clippy::too_many_lines)] // one flat arm per subcommand; splitting hurts readability
 fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
     match action {
         RoomAction::Create { name } => {
@@ -321,6 +334,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
         }
         RoomAction::Members {
             room_id,
+            json,
             status,
             peers,
             timeout,
@@ -330,13 +344,18 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
             if status {
                 // The live connection view is an online command: parse the timeout
                 // before any IO, then run it in a scoped runtime (mirrors `send`).
+                // (`--json` is rejected by clap in this combination for now.)
                 let timeout = message::parse_timeout(&timeout)?;
                 runtime()?.block_on(message::members_status(
                     home, &room_id, &peers, timeout, loopback,
                 ))?;
             } else {
                 let view = room::members(home, &room_id)?;
-                room::print_members(&view);
+                if json {
+                    room::print_members_json(&view)?;
+                } else {
+                    room::print_members(&view);
+                }
             }
         }
         RoomAction::Invite {
@@ -379,20 +398,27 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
         }
         RoomAction::Tail {
             room_id,
+            offline,
+            json,
             peers,
             limit,
             accept_joins,
             loopback,
         } => {
             let room_id = parse_room_id(&room_id)?;
-            runtime()?.block_on(message::tail(
-                home,
-                &room_id,
-                &peers,
-                limit,
-                accept_joins,
-                loopback,
-            ))?;
+            if offline {
+                // Pure local-DB read: fully synchronous, no async runtime (spec D1/D7).
+                room::tail_offline(home, &room_id, limit, json)?;
+            } else {
+                runtime()?.block_on(message::tail(
+                    home,
+                    &room_id,
+                    &peers,
+                    limit,
+                    accept_joins,
+                    loopback,
+                ))?;
+            }
         }
         RoomAction::Join {
             ticket,

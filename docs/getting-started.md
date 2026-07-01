@@ -41,6 +41,12 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   as of issue #20 / IR-0105. Both commands work against the shipped binary and the output
 >   blocks below are reconciled to its actual format. The full two-human exchange is now
 >   complete end-to-end once Step 3 join has been performed.
+>   As of issue #21 / IR-0106, `room tail <ROOM_ID> --offline [--json] [--limit N]` provides
+>   a deterministic, network-free one-shot read of the local log — all validated event types
+>   in canonical `(lamport, event_id)` order, exits 0 — and `room members <ROOM_ID> --json`
+>   emits the roster as a single-line JSON object. Departed members now show `status=left`
+>   (voluntary) or `status=removed` (admin-removed) in both commands. See the
+>   [Offline read](#offline-read-room-tail---offline) section in Step 4.
 >   As of issue #22 / IR-0107, `room tail` also prints a per-peer connection-state line
 >   (`peer … state=connected/offline/unauthorized [reason=…]`) and a roster summary
 >   (`peers: N connected, M offline, K unauthorized`) each time a peer's state changes.
@@ -254,6 +260,17 @@ device key and stored in Alice's local SQLite event log. The `members` command r
 the admin and membership entirely from the persisted event log — there is no separate
 `rooms` table.
 
+`--json` emits the same membership view as a single-line JSON object (stable field names,
+parseable without brittle formatting — IR-0106):
+
+```bash
+iroh-rooms room members <ROOM_ID> --json
+```
+
+```text
+{"room":"blake3:…","admin":"…(Alice's identity_id)…","members":[{"identity_id":"…","role":"admin","status":"active","is_admin":true}]}
+```
+
 ---
 
 ## Step 3 — Invite and join
@@ -459,6 +476,51 @@ delivered to the connected peer in under 2 seconds (PRD §17.1.3) and stored loc
 deterministic `(lamport, event_id)` timeline order. Duplicates are ignored; events with
 invalid signatures or from non-members are rejected and logged — see
 [Troubleshooting](#troubleshooting) for the reason codes.
+
+---
+
+### Offline read: `room tail --offline`
+
+`room tail` with `--offline` is a **separate, fully offline mode** added in issue #21 /
+IR-0106. It is a deterministic, network-free, one-shot projection of the local log — no
+`Node`, no membership requirement, no secrets loaded. It renders **all** validated event
+types (not just messages) and exits 0.
+
+**Command** (any terminal, no peers needed):
+
+```bash
+# Substitute <ROOM_ID>. Reads rooms.db and exits.
+iroh-rooms room tail <ROOM_ID> --offline
+```
+
+**Expected output** (illustrative; reconcile volatile bytes against your run):
+
+```text
+event=blake3:aa… type=room.created  lamport=0 from=alice9f8e role=admin  status=active  at=2026-06-30T12:00:00Z  name="Getting Started Room"
+event=blake3:bb… type=member.invited lamport=1 from=alice9f8e role=admin  status=active  at=2026-06-30T12:00:05Z  invitee=bob1a2b3c role=member
+event=blake3:cc… type=member.joined  lamport=2 from=bob1a2b3c role=member status=active  at=2026-06-30T12:00:40Z  role=member name="Bob"
+event=blake3:dd… type=message.text   lamport=3 from=bob1a2b3c role=member status=active  at=2026-06-30T12:01:04Z  body=I pushed the first prototype.
+```
+
+The `event=`/`type=`/`lamport=`/`from=`/`role=`/`status=`/`at=` fields are a stable prefix
+tests can parse; the trailing summary after `  ` is human context. Rows ordered by
+`(lamport, event_id)` only — `created_at` is advisory display, never a trust input (spike
+§2.3/§2.4). Two runs over the same `rooms.db` produce byte-identical output.
+
+`--json` emits the same rows as a single JSON array, with stable field names and
+type-specific content fields for structured test assertions:
+
+```bash
+iroh-rooms room tail <ROOM_ID> --offline --json
+```
+
+Departed members (`member.left` or `member.removed`) are shown with `status=left` or
+`status=removed` respectively; `--limit N` restricts output to the N most-recent
+causally-complete rows (default 200).
+
+> **Note:** `--offline` is mutually exclusive with `--peer`, `--accept-joins`, and the
+> online-session flags. `--json` requires `--offline` (the live session streams
+> indefinitely; a JSON-array framing does not apply).
 
 ---
 

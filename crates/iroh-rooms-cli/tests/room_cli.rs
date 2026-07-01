@@ -23,6 +23,14 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+use iroh_rooms_core::event::signed;
+use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+use iroh_rooms_core::event::{
+    build_member_invited, build_member_joined, build_member_left, build_member_removed,
+    build_room_created, capability_hash, DeviceBinding, SigningKey,
+};
+use iroh_rooms_core::store::EventStore;
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a `Command` for the `iroh-rooms` binary pointed at `home` via
@@ -592,4 +600,634 @@ fn room_members_truncated_room_id_hex_exits_nonzero() {
         ])
         .assert()
         .failure();
+}
+
+// ── room members --json (AC2 / AC4 — IR-0106) ─────────────────────────────────
+
+/// Helper: create a room and return its `room_id` string.
+fn create_room(home: &TempDir) -> String {
+    let out = cmd(home)
+        .args(["room", "create", "Test Room"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "room create must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    extract_field(&stdout, "room_id")
+        .expect("room_id must appear in `room create` output")
+        .to_owned()
+}
+
+/// AC4: `room members --json` exits 0 and its output parses as a JSON object
+/// with the required top-level fields.
+#[test]
+fn room_members_json_exits_zero_and_parses_as_json_object() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "room members --json must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("--json output must be valid JSON");
+    assert!(parsed.is_object(), "--json output must be a JSON object");
+    assert!(
+        parsed["room"].is_string(),
+        "JSON must have a 'room' string field"
+    );
+    assert!(
+        parsed["members"].is_array(),
+        "JSON must have a 'members' array field"
+    );
+}
+
+/// The `room` field in the JSON output must match the `room_id` from `room create`.
+#[test]
+fn room_members_json_room_field_matches_create_room_id() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["room"].as_str(),
+        Some(room_id.as_str()),
+        "JSON 'room' field must match the room_id from room create"
+    );
+}
+
+/// The `admin` field in the JSON output must equal the creator's `identity_id`.
+#[test]
+fn room_members_json_admin_field_matches_identity_id() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+
+    let show_out = cmd(&home).args(["identity", "show"]).output().unwrap();
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+    let identity_id = extract_field(&show_stdout, "identity_id")
+        .expect("identity_id in identity show output")
+        .to_owned();
+
+    let room_id = create_room(&home);
+
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["admin"].as_str(),
+        Some(identity_id.as_str()),
+        "JSON 'admin' field must equal the creator's identity_id"
+    );
+}
+
+/// AC2 + AC4: the creator must appear in `members` with `role="admin"`,
+/// `status="active"`, and `is_admin=true`.
+#[test]
+fn room_members_json_creator_has_admin_role_active_status_is_admin_true() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let members = parsed["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1, "fresh room must have exactly one member");
+    let m = &members[0];
+    assert_eq!(
+        m["role"].as_str(),
+        Some("admin"),
+        "creator role must be admin"
+    );
+    assert_eq!(
+        m["status"].as_str(),
+        Some("active"),
+        "creator status must be active"
+    );
+    assert_eq!(
+        m["is_admin"].as_bool(),
+        Some(true),
+        "creator is_admin must be true"
+    );
+    assert!(
+        m["identity_id"].is_string(),
+        "each member must have an identity_id string"
+    );
+}
+
+/// The `identity_id` in the members array must equal the creator's `identity_id`.
+#[test]
+fn room_members_json_member_identity_id_matches_creator() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+
+    let show_out = cmd(&home).args(["identity", "show"]).output().unwrap();
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+    let identity_id = extract_field(&show_stdout, "identity_id")
+        .expect("identity_id in identity show output")
+        .to_owned();
+
+    let room_id = create_room(&home);
+
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let members = parsed["members"].as_array().unwrap();
+    assert_eq!(
+        members[0]["identity_id"].as_str(),
+        Some(identity_id.as_str()),
+        "member identity_id must match the creator's identity_id"
+    );
+}
+
+/// JSON output is consistent with the text output: both report the same admin.
+#[test]
+fn room_members_json_and_text_report_same_admin() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+
+    let text_out = cmd(&home)
+        .args(["room", "members", &room_id])
+        .output()
+        .unwrap();
+    assert!(text_out.status.success());
+    let text_stdout = String::from_utf8_lossy(&text_out.stdout);
+    let text_admin = extract_field(&text_stdout, "admin").expect("admin: in text output");
+
+    let json_out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(json_out.status.success());
+    let json_stdout = String::from_utf8_lossy(&json_out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(json_stdout.trim()).unwrap();
+    let json_admin = parsed["admin"].as_str().expect("admin field in JSON");
+
+    assert_eq!(
+        text_admin, json_admin,
+        "text and JSON output must report the same admin identity_id"
+    );
+}
+
+/// AC3 negative: `--json` with an unknown (but valid-format) room id must exit non-zero.
+#[test]
+fn room_members_json_unknown_room_exits_nonzero() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    create_room(&home); // so rooms.db exists
+    let unknown_id = format!("blake3:{}", "cd".repeat(32));
+    cmd(&home)
+        .args(["room", "members", &unknown_id, "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no room"));
+}
+
+// ── AC3: removed / left member representation ─────────────────────────────────
+//
+// These tests seed a `rooms.db` directly using the core event builders (no CLI
+// invite/join needed) and verify that `room members` correctly distinguishes
+// `status=left` (voluntary self-departure) from `status=removed` (admin-removal).
+// Admin-removal dominates a concurrent self-leave (D5). The seeded directory has
+// no `identity.secret` — the offline `room members` does not require one (spec D7).
+
+const AC3M_ADMIN_SEED: [u8; 32] = [0x20; 32];
+const AC3M_ADMIN_DEV_SEED: [u8; 32] = [0x21; 32];
+const AC3M_MEMBER_SEED: [u8; 32] = [0x24; 32];
+const AC3M_MEMBER_DEV_SEED: [u8; 32] = [0x25; 32];
+const AC3M_ROOM_NONCE: [u8; 16] = [0xcc; 16];
+const AC3M_INVITE_ID: [u8; 16] = [0xdb; 16];
+const AC3M_CAP_SECRET: [u8; 16] = [0x5f; 16];
+const AC3M_BASE_TS: u64 = 1_750_000_001_000;
+
+#[derive(Copy, Clone)]
+enum MembersDeparture {
+    Left,
+    Removed,
+    ConcurrentLeftAndRemoved,
+}
+
+/// Seed `home/rooms.db` with genesis → invite → join → departure and return the
+/// room id string for use with the CLI.
+#[allow(clippy::too_many_lines)]
+fn seed_members_departed(home: &TempDir, departure: MembersDeparture) -> String {
+    let admin_id = SigningKey::from_seed(&AC3M_ADMIN_SEED);
+    let admin_dev = SigningKey::from_seed(&AC3M_ADMIN_DEV_SEED);
+    let member_id = SigningKey::from_seed(&AC3M_MEMBER_SEED);
+    let member_dev = SigningKey::from_seed(&AC3M_MEMBER_DEV_SEED);
+
+    let room_id = signed::derive_room_id(&admin_id.identity_key(), &AC3M_ROOM_NONCE, AC3M_BASE_TS);
+    let ctx = ValidationContext::for_room(room_id);
+    let db_path = home.path().join("rooms.db");
+    let mut store = EventStore::open(&db_path).expect("open store");
+
+    // Genesis
+    let genesis_wire = build_room_created(
+        &admin_id,
+        &admin_dev,
+        "AC3 Members Room",
+        &AC3M_ROOM_NONCE,
+        AC3M_BASE_TS,
+    );
+    let genesis_v = validate_wire_bytes(&genesis_wire.to_bytes(), &ctx).expect("validate genesis");
+    let genesis_ev_id = genesis_v.event_id;
+    store.insert(&genesis_v).expect("insert genesis");
+
+    // Invite (Bob)
+    let cap_hash = capability_hash(&room_id, &AC3M_INVITE_ID, &AC3M_CAP_SECRET);
+    let invite_wire = build_member_invited(
+        &admin_id,
+        &admin_dev,
+        &room_id,
+        &AC3M_INVITE_ID,
+        &cap_hash,
+        "member",
+        &member_id.identity_key(),
+        None,
+        None,
+        &[genesis_ev_id],
+        AC3M_BASE_TS + 1_000,
+    );
+    let invite_v = validate_wire_bytes(&invite_wire.to_bytes(), &ctx).expect("validate invite");
+    let invite_ev_id = invite_v.event_id;
+    store.insert(&invite_v).expect("insert invite");
+
+    // Join (Bob)
+    let binding = DeviceBinding::create(&room_id, &member_id, member_dev.device_key());
+    let join_wire = build_member_joined(
+        &member_id,
+        &member_dev,
+        &room_id,
+        &AC3M_INVITE_ID,
+        &AC3M_CAP_SECRET,
+        "member",
+        binding,
+        Some("Bob"),
+        &[invite_ev_id],
+        AC3M_BASE_TS + 2_000,
+    );
+    let join_v = validate_wire_bytes(&join_wire.to_bytes(), &ctx).expect("validate join");
+    let join_ev_id = join_v.event_id;
+    store.insert(&join_v).expect("insert join");
+
+    // Departure
+    match departure {
+        MembersDeparture::Left => {
+            let left_wire = build_member_left(
+                &member_id,
+                &member_dev,
+                &room_id,
+                None,
+                &[join_ev_id],
+                AC3M_BASE_TS + 3_000,
+            );
+            let left_v = validate_wire_bytes(&left_wire.to_bytes(), &ctx).expect("validate left");
+            store.insert(&left_v).expect("insert left");
+        }
+        MembersDeparture::Removed => {
+            let removed_wire = build_member_removed(
+                &admin_id,
+                &admin_dev,
+                &room_id,
+                &member_id.identity_key(),
+                None,
+                None,
+                &[join_ev_id],
+                AC3M_BASE_TS + 3_000,
+            );
+            let removed_v =
+                validate_wire_bytes(&removed_wire.to_bytes(), &ctx).expect("validate removed");
+            store.insert(&removed_v).expect("insert removed");
+        }
+        MembersDeparture::ConcurrentLeftAndRemoved => {
+            // Both events cite the join as parent (concurrent departures).
+            let left_wire = build_member_left(
+                &member_id,
+                &member_dev,
+                &room_id,
+                None,
+                &[join_ev_id],
+                AC3M_BASE_TS + 3_000,
+            );
+            let left_v = validate_wire_bytes(&left_wire.to_bytes(), &ctx).expect("validate left");
+            store.insert(&left_v).expect("insert left");
+
+            let removed_wire = build_member_removed(
+                &admin_id,
+                &admin_dev,
+                &room_id,
+                &member_id.identity_key(),
+                None,
+                None,
+                &[join_ev_id],
+                AC3M_BASE_TS + 3_000,
+            );
+            let removed_v =
+                validate_wire_bytes(&removed_wire.to_bytes(), &ctx).expect("validate removed");
+            store.insert(&removed_v).expect("insert removed");
+        }
+    }
+
+    room_id.to_string()
+}
+
+/// AC3: `room members` text output shows `status=left` for a voluntarily departed member.
+#[test]
+fn room_members_voluntary_departure_shows_status_left() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_departed(&home, MembersDeparture::Left);
+    cmd(&home)
+        .args(["room", "members", &room_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status=left"));
+}
+
+/// AC3: `room members` text output shows `status=removed` for an admin-removed member.
+#[test]
+fn room_members_admin_removal_shows_status_removed() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_departed(&home, MembersDeparture::Removed);
+    cmd(&home)
+        .args(["room", "members", &room_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status=removed"));
+}
+
+/// AC3: `room members` text output does not omit the departed member (shown, not silent).
+#[test]
+fn room_members_departed_member_is_shown_not_omitted() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_departed(&home, MembersDeparture::Left);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The members list must have 2 entries: the admin (active) and the departed member.
+    let member_lines = stdout.lines().filter(|l| l.starts_with("member:")).count();
+    assert_eq!(
+        member_lines, 2,
+        "both the admin and the departed member must appear in `room members` output; \
+         stdout:\n{stdout}"
+    );
+}
+
+/// AC3 + AC4: `room members --json` has `"status":"left"` for a voluntarily departed member.
+#[test]
+fn room_members_json_voluntary_departure_has_left_status() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_departed(&home, MembersDeparture::Left);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "room members --json must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let members = parsed["members"].as_array().expect("members array");
+    let departed = members
+        .iter()
+        .find(|m| m["status"].as_str() == Some("left"))
+        .expect("must find a member with status=left");
+    assert_eq!(
+        departed["role"].as_str(),
+        Some("member"),
+        "the departed member must have role=member"
+    );
+    assert_eq!(
+        departed["is_admin"].as_bool(),
+        Some(false),
+        "the departed member must not be admin"
+    );
+}
+
+/// AC3 + AC4: `room members --json` has `"status":"removed"` for an admin-removed member.
+#[test]
+fn room_members_json_admin_removal_has_removed_status() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_departed(&home, MembersDeparture::Removed);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let members = parsed["members"].as_array().expect("members array");
+    let departed = members
+        .iter()
+        .find(|m| m["status"].as_str() == Some("removed"))
+        .expect("must find a member with status=removed");
+    assert_eq!(departed["role"].as_str(), Some("member"));
+}
+
+/// AC3 D5 dominance: when both a self-leave and a concurrent admin-removal target the
+/// same member, `room members --json` must show `"status":"removed"`, not `"left"`.
+#[test]
+fn room_members_json_admin_removal_dominates_concurrent_self_leave() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_departed(&home, MembersDeparture::ConcurrentLeftAndRemoved);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let members = parsed["members"].as_array().expect("members array");
+    let member_id_hex = SigningKey::from_seed(&AC3M_MEMBER_SEED)
+        .identity_key()
+        .to_string();
+    let bob = members
+        .iter()
+        .find(|m| m["identity_id"].as_str() == Some(member_id_hex.as_str()))
+        .expect("Bob must appear in the members list");
+    assert_eq!(
+        bob["status"].as_str(),
+        Some("removed"),
+        "admin-removal must dominate a concurrent self-leave (D5); Bob's status must be \
+         'removed', not 'left'; member JSON: {bob:#?}"
+    );
+}
+
+// ── AC3: invited member representation ───────────────────────────────────────
+//
+// These tests seed a `rooms.db` with a genesis → invite chain (no join) and
+// verify that `room members` (text and JSON) shows the invited-but-not-joined
+// member with `status=invited`. No `identity.secret` is created because offline
+// `room members` does not require one (spec D7).
+
+const AC3I_ADMIN_SEED: [u8; 32] = [0x30; 32];
+const AC3I_ADMIN_DEV_SEED: [u8; 32] = [0x31; 32];
+const AC3I_MEMBER_SEED: [u8; 32] = [0x34; 32];
+const AC3I_ROOM_NONCE: [u8; 16] = [0xee; 16];
+const AC3I_INVITE_ID: [u8; 16] = [0xdc; 16];
+const AC3I_CAP_SECRET: [u8; 16] = [0x60; 16];
+const AC3I_BASE_TS: u64 = 1_750_000_002_000;
+
+/// Seed `home/rooms.db` with genesis → invite (no join). Returns the room id string.
+fn seed_members_invited(home: &TempDir) -> String {
+    let admin_id = SigningKey::from_seed(&AC3I_ADMIN_SEED);
+    let admin_dev = SigningKey::from_seed(&AC3I_ADMIN_DEV_SEED);
+    let member_id = SigningKey::from_seed(&AC3I_MEMBER_SEED);
+
+    let room_id = signed::derive_room_id(&admin_id.identity_key(), &AC3I_ROOM_NONCE, AC3I_BASE_TS);
+    let ctx = ValidationContext::for_room(room_id);
+    let db_path = home.path().join("rooms.db");
+    let mut store = EventStore::open(&db_path).expect("open store");
+
+    let genesis_wire = build_room_created(
+        &admin_id,
+        &admin_dev,
+        "AC3I Invite Room",
+        &AC3I_ROOM_NONCE,
+        AC3I_BASE_TS,
+    );
+    let genesis_v = validate_wire_bytes(&genesis_wire.to_bytes(), &ctx).expect("validate genesis");
+    let genesis_ev_id = genesis_v.event_id;
+    store.insert(&genesis_v).expect("insert genesis");
+
+    let cap_hash = capability_hash(&room_id, &AC3I_INVITE_ID, &AC3I_CAP_SECRET);
+    let invite_wire = build_member_invited(
+        &admin_id,
+        &admin_dev,
+        &room_id,
+        &AC3I_INVITE_ID,
+        &cap_hash,
+        "member",
+        &member_id.identity_key(),
+        None,
+        None,
+        &[genesis_ev_id],
+        AC3I_BASE_TS + 1_000,
+    );
+    let invite_v = validate_wire_bytes(&invite_wire.to_bytes(), &ctx).expect("validate invite");
+    store.insert(&invite_v).expect("insert invite");
+
+    room_id.to_string()
+}
+
+/// AC3: `room members` text output shows `status=invited` for an invited-but-not-joined member.
+#[test]
+fn room_members_invited_member_shows_status_invited() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_invited(&home);
+    cmd(&home)
+        .args(["room", "members", &room_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status=invited"));
+}
+
+/// AC3 + AC4: `room members --json` has `"status":"invited"` for an invited-but-not-joined member.
+#[test]
+fn room_members_json_invited_member_shows_status_invited() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_invited(&home);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "room members --json must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let members = parsed["members"].as_array().expect("members array");
+    let invited = members
+        .iter()
+        .find(|m| m["status"].as_str() == Some("invited"))
+        .expect("must find a member with status=invited");
+    assert_eq!(
+        invited["role"].as_str(),
+        Some("member"),
+        "invited member must have role=member"
+    );
+    assert_eq!(
+        invited["is_admin"].as_bool(),
+        Some(false),
+        "invited member must not be admin"
+    );
+}
+
+/// AC2 + AC3: after genesis + invite (no join), the room has exactly 2 members:
+/// admin (active) and the invitee (invited).
+#[test]
+fn room_members_json_two_members_after_invite() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_invited(&home);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let members = parsed["members"].as_array().expect("members array");
+    assert_eq!(
+        members.len(),
+        2,
+        "after one invite (no join), room must have exactly 2 members (admin + invitee); \
+         got: {members:#?}"
+    );
+}
+
+/// AC3: the invited member's `identity_id` must appear in `room members --json` members array.
+#[test]
+fn room_members_json_invited_member_identity_id_matches_invitee() {
+    let home = TempDir::new().unwrap();
+    let room_id = seed_members_invited(&home);
+    let out = cmd(&home)
+        .args(["room", "members", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let members = parsed["members"].as_array().expect("members array");
+    let invitee_id = SigningKey::from_seed(&AC3I_MEMBER_SEED)
+        .identity_key()
+        .to_string();
+    let found = members
+        .iter()
+        .any(|m| m["identity_id"].as_str() == Some(invitee_id.as_str()));
+    assert!(
+        found,
+        "invitee's identity_id must appear in the members list; members: {members:#?}"
+    );
 }

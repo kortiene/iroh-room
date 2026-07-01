@@ -312,6 +312,37 @@ and drive the `iroh-rooms-net` carrier from the binary:
   an active member; until that lands the commands run but the round trip is gated on #19. Real-NAT
   delivery inherits the open Gate-A risk from the transport prototype (#9).
 
+**Basic offline room-read commands** have landed in `crates/iroh-rooms-cli` (issue #21 /
+IR-0106), exposing a deterministic, network-free read surface for the local event log — the
+developer-workflow and testing tier for inspecting room state without an active network
+session or membership requirement:
+
+- `iroh-rooms room tail <ROOM_ID> --offline [--json] [--limit <N>]` — a synchronous one-shot
+  read of `<home>/rooms.db`. Renders **all** validated event types (not just messages) in
+  canonical `(lamport, event_id)` order. Default text mode: one stable line per row —
+  `event=… type=… lamport=… from=… role=… status=… at=…  <summary>` — where the attribution
+  prefix is machine-parseable and the summary is human context. `--json` mode emits a single
+  JSON array of objects with stable field names and flattened type-specific fields (`body`,
+  `file_name`, `pipe_id`, …). `--offline` conflicts with the online-session flags; `--json`
+  requires `--offline`. No `Node`, no network, no secret load, no membership check.
+- `iroh-rooms room members <ROOM_ID> --json` — emits the fold-derived roster as a single-line
+  JSON object `{ room, admin, members: [{identity_id, role, status, is_admin}] }`, mirroring
+  `identity show --json`. `--json` conflicts with the online `--status` path.
+- **Removed vs left** distinction: `status=left` (voluntary self-departure, a `member.left`
+  by the subject) is now shown separately from `status=removed` (an admin-authored
+  `member.removed`) in both `room members` and `room tail --offline`. The security lattice is
+  unchanged — both are the same zero-capability `Status::Removed` state; the distinction is
+  display-only, derived from the log, and admin-removal dominates a concurrent self-leave.
+- A new `src/display.rs` helper module backs the display logic for offline members, offline
+  tail, and the online `members --status` path so all three surfaces use the same code.
+- Two new pure core builders — `build_member_left` / `build_member_removed` — land in
+  `iroh-rooms-core::event` as siblings of the invite/join builders. They are not wired to any
+  CLI command here; the future `room leave` / `member remove` authoring issues reuse them.
+- 35+ tests: `tests/tail_cli.rs` (offline order, validated-event coverage, JSON contract,
+  restart determinism, error cases, flag conflicts, secret hygiene, AC3 removed/left/dominance)
+  and `tests/room_cli.rs` (JSON roster, AC2/AC4), plus golden `event_id` regression locks for
+  both new core builders.
+
 The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
 `crates/iroh-rooms-cli` (issue #14 / IR-0010). This is the PRD's most differentiated feature
 — authenticated TCP-over-QUIC forwarding that exposes a local loopback service to an
@@ -433,8 +464,9 @@ into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follo
   see `crates/iroh-rooms-net/NOTES.md`).
 
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
-engine, identity CLI, room creation, room invite, room join, signed messaging, the iroh
-transport, the live pipe, and the peer connection manager) are all landed as prototypes.
+engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
+room-read CLI, the iroh transport, the live pipe, and the peer connection manager) are all
+landed as prototypes.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is file sharing and agent status (both

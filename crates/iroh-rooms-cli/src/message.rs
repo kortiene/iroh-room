@@ -48,6 +48,7 @@ use iroh_rooms_net::{
     DEFAULT_TICK,
 };
 
+use crate::display::{self, display_names, iso8601_utc, short_id};
 use crate::{clock, identity};
 
 /// The single event-store database file under the data-directory home (spec D3).
@@ -390,6 +391,11 @@ pub async fn members_status(
         );
     }
 
+    // Log-derived left/removed refinement (D5), read before the store is handed to
+    // the engine, so a departed member's row reads `left` vs `removed` — the same
+    // projection the offline reads use.
+    let (removed_ids, left_ids) = display::departure_sets(&store, room_id)?;
+
     // Live admission cell the pump refreshes; the manager derives the dial set.
     let admission_cell = Arc::new(Mutex::new(AdmissionView::from_snapshot(&snapshot, &[])));
     let admission: Arc<dyn Admission> = Arc::new(SnapshotAdmission::new(admission_cell.clone()));
@@ -423,7 +429,7 @@ pub async fn members_status(
         let _ = wait_for_any_connected(&node, &desired, timeout).await;
     }
 
-    print_members_status(&node, &snapshot, self_device);
+    print_members_status(&node, &snapshot, self_device, &removed_ids, &left_ids);
 
     node.shutdown()
         .await
@@ -432,7 +438,15 @@ pub async fn members_status(
 }
 
 /// Print membership × live connection state for `room members --status` (spec §6.2).
-fn print_members_status(node: &Node, snapshot: &MembershipSnapshot, self_device: EndpointId) {
+/// The `status=` field is the shared D5 display state, so a departed member reads
+/// `left` vs `removed` consistently with the offline reads.
+fn print_members_status(
+    node: &Node,
+    snapshot: &MembershipSnapshot,
+    self_device: EndpointId,
+    removed_ids: &BTreeSet<IdentityKey>,
+    left_ids: &BTreeSet<IdentityKey>,
+) {
     println!("room: {}", snapshot.room_id());
     match snapshot.admin() {
         Some(admin) => println!("admin: {admin}"),
@@ -445,11 +459,12 @@ fn print_members_status(node: &Node, snapshot: &MembershipSnapshot, self_device:
         } else {
             ""
         };
+        let status = display::member_display_state(m.status, &m.identity, removed_ids, left_ids);
         println!(
             "member: {} role={} status={} conn={}{admin_tag}",
             m.identity,
             role_label(m.role),
-            status_label(m.status),
+            status.as_str(),
             member_conn_field(&entries, m.device, self_device),
         );
     }
@@ -492,15 +507,6 @@ fn role_label(role: Role) -> &'static str {
         Role::Admin => "admin",
         Role::Member => "member",
         Role::Agent => "agent",
-    }
-}
-
-/// Presentation string for a [`Status`] (mirrors `room::status_str`).
-fn status_label(status: Status) -> &'static str {
-    match status {
-        Status::Active => "active",
-        Status::Invited => "invited",
-        Status::Removed => "removed",
     }
 }
 
@@ -729,26 +735,6 @@ pub(crate) fn select_heads(store: &EventStore, room_id: &RoomId) -> Result<Vec<E
     Ok(heads)
 }
 
-/// Build an identity → display-name map from the room's local `member.joined`
-/// events (D10). A sender absent from the map falls back to a short id on display.
-fn display_names(store: &EventStore, room_id: &RoomId) -> Result<BTreeMap<IdentityKey, String>> {
-    let joined = store
-        .by_type(room_id, EventType::MemberJoined)
-        .with_context(|| format!("could not read member.joined events for room {room_id}"))?;
-    let mut names = BTreeMap::new();
-    for se in joined {
-        let Ok(ev) = SignedEvent::decode(&se.wire.signed) else {
-            continue;
-        };
-        if let Content::MemberJoined(c) = ev.content {
-            if let Some(name) = c.display_name {
-                names.insert(ev.sender_id, name);
-            }
-        }
-    }
-    Ok(names)
-}
-
 /// Print each not-yet-shown `message.text` row in the order `events` arrives
 /// (canonical `(lamport, event_id)`), in the D10 identity-first, trust-free format:
 /// `[<created_at>] <author>[ (removed)]: <body>`.
@@ -785,12 +771,6 @@ fn print_new_messages(
             m.body
         );
     }
-}
-
-/// A short, human-friendly id: the first 8 hex chars of an identity key.
-fn short_id(id: &IdentityKey) -> String {
-    let hex = id.to_string();
-    hex.get(..8).unwrap_or(&hex).to_owned()
 }
 
 /// A short, human-friendly device id: the first 8 chars of the endpoint id.
@@ -948,42 +928,14 @@ pub(crate) fn render_endpoint_addr(addr: &EndpointAddr) -> String {
     }
 }
 
-/// Render a ms-since-epoch instant as an ISO-8601 UTC string
-/// (`YYYY-MM-DDThh:mm:ssZ`) for the advisory `created_at` display column (D10).
-/// Mirrors the helper in [`crate::invite`]; no `chrono` dependency.
-fn iso8601_utc(ms: u64) -> String {
-    let secs = ms / 1_000;
-    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
-    let rem = secs % 86_400;
-    let (hh, mm, ss) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
-/// Convert days since the Unix epoch into a `(year, month, day)` civil date
-/// (Howard Hinnant's proleptic-Gregorian algorithm; UTC, no leap seconds).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_event_id, parse_peer, parse_timeout, render_endpoint_addr, short_id, validate_body,
+        parse_event_id, parse_peer, parse_timeout, render_endpoint_addr, validate_body,
         validate_format,
     };
     use iroh::{EndpointAddr, SecretKey};
     use iroh_rooms_core::event::constants::MAX_MESSAGE_BODY_BYTES;
-    use iroh_rooms_core::event::keys::IdentityKey;
     use std::time::Duration;
 
     // ── validate_body ─────────────────────────────────────────────────────────
@@ -1094,34 +1046,6 @@ mod tests {
         assert_eq!(render_endpoint_addr(&EndpointAddr::new(id)), id.to_string());
     }
 
-    // ── short_id ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn short_id_is_first_8_hex() {
-        let id = IdentityKey::from_bytes([0xab; 32]);
-        assert_eq!(short_id(&id), "abababab");
-    }
-
-    // ── iso8601_utc ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn iso8601_utc_unix_epoch_is_midnight() {
-        use super::iso8601_utc;
-        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn iso8601_utc_known_timestamp() {
-        use super::iso8601_utc;
-        // 1_750_000_000_000 ms = 1_750_000_000 s = 2025-06-15T15:06:40Z
-        // (verified by hand via Howard Hinnant's proleptic-Gregorian algorithm)
-        assert_eq!(iso8601_utc(1_750_000_000_000), "2025-06-15T15:06:40Z");
-    }
-
-    #[test]
-    fn iso8601_utc_year_2000_boundary() {
-        use super::iso8601_utc;
-        // 946_684_800_000 ms = 946_684_800 s = exactly 2000-01-01T00:00:00Z
-        assert_eq!(iso8601_utc(946_684_800_000), "2000-01-01T00:00:00Z");
-    }
+    // `short_id` and `iso8601_utc` moved to `crate::display` (spec IR-0106 D5/D6);
+    // their unit tests live alongside them there.
 }
