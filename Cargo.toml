@@ -8,6 +8,11 @@ members = [
   # Throwaway spike (IR-0009): isolated from the shipping crates' dep tree.
   # Kept in the workspace so CI proves it builds (spec OQ-1, recommended option).
   "crates/spike-blobs",
+  # Throwaway spike (IR-0012): the `nat-probe` Gate-A real-NAT hole-punching
+  # measurement harness. Kept in the workspace so CI proves it builds and its
+  # loopback self-check passes — but CI cannot prove NAT traversal (that is the
+  # manual two-host run documented in `crates/spike-nat/NOTES.md`).
+  "crates/spike-nat",
 ]
 resolver = "2"
 
