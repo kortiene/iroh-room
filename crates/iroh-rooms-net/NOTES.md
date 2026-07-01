@@ -182,6 +182,14 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
 - ~~Roster-driven dial reconciliation (ADR-1 "per-room peer manager").~~ **Closed by
   IR-0107** — `PeerManager.reconcile` derives the desired outbound set from the live
   snapshot and starts/stops dial loops on membership change.
+- ~~Sync state restart durability (core prototype D7/OQ-3) — the orphan park,
+  unconfirmed admin-tip suspicion, backfill token buckets, and equivocation audit
+  trail were lost on process restart.~~ **Closed by IR-0201** (#26 / IR-0201):
+  store schema v2 (`user_version = 2`) adds five derived-cache tables
+  (`sync_state`, `sync_backfill_tokens`, `sync_parked`, `sync_parked_missing`,
+  `trust_decisions`); `SyncEngine::open` restores them with fail-closed re-arming
+  before the first access decision; per-mutation checkpoint hooks persist each state
+  change transactionally inside the `Node` pump.
 - Deterministic double-connect tie-break (D8 / OQ-4) — still a follow-up.
 - **Run Gate A** and record the table above. The measurement harness is landed
   (`crates/spike-nat` / `nat-probe`, IR-0012) with a full runbook; what remains is

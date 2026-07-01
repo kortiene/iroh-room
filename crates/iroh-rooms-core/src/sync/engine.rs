@@ -26,7 +26,9 @@ use crate::event::ids::{EventId, RoomId};
 use crate::event::keys::IdentityKey;
 use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
 use crate::membership::{MembershipSnapshot, RoomMembership, Status};
-use crate::store::{EventStore, InsertOutcome, StoreError, StoredEvent};
+use crate::store::{
+    EventStore, InsertOutcome, ParkedRow, StoreError, StoredEvent, SyncStateRow, TrustRow,
+};
 
 use super::config::SyncConfig;
 use super::message::{id_set, Outgoing, PeerId, SyncMessage, Window};
@@ -138,6 +140,21 @@ pub struct SyncCounters {
     pub phantom_depth_dropped: u64,
     /// Frames fanned out / served to peers.
     pub frames_sent: u64,
+
+    // -- restart-durability evidence (IR-0201 §9) -------------------------------
+    /// Parked frames restored from `sync_parked` on `open`.
+    pub parked_restored: u64,
+    /// Restored parked rows dropped because their `wire` failed re-validation
+    /// (corrupt/tampered on disk; spec D5).
+    pub park_corrupt_dropped: u64,
+    /// Set to 1 when an unconfirmed admin-tip suspicion was restored on `open`
+    /// (anti fail-open; spec §1.1 / D3).
+    pub suspicion_restored: u64,
+    /// Trust-decision audit rows restored from `trust_decisions` on `open`.
+    pub trust_restored: u64,
+    /// Per-author backfill token buckets restored on `open` (the amplification
+    /// budget is not reset by the restart; spec §1.3 / R4).
+    pub tokens_restored: u64,
 }
 
 /// One parked orphan frame, held in memory pending backfill (spec D5/D7).
@@ -148,6 +165,10 @@ struct Parked {
     seq: u64,
     /// Backfill-chase depth, bounded by `max_backfill_depth`.
     depth: usize,
+    /// The parents this frame is waiting on — persisted to `sync_parked_missing`
+    /// and used to re-issue `WantEvents` after a restart (spec §6.3). A superset
+    /// is safe: the retry filters by what the store already holds.
+    missing: BTreeSet<EventId>,
 }
 
 /// An advertised-but-unconfirmed admin tip: a peer claims a higher `admin_seq`
@@ -192,6 +213,11 @@ pub struct SyncEngine {
 
     /// In-memory orphan park (spec D5/D7), keyed by event id.
     park: BTreeMap<EventId, Parked>,
+    /// Restored parked frames still owed a one-shot `WantEvents` re-issue on the
+    /// first `on_connect`/`on_tick` after `open` (spec §6.3 — buffering **and
+    /// retry** survive a restart). Ongoing retry thereafter is the anti-entropy
+    /// pulls + [`wake_park`](Self::wake_park), exactly as for a freshly-parked frame.
+    restored_backfill: BTreeSet<EventId>,
     /// Monotonic park arrival counter for eviction ordering.
     park_seq: u64,
     /// Depth to assign a frame that arrives in answer to our backfill (spec §6.2).
@@ -254,6 +280,7 @@ impl SyncEngine {
             fold,
             peers: BTreeSet::new(),
             park: BTreeMap::new(),
+            restored_backfill: BTreeSet::new(),
             park_seq: 0,
             backfill_depth: BTreeMap::new(),
             tokens: BTreeMap::new(),
@@ -266,6 +293,12 @@ impl SyncEngine {
             logs: Vec::new(),
         };
         engine.seed_admin_state()?;
+        // Restore the genuinely non-rebuildable transient state (the orphan park,
+        // the unconfirmed admin-tip suspicion, the backfill token buckets, and the
+        // trust-decision audit) from the v2 sync-cache tables BEFORE recomputing
+        // completeness, so a persisted suspicion re-arms the fail-closed gate and a
+        // reboot cannot fail-open (spec §6.1 / D3).
+        engine.restore_persisted_state()?;
         engine.recompute_completeness()?;
         Ok(engine)
     }
@@ -274,6 +307,22 @@ impl SyncEngine {
     #[must_use]
     pub fn room_id(&self) -> &RoomId {
         &self.room_id
+    }
+
+    /// This engine's config (crate-internal). Used only by the [`SimNet`](super::sim::SimNet)
+    /// restart helper to re-`open` with the same bounds; **not** part of the
+    /// public surface (spec §7).
+    pub(crate) fn config(&self) -> SyncConfig {
+        self.config
+    }
+
+    /// Consume the engine and return its owned [`EventStore`] (crate-internal).
+    /// The [`SimNet`](super::sim::SimNet) restart helper re-`open`s a fresh engine
+    /// over the *same* store to model a process restart — the store's `events` and
+    /// v2 sync-cache tables persist, only the in-memory session state is dropped
+    /// (spec D9 / AC5). **Not** part of the public surface (spec §7).
+    pub(crate) fn into_store(self) -> EventStore {
+        self.store
     }
 
     // ------------------------------------------------------------------
@@ -305,7 +354,7 @@ impl SyncEngine {
     /// never-windowed membership sub-DAG and the bounded recent chat window.
     pub fn on_connect(&mut self, peer: PeerId) -> Vec<Outgoing> {
         self.peers.insert(peer);
-        vec![
+        let mut out = vec![
             to(peer, self.admin_tip_msg()),
             to(peer, self.heads_msg()),
             to(
@@ -326,7 +375,11 @@ impl SyncEngine {
                     have: self.chat_have(),
                 },
             ),
-        ]
+        ];
+        // Re-issue by-id backfill for any park restored from disk (spec §6.3), so a
+        // valid-but-early frame survives a crash, not only a transport reconnect.
+        self.retry_restored_park(&mut out);
+        out
     }
 
     /// A peer link went down: stop fanning out to it. The orphan park is retained
@@ -378,6 +431,9 @@ impl SyncEngine {
         self.refill_tokens();
         self.expire_suspect_tip();
         self.retry_park(&mut out);
+        // A restart may have left parked frames owed their one-shot by-id backfill;
+        // the first tick after `open` re-issues it if no `on_connect` did (spec §6.3).
+        self.retry_restored_park(&mut out);
         let membership_have = self.membership_have();
         let chat_have = self.chat_have();
         for peer in self.peers.iter().copied().collect::<Vec<_>>() {
@@ -567,7 +623,12 @@ impl SyncEngine {
         match validate_wire_bytes(bytes, &ctx) {
             Ok(ev) => self.deliver(ev, from, out),
             Err(reason) => {
-                self.log(&format!("dropped invalid frame: {}", reason.code()));
+                // A stateless-invalid frame (bad signature, non-canonical, …) is a
+                // logged, counted drop — never stored, never fanned out (AC3). The
+                // stable `reject.<code>` line is the CLI-visible signal under the
+                // no-tracing-subscriber constraint (spec D8).
+                self.counters.rejected += 1;
+                self.log(&format!("reject.{}", reason.code()));
             }
         }
     }
@@ -595,8 +656,11 @@ impl SyncEngine {
                 self.on_buffered(ev, from, &missing, out);
             }
             crate::membership::Ingest::Rejected { reason, .. } => {
+                // Fold-rejected (non-member, bad capability, …): counted + logged
+                // with a stable `reject.<code>`, stored nowhere, fanned out nowhere
+                // (AC3 / spec D8).
                 self.counters.rejected += 1;
-                self.log(&format!("fold rejected event: {}", reason.code()));
+                self.log(&format!("reject.{}", reason.code()));
             }
         }
     }
@@ -658,17 +722,18 @@ impl SyncEngine {
                     crate::membership::Ingest::Accepted { .. } => {
                         self.park.remove(&id);
                         self.backfill_depth.remove(&id);
+                        self.restored_backfill.remove(&id);
+                        self.persist_delete_parked(id);
                         self.store_and_fanout(&ev, None, out);
                         changed = true;
                     }
                     crate::membership::Ingest::Rejected { reason, .. } => {
                         self.park.remove(&id);
                         self.backfill_depth.remove(&id);
+                        self.restored_backfill.remove(&id);
+                        self.persist_delete_parked(id);
                         self.counters.rejected += 1;
-                        self.log(&format!(
-                            "parked frame rejected on backfill: {}",
-                            reason.code()
-                        ));
+                        self.log(&format!("reject.{}", reason.code()));
                         changed = true;
                     }
                     crate::membership::Ingest::Buffered { .. } => {}
@@ -695,7 +760,7 @@ impl SyncEngine {
         // implausible derived lamport).
         if depth > self.config.max_backfill_depth {
             self.counters.phantom_depth_dropped += 1;
-            self.log("dropped buffered frame: phantom_parent_depth");
+            self.log("reject.phantom_parent_depth");
             return;
         }
 
@@ -703,12 +768,12 @@ impl SyncEngine {
         // in the room never earns a park or a backfill fan-out (spec §13 vector).
         if !self.signer_plausible(&ev) {
             self.counters.signer_dropped += 1;
-            self.log("dropped buffered frame: anti_amplification_signer");
+            self.log("reject.anti_amplification_signer");
             return;
         }
 
         // Gates 3: park within the per-author + total caps (oldest-first eviction).
-        self.park_frame(ev, depth);
+        self.park_frame(ev, depth, missing);
 
         // Gate 4: rate-limited backfill of the still-missing parents.
         let author = self.park.get(&id).map(|p| p.author);
@@ -775,7 +840,7 @@ impl SyncEngine {
         snap.admin() == Some(sender) || snap.member(sender).is_some()
     }
 
-    fn park_frame(&mut self, ev: ValidatedEvent, depth: usize) {
+    fn park_frame(&mut self, ev: ValidatedEvent, depth: usize, missing: &[EventId]) {
         let id = ev.event_id;
         if self.park.contains_key(&id) {
             return;
@@ -785,10 +850,7 @@ impl SyncEngine {
         // Enforce the global cap (oldest-first).
         while self.park.len() >= self.config.max_parked_total {
             if let Some(evict) = self.oldest_parked(None) {
-                self.park.remove(&evict);
-                self.backfill_depth.remove(&evict);
-                self.counters.park_evicted += 1;
-                self.log("park_evicted: max_parked_total");
+                self.evict_parked(evict, "reject.park_evicted: max_parked_total");
             } else {
                 break;
             }
@@ -797,10 +859,7 @@ impl SyncEngine {
         let author_count = self.park.values().filter(|p| p.author == author).count();
         if author_count >= self.config.max_parked_per_author {
             if let Some(evict) = self.oldest_parked(Some(author)) {
-                self.park.remove(&evict);
-                self.backfill_depth.remove(&evict);
-                self.counters.park_evicted += 1;
-                self.log("park_evicted: max_parked_per_author");
+                self.evict_parked(evict, "reject.park_evicted: max_parked_per_author");
             }
         }
 
@@ -813,9 +872,23 @@ impl SyncEngine {
                 author,
                 seq,
                 depth,
+                missing: missing.iter().copied().collect(),
             },
         );
         self.counters.parked += 1;
+        // Checkpoint the new park row + its missing-parent edges (spec §6.2 / D4).
+        self.persist_parked(id);
+    }
+
+    /// Evict one parked frame (cap overflow): drop it from memory and the
+    /// persisted park, count and log it.
+    fn evict_parked(&mut self, id: EventId, reason: &str) {
+        self.park.remove(&id);
+        self.backfill_depth.remove(&id);
+        self.restored_backfill.remove(&id);
+        self.persist_delete_parked(id);
+        self.counters.park_evicted += 1;
+        self.log(reason);
     }
 
     /// The oldest parked id (optionally restricted to one author), by arrival seq
@@ -884,6 +957,9 @@ impl SyncEngine {
             false
         } else {
             *bucket -= 1;
+            // Checkpoint the depleted bucket so a crash-loop cannot reset the
+            // amplification budget (spec §1.3 / §6.3 / R4).
+            self.persist_tokens();
             true
         }
     }
@@ -891,8 +967,17 @@ impl SyncEngine {
     fn refill_tokens(&mut self) {
         let cap = self.config.backfill_tokens_per_author;
         let refill = self.config.backfill_refill_per_tick;
+        let mut changed = false;
         for bucket in self.tokens.values_mut() {
-            *bucket = bucket.saturating_add(refill).min(cap);
+            let next = bucket.saturating_add(refill).min(cap);
+            if next != *bucket {
+                *bucket = next;
+                changed = true;
+            }
+        }
+        // One batched checkpoint per tick (spec §6.2 token-refill row).
+        if changed {
+            self.persist_tokens();
         }
     }
 
@@ -1086,6 +1171,9 @@ impl SyncEngine {
                 seq,
                 attempts: self.config.max_unconfirmed_tip_attempts,
             });
+            // Persist the raised suspicion so a restart re-arms the fail-closed
+            // gate before any access decision is served (spec §1.1 / D3).
+            self.persist_sync_state();
         }
     }
 
@@ -1101,6 +1189,7 @@ impl SyncEngine {
         };
         if susp.attempts == 0 {
             self.suspect_tip = None;
+            self.persist_sync_state();
             self.log("unconfirmed admin tip expired: admin_tip_unconfirmed");
             if let Err(e) = self.recompute_completeness() {
                 self.log(&format!("completeness recompute failed: {e}"));
@@ -1110,6 +1199,8 @@ impl SyncEngine {
                 attempts: susp.attempts - 1,
                 ..susp
             });
+            // Persist the decremented budget so the bound spans a restart (R4).
+            self.persist_sync_state();
         }
     }
 
@@ -1166,11 +1257,13 @@ impl SyncEngine {
         // tip catches up; otherwise expired by the bounded attempt budget on tick
         // (spec §13), so a fabricated tip cannot pin us fail-closed forever.
         let local = self.store.admin_chain_tip(&self.room_id)?;
+        let mut suspicion_cleared = false;
         let behind = if let Some(susp) = self.suspect_tip {
             let still_behind =
                 local.map_or(true, |(_, loc)| susp.seq > loc) && !self.store.contains(&susp.id)?;
             if !still_behind {
                 self.suspect_tip = None;
+                suspicion_cleared = true;
             }
             still_behind
         } else {
@@ -1217,12 +1310,200 @@ impl SyncEngine {
                 }
             }
         }
+        // Persist a catch-up that cleared the suspicion, so the resolved posture
+        // survives a subsequent restart (spec §6.2 suspicion-clear row).
+        if suspicion_cleared {
+            self.persist_sync_state();
+        }
         Ok(())
     }
 
     fn record_trust(&mut self, decision: TrustDecision) {
         if !self.trust_decisions.contains(&decision) {
+            // Append to the durable audit trail first (a reboot must not erase a
+            // CRITICAL admin-fork alert, spec D6), then hold it in memory.
+            self.persist_trust(&decision);
             self.trust_decisions.push(decision);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Restart durability (IR-0201 §6.1–§6.3): restore transient state on
+    // `open` and checkpoint each mutation. `events` stays authoritative; the
+    // five v2 tables are droppable derived caches. A checkpoint fault is a
+    // logged, **non-fatal** degradation (durability, never correctness — a
+    // reconnect re-pulls; spec §6.2 / §9), so persist helpers log and continue.
+    // ------------------------------------------------------------------
+
+    /// Restore the persisted park, unconfirmed suspicion, backfill token buckets,
+    /// and trust-decision audit on `open` (spec §6.1). The held fold / admin chain
+    /// / derived completeness are **rebuilt from `events`**, never persisted (D1).
+    fn restore_persisted_state(&mut self) -> Result<(), StoreError> {
+        // --- park: re-validate every stored `wire`; drop+log corrupt rows (D5) ---
+        let parked = self.store.load_parked(&self.room_id)?;
+        let ctx = ValidationContext::for_room(self.room_id);
+        let mut max_seq = self.park_seq;
+        for row in parked {
+            match validate_wire_bytes(&row.wire, &ctx) {
+                Ok(ev) => {
+                    max_seq = max_seq.max(row.park_seq);
+                    let depth = usize::try_from(row.depth).unwrap_or(usize::MAX);
+                    self.park.insert(
+                        row.event_id,
+                        Parked {
+                            event: ev,
+                            author: row.author,
+                            seq: row.park_seq,
+                            depth,
+                            missing: row.missing.into_iter().collect(),
+                        },
+                    );
+                    self.restored_backfill.insert(row.event_id);
+                    self.counters.parked_restored += 1;
+                }
+                Err(reason) => {
+                    // A corrupt/tampered park row can never be trusted: drop it and
+                    // log a stable `reject.park_corrupt`, never a panic (spec §9/R3).
+                    let _ = self.store.delete_parked(&self.room_id, &row.event_id);
+                    self.counters.park_corrupt_dropped += 1;
+                    self.log(&format!("reject.park_corrupt: {}", reason.code()));
+                }
+            }
+        }
+        self.park_seq = max_seq;
+
+        // --- sync_state: the unconfirmed admin-tip suspicion (anti fail-open, D3);
+        //     the chat cursor is advisory and intentionally not consumed (OQ-1) ---
+        if let Some(st) = self.store.load_sync_state(&self.room_id)? {
+            if let Some((id, seq, attempts)) = st.suspect_tip {
+                self.suspect_tip = Some(SuspectTip { id, seq, attempts });
+                self.counters.suspicion_restored += 1;
+            }
+        }
+
+        // --- backfill token buckets: restored as-is, NOT refilled by the restart
+        //     (the amplification budget must not reset; spec §1.3 / §6.3) ---
+        let tokens = self.store.load_backfill_tokens(&self.room_id)?;
+        self.counters.tokens_restored = tokens.len() as u64;
+        self.tokens = tokens;
+
+        // --- trust-decision audit: loaded into the live list (not re-persisted),
+        //     so the trail grows across restarts and stays queryable (D6) ---
+        for tr in self.store.load_trust_decisions(&self.room_id)? {
+            let decision = trust_row_to_decision(&tr)?;
+            self.trust_decisions.push(decision);
+            self.counters.trust_restored += 1;
+        }
+        Ok(())
+    }
+
+    /// Re-issue by-id `WantEvents` backfill for every restored parked frame, once,
+    /// on the first `on_connect`/`on_tick` after `open` (spec §6.3). Gated by the
+    /// **restored** token buckets (not a fresh budget), so buffering *and retry*
+    /// survive a restart without resetting the amplification bound. Thereafter the
+    /// frame retries like any other (anti-entropy pulls + [`wake_park`](Self::wake_park)).
+    fn retry_restored_park(&mut self, out: &mut Vec<Outgoing>) {
+        if self.restored_backfill.is_empty() || self.peers.is_empty() {
+            return;
+        }
+        for id in self.restored_backfill.iter().copied().collect::<Vec<_>>() {
+            // One-shot: clear regardless of outcome; ongoing retry is anti-entropy.
+            self.restored_backfill.remove(&id);
+            let Some((author, depth, missing)) = self
+                .park
+                .get(&id)
+                .map(|p| (p.author, p.depth, p.missing.clone()))
+            else {
+                continue;
+            };
+            let to_fetch: Vec<EventId> = missing
+                .into_iter()
+                .filter(|m| !self.store.contains(m).unwrap_or(false))
+                .collect();
+            if to_fetch.is_empty() {
+                continue;
+            }
+            if !self.take_backfill_token(author) {
+                self.counters.backfill_rate_limited += 1;
+                self.log("backfill suppressed: backfill_rate_limited");
+                continue;
+            }
+            for m in &to_fetch {
+                self.backfill_depth.entry(*m).or_insert(depth + 1);
+            }
+            for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
+                for peer in self.peers.iter().copied().collect::<Vec<_>>() {
+                    out.push(Outgoing {
+                        peer,
+                        msg: SyncMessage::WantEvents {
+                            room_id: self.room_id,
+                            ids: chunk.to_vec(),
+                        },
+                    });
+                    self.counters.backfill_requests += 1;
+                }
+            }
+        }
+    }
+
+    /// Checkpoint one parked frame (row + its missing-parent edges).
+    fn persist_parked(&mut self, id: EventId) {
+        let Some(row) = self.park.get(&id).map(|p| ParkedRow {
+            event_id: id,
+            wire: p.event.wire.to_bytes(),
+            author: p.author,
+            park_seq: p.seq,
+            depth: u32::try_from(p.depth).unwrap_or(u32::MAX),
+            missing: p.missing.iter().copied().collect(),
+        }) else {
+            return;
+        };
+        if let Err(e) = self.store.upsert_parked(&self.room_id, &row) {
+            self.log(&format!("checkpoint failed: parked: {e}"));
+        }
+    }
+
+    /// Checkpoint the removal of one parked frame.
+    fn persist_delete_parked(&mut self, id: EventId) {
+        if let Err(e) = self.store.delete_parked(&self.room_id, &id) {
+            self.log(&format!("checkpoint failed: delete_parked: {e}"));
+        }
+    }
+
+    /// Checkpoint the per-room `sync_state` row (the unconfirmed suspicion).
+    fn persist_sync_state(&mut self) {
+        let row = SyncStateRow {
+            chat_cursor: None,
+            suspect_tip: self.suspect_tip.map(|s| (s.id, s.seq, s.attempts)),
+        };
+        if let Err(e) = self.store.save_sync_state(&self.room_id, &row) {
+            self.log(&format!("checkpoint failed: sync_state: {e}"));
+        }
+    }
+
+    /// Checkpoint the per-author backfill token buckets.
+    fn persist_tokens(&mut self) {
+        if let Err(e) = self.store.save_backfill_tokens(&self.room_id, &self.tokens) {
+            self.log(&format!("checkpoint failed: backfill_tokens: {e}"));
+        }
+    }
+
+    /// Append one trust decision to the durable audit trail.
+    fn persist_trust(&mut self, decision: &TrustDecision) {
+        let row = TrustRow {
+            seq: 0, // assigned by the store on append
+            code: decision.code.to_owned(),
+            severity: match decision.severity {
+                Severity::Critical => "critical",
+                Severity::Warning => "warning",
+            }
+            .to_owned(),
+            admin_seq: Some(decision.admin_seq),
+            event_ids: decision.event_ids.clone(),
+            created_at: 0, // advisory only (the engine reads no wall clock)
+        };
+        if let Err(e) = self.store.append_trust_decision(&self.room_id, &row) {
+            self.log(&format!("checkpoint failed: trust_decision: {e}"));
         }
     }
 
@@ -1302,6 +1583,36 @@ impl SyncEngine {
 /// Build an [`Outgoing`] addressed to `peer`.
 fn to(peer: PeerId, msg: SyncMessage) -> Outgoing {
     Outgoing { peer, msg }
+}
+
+/// Map a persisted [`TrustRow`] back to the in-memory [`TrustDecision`] (spec D6
+/// restore). A stored code/severity outside the known vocabulary is store
+/// corruption, surfaced as a typed error (never a panic on stored bytes).
+fn trust_row_to_decision(tr: &TrustRow) -> Result<TrustDecision, StoreError> {
+    let code = match tr.code.as_str() {
+        "equivocation" => "equivocation",
+        "admin_view_suspect" => "admin_view_suspect",
+        other => {
+            return Err(StoreError::integrity(format!(
+                "unknown stored trust code {other:?}"
+            )))
+        }
+    };
+    let severity = match tr.severity.as_str() {
+        "critical" => Severity::Critical,
+        "warning" => Severity::Warning,
+        other => {
+            return Err(StoreError::integrity(format!(
+                "unknown stored trust severity {other:?}"
+            )))
+        }
+    };
+    Ok(TrustDecision {
+        code,
+        severity,
+        admin_seq: tr.admin_seq.unwrap_or(0),
+        event_ids: tr.event_ids.clone(),
+    })
 }
 
 /// Whether a stored event is **chat-class** (spec §4.1): a chat event type that is

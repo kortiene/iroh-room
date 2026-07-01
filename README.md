@@ -506,10 +506,56 @@ Run the gated online tier locally (loopback only; no relay, no external tools):
 cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
 ```
 
+The **hardened recent-history sync implementation** has landed in `crates/iroh-rooms-core`
+(issue #26 / IR-0201), graduating the Phase-0 bounded recent-sync prototype to the MVP
+recent-history-sync implementation by persisting the `SyncEngine`'s genuinely
+non-rebuildable in-flight state across process restarts:
+
+- **Store schema v2** (`user_version = 2`): a forward-only, additive migration adding five
+  derived-cache tables — `sync_state`, `sync_backfill_tokens`, `sync_parked`,
+  `sync_parked_missing`, and `trust_decisions` — scoped per room. The authoritative `events`
+  and `event_parents` tables are untouched; a v1 database upgrades in place (the five tables
+  are created empty). An older binary opening a v2 database fails closed with a typed
+  `StoreError::Migration`.
+- **Restore on `open`**: `SyncEngine::open` now reloads the persisted orphan park
+  (re-validating each `wire` via `validate_wire_bytes` on load — a corrupt or tampered row
+  is dropped and logged as `park_corrupt`, never a panic), the unconfirmed admin-tip
+  suspicion, the per-author backfill token buckets, and the trust-decision audit log, then
+  calls `recompute_completeness` **with the restored suspicion in hand** — so an
+  `AdminViewSuspect` fail-closed posture re-arms **before** any access decision is served
+  after a restart. A reboot cannot clear a removal-sensitive fail-closed gate.
+- **Checkpoint on mutation**: a persistence hook writes each non-rebuildable state change to
+  SQLite transactionally inside the single-owner pump — park insert/evict/wake, suspicion
+  raise/clear/attempts, token consume/refill (batched per tick), trust-decision record — so
+  a crash loses at most one tick of state. Checkpoint faults surface as `SyncError::Store`
+  (logged, non-fatal; `events` stays authoritative).
+- **Retry survives restart**: the restored park's missing-parent edges re-issue `WantEvents`
+  on the first `on_connect`/`on_tick`, gated by the **restored** token buckets (not a fresh
+  full budget) — so buffering **and** retry are durable and the anti-amplification bound
+  cannot be bypassed by crash-looping.
+- **Observable rejection (AC3)**: every invalid-event drop increments `counters().rejected`
+  and appends a stable `reject.<code>` entry to the bounded `logs()` ring; the net
+  `AuditSink` gains `event_rejected`, called from the `Node` pump on the receive path, so
+  rejections are observable without a tracing subscriber (the CLI installs none).
+- **Additive `EventStore` sync-cache API** (`store` feature):
+  `load/save_sync_state`, `load/save_backfill_tokens`, `load/upsert/delete_parked`,
+  `load/append_trust_decision`, and the `ParkedRow`/`SyncStateRow`/`TrustRow` DTOs. The
+  `SyncEngine` and `iroh-rooms-net` public surfaces are unchanged; callers require no
+  signature changes.
+- **`SimNet::restart(peer)`**: drops the engine and re-opens it over the same store,
+  enabling fast deterministic proofs of the restore path under shuffle and partition.
+- **IR-0201 integration suite** (`crates/iroh-rooms-core/tests/sync_restart.rs`): the AC5
+  restart-durability matrix — park, fail-closed re-arming, trust-audit persistence, and
+  rate-limit conservation across restart — plus migration tests (v1→v2 additive, `events`
+  byte-stable, old binary rejects v2), cache-drop equivalence (dropping the five v2 tables
+  and reconnecting converges to the same steady state), and the shuffled-delivery-after-restart
+  scenario.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
-room-read CLI, the iroh transport, the live pipe, the peer connection manager, and the
-Phase 1A two-peer integration test) are all landed as prototypes.
+room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
+Phase 1A two-peer integration test, and the hardened recent-history sync) are all landed;
+the sync engine is now at MVP grade with process-restart durability.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is file sharing and agent status (both

@@ -791,8 +791,23 @@ async fn pump(
                                 shared.audit.bootstrap_blocked(d, sync_message_kind(&msg));
                             }
                         } else {
+                            // AC3 observability (spec §D8): surface an engine reject
+                            // of this inbound frame through the AuditSink so it is
+                            // visible without a tracing subscriber. The reject count
+                            // is the delta in the engine's monotonic counter; the
+                            // per-frame `reject.<code>` detail is in engine.logs().
+                            let rejected_before = engine.counters().rejected;
                             let outs = engine.on_message(inbound.peer, msg);
                             route_all(&shared, outs);
+                            let rejected = engine
+                                .counters()
+                                .rejected
+                                .saturating_sub(rejected_before);
+                            if rejected > 0 {
+                                if let Some(d) = device {
+                                    shared.audit.event_rejected(d, rejected);
+                                }
+                            }
                             if provisional {
                                 // Upgrade-on-learn: if that frame was the join the
                                 // fold accepted, the peer is now an Active member —
