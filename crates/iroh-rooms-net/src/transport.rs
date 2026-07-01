@@ -29,7 +29,7 @@ use crate::handler::EventProtocolHandler;
 use crate::peer::{dial_loop, peer_id};
 use crate::pipe::alpn::PIPE_ALPN;
 use crate::pipe::PipeProtocolHandler;
-use crate::state::{ConnEvent, PeerConnState, PeerTable};
+use crate::state::{ConnEvent, PeerConnState, PeerEntry, PeerTable};
 
 /// Normal application close code for a locally-initiated disconnect (distinct from
 /// [`crate::handler::REJECT_CODE`], which means "unauthorized").
@@ -324,6 +324,13 @@ impl NetTransport {
     #[must_use]
     pub fn peer_states(&self) -> Vec<(EndpointId, PeerConnState)> {
         self.shared.table.snapshot()
+    }
+
+    /// Point-in-time snapshot of every known device and its full [`PeerEntry`]
+    /// (state + offline reason + bound identity) — the §16.3 CLI connection view.
+    #[must_use]
+    pub fn peer_entries(&self) -> Vec<(EndpointId, PeerEntry)> {
+        self.shared.table.entries()
     }
 
     /// The current state of one device, if known.

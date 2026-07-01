@@ -45,6 +45,46 @@ impl PeerConnState {
     }
 }
 
+/// Why a peer is not currently [`Connected`](PeerConnState::Connected) — a purely
+/// **diagnostic** refinement of [`PeerConnState::Offline`] for PRD §16.3 / §18.1
+/// output (spec §4.5). It is *never* a trust input: admission and the dial set are
+/// keyed only by the QUIC-proven `device_id`, and this reason only refines the
+/// human-facing label the CLI renders for an offline peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OfflineReason {
+    /// Desired, but no dial attempt has completed yet (the transient default an
+    /// entry carries until a dial resolves).
+    #[default]
+    NeverDialed,
+    /// `endpoint.connect()` failed — no path to the peer (the common "peer is
+    /// offline / unreachable" case).
+    Unreachable,
+    /// Connected at QUIC but the stream open / handshake failed (TLS/ALPN/proto);
+    /// reachable, but the transport could not carry events.
+    TransportError,
+    /// Was [`Connected`](PeerConnState::Connected) and the live link fell — a
+    /// transient drop the dial loop will redial.
+    LinkDropped,
+    /// Removed from the room mid-session; the managed dial loop was stopped
+    /// (terminal — we will not redial a since-removed peer).
+    Deauthorized,
+}
+
+impl OfflineReason {
+    /// Stable lowercase label for logs/audit/CLI output (pinned by tests exactly
+    /// like [`PeerConnState::label`]; tooling parses these strings).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeverDialed => "never_dialed",
+            Self::Unreachable => "unreachable",
+            Self::TransportError => "transport_error",
+            Self::LinkDropped => "link_dropped",
+            Self::Deauthorized => "deauthorized",
+        }
+    }
+}
+
 /// One peer's tracked entry in the [`PeerTable`].
 #[derive(Clone, Copy, Debug)]
 pub struct PeerEntry {
@@ -52,6 +92,10 @@ pub struct PeerEntry {
     pub state: PeerConnState,
     /// The membership identity the device is bound to, once known (set on admit).
     pub identity: Option<IdentityKey>,
+    /// Why the peer is offline, when [`state`](Self::state) is
+    /// [`Offline`](PeerConnState::Offline). Ignored (and left at its last value)
+    /// for the other states — read it only alongside an `Offline` state.
+    pub offline_reason: OfflineReason,
     /// Wall-clock ms of the last state change (observability only; not a trust
     /// input).
     pub last_change_ms: u64,
@@ -109,7 +153,38 @@ impl PeerTable {
     /// is a silent no-op (so the engine driver's `on_connect`/`on_disconnect` fire
     /// exactly once per real transition even when both the dial and accept sides
     /// race to `Connected`). The `identity` (when `Some`) is always recorded.
+    ///
+    /// This never *changes* the [`OfflineReason`]; use [`set_offline`](Self::set_offline)
+    /// to move a peer to [`Offline`](PeerConnState::Offline) with a diagnostic reason.
     pub fn set(&self, device: EndpointId, state: PeerConnState, identity: Option<IdentityKey>) {
+        self.set_inner(device, state, identity, None);
+    }
+
+    /// Move a device to [`Offline`](PeerConnState::Offline) carrying a diagnostic
+    /// [`OfflineReason`] (spec §4.5). The reason refines the offline label for the
+    /// CLI/logs; it is not a trust input.
+    ///
+    /// A genuine state transition into `Offline` emits a [`ConnEvent`]. A *reason*
+    /// refinement while already `Offline` updates the stored reason but — per spec
+    /// D5 — emits **no** new `ConnEvent`, keeping the transition stream a pure
+    /// state-change stream (the CLI reads the reason from the entry when it renders
+    /// a transition).
+    pub fn set_offline(
+        &self,
+        device: EndpointId,
+        reason: OfflineReason,
+        identity: Option<IdentityKey>,
+    ) {
+        self.set_inner(device, PeerConnState::Offline, identity, Some(reason));
+    }
+
+    fn set_inner(
+        &self,
+        device: EndpointId,
+        state: PeerConnState,
+        identity: Option<IdentityKey>,
+        reason: Option<OfflineReason>,
+    ) {
         let ts_ms = now_ms();
         let event = {
             let mut guard = self
@@ -123,6 +198,7 @@ impl PeerTable {
                         PeerEntry {
                             state,
                             identity,
+                            offline_reason: reason.unwrap_or_default(),
                             last_change_ms: ts_ms,
                         },
                     );
@@ -139,11 +215,21 @@ impl PeerTable {
                         entry.identity = Some(id);
                     }
                     if entry.state == state {
-                        // Idempotent re-set: record identity (done above) but emit nothing.
+                        // Idempotent re-set. A reason refinement (still Offline) updates
+                        // the stored reason silently (D5: no new transition event).
+                        if let Some(r) = reason {
+                            if entry.offline_reason != r {
+                                entry.offline_reason = r;
+                                entry.last_change_ms = ts_ms;
+                            }
+                        }
                         None
                     } else {
                         let from = entry.state;
                         entry.state = state;
+                        if let Some(r) = reason {
+                            entry.offline_reason = r;
+                        }
                         entry.last_change_ms = ts_ms;
                         Some(ConnEvent {
                             device,
@@ -195,6 +281,47 @@ impl PeerTable {
             .map(|(k, _)| *k)
             .collect()
     }
+
+    /// A point-in-time snapshot of every known device and its full [`PeerEntry`]
+    /// (state **and** offline reason **and** bound identity) — the entry the CLI
+    /// renders for the §16.3 connection panel. [`snapshot`](Self::snapshot) stays
+    /// for state-only back-compat.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(EndpointId, PeerEntry)> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// The membership identity bound to a device, if it has been learned (set on a
+    /// successful admit). Keyed by **endpoint** (`device_id`); the identity is the
+    /// secondary grouping key the CLI shows (§4.6).
+    #[must_use]
+    pub fn identity_of(&self, device: EndpointId) -> Option<IdentityKey> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get(&device).and_then(|e| e.identity)
+    }
+
+    /// Every device currently bound to `identity` — the reverse of
+    /// [`identity_of`](Self::identity_of), so the CLI can group a member's multiple
+    /// devices under one identity row (§4.6).
+    #[must_use]
+    pub fn devices_of(&self, identity: IdentityKey) -> Vec<EndpointId> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .iter()
+            .filter(|(_, v)| v.identity == Some(identity))
+            .map(|(k, _)| *k)
+            .collect()
+    }
 }
 
 /// Wall-clock milliseconds since the Unix epoch (observability timestamps only).
@@ -206,7 +333,7 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerConnState, PeerTable};
+    use super::{OfflineReason, PeerConnState, PeerTable};
     use iroh::{EndpointId, SecretKey};
 
     fn device(seed: u8) -> EndpointId {
@@ -265,6 +392,83 @@ mod tests {
         assert_eq!(PeerConnState::Connected.label(), "connected");
         assert_eq!(PeerConnState::Offline.label(), "offline");
         assert_eq!(PeerConnState::Unauthorized.label(), "unauthorized");
+    }
+
+    #[test]
+    fn offline_reason_labels_are_stable() {
+        // The §16.3 diagnostic vocabulary — pinned exactly like the state labels
+        // since the CLI panel / audit lines render them and tooling greps them.
+        assert_eq!(OfflineReason::NeverDialed.label(), "never_dialed");
+        assert_eq!(OfflineReason::Unreachable.label(), "unreachable");
+        assert_eq!(OfflineReason::TransportError.label(), "transport_error");
+        assert_eq!(OfflineReason::LinkDropped.label(), "link_dropped");
+        assert_eq!(OfflineReason::Deauthorized.label(), "deauthorized");
+    }
+
+    #[test]
+    fn offline_reason_default_is_never_dialed() {
+        assert_eq!(OfflineReason::default(), OfflineReason::NeverDialed);
+    }
+
+    #[test]
+    fn set_offline_records_reason_and_emits_transition_once() {
+        let table = PeerTable::new(16);
+        let mut rx = table.subscribe();
+
+        // Connecting -> Offline{Unreachable} is a genuine transition: one event.
+        table.set(device(1), PeerConnState::Connecting, None);
+        let _ = rx.try_recv().expect("first-sight connecting");
+        table.set_offline(device(1), OfflineReason::Unreachable, None);
+        let ev = rx.try_recv().expect("transition into offline");
+        assert_eq!(ev.from, PeerConnState::Connecting);
+        assert_eq!(ev.to, PeerConnState::Offline);
+
+        let entry = table
+            .entries()
+            .into_iter()
+            .find(|(d, _)| *d == device(1))
+            .map(|(_, e)| e)
+            .expect("entry");
+        assert_eq!(entry.offline_reason, OfflineReason::Unreachable);
+    }
+
+    #[test]
+    fn set_offline_reason_refinement_updates_entry_without_new_event() {
+        let table = PeerTable::new(16);
+        table.set_offline(device(2), OfflineReason::Unreachable, None);
+        let mut rx = table.subscribe(); // subscribe AFTER first sight
+
+        // Refine the reason while staying Offline: entry updates, but no event (D5).
+        table.set_offline(device(2), OfflineReason::LinkDropped, None);
+        assert!(
+            rx.try_recv().is_err(),
+            "a reason-only refinement must not emit a ConnEvent"
+        );
+        let entry = table
+            .entries()
+            .into_iter()
+            .find(|(d, _)| *d == device(2))
+            .map(|(_, e)| e)
+            .expect("entry");
+        assert_eq!(entry.offline_reason, OfflineReason::LinkDropped);
+    }
+
+    #[test]
+    fn identity_and_devices_reverse_map() {
+        use iroh_rooms_core::event::keys::IdentityKey;
+        let table = PeerTable::new(16);
+        let id = IdentityKey::from_bytes([0xAB; 32]);
+        table.set(device(3), PeerConnState::Connected, Some(id));
+        table.set(device(4), PeerConnState::Connected, Some(id));
+        table.set(device(5), PeerConnState::Connected, None);
+
+        assert_eq!(table.identity_of(device(3)), Some(id));
+        assert_eq!(table.identity_of(device(5)), None);
+        let mut devs = table.devices_of(id);
+        devs.sort();
+        let mut want = vec![device(3), device(4)];
+        want.sort();
+        assert_eq!(devs, want);
     }
 
     // --- Unknown-device lookups ---

@@ -314,11 +314,66 @@ The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
 - **Gate A (real-NAT run for the pipe ALPN) is still owed** before MVP go, inheriting the
   open Gate-A risk from the transport prototype (#9); see `crates/iroh-rooms-net/NOTES.md`.
 
+The **peer connection manager** has landed in `crates/iroh-rooms-net` and
+`crates/iroh-rooms-cli` (issue #22 / IR-0107), wiring the landed transport primitives
+into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follow-up
+(IR-0005 NOTES D6/OQ-6, N6, and the roster-driven dial reconciliation):
+
+- **`PeerManager`** (`net/src/manager.rs`): the room-scoped owner of the outbound dial
+  set. It derives the **desired** connection set from the live membership snapshot
+  (active members' devices minus self) and **reconciles** the running `dial_loop` set
+  against it on every fold change — starting loops for newly-active members, aborting
+  and tearing down loops for since-removed ones. Idempotent: an unchanged snapshot is a
+  no-op (no loop churn, no spurious `ConnEvent`s). Replaces the flat, never-pruned
+  `dial_tasks` list.
+- **`SnapshotAdmission`** (`net/src/admission.rs`): the production re-point of the
+  accept gate (the IR-0005 NOTES D6/OQ-6 follow-up, now closed). Reads a shared
+  `AdmissionView` cell on every `authorize` call so a device removed mid-session begins
+  being rejected within one tick — not just at the next process restart. The pump is
+  the sole writer; the accept hot path takes a short, non-blocking critical section.
+  `AllowlistAdmission` is retained for fixtures and the join-bootstrap overlay;
+  `JoinBootstrapAdmission` is now generic and composes with either gate.
+- **`OfflineReason`** (`net/src/state.rs`): an additive diagnostic refinement of
+  `PeerConnState::Offline` for PRD §16.3 / §18.1. Five values:
+  `NeverDialed / Unreachable / TransportError / LinkDropped / Deauthorized`. Never a
+  trust input; the four-value `PeerConnState` enum and its pinned label strings are
+  unchanged. `PeerTable` gains `set_offline`, `entries()`, `identity_of`, and
+  `devices_of` to serve the CLI connection panel.
+- **`Node::spawn_room`** (`net/src/node.rs`): the managed-session entry point. The pump
+  constructs the manager and `SnapshotAdmission` cell, reconciles them after every
+  fold-mutating step and on each anti-entropy tick (≤250 ms reaction), and preserves
+  the join-bootstrap provisional path (IR-0104) unchanged. The `RoomReconciler`
+  change-detector ensures reconcile is a no-op when the snapshot has not moved.
+  `Node::reconcile_now()` is a test hook that forces an immediate reconcile.
+- **CLI connection panel** in `room tail <ROOM_ID>`: the `ConnEvent` subscriber prints
+  a stable, greppable per-peer status line on every transition:
+  `peer <identity-short> device=<device-short> state=<state> [reason=<reason>]`
+  and a roster summary: `peers: N connected, M offline, K unauthorized`. Reason strings
+  are pinned identically to the `PeerConnState` labels (`unreachable`, `link_dropped`,
+  `transport_error`, `deauthorized`). An `Unauthorized` peer is never rendered
+  as "offline" (PRD §16.4 honesty rule).
+- **`room members <ROOM_ID> --status`**: brings up an ephemeral managed node, waits
+  for connections to settle, then prints each member row with `role`, membership
+  `status`, and live `conn` field (`connected` / `offline reason=<reason>` /
+  `unauthorized` / `self` / `n/a`). No new CLI noun; the existing `room members`
+  mental model extended with an opt-in flag.
+- **New audit vocabulary**: `peer.deauthorized` (mid-session roster removal — terminal,
+  will not redial) and `peer.offline:<reason>` (diagnostic transition refinement).
+- **Device-selection promotion**: `build_dial_set`'s active-only, self-excluded device
+  selection delegates to `PeerManager::desired_devices` so there is a single
+  implementation shared between the CLI send/pipe paths and the runtime manager.
+- 7 unit tests for `desired_devices` (purity, self-exclusion, invited-only exclusion,
+  removed exclusion, three-actor rooms); live-flip test for `SnapshotAdmission` (proves
+  mid-session removal takes effect); full decision-matrix test and `JoinBootstrapAdmission`
+  over the live gate; `PeerTable` reason-refinement and label-stability tests.
+  **Gate A (real-NAT) remains separately owed** (inherits the IR-0005 residual;
+  see `crates/iroh-rooms-net/NOTES.md`).
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the iroh
-transport, and the live pipe) are all landed as prototypes; the remaining work is file
-sharing, agent status, the `MembershipSnapshot` re-point of admission, and the Gate-A
-real-network confirmation (all tracked separately).
+transport, the live pipe, and the peer connection manager) are all landed as prototypes;
+the remaining work is file sharing, agent status, and the Gate-A real-network
+confirmation (all tracked separately).
 
 ## Repository Layout
 

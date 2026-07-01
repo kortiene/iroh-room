@@ -164,6 +164,22 @@ enum RoomAction {
         #[allow(clippy::doc_markdown)]
         /// The room id printed by `room create` (blake3:<hex>).
         room_id: String,
+        /// Also bring up a node and show each member's live connection state
+        /// (connected / offline+reason / unauthorized) alongside membership.
+        #[arg(long)]
+        status: bool,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        /// Only used with --status.
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// How long to wait for connections to settle before printing (--status).
+        #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
+        timeout: String,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
     },
     /// Mint a key-bound invite ticket for a known invitee identity.
     Invite {
@@ -303,10 +319,25 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
             println!("admin: {}", summary.admin_identity_id);
             println!("next: run `iroh-rooms room members {}`", summary.room_id);
         }
-        RoomAction::Members { room_id } => {
+        RoomAction::Members {
+            room_id,
+            status,
+            peers,
+            timeout,
+            loopback,
+        } => {
             let room_id = parse_room_id(&room_id)?;
-            let view = room::members(home, &room_id)?;
-            room::print_members(&view);
+            if status {
+                // The live connection view is an online command: parse the timeout
+                // before any IO, then run it in a scoped runtime (mirrors `send`).
+                let timeout = message::parse_timeout(&timeout)?;
+                runtime()?.block_on(message::members_status(
+                    home, &room_id, &peers, timeout, loopback,
+                ))?;
+            } else {
+                let view = room::members(home, &room_id)?;
+                room::print_members(&view);
+            }
         }
         RoomAction::Invite {
             room_id,

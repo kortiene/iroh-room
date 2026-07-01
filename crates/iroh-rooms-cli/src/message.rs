@@ -23,11 +23,11 @@
 //! non-member-rejected, deterministic-order) are all satisfied by the
 //! conformance-tested core/engine this module drives (spec §12.1).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -39,12 +39,13 @@ use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey};
 use iroh_rooms_core::event::signed::SignedEvent;
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, RoomMembership, Status};
+use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, Role, RoomMembership, Status};
 use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
-    AllowlistAdmission, JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState,
-    TracingAudit, DEFAULT_TICK,
+    Admission, AdmissionView, AllowlistAdmission, ConnEvent, JoinBootstrapAdmission, NetConfig,
+    NetMode, Node, PeerConnState, PeerEntry, PeerManager, SnapshotAdmission, TracingAudit,
+    DEFAULT_TICK,
 };
 
 use crate::{clock, identity};
@@ -267,19 +268,26 @@ pub async fn tail(
     // store is handed to the engine.
     let display_names = display_names(&store, room_id)?;
 
-    let self_device = endpoint_id_of(secret.device.device_key())?;
-    let dial_set = build_dial_set(&snapshot, self_device, &peer_addrs);
-
-    // Build the admission gate. With `--accept-joins` and a real open-invite window,
-    // wrap it in the provisional join-bootstrap overlay (IR-0104 Approach A); else it
-    // is the normal Active-only allowlist (no strangers admitted).
+    // Build the live admission gate (IR-0107): a `SnapshotAdmission` reading a cell
+    // the node's pump refreshes on every fold change, so a member removed mid-session
+    // stops being admitted within a tick (AC2). Seed the cell with the opening
+    // snapshot so the accept gate is correct before the first tick. With
+    // `--accept-joins` + a real open-invite window, wrap it in the provisional
+    // join-bootstrap overlay (IR-0104 Approach A).
     let host_joins = accept_joins && hosting_joins_effective(&snapshot, &self_id);
     if accept_joins {
         report_accept_joins(&snapshot, &self_id, host_joins);
     }
-    let admission = JoinBootstrapAdmission::new(build_admission(&snapshot), host_joins);
+    let admission_cell = Arc::new(Mutex::new(AdmissionView::from_snapshot(&snapshot, &[])));
+    let admission: Arc<dyn Admission> = Arc::new(JoinBootstrapAdmission::new(
+        SnapshotAdmission::new(admission_cell.clone()),
+        host_joins,
+    ));
 
-    // Hand the store to the engine and bring up the node.
+    // Hand the store to the engine and bring up the managed node. The peer manager
+    // derives + maintains the dial set from the live snapshot (AC1); we pass the
+    // `--peer` hints for deterministic loopback/LAN addressing and do **not** dial
+    // explicitly — the manager owns dialing.
     let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
         .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
     let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
@@ -287,13 +295,15 @@ pub async fn tail(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
-    let node = Node::spawn(
+    let node = Node::spawn_room(
         secret_key,
-        Arc::new(admission),
+        admission,
         Arc::new(TracingAudit),
         engine,
         cfg,
         DEFAULT_TICK,
+        peer_addrs,
+        admission_cell,
     )
     .await
     .context("could not bring up the network node")?;
@@ -310,12 +320,9 @@ pub async fn tail(
     }
     println!("room: {room_id}");
 
-    for addr in dial_set {
-        node.connect_to(addr);
-    }
-
-    // ---- Display loop: poll the timeline, print rows not yet shown, until SIGINT. ----
+    // ---- Display loop: poll the timeline + surface the §16.3 connection panel. ----
     let mut seen: BTreeSet<EventId> = BTreeSet::new();
+    let mut conn_rx = node.conn_events();
     let mut ticker = tokio::time::interval(TAIL_POLL_INTERVAL);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -326,6 +333,13 @@ pub async fn tail(
                     eprintln!("warning: could not listen for Ctrl-C ({err}); shutting down");
                 }
                 break;
+            }
+            conn = conn_rx.recv() => {
+                // On a lagged/closed stream just keep going: the roster summary on the
+                // next transition re-syncs the human view.
+                if let Ok(ev) = conn {
+                    print_conn_transition(&node, ev);
+                }
             }
             _ = ticker.tick() => {
                 match node.room_tail(limit).await {
@@ -340,6 +354,154 @@ pub async fn tail(
         .await
         .context("could not shut down cleanly")?;
     Ok(())
+}
+
+/// `room members <ROOM_ID> --status`: the recommended human-facing connection view
+/// (spec §6.2 point 2 / D6). Brings up an ephemeral managed node, reconciles the
+/// dial set from the live snapshot, waits up to `timeout` for links to settle, then
+/// prints each member with its membership `role`/`status` **and** live connection
+/// state + offline reason + bound device — the §16.3 "distinguish offline peer vs
+/// unauthorized peer" view a human reads.
+///
+/// # Errors
+/// Fails before bring-up if no local identity exists, the room is unknown, the caller
+/// is not an active member, an option is invalid, or the store / node cannot open.
+pub async fn members_status(
+    home: &Path,
+    room_id: &RoomId,
+    peers: &[String],
+    timeout: Duration,
+    loopback: bool,
+) -> Result<()> {
+    let peer_addrs = parse_peers(peers)?;
+
+    let secret = identity::SecretKeys::load(home)?;
+    let self_id = secret.identity.identity_key();
+    let self_device = endpoint_id_of(secret.device.device_key())?;
+
+    let db_path = home.join(DB_FILE);
+    let store = EventStore::open(&db_path)
+        .with_context(|| format!("could not open event store at {}", db_path.display()))?;
+    let (_, snapshot) = fold_room(&store, home, room_id)?;
+    if !snapshot.is_active(&self_id) {
+        bail!(
+            "you are not an active member of room {room_id}; only an active member can query \
+             connection status (this identity is {self_id})"
+        );
+    }
+
+    // Live admission cell the pump refreshes; the manager derives the dial set.
+    let admission_cell = Arc::new(Mutex::new(AdmissionView::from_snapshot(&snapshot, &[])));
+    let admission: Arc<dyn Admission> = Arc::new(SnapshotAdmission::new(admission_cell.clone()));
+    let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
+        .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
+    let cfg = NetConfig {
+        mode: net_mode(loopback),
+        ..NetConfig::default()
+    };
+    let node = Node::spawn_room(
+        secret_key,
+        admission,
+        Arc::new(TracingAudit),
+        engine,
+        cfg,
+        DEFAULT_TICK,
+        peer_addrs,
+        admission_cell,
+    )
+    .await
+    .context("could not bring up the network node")?;
+
+    // Wait (bounded) for the desired peers to connect, so the snapshot we print is
+    // settled rather than mid-dial. Timeout is expected when a peer is genuinely
+    // offline — we then render it as such, which is the whole point.
+    let desired: Vec<EndpointId> = PeerManager::desired_devices(&snapshot, self_device)
+        .into_iter()
+        .collect();
+    if !desired.is_empty() {
+        let _ = wait_for_any_connected(&node, &desired, timeout).await;
+    }
+
+    print_members_status(&node, &snapshot, self_device);
+
+    node.shutdown()
+        .await
+        .context("could not shut down cleanly")?;
+    Ok(())
+}
+
+/// Print membership × live connection state for `room members --status` (spec §6.2).
+fn print_members_status(node: &Node, snapshot: &MembershipSnapshot, self_device: EndpointId) {
+    println!("room: {}", snapshot.room_id());
+    match snapshot.admin() {
+        Some(admin) => println!("admin: {admin}"),
+        None => println!("admin: <none>"),
+    }
+    let entries: HashMap<EndpointId, PeerEntry> = node.peer_entries().into_iter().collect();
+    for m in snapshot.members() {
+        let admin_tag = if snapshot.admin() == Some(&m.identity) {
+            " (admin)"
+        } else {
+            ""
+        };
+        println!(
+            "member: {} role={} status={} conn={}{admin_tag}",
+            m.identity,
+            role_label(m.role),
+            status_label(m.status),
+            member_conn_field(&entries, m.device, self_device),
+        );
+    }
+    println!("{}", roster_summary(&node.peer_entries()));
+}
+
+/// The connection field for one member row: `self` for us, `n/a` for an invited-only
+/// member with no bound device, else the peer's live state (+ offline reason). A
+/// desired-but-never-seen device reads `offline reason=never_dialed`.
+fn member_conn_field(
+    entries: &HashMap<EndpointId, PeerEntry>,
+    device: Option<DeviceKey>,
+    self_device: EndpointId,
+) -> String {
+    let Some(dev) = device else {
+        return "n/a".to_owned();
+    };
+    let Ok(id) = EndpointId::from_bytes(dev.as_bytes()) else {
+        return "n/a".to_owned();
+    };
+    if id == self_device {
+        return "self".to_owned();
+    }
+    match entries.get(&id) {
+        Some(entry) if entry.state == PeerConnState::Offline => {
+            format!(
+                "{} reason={}",
+                entry.state.label(),
+                entry.offline_reason.label()
+            )
+        }
+        Some(entry) => entry.state.label().to_owned(),
+        None => "offline reason=never_dialed".to_owned(),
+    }
+}
+
+/// Presentation string for a [`Role`] (mirrors `room::role_str`).
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Admin => "admin",
+        Role::Member => "member",
+        Role::Agent => "agent",
+    }
+}
+
+/// Presentation string for a [`Status`] (mirrors `room::status_str`).
+fn status_label(status: Status) -> &'static str {
+    match status {
+        Status::Active => "active",
+        Status::Invited => "invited",
+        Status::Removed => "removed",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +633,12 @@ pub(crate) fn build_admission(snapshot: &MembershipSnapshot) -> AllowlistAdmissi
 /// The dial set: every active member's device minus our own, addressed by an
 /// explicit `--peer` when one matches (deterministic LAN/loopback) else by a bare
 /// `EndpointId` resolved through iroh discovery (D5).
+///
+/// The device **selection** (active-only, self-excluded, deduped) delegates to the
+/// net crate's [`PeerManager::desired_devices`] so there is a single implementation
+/// shared with the runtime peer manager (IR-0107 §11 step 1); this wrapper only maps
+/// each selected device to its `--peer`-hinted or bare address for the callers that
+/// still dial explicitly (`room send`, `pipe`).
 pub(crate) fn build_dial_set(
     snapshot: &MembershipSnapshot,
     self_device: EndpointId,
@@ -478,24 +646,15 @@ pub(crate) fn build_dial_set(
 ) -> Vec<EndpointAddr> {
     let by_id: BTreeMap<EndpointId, EndpointAddr> =
         peer_addrs.iter().map(|a| (a.id, a.clone())).collect();
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for m in snapshot.active_members() {
-        let Some(dev) = m.device else { continue };
-        let Ok(id) = EndpointId::from_bytes(dev.as_bytes()) else {
-            continue;
-        };
-        if id == self_device || !seen.insert(id) {
-            continue;
-        }
-        out.push(
+    PeerManager::desired_devices(snapshot, self_device)
+        .into_iter()
+        .map(|id| {
             by_id
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| EndpointAddr::new(id)),
-        );
-    }
-    out
+                .unwrap_or_else(|| EndpointAddr::new(id))
+        })
+        .collect()
 }
 
 /// Convert a core [`DeviceKey`] (`device_id`) into an iroh [`EndpointId`]; they are
@@ -632,6 +791,61 @@ fn print_new_messages(
 fn short_id(id: &IdentityKey) -> String {
     let hex = id.to_string();
     hex.get(..8).unwrap_or(&hex).to_owned()
+}
+
+/// A short, human-friendly device id: the first 8 chars of the endpoint id.
+fn short_device(device: &EndpointId) -> String {
+    let s = device.to_string();
+    s.get(..8).unwrap_or(&s).to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Connection-state panel (PRD §16.3; spec §6.2/§6.3)
+// ---------------------------------------------------------------------------
+
+/// Render one peer's stable, greppable status line (spec §6.2). The offline `reason`
+/// is included **only** for an offline peer, so an unauthorized peer never reads as
+/// "offline" (§16.4 honesty). Reason/state strings are the pinned
+/// [`PeerConnState::label`] / [`OfflineReason::label`] tooling contract.
+fn format_peer_line(device: EndpointId, entry: &PeerEntry) -> String {
+    let identity = entry
+        .identity
+        .map_or_else(|| "unknown".to_owned(), |id| short_id(&id));
+    let dev = short_device(&device);
+    if entry.state == PeerConnState::Offline {
+        format!(
+            "peer {identity} device={dev} state={} reason={}",
+            entry.state.label(),
+            entry.offline_reason.label()
+        )
+    } else {
+        format!("peer {identity} device={dev} state={}", entry.state.label())
+    }
+}
+
+/// A one-line roster summary refreshed on change (spec §6.2). `Connecting` peers are
+/// counted as neither connected nor offline yet — they are transient.
+fn roster_summary(entries: &[(EndpointId, PeerEntry)]) -> String {
+    let (mut connected, mut offline, mut unauthorized) = (0u32, 0u32, 0u32);
+    for (_, e) in entries {
+        match e.state {
+            PeerConnState::Connected => connected += 1,
+            PeerConnState::Offline => offline += 1,
+            PeerConnState::Unauthorized => unauthorized += 1,
+            PeerConnState::Connecting => {}
+        }
+    }
+    format!("peers: {connected} connected, {offline} offline, {unauthorized} unauthorized")
+}
+
+/// Print a per-peer transition line + the refreshed roster summary, driven by the
+/// live [`ConnEvent`] stream (spec §6.2, the mandatory AC3 surface).
+fn print_conn_transition(node: &Node, ev: ConnEvent) {
+    let entries = node.peer_entries();
+    if let Some((device, entry)) = entries.iter().find(|(d, _)| *d == ev.device) {
+        println!("{}", format_peer_line(*device, entry));
+    }
+    println!("{}", roster_summary(&entries));
 }
 
 // ---------------------------------------------------------------------------

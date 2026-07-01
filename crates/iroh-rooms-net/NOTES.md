@@ -156,11 +156,19 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
 
 ## Follow-ups (separate issues)
 
-- Wire the adapter into the `iroh-rooms` CLI binary + runtime (N1); remove the
+- ~~Wire the adapter into the `iroh-rooms` CLI binary + runtime (N1); remove the
   `demo` module's hardcoded seeds in favour of real identities + invite tickets
-  (N3) and mDNS LAN discovery (N4).
-- Re-point `Admission` to the live `MembershipSnapshot` + the fail-closed overlay
-  (D6 / OQ-6).
-- Deterministic double-connect tie-break (D8 / OQ-4); production hardening (N6);
-  chain the blob/pipe ALPNs onto the shared `Router`.
+  (N3) and mDNS LAN discovery (N4).~~ **Closed** — landed across IR-0101–IR-0105
+  (identity CLI, room creation, invite, join, messaging).
+- ~~Re-point `Admission` to the live `MembershipSnapshot` + the fail-closed overlay
+  (D6 / OQ-6).~~ **Closed by IR-0107** — `SnapshotAdmission` reads a shared
+  `AdmissionView` cell that the pump refreshes on every fold change; a device removed
+  mid-session begins being rejected within one tick.
+- ~~Production hardening (N6); chain the blob/pipe ALPNs onto the shared `Router`.~~
+  **Closed** — N6 (managed per-peer lifecycle) closed by IR-0107 (`PeerManager` +
+  `spawn_room` + `RoomReconciler`); pipe/event ALPN chaining closed by IR-0010.
+- ~~Roster-driven dial reconciliation (ADR-1 "per-room peer manager").~~ **Closed by
+  IR-0107** — `PeerManager.reconcile` derives the desired outbound set from the live
+  snapshot and starts/stops dial loops on membership change.
+- Deterministic double-connect tie-break (D8 / OQ-4) — still a follow-up.
 - **Run Gate A** and record the table above.
