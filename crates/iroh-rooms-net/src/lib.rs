@@ -40,6 +40,7 @@
 pub mod admission;
 pub mod alpn;
 pub mod audit;
+pub mod blob;
 pub mod demo;
 pub mod frame;
 pub mod handler;
@@ -57,6 +58,7 @@ pub use admission::{
 };
 pub use alpn::EVENT_ALPN;
 pub use audit::{AuditSink, TracingAudit};
+pub use blob::{BlobError, BlobImport, BlobStore};
 pub use frame::{FrameError, MAX_FRAME_BYTES};
 pub use handler::EventProtocolHandler;
 pub use manager::PeerManager;

@@ -80,4 +80,9 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["store"] }
 # normal dependency of this crate, so this adds no new resolution — only the
 # `net`/`io-util` features those in-test sockets need on top of the runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+# Independent BLAKE3 recompute in the `file share` hash-verification test (IR-0202).
+blake3 = "1"
+# Hex encoding/decoding used by the file_cli.rs hash-verification test. Already
+# a resolved crate in Cargo.lock (used by core and net).
+hex = "0.4"
 

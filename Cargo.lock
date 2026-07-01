@@ -2031,6 +2031,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "blake3",
  "clap",
  "directories",
  "getrandom 0.4.3",
@@ -2065,8 +2066,12 @@ name = "iroh-rooms-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
+ "hex",
  "iroh",
+ "iroh-blobs",
  "iroh-rooms-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
