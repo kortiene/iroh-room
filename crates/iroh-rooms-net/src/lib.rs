@@ -43,6 +43,7 @@ pub mod audit;
 pub mod demo;
 pub mod frame;
 pub mod handler;
+pub mod manager;
 pub mod node;
 pub mod pipe;
 pub mod state;
@@ -51,16 +52,18 @@ pub mod transport;
 mod peer;
 
 pub use admission::{
-    Admission, AdmissionDecision, AllowlistAdmission, JoinBootstrapAdmission, RejectCause,
+    Admission, AdmissionDecision, AdmissionView, AllowlistAdmission, JoinBootstrapAdmission,
+    RejectCause, SnapshotAdmission,
 };
 pub use alpn::EVENT_ALPN;
 pub use audit::{AuditSink, TracingAudit};
 pub use frame::{FrameError, MAX_FRAME_BYTES};
 pub use handler::EventProtocolHandler;
+pub use manager::PeerManager;
 pub use node::{Node, DEFAULT_TICK};
 pub use pipe::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,
     TracingPipeAudit, PIPE_ALPN,
 };
-pub use state::{ConnEvent, PeerConnState, PeerEntry, PeerTable};
+pub use state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
 pub use transport::{Inbound, NetConfig, NetMode, NetTransport, Shared};

@@ -26,6 +26,17 @@ pub trait AuditSink: Send + Sync + 'static {
     /// A peer's link dropped (now offline; will be redialed if still a member).
     fn disconnected(&self, device: EndpointId);
 
+    /// A peer moved to offline with a diagnostic reason (`unreachable` /
+    /// `transport_error` / `link_dropped`) — the PRD §16.3 / §18.1 refinement of a
+    /// generic offline. `reason` is the stable [`OfflineReason`](crate::state::OfflineReason)
+    /// label. Default: no-op, so existing sinks need not change.
+    fn offline(&self, _device: EndpointId, _reason: &'static str) {}
+
+    /// A peer was **deauthorized** mid-session — removed from the room, so the
+    /// managed dial loop was stopped and its link torn down (spec §4.2 step 3).
+    /// Terminal: we will not redial a since-removed peer. Default: no-op.
+    fn deauthorized(&self, _device: EndpointId) {}
+
     /// A connection was admitted **provisionally** for the join bootstrap
     /// (IR-0104, Approach A): a not-yet-Active invitee allowed to pull the
     /// membership sub-DAG and push a single `member.joined`. Default: no-op, so
@@ -72,6 +83,27 @@ impl AuditSink for TracingAudit {
 
     fn disconnected(&self, device: EndpointId) {
         tracing::info!(reason = "peer.disconnected", peer = %device, "link down");
+    }
+
+    fn offline(&self, device: EndpointId, cause: &'static str) {
+        // `peer.offline:<reason>` is the stable, greppable §16.3 diagnostic line —
+        // it distinguishes an unreachable peer from a transport error / link drop.
+        tracing::info!(
+            reason = "peer.offline",
+            cause,
+            peer = %device,
+            "peer is offline"
+        );
+    }
+
+    fn deauthorized(&self, device: EndpointId) {
+        // `peer.deauthorized` is the stable, greppable audit line for a mid-session
+        // roster removal (WARN: a security-relevant membership change).
+        tracing::warn!(
+            reason = "peer.deauthorized",
+            peer = %device,
+            "peer removed from the room mid-session; stopped dialing and tore down the link"
+        );
     }
 
     fn bootstrap_admitted(&self, device: EndpointId) {

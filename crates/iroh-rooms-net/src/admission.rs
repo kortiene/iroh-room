@@ -10,9 +10,11 @@
 //! not a reshape (the reusable-shape seam proven by `spike-blobs::acl::AuthContext`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use iroh::EndpointId;
 use iroh_rooms_core::event::keys::IdentityKey;
+use iroh_rooms_core::membership::MembershipSnapshot;
 
 /// The decision the accept-gate makes from a proven remote [`EndpointId`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +147,114 @@ impl Admission for AllowlistAdmission {
     }
 }
 
+/// An immutable admission decision table derived from a membership snapshot: the
+/// `device_id → identity` reverse map, the Active identity set, and the §0/§5
+/// fail-closed overlay. It carries exactly the three lookups
+/// [`AllowlistAdmission`] holds; [`SnapshotAdmission`] swaps a whole new view in
+/// atomically each time the fold changes, so admission tracks the **live** roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdmissionView {
+    device_to_identity: HashMap<EndpointId, IdentityKey>,
+    active: HashSet<IdentityKey>,
+    fail_closed: HashSet<IdentityKey>,
+}
+
+impl AdmissionView {
+    /// An empty view — fail-closed: every device is rejected as `UnknownDevice`
+    /// until the first snapshot is folded in.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build the view from the current membership snapshot plus the engine's
+    /// fail-closed subject set (`SyncEngine::fail_closed_subjects`).
+    ///
+    /// **Every** member with a bound device is entered into the reverse map so a
+    /// bound-but-inactive device (a removed/left member) resolves to `NotActive`
+    /// rather than `UnknownDevice` — the same distinction the fold makes. Only
+    /// `Active` identities go into the active set, so a since-removed member's
+    /// device stops being admitted the moment the fold learns of the removal.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &MembershipSnapshot, fail_closed: &[IdentityKey]) -> Self {
+        let mut device_to_identity = HashMap::new();
+        let mut active = HashSet::new();
+        for m in snapshot.members() {
+            if let Some(dev) = m.device {
+                if let Ok(id) = EndpointId::from_bytes(dev.as_bytes()) {
+                    device_to_identity.insert(id, m.identity);
+                }
+            }
+            if snapshot.is_active(&m.identity) {
+                active.insert(m.identity);
+            }
+        }
+        Self {
+            device_to_identity,
+            active,
+            fail_closed: fail_closed.iter().copied().collect(),
+        }
+    }
+
+    /// The admission decision for `device` under this view — the **exact** decision
+    /// order of [`AllowlistAdmission`] (`UnknownDevice` → `FailClosed` →
+    /// `NotActive` → `Admit`), so reject-before-bytes and every admission test
+    /// semantics are unchanged.
+    #[must_use]
+    fn decide(&self, device: EndpointId) -> AdmissionDecision {
+        let Some(identity) = self.device_to_identity.get(&device) else {
+            return AdmissionDecision::Reject(RejectCause::UnknownDevice);
+        };
+        if self.fail_closed.contains(identity) {
+            return AdmissionDecision::Reject(RejectCause::FailClosed);
+        }
+        if !self.active.contains(identity) {
+            return AdmissionDecision::Reject(RejectCause::NotActive);
+        }
+        AdmissionDecision::Admit {
+            identity: *identity,
+        }
+    }
+}
+
+/// Admission backed by the **live** membership snapshot (the IR-0005 NOTES D6/OQ-6
+/// production re-point, now due — spec §4.4).
+///
+/// `authorize(device)` reads the current [`AdmissionView`] out of a shared cell on
+/// every call, so a device removed mid-session begins being rejected as soon as the
+/// pump swaps in the post-removal view. The read takes a short, non-blocking
+/// critical section (`Mutex`, never held across an `.await`); at MVP room sizes
+/// (N≤5) this is well below any contention that would justify a lock-free
+/// `arc-swap` dependency (spec OQ-1). The pump is the **sole writer** of the cell.
+#[derive(Clone)]
+pub struct SnapshotAdmission {
+    cell: Arc<Mutex<AdmissionView>>,
+}
+
+impl SnapshotAdmission {
+    /// Wrap a shared admission cell. The caller keeps a clone of `cell` and swaps a
+    /// fresh [`AdmissionView`] into it whenever the fold changes.
+    #[must_use]
+    pub fn new(cell: Arc<Mutex<AdmissionView>>) -> Self {
+        Self { cell }
+    }
+}
+
+impl std::fmt::Debug for SnapshotAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SnapshotAdmission")
+    }
+}
+
+impl Admission for SnapshotAdmission {
+    fn authorize(&self, device: EndpointId) -> AdmissionDecision {
+        self.cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decide(device)
+    }
+}
+
 /// A provisional-aware admission gate for an admin hosting joins (IR-0104,
 /// Approach A — the join bootstrap seam).
 ///
@@ -168,19 +278,25 @@ impl Admission for AllowlistAdmission {
 /// mechanism, never an authorization one: `gate_join` still decides membership on
 /// every peer, so a provisional peer that fails the capability/key/expiry/role gate
 /// grants nothing anywhere.
+///
+/// Generic over the inner gate `A` so it can wrap either the frozen
+/// [`AllowlistAdmission`] (fixtures/tests) or the live [`SnapshotAdmission`] (the
+/// IR-0107 production re-point) without duplicating the overlay logic; the default
+/// keeps the historical `JoinBootstrapAdmission` (over `AllowlistAdmission`) working
+/// unchanged.
 #[derive(Debug, Clone)]
-pub struct JoinBootstrapAdmission {
-    inner: AllowlistAdmission,
+pub struct JoinBootstrapAdmission<A: Admission = AllowlistAdmission> {
+    inner: A,
     accept_joins: bool,
 }
 
-impl JoinBootstrapAdmission {
+impl<A: Admission> JoinBootstrapAdmission<A> {
     /// Wrap `inner` with the provisional join-bootstrap overlay. `accept_joins`
     /// should be set by the admin's join-hosting session **only** while at least one
     /// invite is open; the caller computes that policy (caller-is-admin +
     /// pending-invite) and passes the result here.
     #[must_use]
-    pub fn new(inner: AllowlistAdmission, accept_joins: bool) -> Self {
+    pub fn new(inner: A, accept_joins: bool) -> Self {
         Self {
             inner,
             accept_joins,
@@ -194,7 +310,7 @@ impl JoinBootstrapAdmission {
     }
 }
 
-impl Admission for JoinBootstrapAdmission {
+impl<A: Admission> Admission for JoinBootstrapAdmission<A> {
     fn authorize(&self, device: EndpointId) -> AdmissionDecision {
         match self.inner.authorize(device) {
             // An unknown device + an open join window ⇒ provisional bootstrap admit.
@@ -211,10 +327,12 @@ impl Admission for JoinBootstrapAdmission {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, AdmissionDecision, AllowlistAdmission, JoinBootstrapAdmission, RejectCause,
+        Admission, AdmissionDecision, AdmissionView, AllowlistAdmission, JoinBootstrapAdmission,
+        RejectCause, SnapshotAdmission,
     };
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
+    use std::sync::{Arc, Mutex};
 
     fn device(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
@@ -222,6 +340,20 @@ mod tests {
 
     fn identity(seed: u8) -> IdentityKey {
         IdentityKey::from_bytes([seed; 32])
+    }
+
+    /// Build an [`AdmissionView`] directly (same-module access to private fields)
+    /// so the live-admission tests need no full membership fold.
+    fn view(
+        bindings: &[(EndpointId, IdentityKey)],
+        active: &[IdentityKey],
+        fc: &[IdentityKey],
+    ) -> AdmissionView {
+        AdmissionView {
+            device_to_identity: bindings.iter().copied().collect(),
+            active: active.iter().copied().collect(),
+            fail_closed: fc.iter().copied().collect(),
+        }
     }
 
     #[test]
@@ -433,6 +565,97 @@ mod tests {
         assert_eq!(
             auth.authorize(device(4)),
             AdmissionDecision::Reject(RejectCause::FailClosed)
+        );
+    }
+
+    // ── SnapshotAdmission (IR-0107) — the live-roster re-point ──────────────────
+
+    #[test]
+    fn snapshot_admission_matches_allowlist_decision_matrix() {
+        // The four decision outcomes must match AllowlistAdmission exactly, so the
+        // reject-before-bytes guarantee and every admission semantic is unchanged.
+        let id_active = identity(0xA1);
+        let id_inactive = identity(0xB2);
+        let id_fc = identity(0xC3);
+        let v = view(
+            &[
+                (device(1), id_active),
+                (device(2), id_inactive),
+                (device(3), id_fc),
+            ],
+            &[id_active, id_fc],
+            &[id_fc],
+        );
+        let gate = SnapshotAdmission::new(Arc::new(Mutex::new(v)));
+
+        // unknown device
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        );
+        // bound but not active
+        assert_eq!(
+            gate.authorize(device(2)),
+            AdmissionDecision::Reject(RejectCause::NotActive)
+        );
+        // fail-closed takes priority over active
+        assert_eq!(
+            gate.authorize(device(3)),
+            AdmissionDecision::Reject(RejectCause::FailClosed)
+        );
+        // bound + active
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Admit {
+                identity: id_active
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_admission_live_flip_on_mid_session_removal() {
+        // Admit, then swap in a view without the identity (a mid-session removal):
+        // the very next authorize must reject — proving admission tracks the live
+        // roster, not a start-of-command freeze (AC2).
+        let id = identity(0xD4);
+        let cell = Arc::new(Mutex::new(view(&[(device(5), id)], &[id], &[])));
+        let gate = SnapshotAdmission::new(cell.clone());
+        assert_eq!(
+            gate.authorize(device(5)),
+            AdmissionDecision::Admit { identity: id }
+        );
+
+        // The pump swaps in the post-removal view: device still bound, no longer active.
+        *cell.lock().unwrap() = view(&[(device(5), id)], &[], &[]);
+        assert_eq!(
+            gate.authorize(device(5)),
+            AdmissionDecision::Reject(RejectCause::NotActive)
+        );
+    }
+
+    #[test]
+    fn empty_view_is_fail_closed() {
+        let gate = SnapshotAdmission::new(Arc::new(Mutex::new(AdmissionView::empty())));
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        );
+    }
+
+    #[test]
+    fn join_bootstrap_wraps_snapshot_admission() {
+        // The generic overlay must compose with the live gate: an unknown device in
+        // an open join window is provisional; an Active member is admitted normally.
+        let id = identity(0xE5);
+        let cell = Arc::new(Mutex::new(view(&[(device(6), id)], &[id], &[])));
+        let gate = JoinBootstrapAdmission::new(SnapshotAdmission::new(cell), true);
+        assert_eq!(
+            gate.authorize(device(6)),
+            AdmissionDecision::Admit { identity: id }
+        );
+        assert_eq!(
+            gate.authorize(device(99)),
+            AdmissionDecision::AdmitProvisional
         );
     }
 

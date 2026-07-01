@@ -17,7 +17,7 @@
 //! `&mut SyncEngine` across tasks.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
@@ -34,8 +34,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::admission::Admission;
+use crate::admission::{Admission, AdmissionView};
 use crate::audit::AuditSink;
+use crate::manager::PeerManager;
 use crate::peer::peer_id;
 use crate::pipe::alpn::{PIPE_ALPN, PIPE_ALPN_STR};
 use crate::pipe::registry::is_loopback_target;
@@ -44,7 +45,7 @@ use crate::pipe::{
     connector, new_pipe_id, watcher, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder,
     PipeHandlerState, PipeProtocolHandler, PipeQuery, PipeRegistry, PipeSessions, TracingPipeAudit,
 };
-use crate::state::{ConnEvent, PeerConnState};
+use crate::state::{ConnEvent, PeerConnState, PeerEntry};
 use crate::transport::{Inbound, NetConfig, NetTransport, Shared};
 
 /// Default anti-entropy tick (drives `on_tick` re-pulls + reconnect catch-up).
@@ -58,7 +59,58 @@ enum Cmd {
     Heads(oneshot::Sender<Result<Vec<EventId>, String>>),
     Snapshot(oneshot::Sender<MembershipSnapshot>),
     Completeness(oneshot::Sender<Completeness>),
+    /// Force an immediate peer-manager reconcile + admission refresh (a test hook;
+    /// a no-op for a node with no room session). See [`Node::reconcile_now`].
+    Reconcile(oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
+}
+
+/// The extra inputs a managed room session needs (spec §4.3/§4.4).
+struct RoomConfig {
+    /// Operator `--peer` addresses, used by the manager to resolve each device.
+    addr_hints: Vec<EndpointAddr>,
+    /// The live admission cell the pump refreshes each fold change; the session's
+    /// admission gate reads it on the accept hot path.
+    admission_cell: Arc<Mutex<AdmissionView>>,
+}
+
+/// The pump-owned reconciler that keeps the dial set and the admission cell in step
+/// with the live membership fold (spec §4.3 — snapshot-diff on the existing tick).
+struct RoomReconciler {
+    manager: Arc<PeerManager>,
+    cell: Arc<Mutex<AdmissionView>>,
+    /// The last admission view we reconciled against — the cheap fold-change
+    /// detector. `None` forces the next reconcile (initial + `reconcile_now`).
+    last: Option<AdmissionView>,
+}
+
+impl RoomReconciler {
+    /// Reconcile **only if** the membership-relevant projection of the fold changed
+    /// since the last reconcile. Idempotent otherwise (no dial churn, no admission
+    /// swap). Called after every fold-mutating pump step and on each tick.
+    fn maybe_reconcile(&mut self, engine: &SyncEngine) {
+        let snapshot = engine.snapshot();
+        let view = AdmissionView::from_snapshot(&snapshot, &engine.fail_closed_subjects());
+        if self.last.as_ref() == Some(&view) {
+            return; // no membership-relevant change since last reconcile
+        }
+        // Refresh admission first so the accept gate is never *more* permissive than
+        // the dial set, then reconcile the outbound loops against the same snapshot.
+        *self
+            .cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = view.clone();
+        self.manager.reconcile(&snapshot);
+        self.last = Some(view);
+    }
+
+    /// Force a reconcile regardless of the change detector (the `reconcile_now` test
+    /// hook: makes a just-applied membership change take effect without waiting for
+    /// the natural fold-change detection).
+    fn force_reconcile(&mut self, engine: &SyncEngine) {
+        self.last = None;
+        self.maybe_reconcile(engine);
+    }
 }
 
 /// A running event-transport node: a [`NetTransport`] carrier + an engine pump.
@@ -71,6 +123,11 @@ pub struct Node {
     transport: NetTransport,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     pump: JoinHandle<()>,
+    /// The room-scoped peer manager, present only for a managed room session (spec
+    /// §4.1). `None` for the simple `spawn` path (join bootstrap, pipe, `send`),
+    /// which keeps driving dials through [`Node::connect_to`]. Held so
+    /// [`Node::shutdown`] can abort its dial loops.
+    peer_manager: Option<Arc<PeerManager>>,
     pipe_query: PipeQuery,
     pipe_registry: Arc<PipeRegistry>,
     pipe_sessions: Arc<PipeSessions>,
@@ -82,6 +139,12 @@ impl Node {
     /// Bind a transport for `secret` and spawn the pump driving `engine` over it.
     /// `tick` is the anti-entropy interval (see [`DEFAULT_TICK`]).
     ///
+    /// This is the **unmanaged** path: the caller drives dialing explicitly through
+    /// [`Node::connect_to`] and supplies a fixed `admission` gate. Used by the join
+    /// bootstrap (IR-0104), the pipe commands (IR-0010), and short-lived `room send`.
+    /// For a long-running room session that must react to membership change, use
+    /// [`Node::spawn_room`].
+    ///
     /// # Errors
     /// Returns an error if the endpoint fails to bind.
     pub async fn spawn(
@@ -91,6 +154,60 @@ impl Node {
         engine: SyncEngine,
         cfg: NetConfig,
         tick: Duration,
+    ) -> Result<Self> {
+        Self::spawn_inner(secret, admission, audit, engine, cfg, tick, None).await
+    }
+
+    /// Bind a transport and spawn the pump as a **managed room session** (IR-0107,
+    /// spec §4.1–§4.4).
+    ///
+    /// A [`PeerManager`] derives the outbound dial set from the live membership
+    /// snapshot and reconciles it on every fold change; the pump swaps a fresh
+    /// [`AdmissionView`] into `admission_cell` in the same place, so the (live)
+    /// `admission` gate — expected to be a
+    /// [`SnapshotAdmission`](crate::admission::SnapshotAdmission) reading
+    /// `admission_cell`, optionally wrapped by
+    /// [`JoinBootstrapAdmission`](crate::admission::JoinBootstrapAdmission) — never
+    /// drifts from the dial set. The caller does **not** call [`Node::connect_to`];
+    /// the manager owns dialing. `addr_hints` are the operator's `--peer` addresses
+    /// used to resolve each device deterministically (loopback/LAN).
+    ///
+    /// # Errors
+    /// Returns an error if the endpoint fails to bind.
+    #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
+    pub async fn spawn_room(
+        secret: SecretKey,
+        admission: Arc<dyn Admission>,
+        audit: Arc<dyn AuditSink>,
+        engine: SyncEngine,
+        cfg: NetConfig,
+        tick: Duration,
+        addr_hints: Vec<EndpointAddr>,
+        admission_cell: Arc<Mutex<AdmissionView>>,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            secret,
+            admission,
+            audit,
+            engine,
+            cfg,
+            tick,
+            Some(RoomConfig {
+                addr_hints,
+                admission_cell,
+            }),
+        )
+        .await
+    }
+
+    async fn spawn_inner(
+        secret: SecretKey,
+        admission: Arc<dyn Admission>,
+        audit: Arc<dyn AuditSink>,
+        engine: SyncEngine,
+        cfg: NetConfig,
+        tick: Duration,
+        room: Option<RoomConfig>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         // A dedicated channel for the Pipe plane's reads against the single-owner
@@ -120,6 +237,31 @@ impl Node {
         let conn_rx = transport.conn_events();
         let shared = transport.shared();
 
+        // Build the room-scoped manager + admission-refresh reconciler when this is a
+        // managed session. The manager is moved (as a clone) into the pump so the
+        // single-owner engine drives reconciliation; `Node` keeps a handle to abort
+        // its dial loops on shutdown.
+        let (peer_manager, room_reconciler) = match room {
+            Some(RoomConfig {
+                addr_hints,
+                admission_cell,
+            }) => {
+                let manager = Arc::new(PeerManager::new(
+                    shared.clone(),
+                    transport.endpoint(),
+                    transport.id(),
+                    addr_hints,
+                ));
+                let reconciler = RoomReconciler {
+                    manager: manager.clone(),
+                    cell: admission_cell,
+                    last: None,
+                };
+                (Some(manager), Some(reconciler))
+            }
+            None => (None, None),
+        };
+
         let pump = tokio::spawn(pump(
             engine,
             inbound_rx,
@@ -128,6 +270,7 @@ impl Node {
             cmd_rx,
             pipe_query_rx,
             tick,
+            room_reconciler,
         ));
 
         // The teardown-on-learn watcher (spec §4.5/D5): re-evaluates every live pipe
@@ -144,6 +287,7 @@ impl Node {
             transport,
             cmd_tx,
             pump,
+            peer_manager,
             pipe_query,
             pipe_registry,
             pipe_sessions,
@@ -188,10 +332,32 @@ impl Node {
         self.transport.peer_states()
     }
 
+    /// Point-in-time snapshot of all known peers' full [`PeerEntry`] (state +
+    /// offline reason + bound identity) — the source for the CLI §16.3 connection
+    /// panel and `room members --status` (spec §4.5 / §6).
+    #[must_use]
+    pub fn peer_entries(&self) -> Vec<(EndpointId, PeerEntry)> {
+        self.transport.peer_entries()
+    }
+
     /// Subscribe to the live [`ConnEvent`] transition stream.
     #[must_use]
     pub fn conn_events(&self) -> broadcast::Receiver<ConnEvent> {
         self.transport.conn_events()
+    }
+
+    /// Force the managed peer manager to reconcile against the **current** fold now,
+    /// rather than waiting for the next tick / fold-change detection (spec §5 test
+    /// hook). A no-op for an unmanaged node (one spawned via [`Node::spawn`]).
+    ///
+    /// # Errors
+    /// Returns an error if the pump is gone.
+    pub async fn reconcile_now(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Reconcile(tx))
+            .map_err(|_| anyhow!("pump task is gone"))?;
+        rx.await.map_err(|_| anyhow!("pump dropped the reply"))
     }
 
     /// Publish a locally-authored, stateless-valid `WireEvent` frame: the engine
@@ -489,12 +655,17 @@ impl Node {
             transport,
             cmd_tx,
             pump,
+            peer_manager,
             pipe_watcher,
             ..
         } = self;
         let (tx, rx) = oneshot::channel();
         if cmd_tx.send(Cmd::Shutdown(tx)).is_ok() {
             let _ = rx.await;
+        }
+        // Abort the managed dial loops (if any) so they do not outlive the session.
+        if let Some(manager) = peer_manager {
+            manager.shutdown();
         }
         pump.abort();
         pipe_watcher.abort();
@@ -519,6 +690,13 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
 }
 
 /// The single task that owns the engine and routes its outputs.
+///
+/// For a managed room session (`room` is `Some`) the pump also owns the
+/// [`RoomReconciler`]: after every fold-mutating step (publish, inbound message) and
+/// on each tick it reconciles the [`PeerManager`] dial set and refreshes the live
+/// admission cell against the current snapshot (spec §4.3 — snapshot-diff on the
+/// existing tick, so no new membership-change event plumbing is introduced).
+#[allow(clippy::too_many_arguments)] // one wiring seam; each channel/handle is distinct
 async fn pump(
     mut engine: SyncEngine,
     mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
@@ -527,15 +705,23 @@ async fn pump(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     mut pipe_query_rx: mpsc::UnboundedReceiver<PipeQueryMsg>,
     tick: Duration,
+    mut room: Option<RoomReconciler>,
 ) {
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Establish the initial dial set + admission view from the opening snapshot so a
+    // managed session starts dialing its active members immediately (not after the
+    // first fold change).
+    if let Some(room) = room.as_mut() {
+        room.maybe_reconcile(&engine);
+    }
 
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
-                if handle_cmd(&mut engine, &shared, cmd) {
+                if handle_cmd(&mut engine, &shared, &mut room, cmd) {
                     break;
                 }
             }
@@ -574,6 +760,11 @@ async fn pump(
                                 // lift the restriction and record its identity.
                                 maybe_upgrade_provisional(&engine, &shared, inbound.peer);
                             }
+                            // An inbound message may have advanced membership (a join
+                            // landed, a member was removed): reconcile against it.
+                            if let Some(room) = room.as_mut() {
+                                room.maybe_reconcile(&engine);
+                            }
                         }
                     }
                     Err(err) => {
@@ -593,13 +784,23 @@ async fn pump(
             _ = ticker.tick() => {
                 let outs = engine.on_tick(now_ms());
                 route_all(&shared, outs);
+                // The anti-entropy cadence doubles as the roster-reactive reconcile
+                // trigger (spec §4.3): bounded ≤1-tick latency to react to a change.
+                if let Some(room) = room.as_mut() {
+                    room.maybe_reconcile(&engine);
+                }
             }
         }
     }
 }
 
 /// Apply one command; returns `true` if the pump should stop.
-fn handle_cmd(engine: &mut SyncEngine, shared: &Arc<Shared>, cmd: Cmd) -> bool {
+fn handle_cmd(
+    engine: &mut SyncEngine,
+    shared: &Arc<Shared>,
+    room: &mut Option<RoomReconciler>,
+    cmd: Cmd,
+) -> bool {
     match cmd {
         Cmd::Publish(bytes, reply) => {
             let result = match engine.publish(&bytes) {
@@ -609,6 +810,11 @@ fn handle_cmd(engine: &mut SyncEngine, shared: &Arc<Shared>, cmd: Cmd) -> bool {
                 }
                 Err(err) => Err(err.to_string()),
             };
+            // A publish can advance membership (e.g. an admin `member.removed`):
+            // reconcile the dial set + admission against the new snapshot.
+            if let Some(room) = room.as_mut() {
+                room.maybe_reconcile(engine);
+            }
             let _ = reply.send(result);
             false
         }
@@ -636,6 +842,16 @@ fn handle_cmd(engine: &mut SyncEngine, shared: &Arc<Shared>, cmd: Cmd) -> bool {
         }
         Cmd::Completeness(reply) => {
             let _ = reply.send(engine.completeness());
+            false
+        }
+        Cmd::Reconcile(reply) => {
+            // Force an immediate reconcile against the current fold (a no-op for a
+            // node with no room session). Bypasses the change detector so a
+            // just-applied membership change takes effect without waiting for a tick.
+            if let Some(room) = room.as_mut() {
+                room.force_reconcile(engine);
+            }
+            let _ = reply.send(());
             false
         }
         Cmd::Shutdown(reply) => {

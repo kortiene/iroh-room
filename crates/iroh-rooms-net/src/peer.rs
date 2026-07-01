@@ -22,7 +22,7 @@ use crate::admission::AdmissionDecision;
 use crate::alpn::EVENT_ALPN;
 use crate::frame::{read_frame, write_frame};
 use crate::handler::REJECT_CODE;
-use crate::state::PeerConnState;
+use crate::state::{OfflineReason, PeerConnState};
 use crate::transport::{Inbound, Shared};
 
 /// Bridge an iroh [`EndpointId`] (device key) to the engine's [`PeerId`] — both
@@ -126,7 +126,9 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                             peer = %remote,
                             "dial: remote only provisionally admissible; backing off without establishing"
                         );
-                        shared.table.set(remote, PeerConnState::Offline, None);
+                        shared
+                            .table
+                            .set_offline(remote, OfflineReason::Unreachable, None);
                     }
                     AdmissionDecision::Admit { identity } => {
                         match establish_outbound(&shared, &conn, remote, identity).await {
@@ -141,8 +143,14 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                                     shared.table.set(remote, PeerConnState::Unauthorized, None);
                                     return;
                                 }
-                                shared.table.set(remote, PeerConnState::Offline, None);
+                                // Was Up, the live link fell: a transient drop we redial.
+                                shared
+                                    .table
+                                    .set_offline(remote, OfflineReason::LinkDropped, None);
                                 shared.audit.disconnected(remote);
+                                shared
+                                    .audit
+                                    .offline(remote, OfflineReason::LinkDropped.label());
                             }
                             Established::RemoteRejected => {
                                 // The remote's accept-gate refused us (stable REJECT
@@ -155,15 +163,31 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                                 return;
                             }
                             Established::Failed => {
-                                shared.table.set(remote, PeerConnState::Offline, None);
+                                // Connected at QUIC but the stream open/handshake failed —
+                                // reachable, but the transport could not carry events.
+                                shared.table.set_offline(
+                                    remote,
+                                    OfflineReason::TransportError,
+                                    None,
+                                );
+                                shared
+                                    .audit
+                                    .offline(remote, OfflineReason::TransportError.label());
                             }
                         }
                     }
                 }
             }
             Err(err) => {
+                // `endpoint.connect()` failed: no path to the peer (the common
+                // "peer is offline / unreachable" case).
                 tracing::debug!(%err, peer = %target, "dial: connect failed");
-                shared.table.set(target, PeerConnState::Offline, None);
+                shared
+                    .table
+                    .set_offline(target, OfflineReason::Unreachable, None);
+                shared
+                    .audit
+                    .offline(target, OfflineReason::Unreachable.label());
             }
         }
 
@@ -204,8 +228,9 @@ async fn establish_outbound(
                 tracing::warn!(peer = %remote, "dial: remote refused admission (reject close)");
                 Established::RemoteRejected
             } else {
+                // Reachable QUIC, but the bidi stream would not open — a transport
+                // error, not a "no path" unreachable. The caller records the reason.
                 tracing::warn!(%err, peer = %remote, "dial: open_bi failed");
-                shared.table.set(remote, PeerConnState::Offline, None);
                 Established::Failed
             }
         }

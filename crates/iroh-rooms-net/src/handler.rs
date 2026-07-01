@@ -16,7 +16,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 
 use crate::admission::AdmissionDecision;
 use crate::peer::register_connection;
-use crate::state::PeerConnState;
+use crate::state::{OfflineReason, PeerConnState};
 use crate::transport::Shared;
 
 /// Application close code used when admission rejects a remote endpoint. A stable
@@ -76,7 +76,9 @@ impl ProtocolHandler for EventProtocolHandler {
                 // alive until it closes, then surface the disconnect.
                 conn.closed().await;
                 self.shared.unregister(device);
-                self.shared.table.set(device, PeerConnState::Offline, None);
+                self.shared
+                    .table
+                    .set_offline(device, OfflineReason::LinkDropped, None);
                 self.shared.audit.disconnected(device);
                 Ok(())
             }
@@ -102,7 +104,9 @@ impl ProtocolHandler for EventProtocolHandler {
                 conn.closed().await;
                 self.shared.clear_provisional(device);
                 self.shared.unregister(device);
-                self.shared.table.set(device, PeerConnState::Offline, None);
+                self.shared
+                    .table
+                    .set_offline(device, OfflineReason::LinkDropped, None);
                 self.shared.audit.disconnected(device);
                 Ok(())
             }

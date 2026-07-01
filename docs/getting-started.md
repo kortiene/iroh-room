@@ -41,6 +41,11 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   as of issue #20 / IR-0105. Both commands work against the shipped binary and the output
 >   blocks below are reconciled to its actual format. The full two-human exchange is now
 >   complete end-to-end once Step 3 join has been performed.
+>   As of issue #22 / IR-0107, `room tail` also prints a per-peer connection-state line
+>   (`peer … state=connected/offline/unauthorized [reason=…]`) and a roster summary
+>   (`peers: N connected, M offline, K unauthorized`) each time a peer's state changes.
+>   `room members <ROOM_ID> --status` is also available to query live connection state
+>   from a short-lived node without keeping a session running.
 > - **Step 6** (`iroh-rooms pipe expose | connect | close | list`) is implemented and runnable
 >   as of issue #14 / IR-0010. Output blocks are reconciled against the shipped binary and show
 >   the actual format. Two format notes: `--tcp` requires an IP address (`127.0.0.1:3000`, not
@@ -406,16 +411,25 @@ On startup `room tail` prints its own dialable address as a `listening:` line. O
 network the peers find each other by iroh discovery, so you can ignore it. On a LAN or in CI
 (no discovery), copy that address and pass it to the sender as `--peer` (and vice versa).
 
-**Expected output** — Alice's `room tail` on startup, then Bob's message once it arrives
-(reconciled to the binary; `<author>` is the sender's `member.joined` display name if known,
-else a short identity id):
+**Expected output** — Alice's `room tail` on startup, then Bob's connection and message
+(reconciled to the binary; `<author>` is the sender's `member.joined` display name if
+known, else a short identity id; `<identity-short>` / `<device-short>` are the first 8
+chars of the respective key):
 
 ```text
 listening: <ENDPOINT_ID>@<ip:port>
 tip: share this address with the other peer via --peer
 room: <ROOM_ID>
+peer <identity-short> device=<device-short> state=connected
+peers: 1 connected, 0 offline, 0 unauthorized
 [2026-06-30T12:01:04Z] bob1a2b3c: I pushed the first prototype.
 ```
+
+The two `peer …` / `peers: …` lines are the PRD §16.3 connection panel printed by the
+peer connection manager (IR-0107). They appear on every state change (connect, drop,
+unauthorized), so a long-running `room tail` session gives a live view of who is online.
+To query connection state without a long-running session, use
+`iroh-rooms room members <ROOM_ID> --status`.
 
 **Command** (Terminal B — Bob) — send a message:
 
@@ -660,16 +674,27 @@ reason codes are stable identifiers also written to the local audit log.
 
 - **Reproduce:** stop Alice's process, then from Bob run `room send`, `file fetch`, or
   `pipe connect`.
-- **CLI reports:** a connection-state failure — *no provider / peer unreachable*
-  (PRD §16.3 "offline peer"). Illustrative:
+- **CLI reports:** in a running `room tail` session the connection panel fires on Alice's
+  drop, printing a stable reason string (PRD §16.3 / IR-0107):
 
   ```text
-  Cannot reach peer Alice (9a02…11bd): no provider online.
-  Nothing is queued on a server — this will succeed when both peers are online.
+  peer 9a0211bd device=7f3a2c1b state=offline reason=link_dropped
+  peers: 0 connected, 1 offline, 0 unauthorized
   ```
 
-- **Next action:** bring the peer back online and retry. Nothing is queued anywhere; delivery
-  resumes only when both peers are online together.
+  For one-shot commands (`room send`, `file fetch`) the failure is reported inline:
+
+  ```text
+  delivered: 0 (no peers online — stored locally only)
+  ```
+
+  `room members <ROOM_ID> --status` shows `conn=offline reason=unreachable` for
+  Alice's row if she cannot be reached within the timeout.
+
+- **Next action:** bring the peer back online and retry. Nothing is queued anywhere;
+  delivery resumes only when both peers are online together. The `reason` field
+  distinguishes a peer who went offline cleanly (`link_dropped`) from one that was
+  never reachable (`unreachable`) or had a transport-level failure (`transport_error`).
 
 ### Unauthorized peer
 
