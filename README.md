@@ -34,6 +34,29 @@ Room Event Plane builds on:
 - 70 conformance tests including byte-exact golden vectors (242-byte CSB, `event_id`,
   signature, `room_id_A/B`).
 
+The **protocol conformance test suite** has landed in
+`crates/iroh-rooms-core/tests/` (issue #7 / IR-0003). This is the §-indexed,
+traceable conformance binary the `PHASE-0-SPIKE.md` Spike Plan Gate B and Gate D
+require — one `#[test]` per spike Protocol Test Vector (§1–§20), all fast,
+network-free, and deterministic:
+
+- **`cargo test -p iroh-rooms-core --test protocol_conformance --all-features`**
+  runs the full suite. No wall-clock reads, no entropy — every key is seed-derived
+  and every clock is injected.
+- **Shared `conformance/fixtures.rs`**: deterministic Cast (Alice/Bob/Carol/Dave/Mallory,
+  seed-derived keys), Room (`room_id_A`/`room_id_B`), and a fully-assembled fixture-log
+  DAG (`E_create … E_pipe`, `E_eq_a/b`, `E_mal`). Tier-1 golden values (CSB,
+  `event_id`, signatures, `room_id`) are byte-exact reproductions asserted against
+  the spike; Tier-2 fixture-log ids are regenerated from the landed content schema
+  and pinned as regression tripwires.
+- **Taxonomy completeness gate** (`conformance/taxonomy.rs`): every `RejectReason` (14)
+  and `Flag` (3) code is exercised by a named vector or must be on an explicit `DEFERRED`
+  list — which is empty (the whole taxonomy is covered). Adding a variant to either enum
+  without extending the gate causes the test to fail; a new reason cannot land silently.
+- **Traceability table** in `conformance/mod.rs`: the §1–§20 → test-fn map and the
+  §8 taxonomy code → vector map, embedded as a module doc comment and machine-checkable
+  against the coverage registry.
+
 The **SQLite event store** has landed in `iroh-rooms-core::store` behind the
 `store` cargo feature (issue #8 / IR-0004). It provides the persistence layer
 the membership fold and sync layers will build on:
