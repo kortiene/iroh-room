@@ -690,3 +690,79 @@ fn by_type_excludes_other_event_types() {
         .unwrap()
         .is_empty());
 }
+
+// ── room_ids() (spec IR-0108 §4.2 / §5.1) ────────────────────────────────────
+
+// room_ids() returns an empty vec for an empty store (spec §4.2 substrate).
+#[test]
+fn room_ids_empty_store_returns_empty() {
+    let store = EventStore::open_in_memory().unwrap();
+    assert!(
+        store.room_ids().unwrap().is_empty(),
+        "room_ids() on an empty store must return an empty vec"
+    );
+}
+
+// room_ids() returns the single room when exactly one room is present.
+#[test]
+fn room_ids_single_room_returns_that_room() {
+    let (id, dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&id, &dev);
+    let mut store = EventStore::open_in_memory().unwrap();
+    store.insert(&g).unwrap();
+
+    let ids = store.room_ids().unwrap();
+    assert_eq!(ids, vec![room]);
+}
+
+// room_ids() returns all three rooms, ascending, de-duplicated — even with
+// multiple events in one room (spec §4.2 DISTINCT / ORDER BY guarantee).
+#[test]
+fn room_ids_three_rooms_ascending_deduplicated() {
+    let (id_a, dev_a) = (sk(0x31), sk(0x32));
+    let (id_b, dev_b) = (sk(0x33), sk(0x34));
+    let (id_c, dev_c) = (sk(0x35), sk(0x36));
+    let (g_a, room_a) = genesis(&id_a, &dev_a);
+    let (g_b, room_b) = genesis(&id_b, &dev_b);
+    let (g_c, room_c) = genesis(&id_c, &dev_c);
+    // A second event in room_a — room_ids() must still return room_a only once.
+    let m_a = message(&id_a, &dev_a, room_a, vec![g_a.event_id], "extra", T0 + 1);
+
+    let mut store = EventStore::open_in_memory().unwrap();
+    // Insert interleaved to stress de-duplication and ordering.
+    store.insert(&g_b).unwrap();
+    store.insert(&g_a).unwrap();
+    store.insert(&m_a).unwrap();
+    store.insert(&g_c).unwrap();
+
+    let ids = store.room_ids().unwrap();
+    assert_eq!(ids.len(), 3, "expected exactly 3 distinct rooms");
+
+    let mut expected = vec![room_a, room_b, room_c];
+    expected.sort_unstable();
+    let mut actual = ids;
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "all three rooms must be present");
+}
+
+// room_ids() returns the same result before and after rebuild (derived-state
+// determinism; spec §4.2 "mirrors room_event_ids").
+#[test]
+fn room_ids_survives_rebuild_unchanged() {
+    let (id_a, dev_a) = (sk(0x41), sk(0x42));
+    let (id_b, dev_b) = (sk(0x43), sk(0x44));
+    let (g_a, _room_a) = genesis(&id_a, &dev_a);
+    let (g_b, _room_b) = genesis(&id_b, &dev_b);
+
+    let mut store = EventStore::open_in_memory().unwrap();
+    store.insert(&g_a).unwrap();
+    store.insert(&g_b).unwrap();
+
+    let before = store.room_ids().unwrap();
+    store.rebuild().unwrap();
+    let after = store.room_ids().unwrap();
+    assert_eq!(
+        before, after,
+        "room_ids() must be identical before and after rebuild (restart determinism)"
+    );
+}

@@ -155,7 +155,40 @@ impl Node {
         cfg: NetConfig,
         tick: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(secret, admission, audit, engine, cfg, tick, None).await
+        Self::spawn_inner(secret, admission, audit, engine, cfg, tick, None, None).await
+    }
+
+    /// Like [`Node::spawn`] but with a caller-supplied Live-Pipe-Plane audit sink
+    /// instead of the default [`TracingPipeAudit`].
+    ///
+    /// The `pipe expose` CLI uses this to surface owner-side reject / teardown /
+    /// accept lines directly to the operator's terminal (spec IR-0108 §4.3) — the
+    /// default `tracing` sink is dropped because the CLI installs no subscriber.
+    /// Every other caller keeps the `TracingPipeAudit` default via [`Node::spawn`].
+    ///
+    /// # Errors
+    /// Returns an error if the endpoint fails to bind.
+    #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
+    pub async fn spawn_with_pipe_audit(
+        secret: SecretKey,
+        admission: Arc<dyn Admission>,
+        audit: Arc<dyn AuditSink>,
+        engine: SyncEngine,
+        cfg: NetConfig,
+        tick: Duration,
+        pipe_audit: Arc<dyn PipeAuditSink>,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            secret,
+            admission,
+            audit,
+            engine,
+            cfg,
+            tick,
+            None,
+            Some(pipe_audit),
+        )
+        .await
     }
 
     /// Bind a transport and spawn the pump as a **managed room session** (IR-0107,
@@ -196,10 +229,12 @@ impl Node {
                 addr_hints,
                 admission_cell,
             }),
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
     async fn spawn_inner(
         secret: SecretKey,
         admission: Arc<dyn Admission>,
@@ -208,6 +243,7 @@ impl Node {
         cfg: NetConfig,
         tick: Duration,
         room: Option<RoomConfig>,
+        pipe_audit: Option<Arc<dyn PipeAuditSink>>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         // A dedicated channel for the Pipe plane's reads against the single-owner
@@ -217,7 +253,10 @@ impl Node {
 
         let pipe_registry = Arc::new(PipeRegistry::new());
         let pipe_sessions = Arc::new(PipeSessions::new());
-        let pipe_audit: Arc<dyn PipeAuditSink> = Arc::new(TracingPipeAudit);
+        // Default to the structured `tracing` sink; an explicit caller sink (the
+        // CLI's stderr renderer, spec IR-0108 §4.3) overrides it when supplied.
+        let pipe_audit: Arc<dyn PipeAuditSink> =
+            pipe_audit.unwrap_or_else(|| Arc::new(TracingPipeAudit));
 
         // The pipe accept-gate handler, registered as the second ALPN on the shared
         // Router (one Endpoint serves both planes, spec §6.5.1).

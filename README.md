@@ -368,6 +368,21 @@ The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
 - **Gate A (real-NAT run for the pipe ALPN) is still owed** before MVP go, inheriting the
   open Gate-A risk from the transport prototype (#9); see `crates/iroh-rooms-net/NOTES.md`.
 
+Issue **#23 / IR-0108** reconciles that prototype to the PRD's canonical, user-facing contract
+(no change to the authorization model, event schema, gate, or splice logic):
+
+- `iroh-rooms pipe close <PIPE_ID>` now takes a **bare pipe id** — the room is inferred from the
+  local log (backed by the additive read-only `EventStore::room_ids()`), with an optional
+  `--room <ROOM_ID>` disambiguator that fails closed on an unknown or ambiguous pipe.
+- The owner's `pipe expose` installs a **stderr audit sink** (`Node::spawn_with_pipe_audit`), so
+  an unauthorized connect is rejected **and locally visible** as
+  `pipe.connect.rejected:<cause>`; `-v` also logs each accepted connection. stdout stays clean
+  for scripting.
+- The §13.2.4 security warning names the exposed **target and each allowed member**, and graceful
+  owner exit now covers **SIGINT and SIGTERM** (`pipe.closed{owner_exit}`); a hard kill
+  (SIGKILL / power loss) still stops forwarding but leaves the pipe open on the log until an
+  owner/admin `pipe close` — a documented reachability bound.
+
 The **Gate-A real-NAT measurement harness** has landed in `crates/spike-nat`
 (issue #43 / IR-0012), providing the purpose-built `nat-probe` tool and a complete
 runbook + results schema for closing the one load-bearing Phase-0 assumption still

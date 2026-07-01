@@ -191,6 +191,29 @@ impl EventStore {
         Ok(out)
     }
 
+    /// Every distinct `room_id` present in the store, ascending by raw id
+    /// (bytewise `memcmp`, which is exactly [`RoomId`]'s `Ord`).
+    ///
+    /// The substrate for a global "which room owns this `pipe_id`?" scan
+    /// (`iroh-rooms pipe close <PIPE_ID>` room inference, spec IR-0108 §4.2) and a
+    /// future `room ls`. Additive and read-only — no schema or `user_version`
+    /// change (mirrors [`EventStore::room_event_ids`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] if a
+    /// stored `room_id` is not 32 bytes.
+    pub fn room_ids(&self) -> Result<Vec<RoomId>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT DISTINCT room_id FROM events ORDER BY room_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(RoomId::from_bytes(to_raw_id(&r?)?));
+        }
+        Ok(out)
+    }
+
     // -- parent lookup (both directions) --------------------------------------
 
     /// The declared `prev_events` of an event, in signed order (`ordinal`).
