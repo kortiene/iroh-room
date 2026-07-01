@@ -53,10 +53,11 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   `room members <ROOM_ID> --status` is also available to query live connection state
 >   from a short-lived node without keeping a session running.
 > - **Step 6** (`iroh-rooms pipe expose | connect | close | list`) is implemented and runnable
->   as of issue #14 / IR-0010. Output blocks are reconciled against the shipped binary and show
->   the actual format. Two format notes: `--tcp` requires an IP address (`127.0.0.1:3000`, not
->   `localhost:3000`), and `pipe close` takes both `<ROOM_ID>` and `<PIPE_ID>` as positional
->   arguments.
+>   as of issue #14 / IR-0010, reconciled to the PRD canonical surface by issue #23 / IR-0108.
+>   Output blocks are reconciled against the shipped binary and show the actual format. One
+>   format note: `--tcp` requires an IP address (`127.0.0.1:3000`, not `localhost:3000`).
+>   `pipe close` now takes a bare `<PIPE_ID>` — the room is inferred from the local log; pass
+>   `--room <ROOM_ID>` only to disambiguate a pipe id shared across rooms.
 > - **Steps 5, 7** — `file` and `agent` are scaffold — the binary does not recognise them
 >   yet. **Expected output** blocks for those steps are *illustrative* (consistent with
 >   `PRD.v0.3.md` §16 but not yet captured from a real run).
@@ -66,8 +67,7 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 > - The data-directory override (`--data-dir` flag and `IROH_ROOMS_HOME` env var) is
 >   confirmed by the shipped binary — use these exactly as documented.
 > - A few details for later commands are still pending and are flagged inline as
->   **[reconcile]**: the exact `agent invite`/join syntax and the verbatim `pipe expose`
->   security-warning text.
+>   **[reconcile]**: the exact `agent invite`/join syntax.
 > - **The merged binary is the source of truth.** If you are running against the real
 >   binary and an output differs from any block in this guide, trust the binary and file
 >   the divergence.
@@ -610,8 +610,8 @@ iroh-rooms pipe expose <ROOM_ID> --tcp 127.0.0.1:3000 --allow <BOB_ID>
 **Expected output** (`pipe expose`; the two security lines go to stderr, the rest to stdout):
 
 ```text
-⚠  SECURITY: exposing a local service to named room members.
-   Anyone you allow can reach 127.0.0.1:3000 through this pipe while it is open.
+⚠  SECURITY: exposing 127.0.0.1:3000 to 1 allowed member(s): 9f124ac1.
+   Anyone allowed can reach 127.0.0.1:3000 through this pipe while it is open.
 room: blake3:…(64 hex chars)…
 target: 127.0.0.1:3000
 label: pipe
@@ -620,9 +620,14 @@ listening: <ENDPOINT_ID>@<ip:port>
 tip: share this address with connectors via --peer
 pipe_id: 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
 connectors run: iroh-rooms pipe connect blake3:… 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f --local <PORT>
-close it with: iroh-rooms pipe close blake3:… 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
+close it with: iroh-rooms pipe close 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
 serving the pipe; press Ctrl-C to close it...
 ```
+
+The ⚠ SECURITY lines name the exposed target and each allowed member (short id); both go to
+stderr, so they stay visible even when stdout is redirected. Rejected connect attempts are
+also logged to Alice's stderr as `pipe.connect.rejected:<cause>`; pass `-v` to also log each
+accepted connection.
 
 Copy the `pipe_id:` value (32 lowercase hex chars) as `<PIPE_ID>`.
 
@@ -650,17 +655,21 @@ listing), carried over the authenticated P2P pipe (illustrative):
 **Command** (Terminal A — Alice) — close the pipe when done:
 
 ```bash
-# Substitute <ROOM_ID> and <PIPE_ID>.
-iroh-rooms pipe close <ROOM_ID> <PIPE_ID>
+# Substitute <PIPE_ID> (from Alice's `pipe expose` output or `pipe list`). No room id: the
+# room is inferred from the local log — add `--room <ROOM_ID>` only to disambiguate.
+iroh-rooms pipe close <PIPE_ID>
 ```
 
 Then stop the `http.server` with `Ctrl-C` in its shell.
 
 **What this proves / verify:** an **authorized** peer (Bob) connects and traffic flows over an
-encrypted peer-to-peer connection; an **unauthorized** peer is rejected at connect time
-(spike §5 — see [unauthorized peer](#unauthorized-peer)). Closing emits a `pipe.closed` event;
-pipes also close on owner process exit (PRD §13.2). **Both peers must be online** for a live
-pipe (PRD §14.3).
+encrypted peer-to-peer connection; an **unauthorized** peer is rejected at connect time and the
+rejection is logged on Alice's terminal as `pipe.connect.rejected:<cause>` (spike §5 — see
+[unauthorized peer](#unauthorized-peer)). Closing emits a `pipe.closed` event; pipes also close
+on owner **process exit** — a graceful `Ctrl-C` (SIGINT) or `kill` (SIGTERM) publishes
+`pipe.closed{owner_exit}`. A hard kill (SIGKILL / power loss) cannot: forwarding still stops when
+Alice's endpoint dies, but the pipe shows open in `pipe list` until an owner/admin `pipe close`
+(PRD §13.2). **Both peers must be online** for a live pipe (PRD §14.3).
 
 ---
 
@@ -764,7 +773,8 @@ reason codes are stable identifiers also written to the local audit log.
   `pipe connect`; or have a non-member attempt any room action.
 - **CLI reports:** `pipe.connect.rejected` for the pipe case; mesh `not_a_member` for a
   non-member; a blob request from a non-member returns `AbortReason::Permission`
-  (spike §5, §8). Illustrative:
+  (spike §5, §8). The **pipe owner** (Alice) also sees the rejection on her `pipe expose`
+  terminal (stderr), e.g. `pipe.connect.rejected:not_allowed peer=… pipe=…`. Illustrative:
 
   ```text
   Pipe connect rejected (pipe.connect.rejected): caller not in allowed_members.
@@ -833,7 +843,7 @@ events (spike §5, PRD §13.2) — inspect it to see exactly why a connection wa
 
 Return to a clean state so the demo is repeatable (and matches the Test Plan):
 
-1. Close any open pipes (`iroh-rooms pipe close <ROOM_ID> <PIPE_ID>`) and stop the `http.server`.
+1. Close any open pipes (`iroh-rooms pipe close <PIPE_ID>`) and stop the `http.server`.
 2. Stop any running `room tail` and the participant processes (`Ctrl-C` in each terminal).
 3. Remove the per-participant data directories and the sample file:
 

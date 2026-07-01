@@ -337,6 +337,54 @@ fn guide_documents_pipe_close_command() {
     );
 }
 
+#[test]
+fn guide_pipe_close_uses_bare_pipe_id_not_two_positionals() {
+    // IR-0108 §5.2 reconcile: `pipe close` now takes `<PIPE_ID>` only — the old two-positional
+    // form `pipe close <ROOM_ID> <PIPE_ID>` must NOT appear in the guide (it was never in the
+    // PRD and diverged from the spec's own command table). The guide must show the canonical
+    // single-positional form after the reconcile.
+    let content = guide();
+    // The guide must contain the bare `pipe close <PIPE_ID>` usage (any casing of placeholder).
+    assert!(
+        content.contains("pipe close <PIPE_ID>") || content.contains("pipe close $PIPE_ID"),
+        "guide must document `pipe close <PIPE_ID>` (no ROOM_ID positional) per IR-0108 §5.2"
+    );
+    // The old two-positional form must not appear as a command example.
+    assert!(
+        !content.contains("pipe close <ROOM_ID> <PIPE_ID>")
+            && !content.contains("pipe close $ROOM_ID $PIPE_ID"),
+        "guide must not show the old `pipe close <ROOM_ID> <PIPE_ID>` two-positional form \
+         (reconciled in IR-0108 §5.2)"
+    );
+}
+
+#[test]
+fn guide_documents_pipe_close_owner_exit_behavior() {
+    // IR-0108 §5.5 / issue AC5: the guide must document that the pipe closes on owner process
+    // exit (SIGINT/SIGTERM). This is the "closes on owner process exit" acceptance criterion.
+    let content = guide();
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("owner")
+            && (lower.contains("ctrl-c")
+                || lower.contains("sigint")
+                || lower.contains("process exit")),
+        "guide must document that the pipe closes on owner process exit (IR-0108 AC5 / §5.5)"
+    );
+}
+
+#[test]
+fn guide_documents_pipe_loopback_requirement() {
+    // IR-0108 §5.2 / issue AC2 / §13.2.3: the guide must document that --tcp requires a
+    // loopback address (security boundary — no exposing arbitrary network services).
+    let content = guide();
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("loopback") || lower.contains("127.0.0.1"),
+        "guide must document that --tcp requires a loopback address (IR-0108 §13.2.3 / AC2)"
+    );
+}
+
 // ── Troubleshooting reason codes (spike §8) ───────────────────────────────────
 
 #[test]

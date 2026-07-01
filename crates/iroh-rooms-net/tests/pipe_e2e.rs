@@ -34,8 +34,8 @@ use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::pipe::PipeHello;
 use iroh_rooms_net::{
-    AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, PipeOutcome, TracingAudit,
-    PIPE_ALPN,
+    AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, PipeAuditSink, PipeDenyCause,
+    PipeOutcome, TracingAudit, PIPE_ALPN,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -802,4 +802,412 @@ async fn p6_expired_pipe_is_denied() {
     forwarder.shutdown();
     alice_node.shutdown().await.expect("shutdown alice");
     bob_node.shutdown().await.expect("shutdown bob");
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for HTTP-server tests (P7–P9)
+// ---------------------------------------------------------------------------
+
+/// A minimal hand-rolled HTTP/1.1 server on loopback. Reads until `\r\n\r\n`
+/// to consume the request, then replies with a fixed body. Returns its address
+/// and a counter of accepted TCP connections (so tests can assert zero-bytes-
+/// forwarded denial paths, spec §5.6 WI-6).
+async fn spawn_http_server(body: &'static [u8]) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind http server");
+    let addr = listener.local_addr().expect("http server addr");
+    let count = Arc::new(AtomicUsize::new(0));
+    let count2 = count.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            count2.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                // Drain the request line + headers, ignoring the body.
+                let mut buf = [0u8; 4096];
+                let mut filled = 0;
+                loop {
+                    let n = sock.read(&mut buf[filled..]).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    filled += n;
+                    if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if filled >= buf.len() {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                // Drop sock → EOF on the client side.
+            });
+        }
+    });
+    (addr, count)
+}
+
+// ---------------------------------------------------------------------------
+// RecordingAudit — captures reject/teardown calls (P10)
+// ---------------------------------------------------------------------------
+
+/// A `PipeAuditSink` that records every `connect_rejected` call for assertion
+/// in tests that verify the "locally logged" acceptance criterion (spec AC3 /
+/// IR-0108 §4.3).
+#[derive(Default)]
+struct RecordingAudit {
+    rejects: std::sync::Mutex<Vec<PipeDenyCause>>,
+}
+
+impl PipeAuditSink for RecordingAudit {
+    fn opened(&self, _pipe_id: &[u8; 16], _allowed: usize) {}
+    fn closed(&self, _pipe_id: &[u8; 16], _reason: &str) {}
+    fn connect_accepted(&self, _device: EndpointId, _pipe_id: &[u8; 16]) {}
+    fn connect_rejected(
+        &self,
+        _device: EndpointId,
+        _pipe_id: Option<&[u8; 16]>,
+        cause: PipeDenyCause,
+    ) {
+        self.rejects.lock().unwrap().push(cause);
+    }
+    fn torndown(&self, _device: EndpointId, _pipe_id: &[u8; 16], _cause: PipeDenyCause) {}
+}
+
+// ---------------------------------------------------------------------------
+// P7 (§15.7 AC1/AC4/AC6) — authorized member issues a real HTTP GET and reads
+// the exact body back through the pipe (HTTP-server variant of P1, spec §5.6 WI-6)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p7_http_authorized_member_reads_exact_body() {
+    let (room, log, alice, bob, _carol) = build_room();
+    let (http_addr, http_count) = spawn_http_server(b"hello").await;
+
+    let alice_node = spawn_node(alice.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+
+    let pipe_id = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            http_addr,
+            "http",
+            "localhost:http",
+            &[bob.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("expose pipe");
+    wait_pipe_opened(&bob_node, pipe_id).await;
+
+    let mut forwarder = bob_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
+        .await
+        .expect("bob connects");
+    let local = forwarder.local_addr();
+
+    // Issue a real HTTP/1.1 GET and read back the full response.
+    let raw = tokio::time::timeout(WAIT, async {
+        let mut client = TcpStream::connect(local).await.expect("connect local");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("send request");
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.expect("read response");
+        buf
+    })
+    .await
+    .expect("http round-trip within budget");
+
+    assert!(
+        raw.ends_with(b"hello"),
+        "AC1/AC6: authorized HTTP GET must receive the exact body through the pipe; \
+         got {} bytes: {:?}",
+        raw.len(),
+        &raw[raw.len().saturating_sub(16)..]
+    );
+    assert_eq!(
+        forwarder.next_outcome().await,
+        Some(PipeOutcome::Forwarded),
+        "AC1: connector must report Forwarded"
+    );
+    assert!(
+        http_count.load(Ordering::SeqCst) >= 1,
+        "AC4: owner must have connected to the HTTP server"
+    );
+
+    forwarder.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+}
+
+// ---------------------------------------------------------------------------
+// P8 (§15.7 AC5) — non-allowlisted member's HTTP GET is denied; zero bytes
+// reach the HTTP server (spec §5.6 WI-6 unauthorized-connect scenario)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p8_http_non_allowlisted_denied_zero_bytes_to_server() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (http_addr, http_count) = spawn_http_server(b"hello").await;
+
+    let alice_node = spawn_node(
+        alice.iroh_secret(),
+        allowlist(&[&alice, &bob, &carol]),
+        room,
+        &log,
+    )
+    .await;
+    let carol_node = spawn_node(
+        carol.iroh_secret(),
+        allowlist(&[&alice, &bob, &carol]),
+        room,
+        &log,
+    )
+    .await;
+    connect_event_plane(&alice_node, &alice, &carol_node, &carol).await;
+
+    // The pipe allows only Bob — Carol is Active but not in allowed_members.
+    let pipe_id = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            http_addr,
+            "http",
+            "localhost:http",
+            &[bob.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("expose pipe");
+    wait_pipe_opened(&carol_node, pipe_id).await;
+
+    let mut forwarder = carol_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
+        .await
+        .expect("carol dials pipe");
+    let local = forwarder.local_addr();
+
+    // Carol issues an HTTP GET; the gate denies it before forwarding any bytes.
+    let mut client = TcpStream::connect(local).await.expect("connect local");
+    let _ = client
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await;
+
+    assert_eq!(
+        forwarder.next_outcome().await,
+        Some(PipeOutcome::Denied),
+        "AC5: non-allowlisted HTTP GET must be denied at the per-pipe gate"
+    );
+    assert_eq!(
+        http_count.load(Ordering::SeqCst),
+        0,
+        "AC5: zero bytes must reach the HTTP server for a denied connector"
+    );
+
+    forwarder.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    carol_node.shutdown().await.expect("shutdown carol");
+}
+
+// ---------------------------------------------------------------------------
+// P9 (§15.7 AC7/AC8) — clean close publishes `pipe.closed` on the log and
+// subsequent connects are denied (spec §5.6 WI-6 clean-close scenario)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p9_clean_close_emits_pipe_closed_on_log() {
+    use iroh_rooms_core::event::content::Content;
+    use iroh_rooms_core::event::signed::SignedEvent;
+
+    let (room, log, alice, bob, _carol) = build_room();
+    let (http_addr, _http_count) = spawn_http_server(b"ok").await;
+
+    let alice_node = spawn_node(alice.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+
+    let pipe_id = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            http_addr,
+            "http",
+            "localhost:http",
+            &[bob.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("expose pipe");
+    wait_pipe_opened(&bob_node, pipe_id).await;
+
+    // Establish a live HTTP session so there is something to tear down.
+    let mut forwarder = bob_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
+        .await
+        .expect("bob connects");
+    {
+        let local = forwarder.local_addr();
+        let mut client = TcpStream::connect(local).await.expect("connect local");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("send request");
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(WAIT, client.read_to_end(&mut buf)).await;
+    }
+    assert_eq!(
+        forwarder.next_outcome().await,
+        Some(PipeOutcome::Forwarded),
+        "P9 setup: live HTTP session must report Forwarded"
+    );
+    wait_sessions(&alice_node, 1).await;
+
+    // Owner closes: publishes pipe.closed{closed} and tears the session down.
+    alice_node
+        .pipe_close(
+            &alice.id,
+            &alice.dev,
+            &room,
+            pipe_id,
+            Some("closed"),
+            T0 + 200,
+        )
+        .await
+        .expect("close pipe");
+    wait_sessions(&alice_node, 0).await;
+
+    // The pipe.closed event must appear on the owner's log (AC7 / AC8).
+    // pipe_close() completes only after publish() returns (the pump has ingested
+    // the event), so a single room_tail query is sufficient.
+    let tail = alice_node.room_tail(50).await.expect("room_tail");
+    let has_closed = tail.iter().any(|se| {
+        SignedEvent::decode(&se.wire.signed)
+            .ok()
+            .is_some_and(|ev| matches!(ev.content, Content::PipeClosed(_)))
+    });
+    assert!(
+        has_closed,
+        "AC7/AC8: pipe.closed must appear on the log after pipe_close (issue AC4)"
+    );
+
+    // A fresh connect must be denied (the pipe is closed on the owner's registry).
+    let mut reconnect = bob_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
+        .await
+        .expect("bob re-dials");
+    let _c = TcpStream::connect(reconnect.local_addr())
+        .await
+        .expect("connect");
+    assert_eq!(
+        reconnect.next_outcome().await,
+        Some(PipeOutcome::Denied),
+        "AC7/AC8: a connect after pipe.close must be denied"
+    );
+
+    forwarder.shutdown();
+    reconnect.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+}
+
+// ---------------------------------------------------------------------------
+// P10 (issue AC3) — owner-side audit sink records connect_rejected for an
+// unauthorized member ("rejected and locally logged", spec §5.6 WI-6 / §4.3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p10_audit_sink_records_connect_rejected_for_unauthorized_member() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (echo, _echo_count) = spawn_echo_server().await;
+
+    // Alice's node uses the RecordingAudit sink (the owner-visible path, spec AC3).
+    let recording = Arc::new(RecordingAudit::default());
+    let alice_node = {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in &log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn_with_pipe_audit(
+            alice.iroh_secret(),
+            Arc::new(allowlist(&[&alice, &bob, &carol])),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            TICK,
+            recording.clone(),
+        )
+        .await
+        .expect("spawn alice with recording audit")
+    };
+    let carol_node = spawn_node(
+        carol.iroh_secret(),
+        allowlist(&[&alice, &bob, &carol]),
+        room,
+        &log,
+    )
+    .await;
+    connect_event_plane(&alice_node, &alice, &carol_node, &carol).await;
+
+    // Pipe allows only Bob — Carol is Active but not in allowed_members.
+    let pipe_id = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[bob.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("expose pipe");
+    wait_pipe_opened(&carol_node, pipe_id).await;
+
+    // Carol attempts to connect; the gate must deny and call connect_rejected.
+    let mut forwarder = carol_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
+        .await
+        .expect("carol dials");
+    let _c = TcpStream::connect(forwarder.local_addr())
+        .await
+        .expect("connect local");
+    assert_eq!(
+        forwarder.next_outcome().await,
+        Some(PipeOutcome::Denied),
+        "P10 setup: Carol must be denied"
+    );
+
+    // The recording audit sink must have captured a NotAllowed reject (AC3 / §13.2.7).
+    let rejects = recording.rejects.lock().unwrap().clone();
+    assert!(
+        rejects.contains(&PipeDenyCause::NotAllowed),
+        "AC3: audit sink must record connect_rejected:not_allowed for an unauthorized member; \
+         got: {rejects:?}"
+    );
+
+    forwarder.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    carol_node.shutdown().await.expect("shutdown carol");
 }

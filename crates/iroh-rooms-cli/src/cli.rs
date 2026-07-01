@@ -81,6 +81,9 @@ enum PipeAction {
         /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
         #[arg(long = "peer")]
         peers: Vec<String>,
+        /// Also log per-connection accepts to stderr (rejects/teardowns always log).
+        #[arg(long, short = 'v')]
+        verbose: bool,
         /// Use the loopback/CI network stack instead of real-network discovery.
         #[arg(long, hide = true)]
         loopback: bool,
@@ -107,12 +110,14 @@ enum PipeAction {
     },
     /// Close a pipe you own (or any pipe, as the room admin).
     Close {
+        /// The pipe id to close (32-char hex). The room is inferred from the local
+        /// log; pass --room only to disambiguate a pipe id shared across rooms.
+        pipe_id: String,
         // Backticks would render literally in clap `--help`.
         #[allow(clippy::doc_markdown)]
-        /// The room id printed by `room create` (blake3:<hex>).
-        room_id: String,
-        /// The pipe id to close (32-char hex).
-        pipe_id: String,
+        /// Restrict room inference to this room id (blake3:<hex>); rarely needed.
+        #[arg(long)]
+        room: Option<String>,
         // Backticks would render literally in clap `--help`.
         #[allow(clippy::doc_markdown)]
         /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
@@ -461,6 +466,7 @@ fn dispatch_pipe(home: &std::path::Path, action: PipeAction) -> Result<()> {
             label,
             expires,
             peers,
+            verbose,
             loopback,
         } => {
             let room_id = parse_room_id(&room_id)?;
@@ -472,6 +478,7 @@ fn dispatch_pipe(home: &std::path::Path, action: PipeAction) -> Result<()> {
                 label.as_deref(),
                 expires.as_deref(),
                 &peers,
+                verbose,
                 loopback,
             ))
         }
@@ -488,13 +495,14 @@ fn dispatch_pipe(home: &std::path::Path, action: PipeAction) -> Result<()> {
             ))
         }
         PipeAction::Close {
-            room_id,
             pipe_id,
+            room,
             peers,
             loopback,
         } => {
-            let room_id = parse_room_id(&room_id)?;
-            runtime()?.block_on(pipe::close(home, &room_id, &pipe_id, &peers, loopback))
+            // The room is optional: inferred from the local log when absent.
+            let room = room.as_deref().map(parse_room_id).transpose()?;
+            runtime()?.block_on(pipe::close(home, room.as_ref(), &pipe_id, &peers, loopback))
         }
         PipeAction::List { room_id } => {
             let room_id = parse_room_id(&room_id)?;
