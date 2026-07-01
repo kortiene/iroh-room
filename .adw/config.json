@@ -119,8 +119,8 @@
     "phaseTiers": {
       "classify": "cheap",
       "plan": "capable",
-      "implement": "capable",
-      "tests": "mid",
+      "implement": "mid",
+      "tests": "capable",
       "resolve": "mid",
       "e2e": "mid",
       "review": "capable",
@@ -135,10 +135,10 @@
         "opencode": "anthropic/claude-haiku-4-5"
       },
       "mid": {
-        "claude": "claude-sonnet-4-6",
+        "claude": "claude-sonnet-5",
         "pi": "sonnet",
         "codex": "gpt-5.4",
-        "opencode": "anthropic/claude-sonnet-4-6"
+        "opencode": "anthropic/claude-sonnet-5"
       },
       "capable": {
         "claude": "claude-opus-4-8",
