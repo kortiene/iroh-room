@@ -24,6 +24,10 @@
 //!   event ([`invite::build_member_invited`], §7).
 //! * [`join`] — pure assembly of a signed joiner [`content::MemberJoined`]
 //!   event ([`join::build_member_joined`], §7).
+//! * [`left`] — pure assembly of a signed [`content::MemberLeft`] self-departure
+//!   event ([`left::build_member_left`], §7).
+//! * [`removed`] — pure assembly of a signed admin [`content::MemberRemoved`]
+//!   removal event ([`removed::build_member_removed`], §7).
 //! * [`validate`] — the stateless [`validate::validate_wire_bytes`] pipeline
 //!   (§6) returning a [`validate::ValidatedEvent`] or a typed [`RejectReason`].
 //! * [`reject`] — the [`RejectReason`] / [`Flag`] taxonomy (§8) and the deferred
@@ -43,9 +47,11 @@ pub mod ids;
 pub mod invite;
 pub mod join;
 pub mod keys;
+pub mod left;
 pub mod message;
 pub mod pipe;
 pub mod reject;
+pub mod removed;
 pub mod signed;
 pub mod validate;
 pub mod wire;
@@ -58,9 +64,11 @@ pub use ids::{EventId, HashRef, RoomId};
 pub use invite::build_member_invited;
 pub use join::build_member_joined;
 pub use keys::{DeviceKey, IdentityKey, Signature, SigningKey};
+pub use left::build_member_left;
 pub use message::build_message_text;
 pub use pipe::{build_pipe_closed, build_pipe_opened};
 pub use reject::{Flag, MembershipOracle, RejectReason};
+pub use removed::build_member_removed;
 pub use signed::SignedEvent;
 pub use validate::{
     validate_wire_bytes, validate_with_membership, ValidatedEvent, ValidationContext,

@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 mod cli;
 mod clock;
+mod display;
 mod identity;
 mod invite;
 mod join;
