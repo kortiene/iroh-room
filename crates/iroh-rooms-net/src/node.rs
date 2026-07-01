@@ -24,12 +24,12 @@ use anyhow::{anyhow, bail, Result};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::content::{Content, PipeOpened};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
-use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::SignedEvent;
 use iroh_rooms_core::event::{build_pipe_closed, build_pipe_opened};
 use iroh_rooms_core::membership::MembershipSnapshot;
 use iroh_rooms_core::store::StoredEvent;
-use iroh_rooms_core::sync::{Completeness, Outgoing, SyncEngine, SyncMessage};
+use iroh_rooms_core::sync::{Completeness, Outgoing, PeerId, SyncEngine, SyncMessage};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -555,8 +555,26 @@ async fn pump(
                 // drop, never a crash (spec §4.3 defense-in-depth).
                 match SyncMessage::decode(&inbound.bytes) {
                     Ok(msg) => {
-                        let outs = engine.on_message(inbound.peer, msg);
-                        route_all(&shared, outs);
+                        // Join-bootstrap restriction (IR-0104, Approach A): a
+                        // *provisional* peer is served the membership sub-DAG only.
+                        // Drop any request that would serve it chat/files/arbitrary
+                        // events; allow membership pulls and its `member.joined` push.
+                        let device = endpoint_of(inbound.peer);
+                        let provisional = device.is_some_and(|d| shared.is_provisional(d));
+                        if provisional && !provisional_allows(&msg) {
+                            if let Some(d) = device {
+                                shared.audit.bootstrap_blocked(d, sync_message_kind(&msg));
+                            }
+                        } else {
+                            let outs = engine.on_message(inbound.peer, msg);
+                            route_all(&shared, outs);
+                            if provisional {
+                                // Upgrade-on-learn: if that frame was the join the
+                                // fold accepted, the peer is now an Active member —
+                                // lift the restriction and record its identity.
+                                maybe_upgrade_provisional(&engine, &shared, inbound.peer);
+                            }
+                        }
                     }
                     Err(err) => {
                         tracing::debug!(%err, peer = %inbound.peer, "pump: dropping undecodable inbound frame");
@@ -651,6 +669,76 @@ fn route_all(shared: &Arc<Shared>, outs: Vec<Outgoing>) {
     for out in outs {
         shared.route(&out);
     }
+}
+
+/// Map an engine [`PeerId`] back to its transport [`EndpointId`] (same 32
+/// `device_id` bytes). `None` only on a malformed id, which never originates from a
+/// real connection.
+fn endpoint_of(peer: PeerId) -> Option<EndpointId> {
+    EndpointId::from_bytes(peer.as_bytes()).ok()
+}
+
+/// Whether a provisional join-bootstrap peer (IR-0104, Approach A) may be served
+/// `msg`. It may pull the never-windowed membership sub-DAG ([`WantMembership`]) and
+/// push its `member.joined` ([`Events`], which the fold judges), plus the harmless
+/// tip/head/not-found advertisements. It may **not** pull chat or arbitrary events
+/// ([`WantRecentChat`] / [`WantEvents`]) — those would serve room content to a
+/// not-yet-member, the privacy regression the spec scopes out.
+///
+/// [`WantMembership`]: SyncMessage::WantMembership
+/// [`Events`]: SyncMessage::Events
+/// [`WantRecentChat`]: SyncMessage::WantRecentChat
+/// [`WantEvents`]: SyncMessage::WantEvents
+fn provisional_allows(msg: &SyncMessage) -> bool {
+    matches!(
+        msg,
+        SyncMessage::WantMembership { .. }
+            | SyncMessage::Events { .. }
+            | SyncMessage::AdminTip { .. }
+            | SyncMessage::Heads { .. }
+            | SyncMessage::NotFound { .. }
+    )
+}
+
+/// A stable, greppable kind string for the `join.bootstrap.blocked` audit line.
+fn sync_message_kind(msg: &SyncMessage) -> &'static str {
+    match msg {
+        SyncMessage::AdminTip { .. } => "admin_tip",
+        SyncMessage::Heads { .. } => "heads",
+        SyncMessage::WantEvents { .. } => "want_events",
+        SyncMessage::WantMembership { .. } => "want_membership",
+        SyncMessage::WantRecentChat { .. } => "want_recent_chat",
+        SyncMessage::Events { .. } => "events",
+        SyncMessage::NotFound { .. } => "not_found",
+        // `SyncMessage` is `#[non_exhaustive]`; an unknown future kind is "other".
+        _ => "other",
+    }
+}
+
+/// Upgrade-on-learn (IR-0104, Approach A): once a provisional peer's `member.joined`
+/// is accepted by the fold, its device is bound to a now-Active identity. Lift the
+/// provisional restriction and record the learned identity so subsequent traffic is
+/// served as a normal member. A no-op until the join lands.
+fn maybe_upgrade_provisional(engine: &SyncEngine, shared: &Arc<Shared>, peer: PeerId) {
+    let snapshot = engine.snapshot();
+    let device_key = DeviceKey::from_bytes(*peer.as_bytes());
+    let Some(identity) = snapshot.identity_of_device(&device_key) else {
+        return;
+    };
+    if !snapshot.is_active(identity) {
+        return;
+    }
+    let Some(device) = endpoint_of(peer) else {
+        return;
+    };
+    shared.clear_provisional(device);
+    // Record the now-known identity on the live Connected entry (it was admitted
+    // without one). The peer is already in the engine's fan-out set from its
+    // `on_connect`, so no re-handshake is needed.
+    shared
+        .table
+        .set(device, PeerConnState::Connected, Some(*identity));
+    shared.audit.bootstrap_upgraded(device, identity);
 }
 
 /// Advisory wall-clock ms for `on_tick` (the engine treats it as advisory only).

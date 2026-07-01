@@ -10,7 +10,7 @@
 //! the peer is offline — the engine re-pulls on reconnect), and
 //! [`peers`](SyncTransport::peers) is the set of `Connected` authenticated devices.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
@@ -90,6 +90,12 @@ pub struct Shared {
     outbound: Mutex<HashMap<EndpointId, mpsc::UnboundedSender<Vec<u8>>>>,
     /// Live connection handles (so a local disconnect can close a specific link).
     connections: Mutex<HashMap<EndpointId, Connection>>,
+    /// Devices admitted **provisionally** for the join bootstrap (IR-0104,
+    /// Approach A): a not-yet-Active invitee allowed to pull the membership sub-DAG
+    /// and push its `member.joined`, but served nothing else. The engine driver
+    /// reads this to restrict service (membership-only) and clears it on
+    /// upgrade-on-learn; the accept handler clears it on disconnect.
+    provisional: Mutex<HashSet<EndpointId>>,
     /// The single inbound sink feeding the engine driver.
     pub(crate) inbound_tx: mpsc::UnboundedSender<Inbound>,
 }
@@ -159,6 +165,35 @@ impl Shared {
         // No live writer ⇒ peer offline ⇒ drop (engine re-pulls on reconnect).
     }
 
+    /// Mark `device` as a provisional join-bootstrap peer (IR-0104, Approach A).
+    /// Set on the provisional accept, before the peer flips to `Connected`, so the
+    /// engine driver sees it provisional for the very first inbound frame.
+    pub(crate) fn mark_provisional(&self, device: EndpointId) {
+        self.provisional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(device);
+    }
+
+    /// Clear a device's provisional mark — on upgrade-on-learn (its join was
+    /// accepted, so it is now a full member) or on disconnect.
+    pub(crate) fn clear_provisional(&self, device: EndpointId) {
+        self.provisional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
+    }
+
+    /// Whether `device` is currently a provisional join-bootstrap peer (served the
+    /// membership sub-DAG only).
+    #[must_use]
+    pub(crate) fn is_provisional(&self, device: EndpointId) -> bool {
+        self.provisional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&device)
+    }
+
     /// The `Connected` authenticated devices, as engine [`PeerId`]s.
     pub(crate) fn connected_peers(&self) -> Vec<PeerId> {
         self.table
@@ -217,6 +252,7 @@ impl NetTransport {
             table: PeerTable::new(cfg.conn_event_capacity),
             outbound: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            provisional: Mutex::new(HashSet::new()),
             inbound_tx,
         });
 
@@ -377,7 +413,7 @@ mod tests {
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::ids::RoomId;
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
@@ -395,6 +431,7 @@ mod tests {
             table: PeerTable::new(8),
             outbound: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            provisional: Mutex::new(HashSet::new()),
             inbound_tx,
         });
         (shared, inbound_rx)

@@ -22,6 +22,8 @@
 //!   event ([`genesis::build_room_created`], §5/§6/§7).
 //! * [`invite`] — pure assembly of a signed admin [`content::MemberInvited`]
 //!   event ([`invite::build_member_invited`], §7).
+//! * [`join`] — pure assembly of a signed joiner [`content::MemberJoined`]
+//!   event ([`join::build_member_joined`], §7).
 //! * [`validate`] — the stateless [`validate::validate_wire_bytes`] pipeline
 //!   (§6) returning a [`validate::ValidatedEvent`] or a typed [`RejectReason`].
 //! * [`reject`] — the [`RejectReason`] / [`Flag`] taxonomy (§8) and the deferred
@@ -39,6 +41,7 @@ pub mod content;
 pub mod genesis;
 pub mod ids;
 pub mod invite;
+pub mod join;
 pub mod keys;
 pub mod message;
 pub mod pipe;
@@ -53,6 +56,7 @@ pub use content::{capability_hash, Content, EventType};
 pub use genesis::build_room_created;
 pub use ids::{EventId, HashRef, RoomId};
 pub use invite::build_member_invited;
+pub use join::build_member_joined;
 pub use keys::{DeviceKey, IdentityKey, Signature, SigningKey};
 pub use message::build_message_text;
 pub use pipe::{build_pipe_closed, build_pipe_opened};

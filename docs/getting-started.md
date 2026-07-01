@@ -32,23 +32,23 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 > - **Step 2** (`iroh-rooms room create` / `iroh-rooms room members`) is implemented and
 >   runnable as of issue #17 / IR-0102. Output blocks are reconciled against the shipped
 >   binary and show the actual format.
-> - **Step 3 (invite half)** — `iroh-rooms room invite` is implemented and runnable as of
->   issue #18 / IR-0103. The output block for that command is reconciled against the shipped
->   binary and shows the actual format. `room join` and the rest of Step 3 remain scaffold.
+> - **Step 3** (`iroh-rooms room invite` + `iroh-rooms room join`) is implemented and
+>   runnable as of issues #18 / IR-0103 (invite) and #19 / IR-0104 (join). Output blocks for
+>   both commands are reconciled against the shipped binary and show the actual format. Note
+>   that the admin must keep `room tail --accept-joins <ROOM_ID>` running while the joiner
+>   executes `room join` — see the step instructions below.
 > - **Step 4** (`iroh-rooms room send` / `iroh-rooms room tail`) is implemented and runnable
 >   as of issue #20 / IR-0105. Both commands work against the shipped binary and the output
->   blocks below are reconciled to its actual format. The *full two-human* exchange in this
->   step additionally needs `room join` (#19) so a second participant is an active member;
->   until that lands, the commands run but you cannot complete the round trip end-to-end.
+>   blocks below are reconciled to its actual format. The full two-human exchange is now
+>   complete end-to-end once Step 3 join has been performed.
 > - **Step 6** (`iroh-rooms pipe expose | connect | close | list`) is implemented and runnable
 >   as of issue #14 / IR-0010. Output blocks are reconciled against the shipped binary and show
 >   the actual format. Two format notes: `--tcp` requires an IP address (`127.0.0.1:3000`, not
 >   `localhost:3000`), and `pipe close` takes both `<ROOM_ID>` and `<PIPE_ID>` as positional
 >   arguments.
-> - **Steps 3, 5, 7** (except `room invite`/`room send`/`room tail`) — `room join`, `file`,
->   `agent` are scaffold — the binary does not recognise them yet. **Expected output**
->   blocks for those steps are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
->   captured from a real run).
+> - **Steps 5, 7** — `file` and `agent` are scaffold — the binary does not recognise them
+>   yet. **Expected output** blocks for those steps are *illustrative* (consistent with
+>   `PRD.v0.3.md` §16 but not yet captured from a real run).
 >
 > General notes:
 >
@@ -263,7 +263,7 @@ expires can attempt to join as the named key. Handle it like a password.
 
 ### Invite and join Bob
 
-**Command** (Terminal A — Alice):
+**Command** (Terminal A — Alice) — issue the invite:
 
 ```bash
 # Substitute <ROOM_ID> from Step 2 and <BOB_ID> from Bob's `identity show` (Step 1).
@@ -287,18 +287,36 @@ next: the invitee runs `iroh-rooms room join <ticket>`
 
 Copy the `roomtkt1…` token as `<BOB_TICKET>`.
 
-**Command** (Terminal B — Bob):
+**Command** (Terminal A — Alice) — start hosting joins **before** Bob redeems the ticket:
+
+```bash
+# Substitute <ROOM_ID>. --accept-joins opens the join-bootstrap window while invites are
+# open, letting invited peers pull the membership history and push their member.joined.
+# Leave this running until all pending joins complete; stop it with Ctrl-C.
+iroh-rooms room tail <ROOM_ID> --accept-joins
+```
+
+This prints a `listening:` address (same format as a plain `room tail`). On a LAN or in CI
+copy that address and pass it to `room join` as `--peer`.
+
+**Command** (Terminal B — Bob) — redeem the ticket while Alice's session is live:
 
 ```bash
 # Substitute <BOB_TICKET> with the ticket Alice produced above.
+# Add --peer <ALICE_LISTENING_ADDR> on a LAN / in CI (no discovery).
 iroh-rooms room join <BOB_TICKET>
 ```
 
-**Expected output** (illustrative):
+**Expected output** (reconciled to the binary):
 
 ```text
-Joined room "Getting Started Room" (room_7Q3…f0) as member.
-Syncing recent history from online peers…
+listening: <ENDPOINT_ID>@<ip:port>
+joined: blake3:…(64 hex chars)…
+room: blake3:…(64 hex chars)…
+name: "Getting Started Room"
+role: member
+members: 2 active
+next: run `iroh-rooms room members blake3:…` or `iroh-rooms room tail blake3:…`
 ```
 
 ### Invite and join the Agent
@@ -327,10 +345,18 @@ next: the invitee runs `iroh-rooms room join <ticket>`
 
 Copy the `roomtkt1…` token as `<AGENT_TICKET>`.
 
+If Alice's `room tail --accept-joins` session from the Bob-join step is still running, the
+agent can join immediately. Otherwise restart it in Terminal A:
+
+```bash
+iroh-rooms room tail <ROOM_ID> --accept-joins
+```
+
 **Command** (Terminal C — Agent):
 
 ```bash
 # Substitute <AGENT_TICKET> with the agent ticket Alice produced above.
+# Add --peer <ALICE_LISTENING_ADDR> on a LAN / in CI (no discovery).
 iroh-rooms room join <AGENT_TICKET>
 ```
 
@@ -354,8 +380,11 @@ Members of room_7Q3…f0:
 
 **What this proves / verify:** the member list, computed by folding each peer's local log
 (spike §3.4), now shows Alice (admin), Bob (member), and the agent with `role = agent`. Both
-Alice's and Bob's lists agree. The agent was admitted only through an explicit, key-bound
-invite — it could not have joined otherwise (spike §3.5).
+Alice's and Bob's lists agree after sync. The `member.joined` event was authored by the joiner
+itself (its own key + device binding), validated by `gate_join` on every peer against the
+causal ancestors (including the naming invite and the capability secret), and stored locally
+before Alice's session acknowledged it. The agent was admitted only through an explicit,
+key-bound invite — it could not have joined otherwise (spike §3.5).
 
 ---
 
@@ -664,11 +693,26 @@ reason codes are stable identifiers also written to the local audit log.
   for an expired one (spike §8). Illustrative:
 
   ```text
-  Join failed (bad_capability): ticket is malformed or the secret does not match.
+  Join failed (bad_capability): this ticket's secret or identity does not match the invite (bad_capability)
   ```
 
 - **Next action:** ask the admin for a fresh `room invite` (re-issue, optionally with a longer
   `--expires`). There is no native revocation, so a re-issue is the fix.
+
+### Admin not hosting joins
+
+- **Reproduce:** run `room join` while the admin has no `room tail --accept-joins` session running.
+- **CLI reports:** a bootstrap-timeout error — the joiner can reach the admin's endpoint but
+  the connection is closed before bytes (the default admission gate rejects unknown devices):
+
+  ```text
+  could not bootstrap the room membership within 10s; is the room admin online and accepting joins?
+  Pass `--peer <admin-addr>` for a deterministic dial.
+  ```
+
+- **Next action:** have the admin start `iroh-rooms room tail <ROOM_ID> --accept-joins` and
+  retry `room join`. The `--accept-joins` flag opens the provisional-admission window; without
+  it no join can bootstrap. Nothing was written locally; the retry is clean.
 
 ### Unavailable file
 

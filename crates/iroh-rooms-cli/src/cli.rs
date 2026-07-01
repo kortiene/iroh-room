@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
-use crate::{identity, invite, message, paths, pipe, room};
+use crate::{identity, invite, join, message, paths, pipe, room};
 
 /// Local-first rooms over iroh — local identity and device management.
 #[derive(Debug, Parser)]
@@ -228,6 +228,31 @@ enum RoomAction {
         /// Historical rows to render on startup.
         #[arg(long, default_value_t = crate::message::DEFAULT_TAIL_LIMIT)]
         limit: u32,
+        /// Host joins: admit invited peers to bootstrap their join (admin only,
+        /// while invites are open). Lets `room join` complete against this session.
+        #[arg(long = "accept-joins")]
+        accept_joins: bool,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+    /// Redeem an invite ticket and join the room as an active member.
+    Join {
+        /// The roomtkt1… ticket printed by `room invite`.
+        ticket: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Optional display name advertised in the join (member.joined.display_name).
+        #[arg(long = "display-name")]
+        display_name: Option<String>,
+        /// Bootstrap timeout as <int>{ms|s|m}, e.g. 10s.
+        #[arg(long, default_value = crate::join::DEFAULT_JOIN_TIMEOUT)]
+        timeout: String,
         /// Use the loopback/CI network stack instead of real-network discovery.
         #[arg(long, hide = true)]
         loopback: bool,
@@ -259,78 +284,105 @@ pub fn run() -> Result<()> {
                 identity::print_show(&profile, json)?;
             }
         },
-        Command::Room { action } => match action {
-            RoomAction::Create { name } => {
-                // `room::create` validates the name first, then loads secrets and
-                // ensures the home, so an invalid name leaves the filesystem clean.
-                let summary = room::create(&home, &name)?;
-                println!("created room \"{}\"", summary.room_name);
-                println!("room_id: {}", summary.room_id);
-                println!("admin: {}", summary.admin_identity_id);
-                println!("next: run `iroh-rooms room members {}`", summary.room_id);
-            }
-            RoomAction::Members { room_id } => {
-                let room_id: RoomId = room_id
-                    .parse()
-                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
-                let view = room::members(&home, &room_id)?;
-                room::print_members(&view);
-            }
-            RoomAction::Invite {
-                room_id,
-                invitee,
-                role,
-                expires,
-            } => {
-                let room_id: RoomId = room_id
-                    .parse()
-                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
-                // `invite` validates --invitee/--role/--expires before any IO, so a
-                // bad invocation leaves the store untouched.
-                let summary = invite::invite(&home, &room_id, &invitee, &role, expires.as_deref())?;
-                invite::print_invite(&summary);
-            }
-            RoomAction::Send {
-                room_id,
-                message,
-                format,
-                reply_to,
-                peers,
+        Command::Room { action } => dispatch_room(&home, action)?,
+        Command::Pipe { action } => dispatch_pipe(&home, action)?,
+    }
+    Ok(())
+}
+
+/// Dispatch the `room` subcommands (kept out of [`run`] so the dispatcher stays
+/// small and readable, mirroring [`dispatch_pipe`]).
+fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
+    match action {
+        RoomAction::Create { name } => {
+            // `room::create` validates the name first, then loads secrets and
+            // ensures the home, so an invalid name leaves the filesystem clean.
+            let summary = room::create(home, &name)?;
+            println!("created room \"{}\"", summary.room_name);
+            println!("room_id: {}", summary.room_id);
+            println!("admin: {}", summary.admin_identity_id);
+            println!("next: run `iroh-rooms room members {}`", summary.room_id);
+        }
+        RoomAction::Members { room_id } => {
+            let room_id = parse_room_id(&room_id)?;
+            let view = room::members(home, &room_id)?;
+            room::print_members(&view);
+        }
+        RoomAction::Invite {
+            room_id,
+            invitee,
+            role,
+            expires,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            // `invite` validates --invitee/--role/--expires before any IO, so a
+            // bad invocation leaves the store untouched.
+            let summary = invite::invite(home, &room_id, &invitee, &role, expires.as_deref())?;
+            invite::print_invite(&summary);
+        }
+        RoomAction::Send {
+            room_id,
+            message,
+            format,
+            reply_to,
+            peers,
+            timeout,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            // Parse the timeout before any IO so a bad value writes nothing.
+            let timeout = message::parse_timeout(&timeout)?;
+            // The online command runs in a scoped runtime; the rest stays
+            // synchronous (spec IR-0105 D2).
+            let summary = runtime()?.block_on(message::send(
+                home,
+                &room_id,
+                &message,
+                format.as_deref(),
+                reply_to.as_deref(),
+                &peers,
                 timeout,
                 loopback,
-            } => {
-                let room_id: RoomId = room_id
-                    .parse()
-                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
-                // Parse the timeout before any IO so a bad value writes nothing.
-                let timeout = message::parse_timeout(&timeout)?;
-                // The online command runs in a scoped runtime; the rest of `run`
-                // stays synchronous (spec IR-0105 D2).
-                let summary = runtime()?.block_on(message::send(
-                    &home,
-                    &room_id,
-                    &message,
-                    format.as_deref(),
-                    reply_to.as_deref(),
-                    &peers,
-                    timeout,
-                    loopback,
-                ))?;
-                message::print_send(&summary);
-            }
-            RoomAction::Tail {
-                room_id,
-                peers,
+            ))?;
+            message::print_send(&summary);
+        }
+        RoomAction::Tail {
+            room_id,
+            peers,
+            limit,
+            accept_joins,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            runtime()?.block_on(message::tail(
+                home,
+                &room_id,
+                &peers,
                 limit,
+                accept_joins,
                 loopback,
-            } => {
-                let room_id: RoomId = room_id
-                    .parse()
-                    .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))?;
-                runtime()?.block_on(message::tail(&home, &room_id, &peers, limit, loopback))?;
-            }
-        },
-        Command::Pipe { action } => dispatch_pipe(&home, action)?,
+            ))?;
+        }
+        RoomAction::Join {
+            ticket,
+            peers,
+            display_name,
+            timeout,
+            loopback,
+        } => {
+            // Parse the timeout before any IO so a bad value writes nothing and
+            // dials nothing (the ticket is decoded inside `join`, also pre-IO).
+            let timeout = message::parse_timeout(&timeout)?;
+            let summary = runtime()?.block_on(join::join(
+                home,
+                &ticket,
+                &peers,
+                display_name.as_deref(),
+                timeout,
+                loopback,
+            ))?;
+            join::print_join(&summary);
+        }
     }
     Ok(())
 }

@@ -25,6 +25,20 @@ pub trait AuditSink: Send + Sync + 'static {
     fn connected(&self, device: EndpointId);
     /// A peer's link dropped (now offline; will be redialed if still a member).
     fn disconnected(&self, device: EndpointId);
+
+    /// A connection was admitted **provisionally** for the join bootstrap
+    /// (IR-0104, Approach A): a not-yet-Active invitee allowed to pull the
+    /// membership sub-DAG and push a single `member.joined`. Default: no-op, so
+    /// existing sinks need not change.
+    fn bootstrap_admitted(&self, _device: EndpointId) {}
+    /// A provisional join-bootstrap connection was upgraded to a full member after
+    /// its `member.joined` was accepted by the fold (upgrade-on-learn). Default:
+    /// no-op.
+    fn bootstrap_upgraded(&self, _device: EndpointId, _identity: &IdentityKey) {}
+    /// A non-membership request from a provisional peer was dropped — a provisional
+    /// connection is served the membership sub-DAG only (`kind` is the stable
+    /// sync-message kind that was refused). Default: no-op.
+    fn bootstrap_blocked(&self, _device: EndpointId, _kind: &'static str) {}
 }
 
 /// The default audit sink: structured `tracing` events with stable reason codes.
@@ -58,6 +72,36 @@ impl AuditSink for TracingAudit {
 
     fn disconnected(&self, device: EndpointId) {
         tracing::info!(reason = "peer.disconnected", peer = %device, "link down");
+    }
+
+    fn bootstrap_admitted(&self, device: EndpointId) {
+        // `join.bootstrap.admitted` is the stable, greppable audit line (IR-0104
+        // §8). INFO: a provisional admit is an expected part of the join handshake.
+        tracing::info!(
+            reason = "join.bootstrap.admitted",
+            peer = %device,
+            "admitted a provisional join-bootstrap peer (membership sub-DAG only)"
+        );
+    }
+
+    fn bootstrap_upgraded(&self, device: EndpointId, identity: &IdentityKey) {
+        tracing::info!(
+            reason = "join.bootstrap.upgraded",
+            peer = %device,
+            %identity,
+            "provisional peer's join was accepted; upgraded to active member"
+        );
+    }
+
+    fn bootstrap_blocked(&self, device: EndpointId, kind: &'static str) {
+        // `join.bootstrap.blocked:<kind>` — a provisional peer asked for more than
+        // the membership sub-DAG; we refuse and serve nothing (privacy mitigation).
+        tracing::warn!(
+            reason = "join.bootstrap.blocked",
+            kind,
+            peer = %device,
+            "dropped a non-membership request from a provisional join-bootstrap peer"
+        );
     }
 }
 

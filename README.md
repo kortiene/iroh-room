@@ -205,6 +205,62 @@ adding the second authoring command and the first out-of-band capability artifac
   capability-hash AC4, ticket round-trip + corruption rejection; CLI integration: admin path,
   non-admin rejection, bad args, secret-not-in-output).
 
+**Room join by ticket** has landed in `crates/iroh-rooms-cli`, `crates/iroh-rooms-core`,
+and `crates/iroh-rooms-net` (issue #19 / IR-0104), closing the invite handshake and
+making the full two-human exchange end-to-end runnable:
+
+- `iroh-rooms room join <TICKET> [--peer <ENDPOINT_ADDR>]… [--display-name <NAME>] [--timeout <DUR>]`
+  — redeems a `roomtkt1…` ticket from `room invite`, becoming an `Active` member whose join
+  both peers converge on. Concretely: decodes the ticket (fail-closed), pre-checks the local
+  identity matches `ticket.invitee_key` (wrong identity is an actionable error before any
+  network IO), brings up an ephemeral `Node`, dials the admin, pulls the never-windowed
+  membership sub-DAG via the engine's existing `WantMembership` handshake, assembles and signs
+  a `member.joined` via the new `build_member_joined` core builder, self-validates it through
+  the full stateless §6 pipeline, fold-checks it locally (bad secret → `BadCapability`,
+  expired invite → `ExpiredInvite`, role mismatch → `InsufficientRole` — all deterministic,
+  the same verdict every peer reaches), publishes it to the admin, waits for the local
+  `Active` transition, then prints the `JoinSummary` (join `event_id`, room, name, role,
+  active-member count, and a next-step hint). A join that never reaches the admin is a
+  **failure**, not a silent local success — unlike `send`, join is inherently online.
+- `iroh-rooms room tail <ROOM_ID> --accept-joins` — the admin side of the bootstrap: runs
+  the existing `room tail` session with the new `--accept-joins` flag, which engages the
+  `JoinBootstrapAdmission` gate (provisional admission). Without this flag on the admin's
+  node, the joiner's connection is rejected before bytes (the default fail-closed behaviour);
+  with it, a genuinely unknown device (a first-time invitee) is admitted **provisionally** —
+  served only the secret-free membership sub-DAG and allowed to push a single
+  `member.joined`, then upgraded to full membership when the fold accepts the join
+  (`upgrade-on-learn`). Chat/file/pipe planes remain off-limits to provisional peers.
+- A pure `build_member_joined(...)` assembler lands in `iroh-rooms-core::event::join`,
+  the sibling of `build_room_created` / `build_member_invited`: deterministic, clock-/RNG-free,
+  accepting the joiner's identity and device signing keys, `via_invite_id`, `capability_secret`,
+  `role`, an already-built `DeviceBinding`, optional `display_name`, `prev_events`, and
+  `created_at`. The `capability_secret` legitimately lands on the log inside the join (Spike §7
+  — the join is the proof of the capability; key-binding + departure-consumption keep a replay
+  under another key inert). The CLI holds it in a `Zeroizing` buffer from ticket-decode until
+  it is placed in the content and never prints it.
+- `JoinBootstrapAdmission` in `iroh-rooms-net::admission` (Approach A): wraps
+  `AllowlistAdmission` and changes exactly one outcome — an **unknown** device (no prior
+  binding) is `AdmitProvisional` when `accept_joins` is set, otherwise rejected as before.
+  Bound-but-inactive devices (removed/left members), fail-closed identities, and all
+  non-membership traffic paths are unchanged. Authorization is unchanged: `gate_join` in the
+  landed membership fold remains the convergent authority on every peer regardless of how the
+  connection was admitted. The audit log gains stable `join.bootstrap.*` vocabulary:
+  `bootstrap_admitted` / `bootstrap_upgraded` / `bootstrap_blocked`.
+- The privacy trade-off of Approach A (provisional admission discloses the secret-free
+  membership sub-DAG to a dialer who knows `room_id` + admin `EndpointId` during an open-invite
+  window) is explicitly documented and scoped: no capability secret is disclosed; a dialer who
+  fails `gate_join` is not made a member; the window closes when `--accept-joins` is not set.
+  Approach B (a dedicated capability-proving join ALPN that gates sub-DAG service on a proof)
+  is the documented hardening follow-up and is tracked separately.
+- Tests: 15+ core unit tests for `build_member_joined` (determinism, all-field round-trip,
+  stateless validation, device-binding enforcement, wrong-room, empty `prev_events`, unicode
+  display names, agent role); 15+ unit tests for `JoinBootstrapAdmission` (full decision matrix,
+  sticky-departure preservation, fail-closed priority, multi-device, join-window toggling);
+  8+ CLI unit tests for dial-set construction, timeout parsing, and rejection-message format;
+  and a two-peer loopback integration suite (`net/tests/join_e2e.rs`) covering valid join,
+  wrong identity, expired invite, and bad secret — asserting the joiner appears in `room members`
+  on **both** peers after sync (AC5).
+
 **Signed message send and receive** has landed in `crates/iroh-rooms-cli` (issue #20 /
 IR-0105), adding the first **online** commands — the first that leave the local filesystem
 and drive the `iroh-rooms-net` carrier from the binary:
@@ -259,10 +315,10 @@ The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
   open Gate-A risk from the transport prototype (#9); see `crates/iroh-rooms-net/NOTES.md`.
 
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
-engine, identity CLI, room creation, room invite, signed messaging, the iroh transport, and
-the live pipe) are all landed as prototypes; the remaining work is room join, file sharing,
-agent status, the `MembershipSnapshot` re-point of admission, and the Gate-A real-network
-confirmation (all tracked separately).
+engine, identity CLI, room creation, room invite, room join, signed messaging, the iroh
+transport, and the live pipe) are all landed as prototypes; the remaining work is file
+sharing, agent status, the `MembershipSnapshot` re-point of admission, and the Gate-A
+real-network confirmation (all tracked separately).
 
 ## Repository Layout
 

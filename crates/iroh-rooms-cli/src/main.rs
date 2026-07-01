@@ -9,6 +9,7 @@ mod cli;
 mod clock;
 mod identity;
 mod invite;
+mod join;
 mod message;
 mod paths;
 mod pipe;
