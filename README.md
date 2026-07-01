@@ -478,10 +478,38 @@ into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follo
   **Gate A (real-NAT) remains separately owed** (inherits the IR-0005 residual;
   see `crates/iroh-rooms-net/NOTES.md`).
 
+The **two-peer Phase 1A integration test suite** has landed in
+`crates/iroh-rooms-cli/tests/two_peer_e2e.rs` (issue #24 / IR-0109), the PRD §19 Phase 1A
+deliverable 8 — the product-level proof that the entire Phase 1A slice works end-to-end
+across two isolated participants driven through the real `iroh-rooms` binary:
+
+- **Tiered by CI reliability:** a deterministic, network-free CI tier
+  (`full_slice_runs_without_central_server`, `message_persists_across_restart`, plus nine
+  harness unit tests) always runs in `cargo test`; an `#[ignore]`-gated online tier
+  (membership convergence, live pipe, unauthorized denial) requires two live loopback
+  processes and is run with the documented command below.
+- **No relay, no discovery, no central application server:** every online step uses the
+  hidden `--loopback` flag (`NetMode::Loopback` = `RelayMode::Disabled` + `presets::Minimal`)
+  over pure loopback QUIC. The `ChildSession` harness parses each host's `listening:` address
+  and threads it into the peer's `--peer` for deterministic dial — proving AC1 structurally.
+- **All five acceptance criteria covered:** no-central-server (CI), membership convergence
+  (gated), message restart-persistence (CI), authorized pipe bytes (gated), unauthorized
+  denial (gated — proven by zero forwarded bytes and the `pipe.connect.rejected:not_allowed`
+  owner-stderr signal from the IR-0108 audit sink).
+- **Backed at the Node layer:** `join_e2e.rs`, `message_e2e.rs`, and `pipe_e2e.rs` remain
+  the always-green CI backstop for the same ACs at the transport layer; the CLI suite adds
+  product-level coverage on top.
+
+Run the gated online tier locally (loopback only; no relay, no external tools):
+
+```bash
+cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
+```
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
-room-read CLI, the iroh transport, the live pipe, and the peer connection manager) are all
-landed as prototypes.
+room-read CLI, the iroh transport, the live pipe, the peer connection manager, and the
+Phase 1A two-peer integration test) are all landed as prototypes.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is file sharing and agent status (both
