@@ -75,4 +75,9 @@ serde_json = "1"
 # Decode the `roomtkt1…` ticket token in CLI e2e tests that cross the
 # CLI-output → ticket-codec boundary (AC2/AC4 from the invite-ticket spec).
 iroh-rooms-core = { path = "../iroh-rooms-core", features = ["store"] }
+# The two-peer integration suite (`tests/two_peer_e2e.rs`, IR-0109) runs an
+# in-test loopback TCP echo target + client for the pipe tier. tokio is already a
+# normal dependency of this crate, so this adds no new resolution — only the
+# `net`/`io-util` features those in-test sockets need on top of the runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 

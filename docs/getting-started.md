@@ -61,6 +61,14 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 > - **Steps 5, 7** — `file` and `agent` are scaffold — the binary does not recognise them
 >   yet. **Expected output** blocks for those steps are *illustrative* (consistent with
 >   `PRD.v0.3.md` §16 but not yet captured from a real run).
+> - **Issue #24 / IR-0109** adds the Phase 1A two-peer integration test suite
+>   (`crates/iroh-rooms-cli/tests/two_peer_e2e.rs`). The CI tier (offline-backbone and
+>   restart-persistence tests) runs automatically via `cargo test`. The full online tier —
+>   membership convergence and live pipe — is `#[ignore]`-gated; run it locally with:
+>   ```bash
+>   cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
+>   ```
+>   Every step in this guide that is runnable (Steps 1–4, Step 6) is exercised by the suite.
 >
 > General notes:
 >
