@@ -337,6 +337,46 @@ The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
 - **Gate A (real-NAT run for the pipe ALPN) is still owed** before MVP go, inheriting the
   open Gate-A risk from the transport prototype (#9); see `crates/iroh-rooms-net/NOTES.md`.
 
+The **Gate-A real-NAT measurement harness** has landed in `crates/spike-nat`
+(issue #43 / IR-0012), providing the purpose-built `nat-probe` tool and a complete
+runbook + results schema for closing the one load-bearing Phase-0 assumption still
+without measured evidence. No shipping code changes; this is a throwaway spike crate
+on the same pattern as `spike-blobs`:
+
+- **`nat-probe listen [--relay-only] [--loopback] [--seed <N>]`** — stands up a
+  minimal `iroh::Endpoint` on the n0 stack (DNS discovery + default relay), serves a
+  trivial echo protocol on `/iroh-rooms/nat-probe/1` (no room data; spec §8), prints
+  its `EndpointId` and home relay URL.
+- **`nat-probe dial <ENDPOINT_ID> …`** — dials purely by `EndpointId` (discovery
+  resolves the path), measures TTFB / RTT / throughput, reads the **settled path type
+  directly off iroh** (active-addr set on `Endpoint::remote_info` — the `ConnectionType`
+  watcher is absent on iroh 1.0.1; see `crates/spike-nat/NOTES.md §2`), and emits a
+  `ProbeResult` as human summary on stdout and structured JSON on `--json`.
+- **`--relay-only`** suppresses direct paths (`clear_ip_transports`) for a controlled
+  relay measurement. **`--loopback`** is the offline self-check (relay disabled, dial
+  by `--addr`); it proves the harness works but is NOT Gate A.
+- **`ProbeResult`** (spec §5 field table): `scenario`, `direction`, `nat_a`/`nat_b`,
+  `established`, `path_type`, `initial_path_type`, `hole_punched`, `ttfb_direct_ms` /
+  `ttfb_relay_ms`, `rtt_ms`, `rtt_p90_ms`, `throughput_mbit_s`, `setup_time_ms`,
+  `relay_url`, `iroh_version`, `run_at_utc`. TTFB is bucketed into the direct/relay
+  column by the settled path type (forced to relay under `--relay-only`) so natural
+  and controlled relay runs are directly comparable.
+- **Runbook** in `crates/spike-nat/NOTES.md` §4: two hosts on different real networks,
+  both directions, natural + `--relay-only`, ≥2 NAT scenarios incl. ≥1 likely-symmetric
+  (CGNAT/mobile). Operator-supplied `--nat-a`/`--nat-b`/`--scenario`/`--direction`/
+  `--run-at` carry all the context; no wall-clock is read in any decision path.
+- **GO/NO-GO rubric** (`crates/spike-nat/NOTES.md` §5): GO iff every scenario
+  establishes both directions within ≤10 s via at least relay, ≥1 non-symmetric
+  scenario achieves direct, and relay usability meets ≥1 Mbit/s / RTT ≤300 ms. A
+  NO-GO is a hard input to the Gate E memo (#15).
+- **Results artifact**: `crates/spike-nat/results/` — one JSON per run + a rolled-up
+  `results.md` table that drops verbatim into `crates/iroh-rooms-net/NOTES.md` under
+  "Gate A (real-network)".
+- CI proves the harness builds, its loopback self-check passes (a bidi echo on
+  loopback, well-formed `ProbeResult` emitted, path classification correct), and all
+  unit tests pass; **the manual two-host execution is still owed** before Gate A
+  closes (see `crates/iroh-rooms-net/NOTES.md` for the pending table and Gate E feed).
+
 The **peer connection manager** has landed in `crates/iroh-rooms-net` and
 `crates/iroh-rooms-cli` (issue #22 / IR-0107), wiring the landed transport primitives
 into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follow-up
@@ -394,9 +434,11 @@ into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follo
 
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the iroh
-transport, the live pipe, and the peer connection manager) are all landed as prototypes;
-the remaining work is file sharing, agent status, and the Gate-A real-network
-confirmation (all tracked separately).
+transport, the live pipe, and the peer connection manager) are all landed as prototypes.
+The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
+remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
+Gate E memo (#15). The remaining feature work is file sharing and agent status (both
+tracked separately).
 
 ## Repository Layout
 
@@ -405,6 +447,7 @@ crates/iroh-rooms-core/   Core protocol and domain library
 crates/iroh-rooms-cli/    CLI binary (identity, room, pipe subcommands; scaffold for file, agent)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
+crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate
 specs/                    Implementation specs produced during planning

@@ -112,30 +112,42 @@ Confirmed against the pinned source; no blocking divergences:
   `identity_of_device` + the Active set). The production re-point is a swap of those
   two lookups, not a reshape.
 
-## Gate A (real-network) — STATUS: NOT YET RUN
+## Gate A (real-network) — STATUS: NOT YET RUN (measurement harness landed, IR-0012)
 
 **A green loopback run is NOT Gate A.** The Gate-A NAT test (two physical machines
-on different real NATs) was not performed in this phase — no two-NAT rig was
-available, which the Test Plan permits ("if available"). It remains **owed before
-MVP go**.
+on different real NATs) has not been executed — it remains **owed before MVP go**.
+What changed in IR-0012 (#43): the previously-missing rig now exists. A dedicated
+substrate probe **`nat-probe`** (`crates/spike-nat`) and a full runbook +
+GO/NO-GO rubric + results schema are landed and CI-proven; only the manual
+two-host *execution* is outstanding.
 
-To run it with the delivered binary (no code change needed):
+Two complementary runs close Gate A (see `crates/spike-nat/NOTES.md` for the full
+runbook):
 
-1. On machine A: `net-smoke listen --real` → prints `endpoint id` (+ relay/direct
-   hints once discovery settles).
-2. On machine B: `net-smoke dial <ENDPOINT_ID> --real` (dial purely by id; n0 DNS
-   discovery + relay resolve the path). Repeat with the roles reversed (both dial
-   directions).
-3. Record per scenario: establishment success + time-to-first-event, **path type
-   achieved** (direct hole-punched vs relay — read off iroh's path watcher; do not
-   assume), RTT, throughput. Run ≥2 NAT scenarios incl. ≥1 likely-symmetric
-   (CGNAT/mobile). GO iff a path is established both directions within ≤10 s in every
-   scenario via at least relay fallback, with a direct path in ≥1 non-symmetric
-   scenario.
+1. **Substrate probe** — `nat-probe` measures the iroh substrate directly (bare
+   `Endpoint` echo on `/iroh-rooms/nat-probe/1`): establishment, **path type read
+   off iroh's `remote_info` active-addr set** (iroh 1.0.1 has no `ConnectionType`
+   watcher — see `spike-nat/NOTES.md` §2), TTFB (direct + relay via `--relay-only`),
+   RTT, and throughput, emitted as structured JSON.
+2. **Confirmation pass over this carrier** — drives the *real shipping transport*
+   across the same two hosts, no code change:
+   - Event ALPN: `net-smoke listen --real` | `net-smoke dial <ENDPOINT_ID> --real`
+     (both directions), recording establishment + time-to-first-event + path type
+     (same `remote_info` method). This closes the IR-0005 Gate-A residual for the
+     event plane.
+   - Pipe ALPN: bring up `iroh-rooms pipe` across the two hosts (IR-0010) and
+     confirm a byte crosses `/iroh-rooms/pipe/1` over the real NAT — closes the
+     pipe ALPN's owed Gate A (see below).
+
+Run ≥2 NAT scenarios incl. ≥1 likely-symmetric (CGNAT/mobile), both directions.
+GO iff a path is established both directions within ≤10 s in every scenario via at
+least relay fallback, with a direct hole-punched path in ≥1 non-symmetric scenario
+and usable relay throughput (≥1 Mbit/s, RTT ≤ ~300 ms). Paste the rolled-up
+`crates/spike-nat/results/results.md` table in place of the placeholder below.
 
 | scenario | direction | established | path type | TTF event | RTT | throughput |
 |----------|-----------|-------------|-----------|-----------|-----|------------|
-| _(pending real-network rig)_ | | | | | | |
+| _(pending manual two-host run — harness: `crates/spike-nat`, `nat-probe`)_ | | | | | | |
 
 ### Loopback baseline (reference only — NOT Gate A)
 
@@ -171,4 +183,7 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
   IR-0107** — `PeerManager.reconcile` derives the desired outbound set from the live
   snapshot and starts/stops dial loops on membership change.
 - Deterministic double-connect tie-break (D8 / OQ-4) — still a follow-up.
-- **Run Gate A** and record the table above.
+- **Run Gate A** and record the table above. The measurement harness is landed
+  (`crates/spike-nat` / `nat-probe`, IR-0012) with a full runbook; what remains is
+  the manual two-host execution (substrate probe + this carrier's confirmation
+  pass) and pasting the results table here.

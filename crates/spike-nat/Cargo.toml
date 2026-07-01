@@ -1,0 +1,42 @@
+# Throwaway spike crate (IR-0012). The `nat-probe` Gate-A measurement harness:
+# stands up two iroh endpoints on separate real NATs, attempts a direct QUIC
+# connection via n0 discovery + relay, and records direct-vs-relay path type,
+# TTFB, RTT and throughput. It MUST NOT be depended on by the shipping crates
+# (`iroh-rooms-core` / `iroh-rooms-cli` / `iroh-rooms-net`). See `NOTES.md` for
+# the API reconciliation, the runbook, and the findings.
+[package]
+name = "spike-nat"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack has a higher
+# MSRV than the shipping crates, and this is a throwaway spike, so we make no
+# MSRV claim here rather than relaxing the workspace value (mirrors spike-blobs).
+publish = false
+
+[lib]
+name = "spike_nat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nat-probe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The proven pin (same line the shipping `iroh-rooms-net` carrier runs on). Zero
+# 0.x crates. The connection-type/path classification and the relay-force knob
+# are read off this exact version's API — see `NOTES.md` §2.
+iroh = "=1.0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
