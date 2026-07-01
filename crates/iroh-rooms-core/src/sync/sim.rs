@@ -150,6 +150,44 @@ impl SimNet {
         self.connect(a, b);
     }
 
+    /// Model a **process restart** of `peer` (spec D9 / AC5): tear down its live
+    /// links (a restart loses every connection), drop the engine's in-memory
+    /// session state, and re-`open` a fresh engine over the **same** store.
+    ///
+    /// Because the store (its `events` table and the v2 sync-cache tables) is
+    /// reused, this exercises the restore-from-tables + re-fold path — the
+    /// persisted park, unconfirmed suspicion, backfill token buckets, and
+    /// trust-decision audit come back, while the park's `WantEvents` retry is
+    /// re-issued on the next [`reconnect`](Self::reconnect)/[`tick`](Self::tick).
+    /// The caller reconnects afterwards to resume traffic.
+    ///
+    /// # Errors
+    /// Propagates [`SyncError`](super::SyncError) from re-opening the engine.
+    ///
+    /// # Panics
+    /// Panics if `peer` is not registered.
+    pub fn restart(&mut self, peer: PeerId) -> Result<(), super::SyncError> {
+        // A restart loses every live connection; drop this peer's links first so
+        // the mesh reflects reality and the caller must reconnect to resume.
+        let linked: Vec<PeerId> = self
+            .links
+            .get(&peer)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        for other in linked {
+            self.disconnect(peer, other);
+        }
+        // Drop in-flight frames to/from the restarted peer (a real restart loses
+        // its socket buffers); other peers' traffic is unaffected.
+        self.queue.retain(|env| env.from != peer && env.to != peer);
+        let engine = self.engines.remove(&peer).expect("unknown peer");
+        let config = engine.config();
+        let store = engine.into_store();
+        let restarted = SyncEngine::open(store, self.room_id, config)?;
+        self.engines.insert(peer, restarted);
+        Ok(())
+    }
+
     /// Partition the mesh into two groups, tearing down every cross-group link.
     pub fn partition(&mut self, group_a: &[PeerId], group_b: &[PeerId]) {
         for a in group_a {

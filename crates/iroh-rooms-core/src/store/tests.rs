@@ -745,6 +745,164 @@ fn room_ids_three_rooms_ascending_deduplicated() {
     assert_eq!(actual, expected, "all three rooms must be present");
 }
 
+// ── schema v2 sync-cache round-trips (IR-0201) ───────────────────────────────
+
+// The v2 migration stamps user_version = 2 and creates the five sync-cache tables.
+#[test]
+fn migration_v2_stamps_version_and_creates_sync_cache_tables() {
+    let store = EventStore::open_in_memory().unwrap();
+    let version: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2, "store must migrate to user_version 2");
+    for tbl in [
+        "sync_state",
+        "sync_backfill_tokens",
+        "sync_parked",
+        "sync_parked_missing",
+        "trust_decisions",
+    ] {
+        let found: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![tbl],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "v2 table {tbl} must exist after migration");
+    }
+}
+
+// sync_state round-trips the unconfirmed suspicion (Some/None) idempotently.
+#[test]
+fn sync_state_round_trips_suspect_tip() {
+    use super::SyncStateRow;
+    let room = RoomId::from_bytes([0x21; 32]);
+    let mut store = EventStore::open_in_memory().unwrap();
+
+    // No row yet.
+    assert!(store.load_sync_state(&room).unwrap().is_none());
+
+    // Persist a suspicion; read it back exactly.
+    let tip = EventId::from_bytes([0x42; 32]);
+    let row = SyncStateRow {
+        chat_cursor: None,
+        suspect_tip: Some((tip, 7, 5)),
+    };
+    store.save_sync_state(&room, &row).unwrap();
+    assert_eq!(store.load_sync_state(&room).unwrap(), Some(row));
+
+    // Upsert to cleared suspicion (idempotent single row).
+    let cleared = SyncStateRow::default();
+    store.save_sync_state(&room, &cleared).unwrap();
+    assert_eq!(store.load_sync_state(&room).unwrap(), Some(cleared));
+}
+
+// backfill token buckets round-trip and are replaced wholesale on save.
+#[test]
+fn backfill_tokens_round_trip_and_replace() {
+    use std::collections::BTreeMap;
+    let room = RoomId::from_bytes([0x22; 32]);
+    let alice = sk(0x51).identity_key();
+    let bob = sk(0x52).identity_key();
+    let mut store = EventStore::open_in_memory().unwrap();
+
+    assert!(store.load_backfill_tokens(&room).unwrap().is_empty());
+
+    let mut tokens = BTreeMap::new();
+    tokens.insert(alice, 3);
+    tokens.insert(bob, 0);
+    store.save_backfill_tokens(&room, &tokens).unwrap();
+    assert_eq!(store.load_backfill_tokens(&room).unwrap(), tokens);
+
+    // A subsequent save replaces the whole set (depleted budget persists).
+    let mut fewer = BTreeMap::new();
+    fewer.insert(alice, 1);
+    store.save_backfill_tokens(&room, &fewer).unwrap();
+    assert_eq!(store.load_backfill_tokens(&room).unwrap(), fewer);
+}
+
+// parked frames round-trip (row + missing edges) and delete cascades the edges.
+#[test]
+fn parked_round_trip_upsert_load_delete_cascades() {
+    use super::ParkedRow;
+    let room = RoomId::from_bytes([0x23; 32]);
+    let child = EventId::from_bytes([0x61; 32]);
+    let parent = EventId::from_bytes([0x62; 32]);
+    let author = sk(0x53).identity_key();
+    let mut store = EventStore::open_in_memory().unwrap();
+
+    let row = ParkedRow {
+        event_id: child,
+        wire: vec![0xde, 0xad, 0xbe, 0xef],
+        author,
+        park_seq: 9,
+        depth: 2,
+        missing: vec![parent],
+    };
+    store.upsert_parked(&room, &row).unwrap();
+    assert_eq!(store.load_parked(&room).unwrap(), vec![row.clone()]);
+
+    // Idempotent upsert (checkpoint replay is a no-op).
+    store.upsert_parked(&room, &row).unwrap();
+    assert_eq!(store.load_parked(&room).unwrap().len(), 1);
+
+    // Delete removes the frame and cascades its missing edges.
+    store.delete_parked(&room, &child).unwrap();
+    assert!(store.load_parked(&room).unwrap().is_empty());
+    let orphan_edges: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_parked_missing WHERE room_id = ?1",
+            params![&room.as_bytes()[..]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_edges, 0, "missing edges must cascade on delete");
+}
+
+// trust decisions are append-only with monotone per-room seq and CBOR event_ids.
+#[test]
+fn trust_decisions_append_only_monotone_seq() {
+    use super::TrustRow;
+    let room = RoomId::from_bytes([0x24; 32]);
+    let a = EventId::from_bytes([0x71; 32]);
+    let b = EventId::from_bytes([0x72; 32]);
+    let mut store = EventStore::open_in_memory().unwrap();
+
+    assert!(store.load_trust_decisions(&room).unwrap().is_empty());
+
+    let first = TrustRow {
+        seq: 0,
+        code: "equivocation".to_owned(),
+        severity: "critical".to_owned(),
+        admin_seq: Some(4),
+        event_ids: vec![a, b],
+        created_at: 0,
+    };
+    let seq0 = store.append_trust_decision(&room, &first).unwrap();
+    assert_eq!(seq0, 0);
+
+    let second = TrustRow {
+        code: "admin_view_suspect".to_owned(),
+        severity: "warning".to_owned(),
+        admin_seq: Some(5),
+        event_ids: vec![a],
+        ..first.clone()
+    };
+    let seq1 = store.append_trust_decision(&room, &second).unwrap();
+    assert_eq!(seq1, 1, "seq is per-room monotone");
+
+    let loaded = store.load_trust_decisions(&room).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].code, "equivocation");
+    assert_eq!(loaded[0].event_ids, vec![a, b]);
+    assert_eq!(loaded[1].code, "admin_view_suspect");
+    assert_eq!(loaded[1].seq, 1);
+}
+
 // room_ids() returns the same result before and after rebuild (derived-state
 // determinism; spec §4.2 "mirrors room_event_ids").
 #[test]
@@ -764,5 +922,144 @@ fn room_ids_survives_rebuild_unchanged() {
     assert_eq!(
         before, after,
         "room_ids() must be identical before and after rebuild (restart determinism)"
+    );
+}
+
+// v1→v2 migration is additive: existing `events` rows survive byte-for-byte;
+// the five new v2 derived-cache tables are created empty (spec §D1/§D7).
+#[test]
+fn migration_v1_to_v2_is_additive_preserves_events() {
+    use rusqlite::Connection;
+
+    let (id, dev) = (sk(0x60), sk(0x61));
+    let (genesis_ev, _room) = genesis(&id, &dev);
+    let wire_bytes = genesis_ev.wire.to_bytes();
+
+    // Simulate a v1 database: create only the v1 tables and insert one event.
+    // No v2 tables exist yet; user_version = 1.
+    let v1_ddl = "
+        CREATE TABLE events (
+            event_id    BLOB    NOT NULL PRIMARY KEY,
+            wire        BLOB    NOT NULL,
+            room_id     BLOB    NOT NULL,
+            sender_id   BLOB    NOT NULL,
+            device_id   BLOB    NOT NULL,
+            event_type  TEXT    NOT NULL,
+            created_at  INTEGER NOT NULL,
+            lamport     INTEGER,
+            admin_seq   INTEGER
+        ) STRICT;
+        CREATE TABLE event_parents (
+            child_id    BLOB    NOT NULL,
+            parent_id   BLOB    NOT NULL,
+            ordinal     INTEGER NOT NULL,
+            PRIMARY KEY (child_id, ordinal),
+            FOREIGN KEY (child_id) REFERENCES events(event_id) ON DELETE CASCADE
+        ) STRICT;
+        CREATE INDEX idx_events_room_order ON events(room_id, lamport, event_id);
+    ";
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(v1_ddl).unwrap();
+    conn.execute(
+        "INSERT INTO events(event_id, wire, room_id, sender_id, device_id,
+                            event_type, created_at, lamport, admin_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &genesis_ev.event_id.as_bytes()[..],
+            &wire_bytes[..],
+            &genesis_ev.event.room_id.as_bytes()[..],
+            &genesis_ev.event.sender_id.as_bytes()[..],
+            &genesis_ev.event.device_id.as_bytes()[..],
+            genesis_ev.event.event_type.as_str(),
+            i64::try_from(genesis_ev.event.created_at).unwrap(),
+            0_i64,
+            0_i64,
+        ],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 1_i64).unwrap();
+
+    // Run the v1→v2 migration.
+    super::schema::migrate(&conn).unwrap();
+
+    // user_version must now be 2.
+    let ver: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, 2, "user_version must be 2 after migration");
+
+    // The event must be present with byte-identical wire bytes.
+    let wire_back: Vec<u8> = conn
+        .query_row(
+            "SELECT wire FROM events WHERE event_id = ?1",
+            params![&genesis_ev.event_id.as_bytes()[..]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        wire_back, wire_bytes,
+        "event wire bytes must survive migration byte-for-byte"
+    );
+
+    // The five v2 tables must exist and be empty (additive: no rows fabricated).
+    for tbl in [
+        "sync_state",
+        "sync_backfill_tokens",
+        "sync_parked",
+        "sync_parked_missing",
+        "trust_decisions",
+    ] {
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![tbl],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            found, 1,
+            "v2 table {tbl} must exist after migration from v1"
+        );
+
+        let row_count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {tbl}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            row_count, 0,
+            "v2 table {tbl} must be empty (additive migration, no rows fabricated)"
+        );
+    }
+}
+
+// D8: room_event_ids is the set-equality oracle (spec `bounded-recent-sync-prototype.md` D8).
+// The engine's digest() calls it to compare event sets after sync; this tests the method
+// directly so a regression in the query is caught at the store layer, not only via SimNet.
+#[test]
+fn room_event_ids_returns_full_validated_set() {
+    use std::collections::BTreeSet;
+    let (id, dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&id, &dev);
+    let m1 = message(&id, &dev, room, vec![g.event_id], "one", T0 + 1);
+    let m2 = message(&id, &dev, room, vec![m1.event_id], "two", T0 + 2);
+    let mut store = EventStore::open_in_memory().unwrap();
+    store
+        .insert_all(&[g.clone(), m1.clone(), m2.clone()])
+        .unwrap();
+
+    let ids = store.room_event_ids(&room).unwrap();
+    assert_eq!(ids.len(), 3, "must contain all three stored events");
+    assert!(ids.contains(&g.event_id), "genesis must be in the set");
+    assert!(ids.contains(&m1.event_id), "m1 must be in the set");
+    assert!(ids.contains(&m2.event_id), "m2 must be in the set");
+
+    // The return type is BTreeSet for deterministic ordering (spec D8).
+    let expected: BTreeSet<EventId> = [g.event_id, m1.event_id, m2.event_id].into_iter().collect();
+    assert_eq!(ids, expected, "the set must equal exactly the inserted ids");
+
+    // A room with no stored events returns an empty set.
+    let other_room = RoomId::from_bytes([0x99; 32]);
+    assert!(
+        store.room_event_ids(&other_room).unwrap().is_empty(),
+        "an unknown room must return an empty set"
     );
 }

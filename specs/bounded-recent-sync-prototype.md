@@ -197,10 +197,10 @@ Read before implementing.
 - **CLI wiring** (`room tail`, connection-state output, `iroh-rooms sync` UX) — sibling CLI issue
   (#34). The engine exposes the queries the CLI will render.
 - **Multi-device per identity, multi-admin** (deferred protocol scope).
-- **Process-restart durability of the in-flight orphan park** — the spike keeps the orphan park
-  in-memory (survives transport reconnect, which the acceptance criteria require) and rebuilds steady
-  state from the authoritative `events` table on open (spike §9). On-disk parking via a store schema
-  v2 is a documented follow-on (D7, OQ-3).
+- ~~**Process-restart durability of the in-flight orphan park**~~ — **Closed by IR-0201 (#26).**
+  The spike kept the orphan park in-memory (transport-reconnect durability only). Store schema v2
+  now persists the park, admin-tip suspicion, backfill token buckets, and trust-decision audit
+  across process restarts (D7, OQ-3 — see §5 D7 and §14 OQ-3 below).
 
 ### 3.3 Why the split is safe
 
@@ -380,13 +380,15 @@ this issue.
 
 ### D7 — `sync_state` / `trust_decisions` are derived caches; spike keeps them in-memory
 
-Per spike §9 these are rebuildable from `events`. For the spike: keep them **in-memory** in the engine
-(`highest_known_admin_tip`, orphan park + per-author counters, backfill token buckets, recent-window
-cursor, fail-closed subject set, equivocation alerts), rebuilt on `SyncEngine::open` by re-folding
-`events` and re-deriving the admin tip. **Rationale:** avoids touching the **frozen** store schema
-(`user_version = 1`); satisfies "buffered/backfilled, not rejected" and "reconnect after missed
-events" (which need transport-reconnect durability, not process-restart durability). A store **v2**
-migration persisting `sync_state`/`trust_decisions` is a documented follow-on (OQ-3).
+**Closed by IR-0201 (#26).** Per spike §9 these are rebuildable from `events`. For the spike: kept
+**in-memory** in the engine (`highest_known_admin_tip`, orphan park + per-author counters, backfill
+token buckets, recent-window cursor, fail-closed subject set, equivocation alerts), rebuilt on
+`SyncEngine::open` by re-folding `events` and re-deriving the admin tip. **Rationale:** avoided
+touching the **frozen** store schema (`user_version = 1`); satisfied transport-reconnect durability.
+The store **v2** migration persisting the full non-rebuildable state across process restarts
+landed in IR-0201: five derived-cache tables (`sync_state`, `sync_backfill_tokens`, `sync_parked`,
+`sync_parked_missing`, `trust_decisions`), restore-on-open with fail-closed re-arming, and
+per-mutation checkpoint hooks inside the single-owner pump.
 
 ### D8 — Set-equality oracle: a small additive read-only store helper + an engine digest
 
@@ -721,8 +723,9 @@ All deterministic tests run over `SimNet` (no network, no async, no wall clock e
   membership/chat pulls enough?** Recommendation: include `Heads` as a cheap delta hint but keep the
   by-id backfill loop as the correctness path (heads are an optimization, not a trust input).
 - **OQ-3 — Persist `sync_state`/`trust_decisions` (store v2) now, or keep them in-memory (D7)?**
-  Recommendation: in-memory for the spike (rebuildable per spike §9); schedule the v2 migration with
-  the CLI issue when process-restart durability of the park actually matters.
+  **Resolved by IR-0201 (#26).** In-memory for the spike (rebuildable per spike §9). The store v2
+  migration landed in IR-0201: per-mutation checkpoints for park/suspicion/trust (durability-critical),
+  batched per-tick write for token refill — the OQ-3 recommendation was adopted verbatim.
 - **OQ-4 — Gossip-carried admin-tip advertisement (ADR-1 optional channel)?** Recommendation: keep
   admin-tip on the mesh pull RPC for the spike; the optional gossip channel is a post-MVP
   liveness/notify optimization off the critical path.

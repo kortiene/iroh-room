@@ -37,6 +37,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::event::cbor::{self, CborValue};
 use crate::event::constants::DIGEST_LEN;
 use crate::event::content::EventType;
 use crate::event::ids::{EventId, RoomId};
@@ -46,7 +47,7 @@ use crate::event::validate::ValidatedEvent;
 use crate::event::wire::WireEvent;
 
 pub use error::StoreError;
-pub use model::{InsertOutcome, InsertStats, StoredEvent};
+pub use model::{InsertOutcome, InsertStats, ParkedRow, StoredEvent, SyncStateRow, TrustRow};
 
 /// A raw 32-byte id as stored in a BLOB column.
 type RawId = [u8; DIGEST_LEN];
@@ -392,6 +393,358 @@ impl EventStore {
         rebuild_in_tx(&tx)?;
         tx.commit()?;
         Ok(())
+    }
+
+    // -- schema-v2 sync-cache (IR-0201) ---------------------------------------
+    //
+    // All five tables below are DERIVED CACHES (spec D1): droppable and
+    // re-derivable from `events` + reconnect. The store persists and returns them
+    // verbatim and re-decides no validity — the sync engine re-validates a
+    // restored `wire` on load (spec D5). Writes go through short transactions; a
+    // checkpoint miss degrades durability, never correctness (`events` stays
+    // authoritative), so callers treat a failure as non-fatal (spec §6.2).
+
+    /// Load the per-room `sync_state` row (advisory cursor + unconfirmed
+    /// admin-tip suspicion), or `None` if none was ever written.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] if a
+    /// stored id/counter is malformed.
+    pub fn load_sync_state(&self, room: &RoomId) -> Result<Option<SyncStateRow>, StoreError> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT chat_cursor_lamport, chat_cursor_event, \
+                        suspect_tip_event, suspect_tip_seq, suspect_tip_attempts \
+                 FROM sync_state WHERE room_id = ?1",
+            )?
+            .query_row(params![&room.as_bytes()[..]], |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<Vec<u8>>>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((cur_l, cur_e, susp_e, susp_s, susp_a)) = row else {
+            return Ok(None);
+        };
+        let chat_cursor = match (cur_l, cur_e) {
+            (Some(l), Some(e)) => Some((sql_to_u64(l)?, EventId::from_bytes(to_raw_id(&e)?))),
+            _ => None,
+        };
+        let suspect_tip = match (susp_e, susp_s) {
+            (Some(e), Some(s)) => Some((
+                EventId::from_bytes(to_raw_id(&e)?),
+                sql_to_u64(s)?,
+                u32::try_from(susp_a)
+                    .map_err(|_| StoreError::integrity("suspect_tip_attempts out of range"))?,
+            )),
+            _ => None,
+        };
+        Ok(Some(SyncStateRow {
+            chat_cursor,
+            suspect_tip,
+        }))
+    }
+
+    /// Upsert the single per-room `sync_state` row (`updated_at` is advisory and
+    /// stored as `0`, keeping the write clock-free and restart-deterministic).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] if a
+    /// counter exceeds the `SQLite` INTEGER range.
+    pub fn save_sync_state(&mut self, room: &RoomId, st: &SyncStateRow) -> Result<(), StoreError> {
+        let (cur_l, cur_e) = match &st.chat_cursor {
+            Some((l, e)) => (Some(u64_to_sql(*l)?), Some(e.as_bytes().to_vec())),
+            None => (None, None),
+        };
+        let (susp_e, susp_s, susp_a) = match &st.suspect_tip {
+            Some((id, seq, att)) => (
+                Some(id.as_bytes().to_vec()),
+                Some(u64_to_sql(*seq)?),
+                i64::from(*att),
+            ),
+            None => (None, None, 0_i64),
+        };
+        let tx = self.conn.transaction()?;
+        tx.prepare_cached(
+            "INSERT INTO sync_state \
+                (room_id, chat_cursor_lamport, chat_cursor_event, \
+                 suspect_tip_event, suspect_tip_seq, suspect_tip_attempts, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0) \
+             ON CONFLICT(room_id) DO UPDATE SET \
+                chat_cursor_lamport = excluded.chat_cursor_lamport, \
+                chat_cursor_event   = excluded.chat_cursor_event, \
+                suspect_tip_event    = excluded.suspect_tip_event, \
+                suspect_tip_seq      = excluded.suspect_tip_seq, \
+                suspect_tip_attempts = excluded.suspect_tip_attempts, \
+                updated_at           = excluded.updated_at",
+        )?
+        .execute(params![
+            &room.as_bytes()[..],
+            cur_l,
+            cur_e,
+            susp_e,
+            susp_s,
+            susp_a
+        ])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the per-author backfill token buckets for a room (empty if none).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] on a
+    /// malformed author id / negative token count.
+    pub fn load_backfill_tokens(
+        &self,
+        room: &RoomId,
+    ) -> Result<BTreeMap<IdentityKey, u32>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT author_id, tokens FROM sync_backfill_tokens WHERE room_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![&room.as_bytes()[..]], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for r in rows {
+            let (author, tokens) = r?;
+            let author = IdentityKey::from_bytes(to_raw_id(&author)?);
+            let tokens = u32::try_from(tokens)
+                .map_err(|_| StoreError::integrity("backfill token count out of range"))?;
+            out.insert(author, tokens);
+        }
+        Ok(out)
+    }
+
+    /// Replace the room's backfill token buckets with `tokens`, in one
+    /// transaction (the batched per-tick checkpoint, spec §6.2 / D4).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn save_backfill_tokens(
+        &mut self,
+        room: &RoomId,
+        tokens: &BTreeMap<IdentityKey, u32>,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM sync_backfill_tokens WHERE room_id = ?1",
+            params![&room.as_bytes()[..]],
+        )?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO sync_backfill_tokens (room_id, author_id, tokens) VALUES (?1, ?2, ?3)",
+            )?;
+            for (author, t) in tokens {
+                stmt.execute(params![
+                    &room.as_bytes()[..],
+                    &author.as_bytes()[..],
+                    i64::from(*t)
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the persisted orphan park for a room, oldest-first by `park_seq` (the
+    /// deterministic re-insertion order), each row carrying its still-missing
+    /// parents. The `wire` bytes are returned verbatim and re-validated by the
+    /// engine on load (spec D5) — this method does **not** decode them.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] on a
+    /// malformed stored id / out-of-range counter.
+    pub fn load_parked(&self, room: &RoomId) -> Result<Vec<ParkedRow>, StoreError> {
+        // (event_id, wire, author_id, park_seq, depth) — the raw `sync_parked` row
+        // before fallible id/counter conversion.
+        let raw: Vec<RawParkedRow> = {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT event_id, wire, author_id, park_seq, depth FROM sync_parked \
+                 WHERE room_id = ?1 ORDER BY park_seq, event_id",
+            )?;
+            let rows = stmt.query_map(params![&room.as_bytes()[..]], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
+        let mut out = Vec::with_capacity(raw.len());
+        for (event_id, wire, author, park_seq, depth) in raw {
+            let event_id = EventId::from_bytes(to_raw_id(&event_id)?);
+            let author = IdentityKey::from_bytes(to_raw_id(&author)?);
+            let park_seq = sql_to_u64(park_seq)?;
+            let depth = u32::try_from(depth)
+                .map_err(|_| StoreError::integrity("parked depth out of range"))?;
+            let missing = self.parked_missing(room, &event_id)?;
+            out.push(ParkedRow {
+                event_id,
+                wire,
+                author,
+                park_seq,
+                depth,
+                missing,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The persisted still-missing parents of one parked frame.
+    fn parked_missing(&self, room: &RoomId, id: &EventId) -> Result<Vec<EventId>, StoreError> {
+        id_query(
+            &self.conn,
+            "SELECT missing_id FROM sync_parked_missing \
+             WHERE room_id = ?1 AND event_id = ?2 ORDER BY missing_id",
+            params![&room.as_bytes()[..], &id.as_bytes()[..]],
+        )
+    }
+
+    /// Insert (or refresh) one parked frame and its missing-parent edge set, in
+    /// one transaction. Idempotent on `(room_id, event_id)` (checkpoint replay is
+    /// a no-op, spec §8.3).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] if
+    /// `park_seq` exceeds the `SQLite` INTEGER range.
+    pub fn upsert_parked(&mut self, room: &RoomId, row: &ParkedRow) -> Result<(), StoreError> {
+        let park_seq = u64_to_sql(row.park_seq)?;
+        let tx = self.conn.transaction()?;
+        tx.prepare_cached(
+            "INSERT INTO sync_parked (room_id, event_id, wire, author_id, park_seq, depth) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(room_id, event_id) DO UPDATE SET \
+                wire = excluded.wire, author_id = excluded.author_id, \
+                park_seq = excluded.park_seq, depth = excluded.depth",
+        )?
+        .execute(params![
+            &room.as_bytes()[..],
+            &row.event_id.as_bytes()[..],
+            &row.wire,
+            &row.author.as_bytes()[..],
+            park_seq,
+            i64::from(row.depth),
+        ])?;
+        // Replace the missing-parent edge set for this frame.
+        tx.execute(
+            "DELETE FROM sync_parked_missing WHERE room_id = ?1 AND event_id = ?2",
+            params![&room.as_bytes()[..], &row.event_id.as_bytes()[..]],
+        )?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO sync_parked_missing (room_id, event_id, missing_id) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for m in &row.missing {
+                stmt.execute(params![
+                    &room.as_bytes()[..],
+                    &row.event_id.as_bytes()[..],
+                    &m.as_bytes()[..]
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete one parked frame (its `sync_parked_missing` edges cascade via the
+    /// foreign key). A no-op if the frame is not present.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn delete_parked(&mut self, room: &RoomId, id: &EventId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM sync_parked WHERE room_id = ?1 AND event_id = ?2",
+            params![&room.as_bytes()[..], &id.as_bytes()[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Load the append-only trust-decision audit trail for a room, in insertion
+    /// order (`seq`).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] on a
+    /// malformed stored row (bad `event_ids` CBOR / out-of-range counter).
+    pub fn load_trust_decisions(&self, room: &RoomId) -> Result<Vec<TrustRow>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, code, severity, admin_seq, event_ids, created_at \
+             FROM trust_decisions WHERE room_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![&room.as_bytes()[..]], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (seq, code, severity, admin_seq, event_ids, created_at) = r?;
+            out.push(TrustRow {
+                seq: sql_to_u64(seq)?,
+                code,
+                severity,
+                admin_seq: admin_seq.map(sql_to_u64).transpose()?,
+                event_ids: decode_id_array(&event_ids)?,
+                created_at: sql_to_u64(created_at)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Append one trust decision, assigning the next per-room monotone `seq`
+    /// (returned). Append-only: never overwrites a prior alert (spec D6).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] if a
+    /// counter exceeds the `SQLite` INTEGER range.
+    pub fn append_trust_decision(
+        &mut self,
+        room: &RoomId,
+        row: &TrustRow,
+    ) -> Result<u64, StoreError> {
+        let admin_seq = row.admin_seq.map(u64_to_sql).transpose()?;
+        let created_at = u64_to_sql(row.created_at)?;
+        let event_ids = encode_id_array(&row.event_ids);
+        let tx = self.conn.transaction()?;
+        let next: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM trust_decisions WHERE room_id = ?1",
+            )?
+            .query_row(params![&room.as_bytes()[..]], |r| r.get(0))?;
+        tx.prepare_cached(
+            "INSERT INTO trust_decisions \
+                (room_id, seq, code, severity, admin_seq, event_ids, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?
+        .execute(params![
+            &room.as_bytes()[..],
+            next,
+            row.code.as_str(),
+            row.severity.as_str(),
+            admin_seq,
+            event_ids,
+            created_at,
+        ])?;
+        tx.commit()?;
+        sql_to_u64(next)
     }
 }
 
@@ -816,6 +1169,10 @@ fn compute_admin(
 /// The raw `STORED_COLS` row as `rusqlite` yields it, before fallible conversion.
 type RawEventRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, Option<i64>, Option<i64>);
 
+/// A raw `sync_parked` row `(event_id, wire, author_id, park_seq, depth)` as
+/// `rusqlite` yields it, before fallible id/counter conversion.
+type RawParkedRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64);
+
 fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEventRow> {
     Ok((
         row.get(0)?,
@@ -903,6 +1260,42 @@ fn to_raw_id(bytes: &[u8]) -> Result<RawId, StoreError> {
 /// A non-negative stored derived value as a `u64`.
 fn sql_to_u64(v: i64) -> Result<u64, StoreError> {
     u64::try_from(v).map_err(|_| StoreError::integrity("derived column is negative"))
+}
+
+/// A `u64` counter as a `SQLite` INTEGER, surfacing an out-of-range value as a
+/// typed integrity error rather than a silent wrap. Used for the v2 sync-cache
+/// counters (`park_seq`, `admin_seq`, `suspect_tip_seq`) that *are* meaningful,
+/// unlike the advisory `created_at` (which reinterprets, [`created_at_to_sql`]).
+fn u64_to_sql(v: u64) -> Result<i64, StoreError> {
+    i64::try_from(v).map_err(|_| StoreError::integrity("counter exceeds i64 range"))
+}
+
+/// Encode a list of ids as a canonical-CBOR byte array (the `trust_decisions`
+/// `event_ids` column), reusing the event core's deterministic codec.
+fn encode_id_array(ids: &[EventId]) -> Vec<u8> {
+    cbor::encode(&CborValue::Array(
+        ids.iter()
+            .map(|id| CborValue::Bytes(id.as_bytes().to_vec()))
+            .collect(),
+    ))
+}
+
+/// Decode a canonical-CBOR id array, surfacing corruption as a typed integrity
+/// error (never a panic on stored bytes, spec §9).
+fn decode_id_array(bytes: &[u8]) -> Result<Vec<EventId>, StoreError> {
+    let value = cbor::decode_canonical(bytes)
+        .map_err(|_| StoreError::integrity("trust event_ids not canonical CBOR"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| StoreError::integrity("trust event_ids not a CBOR array"))?;
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let b = it
+            .as_bytes()
+            .ok_or_else(|| StoreError::integrity("trust event_id not CBOR bytes"))?;
+        out.push(EventId::from_bytes(to_raw_id(b)?));
+    }
+    Ok(out)
 }
 
 /// Map an advisory `created_at` (`u64` ms epoch) to the `SQLite` INTEGER domain.

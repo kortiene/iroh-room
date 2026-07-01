@@ -32,6 +32,16 @@ pub trait AuditSink: Send + Sync + 'static {
     /// label. Default: no-op, so existing sinks need not change.
     fn offline(&self, _device: EndpointId, _reason: &'static str) {}
 
+    /// One or more inbound sync frames from `device` were **rejected** by the
+    /// engine before being stored or fanned out (invalid signature, non-member,
+    /// bad capability, …) — the AC3 "invalid event rejected" signal
+    /// (harden-recent-history-sync §D8). `count` is how many frames the
+    /// just-processed inbound message rejected; the stable per-frame
+    /// `reject.<code>` detail lives in the engine's bounded `logs()`. Surfaced
+    /// here so a CLI/host observes rejections **without** a `tracing` subscriber
+    /// (the CLI installs none). Default: no-op, so existing sinks need not change.
+    fn event_rejected(&self, _device: EndpointId, _count: u64) {}
+
     /// A peer was **deauthorized** mid-session — removed from the room, so the
     /// managed dial loop was stopped and its link torn down (spec §4.2 step 3).
     /// Terminal: we will not redial a since-removed peer. Default: no-op.
@@ -93,6 +103,17 @@ impl AuditSink for TracingAudit {
             cause,
             peer = %device,
             "peer is offline"
+        );
+    }
+
+    fn event_rejected(&self, device: EndpointId, count: u64) {
+        // `event.rejected` is the stable, greppable AC3 audit line. WARN because a
+        // dropped peer frame is a security-relevant event (PRD §16.3).
+        tracing::warn!(
+            reason = "event.rejected",
+            count,
+            peer = %device,
+            "rejected invalid inbound sync frame(s); not stored, not re-broadcast"
         );
     }
 
@@ -174,6 +195,13 @@ mod tests {
     #[test]
     fn tracing_audit_connected_does_not_panic() {
         TracingAudit.connected(device(3));
+    }
+
+    #[test]
+    fn tracing_audit_event_rejected_does_not_panic() {
+        // AC3 observability sink must be non-panicking for any reject count.
+        TracingAudit.event_rejected(device(5), 1);
+        TracingAudit.event_rejected(device(5), 0);
     }
 
     #[test]
