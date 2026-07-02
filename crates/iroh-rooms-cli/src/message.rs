@@ -38,8 +38,11 @@ use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey};
 use iroh_rooms_core::event::signed::SignedEvent;
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{build_agent_status, build_message_text};
 use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, Role, RoomMembership, Status};
+// The offline authoring half of `send`/`send_agent_status` goes through the SDK
+// façade (spec IR-0301 §5.4); the online engine/transport imports above stay
+// direct `core`/`net` deps (the optional online-path migration).
+use iroh_rooms::events::{build_agent_status, build_message_text};
 use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{

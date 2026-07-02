@@ -5,6 +5,10 @@ members = [
   # The real full-mesh iroh QUIC event-transport adapter (IR-0005). A shipping
   # crate (the CLI will depend on it), unlike the throwaway spike below.
   "crates/iroh-rooms-net",
+  # The public Rust SDK façade (IR-0301): a curated, stability-tiered re-export
+  # of `iroh-rooms-core`/`iroh-rooms-net`'s already-shipped surface. `publish =
+  # false` for the Phase 2 developer preview; see crates/iroh-rooms/Cargo.toml.
+  "crates/iroh-rooms",
   # Throwaway spike (IR-0009): isolated from the shipping crates' dep tree.
   # Kept in the workspace so CI proves it builds (spec OQ-1, recommended option).
   "crates/spike-blobs",

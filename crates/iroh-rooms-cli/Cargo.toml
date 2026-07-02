@@ -29,6 +29,12 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # `room tail` bring up a `Node` over it to push/receive `message.text` frames
 # (spec IR-0105 D2).
 iroh-rooms-net = { path = "../iroh-rooms-net" }
+# The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
+# (spec AC2). The offline authoring path imports stable items through here
+# instead of `iroh-rooms-core` directly; `experimental` is enabled so the
+# façade's re-exports stay a strict superset of what the CLI already needs
+# (see `docs/sdk-coverage.md`).
+iroh-rooms = { path = "../iroh-rooms", features = ["experimental"] }
 # Async runtime for the two online commands (`room send`, `room tail`). The offline
 # commands stay synchronous; each online command enters a scoped runtime (D2).
 # `signal` powers `room tail`'s Ctrl-C shutdown.

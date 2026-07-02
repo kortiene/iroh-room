@@ -36,6 +36,12 @@
 //!   [`SyncTransport`](iroh_rooms_core::sync::SyncTransport) (G6).
 //! - [`Node`] — a thin runtime pairing a transport with a `SyncEngine` and
 //!   pumping them (used by the `net-smoke` binary and the loopback tests).
+//!
+//! **This is an implementation crate.** The supported SDK entry point is the
+//! `iroh-rooms` façade (issue #36 / IR-0301), which re-exports this crate's
+//! online-runtime surface behind its `experimental` feature. Depend on this
+//! crate directly only for advanced use; every item here may change without
+//! the façade's `0.x` stability policy.
 
 pub mod admission;
 pub mod alpn;

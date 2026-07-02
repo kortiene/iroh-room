@@ -1,0 +1,54 @@
+# The public Rust SDK façade (IR-0301): a curated, documented, stability-tiered
+# re-export of the already-shipped `iroh-rooms-core`/`iroh-rooms-net` surface.
+# Zero new behavior — see `src/lib.rs` for the stability policy and `spec
+# initial-rust-sdk-surface.md` for the design rationale.
+[package]
+name = "iroh-rooms"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false            # developer preview; crates.io release is a follow-up (spec OQ3)
+description = "Iroh Rooms Rust SDK: a curated, stability-tiered façade over iroh-rooms-core/-net"
+# Deliberately does NOT inherit the workspace `rust-version`: the `experimental`
+# feature pulls in `iroh-rooms-net` -> the iroh 1.0 stack (rustc >= 1.85),
+# mirroring `iroh-rooms-net/Cargo.toml`.
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Stable surface only: pure/deterministic protocol authoring + validation +
+# membership fold + ticket codec. No IO, no network, no local store.
+default = []
+# The online runtime tier (spec D3/D4): transport, sync engine, local store,
+# blob serve/fetch, live-pipe forwarding. Off by default so a default-features
+# consumer cannot even name an experimental type.
+experimental = ["dep:iroh-rooms-net", "iroh-rooms-core/sync"]
+# Convenience alias for the full surface.
+full = ["experimental"]
+
+[dependencies]
+# Stable tier: pure protocol only, no `store`/`sync` feature.
+iroh-rooms-core = { path = "../iroh-rooms-core" }
+# Experimental tier only.
+iroh-rooms-net = { path = "../iroh-rooms-net", optional = true }
+
+[dev-dependencies]
+# Async runtime for the online examples' `main()`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `EndpointId`/`EndpointAddr`/`SecretKey` for the online examples' peer wiring.
+# Same pin `iroh-rooms-net` resolves.
+iroh = "=1.0.1"
+# CSPRNG room-nonce generation in the offline examples (spec IR-0102 D5). Same
+# 0.4 line `iroh-rooms-core` already resolves.
+getrandom = "0.4"
+# Lowercase-hex rendering of `pipe_id`/blob hashes in the online examples.
+# Same 0.4 line `iroh-rooms-core`/`-net` already resolve.
+hex = "0.4"
+# Ergonomic error context for the online examples' `main() -> Result<()>`.
+# Same 1.x line `iroh-rooms-net`/`-cli` already resolve.
+anyhow = "1"

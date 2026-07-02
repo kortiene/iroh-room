@@ -18,14 +18,11 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh_rooms_core::event::constants::{MAX_PREV_EVENTS, SHORT_ID_LEN};
-use iroh_rooms_core::event::ids::RoomId;
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{build_member_invited, capability_hash};
-use iroh_rooms_core::membership::{Ingest, RoomMembership};
+use iroh_rooms::events::constants::{MAX_PREV_EVENTS, SHORT_ID_LEN};
+use iroh_rooms::events::{capability_hash, validate_wire_bytes, ValidationContext};
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::{build_member_invited, Ingest, RoomId, RoomInviteTicket, RoomMembership};
 use iroh_rooms_core::store::EventStore;
-use iroh_rooms_core::ticket::RoomInviteTicket;
 use zeroize::Zeroizing;
 
 use crate::error::{CodedResultExt, ErrorCode};

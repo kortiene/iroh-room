@@ -29,7 +29,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::build_file_shared;
+// The offline authoring half of `share` goes through the SDK façade (spec
+// IR-0301 §5.4); the online engine/transport imports below stay direct
+// `core`/`net` deps (the optional online-path migration).
+use iroh_rooms::files::build_file_shared;
 use iroh_rooms_core::event::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
 use iroh_rooms_core::event::content::{Content, EventType, FileShared};
 use iroh_rooms_core::event::ids::{HashRef, RoomId};
