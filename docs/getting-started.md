@@ -64,9 +64,13 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   implemented** — the serve/fetch half is a tracked follow-up. After sharing, the file is
 >   held locally; peers can see the reference via `file list` (with `provider: reference-only`)
 >   but cannot yet fetch the bytes. The `file fetch` block in Step 5 remains *illustrative*.
-> - **Step 7** — `agent` is scaffold — the binary does not recognise it yet. **Expected output**
->   blocks for Step 7 are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
->   captured from a real run).
+> - **`agent invite`** is implemented and runnable as of issue #31 / IR-0206: it mints a
+>   key-bound, agent-role invite ticket for a named agent identity (the same artifact
+>   `room invite --role agent` produces, under the PRD §16 `agent invite <ROOM_ID> <AGENT_ID>`
+>   surface). The agent then joins with the shared `room join <ticket>` flow.
+> - **Step 7** (`agent status`) is still scaffold — the binary does not recognise it yet.
+>   **Expected output** blocks for Step 7 are *illustrative* (consistent with `PRD.v0.3.md`
+>   §16 but not yet captured from a real run).
 > - **Issue #24 / IR-0109** adds the Phase 1A two-peer integration test suite
 >   (`crates/iroh-rooms-cli/tests/two_peer_e2e.rs`). The CI tier (offline-backbone and
 >   restart-persistence tests) runs automatically via `cargo test`. The full online tier —
@@ -81,7 +85,7 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 > - The data-directory override (`--data-dir` flag and `IROH_ROOMS_HOME` env var) is
 >   confirmed by the shipped binary — use these exactly as documented.
 > - A few details for later commands are still pending and are flagged inline as
->   **[reconcile]**: the exact `agent invite`/join syntax.
+>   **[reconcile]**: the `agent status` command surface (tracked separately).
 > - **The merged binary is the source of truth.** If you are running against the real
 >   binary and an output differs from any block in this guide, trust the binary and file
 >   the divergence.
@@ -361,11 +365,11 @@ next: run `iroh-rooms room members blake3:…` or `iroh-rooms room tail blake3:�
 
 ```bash
 # Substitute <ROOM_ID> from Step 2 and <AGENT_ID> from the agent's identity show (Step 1).
-# --role agent grants the agent role; omit --expires for a non-expiring invite.
-iroh-rooms room invite <ROOM_ID> --invitee <AGENT_ID> --role agent
+# The agent command group pins the role to `agent`; omit --expires for a non-expiring invite.
+iroh-rooms agent invite <ROOM_ID> <AGENT_ID>
 ```
 
-**Expected output**:
+**Expected output** (reconciled to the binary):
 
 ```text
 invite_id: ab12…ab12
@@ -378,6 +382,9 @@ ticket:
 warning: this ticket carries a secret — share it over a private channel and treat it like a password.
 next: the invitee runs `iroh-rooms room join <ticket>`
 ```
+
+Stderr also prints a reminder that the agent is a first-class participant but not implicitly
+trusted — it only gains access once it redeems the ticket.
 
 Copy the `roomtkt1…` token as `<AGENT_TICKET>`.
 

@@ -5,6 +5,7 @@
 
 use std::process::ExitCode;
 
+mod agent;
 mod cli;
 mod clock;
 mod display;

@@ -26,6 +26,28 @@
 //!
 //! Every await is bounded (via `wait_until_contains` / a manual `timeout`) so a
 //! wiring bug fails fast rather than hanging CI (mirrors `message_e2e` / `pipe_e2e`).
+//!
+//! ## IR-0206 (agent identity) — the live-transport tier
+//!
+//! An agent is an ordinary principal distinguished only by `role = "agent"`
+//! (Spike §1); `build_admin_room` takes the invited `role` so the same
+//! genesis→invite→dial→join→fold pipeline above is reused verbatim for an agent.
+//! The CLI/unit/fold-level suites (`agent_cli.rs`, `agent.rs`, `fold.rs`) already
+//! prove every IR-0206 AC in-process; these two tests are the live-transport
+//! counterpart explicitly deferred to the e2e phase — two real async `Node`s
+//! dialing each other over loopback QUIC, not an in-memory fold call:
+//!
+//! * **AC1/AC2/AC4** — `agent_role_join_over_real_transport_becomes_active`: an
+//!   agent-role invite + a real QUIC dial + join is accepted on **both** peers,
+//!   and both snapshots resolve `Role::Agent` — the identical wire pipeline as a
+//!   member join, proving humans and agents share one protocol model even at the
+//!   transport boundary.
+//! * **AC3** — `uninvited_agent_cannot_gain_active_membership_over_real_transport`:
+//!   an agent identity with **no** invite on the admin's log dials in under the
+//!   same join-bootstrap admission a legitimate joiner uses (so the connection
+//!   itself is not the gate), then forges a `member.joined`. The fold rejects it
+//!   with `BadCapability` on both peers and the agent never becomes `Active` —
+//!   explicit invite is enforced at the log, not the wire.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +62,7 @@ use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};
 use iroh_rooms_core::event::wire::WireEvent;
+use iroh_rooms_core::membership::Role;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
@@ -123,11 +146,13 @@ struct RoomSetup {
 }
 
 /// Build the admin's room: genesis (admin = admin) + a single `member.invited`
-/// for `joiner_identity`. `expires_at` is `None` for the normal case and
-/// `Some(T0 + 1)` for the expiry test.
+/// for `joiner_identity` with the given `role` ("member" or "agent", IR-0206).
+/// `expires_at` is `None` for the normal case and `Some(T0 + 1)` for the expiry
+/// test.
 fn build_admin_room(
     admin: &Principal,
     joiner_identity: IdentityKey,
+    role: &str,
     expires_at: Option<u64>,
 ) -> RoomSetup {
     let room_id = signed::derive_room_id(&admin.identity(), &NONCE, T0);
@@ -161,7 +186,7 @@ fn build_admin_room(
         content: Content::MemberInvited(MemberInvited {
             invite_id: INV_ID,
             capability_hash: capability_hash(&room_id, &INV_ID, &INV_SECRET),
-            role: "member".to_owned(),
+            role: role.to_owned(),
             invitee_key: joiner_identity,
             expires_at,
             invitee_hint: None,
@@ -286,7 +311,7 @@ async fn valid_join_both_peers_show_joiner_active() {
     let admin = Principal::new(0x01);
     let joiner = Principal::new(0x10);
 
-    let setup = build_admin_room(&admin, joiner.identity(), None);
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
     let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
@@ -369,7 +394,7 @@ async fn bad_capability_secret_join_not_accepted() {
     let admin = Principal::new(0x01);
     let joiner = Principal::new(0x10);
 
-    let setup = build_admin_room(&admin, joiner.identity(), None);
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
     let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
@@ -447,7 +472,7 @@ async fn expired_invite_join_not_accepted() {
     let joiner = Principal::new(0x10);
 
     // Invite expires at T0+1; the join will have created_at = T0+1_000 (after expiry).
-    let setup = build_admin_room(&admin, joiner.identity(), Some(T0 + 1));
+    let setup = build_admin_room(&admin, joiner.identity(), "member", Some(T0 + 1));
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
     let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
@@ -531,7 +556,7 @@ async fn provisional_peer_does_not_receive_chat_events() {
     let admin = Principal::new(0x01);
     let joiner = Principal::new(0x10);
 
-    let setup = build_admin_room(&admin, joiner.identity(), None);
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     // Seed the admin with the room log.
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
@@ -570,4 +595,182 @@ async fn provisional_peer_does_not_receive_chat_events() {
 
     admin_node.shutdown().await.expect("shutdown admin");
     joiner_node.shutdown().await.expect("shutdown joiner");
+}
+
+// ── IR-0206 — agent identity over the live transport ─────────────────────────
+
+/// AC1/AC2/AC4: An agent-role invite, redeemed over a **real QUIC dial** between
+/// two live `Node`s (not an in-memory fold call), is accepted on both peers and
+/// both snapshots resolve `Role::Agent`. This is the wire-boundary counterpart of
+/// `valid_join_both_peers_show_joiner_active` (which proves the identical pipeline
+/// for `role = "member"`) and of the fold-only
+/// `agent_join_folds_to_active_with_role_agent` unit test in
+/// `iroh-rooms-core/src/membership/fold.rs`: the same genesis→invite→dial→join
+/// path carries an agent to `Active` with no agent-specific transport code path,
+/// proving AC4 ("one protocol model") holds all the way to the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_role_join_over_real_transport_becomes_active() {
+    let admin = Principal::new(0x01);
+    let agent = Principal::new(0x10);
+
+    let setup = build_admin_room(&admin, agent.identity(), "agent", None);
+
+    let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
+    let agent_node = spawn_joiner_node(&agent, &admin, setup.room_id).await;
+
+    agent_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+
+    agent_node
+        .wait_until_contains(setup.genesis_event_id, WAIT)
+        .await
+        .expect("agent pulled genesis from admin (WantMembership pull)");
+    agent_node
+        .wait_until_contains(setup.invite_dag_id, WAIT)
+        .await
+        .expect("agent pulled its agent-role invite from admin");
+
+    let heads = agent_node.heads().await.expect("agent DAG heads");
+    let binding = DeviceBinding::create(&setup.room_id, &agent.id, agent.device_key());
+    let join_wire = build_member_joined(
+        &agent.id,
+        &agent.dev,
+        &setup.room_id,
+        &INV_ID,
+        &INV_SECRET,
+        "agent",
+        binding,
+        Some("Agent"),
+        &heads,
+        T0 + 1_000,
+    );
+
+    publish_and_wait_admin(&agent_node, &admin_node, join_wire).await;
+
+    // AC1/AC2: both peers converge on Active over the real wire, not just the
+    // publishing side.
+    assert!(
+        wait_active(&admin_node, &agent.identity(), WAIT).await,
+        "admin's snapshot must show the agent as Active after the join is folded"
+    );
+    assert!(
+        wait_active(&agent_node, &agent.identity(), WAIT).await,
+        "agent's own snapshot must show itself as Active"
+    );
+
+    // AC2/AC4: the folded role is Agent on both peers — the role survived the
+    // wire (dial, sub-DAG pull, publish, fold) unchanged.
+    let admin_snap = admin_node.snapshot().await.expect("admin snapshot");
+    let agent_snap = agent_node.snapshot().await.expect("agent snapshot");
+    assert_eq!(
+        admin_snap.role(&agent.identity()),
+        Some(Role::Agent),
+        "AC2/AC4: the admin's live snapshot must resolve the joiner to Role::Agent"
+    );
+    assert_eq!(
+        agent_snap.role(&agent.identity()),
+        Some(Role::Agent),
+        "AC2/AC4: the agent's own live snapshot must resolve itself to Role::Agent"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    agent_node.shutdown().await.expect("shutdown agent");
+}
+
+/// AC3: An agent identity with **no** `member.invited` anywhere on the admin's
+/// log dials in under the same join-bootstrap admission a legitimate joiner uses
+/// (`JoinBootstrapAdmission` with `accept_joins=true`), so the proof is not "the
+/// connection itself was refused" — it is that explicit invitation is enforced at
+/// the membership log, exactly as PRD §13.3 requires. The uninvited agent forges
+/// a `member.joined` citing a fabricated invite id/secret; the fold on both peers
+/// rejects it with `BadCapability` (no matching on-log invite to satisfy), and
+/// the agent never reaches `Active` on either side. This is the live-transport
+/// counterpart of the fold-only `uninvited_agent_join_without_invite_rejected`
+/// unit test in `iroh-rooms-core/src/membership/fold.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uninvited_agent_cannot_gain_active_membership_over_real_transport() {
+    let admin = Principal::new(0x01);
+    let stranger_agent = Principal::new(0x20);
+
+    // The admin's room has a genesis only — no invite for `stranger_agent` at all.
+    let room_id = signed::derive_room_id(&admin.identity(), &NONCE, T0);
+    let genesis_ev = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: admin.identity(),
+        device_id: admin.device_key(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Uninvited Agent Room".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![admin.identity()],
+            device_binding: DeviceBinding::create(&room_id, &admin.id, admin.device_key()),
+        }),
+    };
+    let genesis_event_id = genesis_ev.event_id();
+    let genesis_bytes = wire(&genesis_ev, &admin.dev);
+
+    let admin_node = spawn_admin_node(&admin, room_id, &[genesis_bytes]).await;
+    let agent_node = spawn_joiner_node(&stranger_agent, &admin, room_id).await;
+
+    // The uninvited agent dials the admin. It is admitted only provisionally by
+    // `JoinBootstrapAdmission` (identical to a legitimate first-time joiner) and
+    // can pull the public genesis — that provisional admission is not the gate.
+    agent_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    agent_node
+        .wait_until_contains(genesis_event_id, WAIT)
+        .await
+        .expect("even an uninvited agent can pull the public genesis (bootstrap semantics)");
+
+    // No invite exists to redeem, so the agent forges one: a fabricated
+    // invite_id/secret that matches no on-log `member.invited`.
+    let heads = agent_node.heads().await.expect("agent DAG heads");
+    let binding = DeviceBinding::create(&room_id, &stranger_agent.id, stranger_agent.device_key());
+    let forged_invite_id = [0x99u8; 16];
+    let forged_secret = [0x77u8; 16];
+    let join_wire = build_member_joined(
+        &stranger_agent.id,
+        &stranger_agent.dev,
+        &room_id,
+        &forged_invite_id,
+        &forged_secret,
+        "agent",
+        binding,
+        None,
+        &heads,
+        T0 + 1_000,
+    );
+
+    // `publish` succeeds (the join is stateless-valid: well-formed and signed);
+    // the fold is the decisive gate and rejects it, so it is never stored or
+    // fanned out — there is no event id to wait for on either peer.
+    agent_node
+        .publish(join_wire.to_bytes())
+        .await
+        .expect("publish member.joined");
+
+    // Allow a brief settling window so any in-flight engine work completes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // AC3: neither peer's fold ever shows the uninvited agent as Active — explicit
+    // invitation is enforced at the log, not merely at the connection boundary.
+    let admin_snap = admin_node.snapshot().await.expect("admin snapshot");
+    assert!(
+        !admin_snap.is_active(&stranger_agent.identity()),
+        "AC3: admin must NOT show an uninvited agent as Active over the real wire"
+    );
+    let agent_snap = agent_node.snapshot().await.expect("agent snapshot");
+    assert!(
+        !agent_snap.is_active(&stranger_agent.identity()),
+        "AC3: the uninvited agent must NOT show itself as Active"
+    );
+    assert_eq!(
+        admin_snap.role(&stranger_agent.identity()),
+        None,
+        "AC3: an uninvited agent has no resolved role in the admin's live snapshot"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    agent_node.shutdown().await.expect("shutdown agent");
 }

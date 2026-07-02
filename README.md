@@ -221,7 +221,9 @@ adding the second authoring command and the first out-of-band capability artifac
   — enforcement lives in the landed `gate_join`, not the local clock. `expires: never` when
   absent.
 - `--role admin` is rejected at the CLI (single immutable admin; the fold has no second-admin
-  semantics). `agent` and `member` are accepted.
+  semantics). `agent` and `member` are accepted. (Issue #31 / IR-0206 adds a dedicated
+  `iroh-rooms agent invite <ROOM_ID> <AGENT_ID>` wrapper over this same path with `role`
+  pinned to `agent` — see the Agent identity entry below.)
 - Tickets are key-bound to the named `--invitee`; open/bearer tickets are out of scope for MVP.
 - Output is script-friendly labeled lines, ending with the ticket token and a password-grade warning.
 - 20+ tests (core unit: deterministic builder, golden event id, secret-absent-from-log AC3,
@@ -593,11 +595,40 @@ Blob Plane and making `iroh-rooms file share` operational:
   Until it lands a shared blob is held locally and shown as `provider: you (local)` in
   `file list`; peers that have not yet imported it see `provider: reference-only`.
 
+**Agent identity** has landed in `crates/iroh-rooms-cli` (issue #31 / IR-0206), giving agents a
+first-class, explicitly-invited participant role built entirely on the already-landed identity,
+invite, and membership-fold primitives (PRD §15.8, §13.3):
+
+- `iroh-rooms agent invite <ROOM_ID> <AGENT_ID> [--expires <DURATION>]` — a thin CLI wrapper
+  that delegates to the landed `room invite` path with `role` pinned to `"agent"`; it mints the
+  byte-for-byte same capability artifact as `room invite --invitee <AGENT_ID> --role agent`, so
+  no new authorization surface is introduced. The positional `<AGENT_ID>` replaces `--invitee`
+  and there is deliberately no `--role` flag — the verb *is* the role. `print_agent_invite`
+  reuses the landed `print_invite` for stdout, then adds a stderr-only "not implicitly trusted"
+  reminder (PRD §13.3) so stdout stays script-parseable.
+- **No new identity path**: an agent is created with the same `identity create` command as a
+  human (issue #16 / IR-0101) and is structurally identical on disk and in `identity show` — the
+  `agent` role is assigned only later, at invite time, never at creation (AC4, "one protocol
+  model").
+- **No new fold logic**: `RoomMembership` already modeled `Role::Agent` generically; IR-0206
+  adds fold-level regression tests (not new production code) locking the invariant that an agent
+  invite/join folds to `role=agent` through the identical invite → join → gate path as a member,
+  and that an uninvited agent has no membership state at all (AC2/AC3).
+- 35+ tests: 7 `agent.rs` unit tests (role pinning, expiry forwarding, self-invite rejection,
+  pre-persist validation) plus 20 `tests/agent_cli.rs` CLI integration tests (own identity +
+  device key, structural parity with a human identity, role in the persisted fold, ticket parity
+  with `room invite --role agent`, admin-only gate, secret hygiene, mismatched-ticket rejection);
+  5 new `iroh-rooms-core` fold unit tests (AC2/AC3/AC4); 2 new `iroh-rooms-net/tests/join_e2e.rs`
+  live-transport tests (an agent join over real QUIC becomes `Active`; an uninvited agent's
+  forged join is rejected `BadCapability` on both peers); and 1 `#[ignore]`-gated two-process
+  `tests/two_peer_e2e.rs` test proving `agent invite` + `room join` converge across two
+  independently spawned `iroh-rooms` binaries.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
-Phase 1A two-peer integration test, the hardened recent-history sync, and file import) are
-all landed.
+Phase 1A two-peer integration test, the hardened recent-history sync, file import, and agent
+identity) are all landed.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is the file serve/fetch half (`file fetch`,
@@ -607,7 +638,7 @@ blob serving ALPN, and peer delivery) and agent status (both tracked separately)
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe subcommands; scaffold for agent)
+crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe, agent invite subcommands; agent status still scaffold)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)

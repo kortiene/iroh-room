@@ -812,7 +812,7 @@ mod tests {
     use crate::event::signed::{self, SignedEvent};
     use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
     use crate::event::wire::WireEvent;
-    use crate::membership::Status;
+    use crate::membership::{Role, Status};
 
     const NONCE: [u8; 16] = [0xaa; 16];
     const T0: u64 = 1_750_000_000_000;
@@ -1180,6 +1180,284 @@ mod tests {
                 }
             ),
             "join by wrong identity must be rejected; got {outcome:?}"
+        );
+    }
+
+    // ── IR-0206: agent-role membership fold (AC2 / AC3 / AC4) ────────────────
+    //
+    // An agent is an ordinary principal, distinguished only by `role = "agent"`
+    // (Spike §1). These lock the invariant the `agent invite` CLI wrapper leans
+    // on: the fold drives an agent through the *same* invite → join → gate path
+    // as a member (only the role attribute differs), and an uninvited agent has
+    // no access. `make_invite`/`make_join` above hardcode `role = "member"`, so
+    // the agent path needs the role-parameterized variants below.
+
+    /// A fixed agent invite handle/secret, distinct from the member fixtures so
+    /// the two never collide within a single test's DAG.
+    const AGENT_INVITE_ID: [u8; 16] = [0x07; 16];
+    const AGENT_SECRET: [u8; 16] = [0xa9; 16];
+
+    /// [`make_invite`] with the invited `role` chosen by the caller.
+    #[allow(clippy::too_many_arguments)] // mirrors make_invite plus an explicit role
+    fn make_invite_role(
+        admin_id: &SigningKey,
+        admin_dev: &SigningKey,
+        room: RoomId,
+        invitee: &SigningKey,
+        invite_id: [u8; 16],
+        cap_hash: [u8; 32],
+        role: &str,
+        prev: crate::event::ids::EventId,
+        t: u64,
+    ) -> ValidatedEvent {
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin_id.identity_key(),
+            device_id: admin_dev.device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: t,
+            prev_events: vec![prev],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: cap_hash,
+                role: role.to_owned(),
+                invitee_key: invitee.identity_key(),
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        validate_wire_bytes(&seal(&ev, admin_dev), &ctx(room)).expect("invite stateless-valid")
+    }
+
+    /// [`make_join`] with the redeemed `role` chosen by the caller.
+    #[allow(clippy::too_many_arguments)] // mirrors make_join plus an explicit role
+    fn make_join_role(
+        invitee: &SigningKey,
+        invitee_dev: &SigningKey,
+        room: RoomId,
+        invite_id: [u8; 16],
+        secret: [u8; 16],
+        role: &str,
+        prev: crate::event::ids::EventId,
+        t: u64,
+    ) -> ValidatedEvent {
+        let id_key = invitee.identity_key();
+        let dev_key = invitee_dev.device_key();
+        let binding = DeviceBinding::create(&room, invitee, dev_key);
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: id_key,
+            device_id: dev_key,
+            event_type: EventType::MemberJoined,
+            created_at: t,
+            prev_events: vec![prev],
+            content: Content::MemberJoined(MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: secret,
+                role: role.to_owned(),
+                device_binding: binding,
+                display_name: None,
+            }),
+        };
+        validate_wire_bytes(&seal(&ev, invitee_dev), &ctx(room)).expect("join stateless-valid")
+    }
+
+    // AC2: an admin `member.invited{role="agent"}` is accepted and folds the
+    // subject to status=Invited, role=Agent — the agent role reaches membership
+    // state through the same path as a member, only the attribute differs.
+    #[test]
+    fn agent_invite_folds_to_role_agent_status_invited() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let agent = sk(7);
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &AGENT_INVITE_ID, &AGENT_SECRET);
+        let invite = make_invite_role(
+            &admin_id,
+            &admin_dev,
+            room,
+            &agent,
+            AGENT_INVITE_ID,
+            cap_hash,
+            "agent",
+            genesis.event_id,
+            T0 + 1,
+        );
+        let outcome = {
+            let mut m = RoomMembership::new(room);
+            m.ingest(genesis.clone());
+            m.ingest(invite.clone())
+        };
+        assert!(
+            matches!(outcome, Ingest::Accepted { .. }),
+            "an admin agent-role invite must be accepted by the fold; got {outcome:?}"
+        );
+        let snap = RoomMembership::from_events(room, [genesis, invite]).snapshot();
+        assert_eq!(
+            snap.status(&agent.identity_key()),
+            Some(Status::Invited),
+            "the invited agent reads status=Invited before joining"
+        );
+        assert_eq!(
+            snap.role(&agent.identity_key()),
+            Some(Role::Agent),
+            "the invited agent must fold to Role::Agent (AC2)"
+        );
+    }
+
+    // AC2/AC4: the full agent invite+join path folds to Active with Role::Agent —
+    // the identical fold path as a human member (cf.
+    // `valid_join_transitions_invitee_to_active`), proving humans and agents are
+    // represented through one protocol model, distinguished only by the role.
+    #[test]
+    fn agent_join_folds_to_active_with_role_agent() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (agent, agent_dev) = (sk(7), sk(8));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &AGENT_INVITE_ID, &AGENT_SECRET);
+        let invite = make_invite_role(
+            &admin_id,
+            &admin_dev,
+            room,
+            &agent,
+            AGENT_INVITE_ID,
+            cap_hash,
+            "agent",
+            genesis.event_id,
+            T0 + 1,
+        );
+        let join = make_join_role(
+            &agent,
+            &agent_dev,
+            room,
+            AGENT_INVITE_ID,
+            AGENT_SECRET,
+            "agent",
+            invite.event_id,
+            T0 + 2,
+        );
+        let snap = RoomMembership::from_events(room, [genesis, invite, join]).snapshot();
+        assert!(
+            snap.is_active(&agent.identity_key()),
+            "an agent that redeemed a valid agent invite must be Active"
+        );
+        assert_eq!(
+            snap.role(&agent.identity_key()),
+            Some(Role::Agent),
+            "an active agent keeps Role::Agent through the join (AC2/AC4)"
+        );
+    }
+
+    // AC3 (default-deny): an agent that was never invited has no membership state
+    // at all — an unknown subject is neither known, roled, nor active.
+    #[test]
+    fn uninvited_agent_is_not_active() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let agent = sk(7);
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let snap = RoomMembership::from_events(room, [genesis]).snapshot();
+        let agent_key = agent.identity_key();
+        assert_eq!(
+            snap.status(&agent_key),
+            None,
+            "an uninvited agent has no membership status"
+        );
+        assert_eq!(
+            snap.role(&agent_key),
+            None,
+            "an uninvited agent has no resolved role"
+        );
+        assert!(
+            !snap.is_active(&agent_key),
+            "an uninvited agent must never be active (AC3 default-deny)"
+        );
+    }
+
+    // AC3 (no implicit access): a well-formed, signed agent `member.joined` that
+    // cites an invite with no matching on-log `member.invited` is rejected with
+    // BadCapability — never accepted — and grants no access.
+    #[test]
+    fn uninvited_agent_join_without_invite_rejected() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (agent, agent_dev) = (sk(7), sk(8));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        // No invite is ingested: the join cites an invite_id that does not exist
+        // on the log, so gate_join finds no key-bound capability to match.
+        let orphan_join = make_join_role(
+            &agent,
+            &agent_dev,
+            room,
+            AGENT_INVITE_ID,
+            AGENT_SECRET,
+            "agent",
+            genesis.event_id,
+            T0 + 2,
+        );
+        let mut membership = RoomMembership::new(room);
+        membership.ingest(genesis);
+        let outcome = membership.ingest(orphan_join);
+        assert!(
+            matches!(
+                outcome,
+                Ingest::Rejected {
+                    reason: RejectReason::BadCapability,
+                    ..
+                }
+            ),
+            "an agent join with no matching invite must be rejected with BadCapability; got {outcome:?}"
+        );
+        assert!(
+            !membership.snapshot().is_active(&agent.identity_key()),
+            "a rejected agent join grants no room access (AC3)"
+        );
+    }
+
+    // AC4 (role integrity): the redeemed role must equal the invited role, so a
+    // ticket's role cannot be altered at redemption. An agent-role join against a
+    // member-role invite is rejected with InsufficientRole (and vice versa).
+    #[test]
+    fn agent_join_cannot_redeem_member_role_invite() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (agent, agent_dev) = (sk(7), sk(8));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &AGENT_INVITE_ID, &AGENT_SECRET);
+        // The invite is minted for role "member"…
+        let invite = make_invite_role(
+            &admin_id,
+            &admin_dev,
+            room,
+            &agent,
+            AGENT_INVITE_ID,
+            cap_hash,
+            "member",
+            genesis.event_id,
+            T0 + 1,
+        );
+        // …but the subject tries to redeem it as an "agent" (role mismatch).
+        let join = make_join_role(
+            &agent,
+            &agent_dev,
+            room,
+            AGENT_INVITE_ID,
+            AGENT_SECRET,
+            "agent",
+            invite.event_id,
+            T0 + 2,
+        );
+        let mut membership = RoomMembership::new(room);
+        membership.ingest(genesis);
+        membership.ingest(invite);
+        let outcome = membership.ingest(join);
+        assert!(
+            matches!(
+                outcome,
+                Ingest::Rejected {
+                    reason: RejectReason::InsufficientRole,
+                    ..
+                }
+            ),
+            "a role-mismatched join must be rejected with InsufficientRole; got {outcome:?}"
         );
     }
 }

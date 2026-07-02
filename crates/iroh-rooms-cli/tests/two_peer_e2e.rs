@@ -46,6 +46,21 @@
 //! No production code is modified: everything the test drives (`--loopback`,
 //! `--peer`, `--accept-joins`, `room tail --offline --json`, `room members --json`,
 //! the `pipe expose` stderr audit sink) already ships.
+//!
+//! ## IR-0206 (agent identity) — the two-process tier
+//!
+//! `agent_role_converges_over_real_process_boundary` (gated `#[ignore]`, same
+//! tier as `two_peers_converge_on_membership`) is the CLI's own two-process proof
+//! that `agent invite` + the shared `room join` converge `role=agent,
+//! status=active` across two independently spawned `iroh-rooms` binaries over
+//! real loopback QUIC — the same real product path
+//! `two_peers_converge_on_membership` proves for a member, run instead through
+//! the `agent invite` verb. The in-process CLI suite (`agent_cli.rs`), the fold
+//! suite (`iroh-rooms-core/src/membership/fold.rs`), and the Node-API live-wire
+//! suite (`iroh-rooms-net/tests/join_e2e.rs`) already cover every IR-0206 AC
+//! without a spawned OS process; this test adds the one tier those do not: the
+//! shipped binary, spawned twice, talking to itself over the network exactly as
+//! a user would invoke it.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read};
@@ -966,6 +981,99 @@ fn two_peers_converge_on_membership() {
     assert_eq!(
         alice_set, expected,
         "the converged roster must be {{Alice admin/active, Bob member/active}}"
+    );
+}
+
+/// IR-0206 AC2/AC4 (process/network boundary) — `agent invite` + `room join`
+/// converge `role=agent, status=active` across two independently spawned
+/// `iroh-rooms` binaries talking over real loopback QUIC. Mirrors
+/// `two_peers_converge_on_membership` exactly, except the invite is minted with
+/// `agent invite <ROOM_ID> <AGENT_ID>` (not `room invite --role agent`), proving
+/// the dedicated agent verb drives the identical real two-process, real-network
+/// path — the entire chain (process spawn, network dial, event fan-out, fold,
+/// JSON roster) runs through the shipped binary exactly as a user would invoke
+/// it, which no other IR-0206 test in this workspace exercises.
+#[test]
+#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+fn agent_role_converges_over_real_process_boundary() {
+    let alice_home = TempDir::new().expect("alice home");
+    let agent_home = TempDir::new().expect("agent home");
+    identity_create(&alice_home, "Alice");
+    identity_create(&agent_home, "build-agent");
+    let alice_id = identity_id(&alice_home);
+    let agent_id = identity_id(&agent_home);
+    let room = room_create(&alice_home, "Agent Room");
+
+    // The surface under test is `agent invite`, not `room invite --role agent`.
+    let out = one_shot(
+        alice_home.path(),
+        &["agent", "invite", &room, &agent_id, "--expires", "24h"],
+    );
+    assert!(
+        out.status.success(),
+        "agent invite must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        extract_field(&stdout, "role"),
+        Some("agent"),
+        "agent invite must pin role: agent"
+    );
+    let ticket = extract_ticket(&stdout)
+        .expect("agent invite must print a roomtkt1… ticket")
+        .to_owned();
+
+    // Alice hosts the provisional join-bootstrap window and advertises her address.
+    let alice_tail = ChildSession::spawn(
+        alice_home.path(),
+        &["room", "tail", &room, "--accept-joins", "--loopback"],
+    );
+    let listening = alice_tail
+        .wait_for_line("listening:", WAIT)
+        .unwrap_or_else(|err| panic!("alice tail never advertised a listening address: {err}"));
+    let alice_addr = parse_listening(&listening);
+
+    // The agent redeems its ticket via the shared `room join` (there is no
+    // separate `agent join` verb — D1/Assumption 5 of the IR-0206 spec).
+    let join = one_shot(
+        agent_home.path(),
+        &["room", "join", &ticket, "--peer", &alice_addr, "--loopback"],
+    );
+    assert!(
+        join.status.success(),
+        "agent join must succeed; stderr: {}",
+        String::from_utf8_lossy(&join.stderr)
+    );
+    let join_stdout = String::from_utf8_lossy(&join.stdout);
+    assert!(
+        join_stdout.contains("members: 2 active"),
+        "agent join must report a 2-member room; got:\n{join_stdout}"
+    );
+
+    // The join returns only after the admin observed it, but the tail child
+    // persists asynchronously — poll Alice's roster to absorb that window.
+    wait_until_member_active(&alice_home, &room, &agent_id, WAIT);
+    drop(alice_tail);
+
+    let alice_roster = members_json(&alice_home, &room);
+    let agent_roster = members_json(&agent_home, &room);
+
+    let expected: BTreeSet<(String, String, String)> = [
+        (alice_id.clone(), "admin".to_owned(), "active".to_owned()),
+        (agent_id.clone(), "agent".to_owned(), "active".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    let alice_set = roster_set(&alice_roster);
+    let agent_set = roster_set(&agent_roster);
+    assert_eq!(
+        alice_set, agent_set,
+        "both homes must agree on the membership set"
+    );
+    assert_eq!(
+        alice_set, expected,
+        "the converged roster must be {{Alice admin/active, agent agent/active}} (AC2)"
     );
 }
 
