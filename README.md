@@ -722,6 +722,68 @@ panel distinguishing the two live, while `peer_offline` / `peer_unauthorized` ar
 command-failure twins (e.g. `pipe connect`). A clock-skewed but otherwise valid event is a
 `warning[clock_skew]` advisory only — it is still accepted, ordered, and displayed.
 
+**Actionable next steps (issue #38 / IR-0303).** Every terminal `error[<code>]:` line a
+script-facing coded failure can print is immediately followed, on the next stderr line, by a
+fixed, secret-free `next: <action>` line naming the concrete next step — a second, additive
+render line, never a replacement for the `error[<code>]:` contract above, so a script matching
+`^error\[` or branching on `$?` is unaffected. A structural/crypto rejection (Integrity, exit
+`4`, minus `hash_mismatch`) and `invalid_argument`/`internal` have no generic next step (the
+call-site message already carries the context); every other code below has one.
+
+| Code | Category | Exit | Meaning | Next action |
+| --- | --- | ---: | --- | --- |
+| `internal` | Internal | `1` | unexpected / uncoded internal error | — (see the message) |
+| `invalid_room_id` | Usage | `2` | room id argument does not parse | copy the room id from `room create` / `room members` (form `blake3:<hex>`) |
+| `invalid_argument` | Usage | `2` | an option value is malformed | — (see the message) |
+| `no_such_file` | Usage | `2` | `file share` path missing, or `file fetch` reference not found/synced | check the path for `file share`, or run `file list` / `room tail` first to sync the reference for `file fetch` |
+| `permission_denied` | Usage | `2` | `file share` path exists but cannot be read | check the file's read permissions, or share a copy you can read |
+| `file_too_large` | Usage | `2` | `file share` path exceeds the MVP size cap | the MVP share limit is fixed; split or compress the file |
+| `identity_not_found` | Usage | `2` | no local identity exists | run `iroh-rooms identity create --name <name>` first |
+| `room_not_found` | Usage | `2` | no room with this id is known locally | run `iroh-rooms room create <name>`, or join an invite ticket first |
+| `no_discovery_hint` | Usage | `2` | the invite ticket carries no admin discovery hint | pass `--peer <admin-addr>` (the ticket carried no discovery hint) |
+| `not_a_member` | Auth | `3` | sender/caller is not a current room member | ask the admin to invite you and complete `room join` first |
+| `unbound_device` | Auth | `3` | sender has no device bound in membership state | ask the admin to invite you and complete `room join` first |
+| `insufficient_role` | Auth | `3` | sender's role does not permit this event type | ask the admin to invite you with the intended role |
+| `expired_invite` | Auth | `3` | the cited invite was consumed or its expiry passed | ask the admin for a fresh `room invite` (optionally with a longer `--expires`) |
+| `bad_capability` | Auth | `3` | a join's capability secret did not match the invite | ask the admin to re-issue the invite for your identity id |
+| `wrong_identity` | Auth | `3` | local identity ≠ the ticket's bound `invitee_key` | ask the admin to re-issue the invite for your identity id (`identity show`) |
+| `peer_unauthorized` | Auth | `3` | a connectivity command was refused as not-a-member | ask the admin to confirm your membership has synced, then retry |
+| `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch` | Integrity | `4` | crypto / structural §8 rejections | — (structural; not user-fixable) |
+| `hash_mismatch` | Integrity | `4` | a fetched blob's independently recomputed BLAKE3-256 disagrees with the reference | do not trust this file; the reference or a provider may be corrupt — ask for a fresh `file share` |
+| `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` | Ticket | `5` | the ticket token failed to decode (see the message for which check failed) | check the whole ticket was copied (no truncation/whitespace); if it persists, ask the admin for a fresh `room invite` |
+| `no_admin_reachable` | Connectivity | `6` | `room join` never observed the admin within the timeout | ask the admin to run `room tail <ROOM_ID> --accept-joins`, then retry; or pass `--peer <admin-addr>` |
+| `peer_offline` | Connectivity | `6` | a connectivity command could not reach an authorized peer | ask the owner to come online (run `room tail <ROOM_ID>`), then retry; or pass `--peer <owner-addr>` |
+| `blob_unavailable` | Connectivity | `6` | no reachable provider holds the requested blob | ask a peer that holds the file to run `room tail <ROOM_ID>`, then retry `file fetch` |
+
+Every next-action string is a fixed, non-interpolating `&'static str` (`ErrorCode::next_action()`
+in `crates/iroh-rooms-cli/src/error.rs`) — structurally incapable of leaking a secret; runtime
+context (a path, an id, a resolved `--peer`) stays in the `error[<code>]:` message, never in the
+`next:` line.
+
+**Verbose network diagnostics (issue #38 / IR-0303).** `room members <ROOM_ID> --status
+--verbose` (`-v`) and `room tail <ROOM_ID> --verbose` append a stderr-only, opt-in `diag:` block
+— hidden by default (§18.5 "hide networking details unless needed") — surfacing the network
+facts a developer needs to self-diagnose a P2P failure: this node's dialable address(es) + home
+relay url, and, per known peer, its live path classification read from iroh's `remote_info`
+*active* transport-address set (never inferred from latency — iroh 1.0.1 has no `ConnectionType`
+watcher):
+
+```text
+diag: local id=<endpoint_id> direct=<ip:port,…|none> relay=<url|none>
+diag: peer <short_id> device=<short> state=connected path=direct relay=none
+diag: peer <short_id> device=<short> state=connected path=relay  relay=<url>
+diag: transport connected=2 (direct=1 relay=1 mixed=0) offline=0 unauthorized=0
+```
+
+`path=` is `direct` (a hole-punched UDP path), `relay` (relayed only), `mixed` (both active — not
+yet fully hole-punched), or `none` (no active transport — always true for an `offline` or
+`unauthorized` peer, which never renders as reachable). The block is purely diagnostic — like
+`OfflineReason`, it is a read-only transport observation and never an authorization input — and
+never renders a private key, a ticket secret, or a message payload; only public identifiers
+(`EndpointId`/`IdentityKey`), connection-state labels, IP socket addresses, and relay URLs.
+Without `--verbose` the output is byte-identical to today (AC2: the machine surface — the
+`error[<code>]:`/`warning[<code>]:` lines and the category → exit scheme — is unchanged).
+
 **File fetch and verification** — the serve + fetch half of the Blob Plane — has landed in
 `crates/iroh-rooms-net` and `crates/iroh-rooms-cli` (issue #29 / IR-0204), closing the gap
 #27/#28 left open and completing the PRD §9.2 file-sharing journey:

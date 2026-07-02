@@ -102,7 +102,7 @@ pub fn invite(
     if ids.is_empty() {
         crate::bail_coded!(
             crate::error::ErrorCode::RoomNotFound,
-            "no room {} in {}; run `iroh-rooms room create` first",
+            "no room {} in {}",
             room_id,
             home.display()
         );

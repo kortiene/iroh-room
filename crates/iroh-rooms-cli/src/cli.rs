@@ -310,6 +310,11 @@ enum RoomAction {
         /// How long to wait for connections to settle before printing (--status).
         #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
         timeout: String,
+        /// Print a `diag:` network-diagnostics block to stderr: local dialable
+        /// address + relay url, and each peer's direct/relay/mixed/none path
+        /// (only meaningful with --status; hidden unless asked, spec IR-0303).
+        #[arg(long, short = 'v', requires = "status")]
+        verbose: bool,
         /// Use the loopback/CI network stack instead of real-network discovery.
         #[arg(long, hide = true)]
         loopback: bool,
@@ -389,6 +394,11 @@ enum RoomAction {
         /// while invites are open). Lets `room join` complete against this session.
         #[arg(long = "accept-joins")]
         accept_joins: bool,
+        /// Print a `diag:` network-diagnostics block to stderr on startup: local
+        /// dialable address + relay url, and each peer's direct/relay/mixed/none
+        /// path (hidden unless asked, spec IR-0303).
+        #[arg(long, short = 'v', conflicts_with = "offline")]
+        verbose: bool,
         /// Use the loopback/CI network stack instead of real-network discovery.
         #[arg(long, hide = true)]
         loopback: bool,
@@ -535,7 +545,7 @@ fn dispatch_file(home: &std::path::Path, action: FileAction) -> Result<()> {
         } => {
             let room_id = parse_room_id(&room_id)?;
             // Parse the timeout before any IO so a bad value writes nothing.
-            let timeout = message::parse_timeout(&timeout)?;
+            let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
             let summary = runtime()?.block_on(file::fetch(
                 home,
                 &room_id,
@@ -571,6 +581,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
             status,
             peers,
             timeout,
+            verbose,
             loopback,
         } => {
             let room_id = parse_room_id(&room_id)?;
@@ -580,7 +591,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                 // (`--json` is rejected by clap in this combination for now.)
                 let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
                 runtime()?.block_on(message::members_status(
-                    home, &room_id, &peers, timeout, loopback,
+                    home, &room_id, &peers, timeout, loopback, verbose,
                 ))?;
             } else {
                 let view = room::members(home, &room_id)?;
@@ -636,6 +647,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
             peers,
             limit,
             accept_joins,
+            verbose,
             loopback,
         } => {
             let room_id = parse_room_id(&room_id)?;
@@ -650,6 +662,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                     limit,
                     accept_joins,
                     loopback,
+                    verbose,
                 ))?;
             }
         }

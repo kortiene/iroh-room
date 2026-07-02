@@ -483,6 +483,19 @@ impl Node {
         self.transport.conn_events()
     }
 
+    /// Per-peer live path classification (direct/relay/mixed/none) + relay url (spec
+    /// IR-0303 §5.3) — the data behind `room members --status --verbose` / `room
+    /// tail --verbose`'s `diag:` block. Diagnostic only, off any hot path.
+    pub async fn peer_paths(&self) -> Vec<(EndpointId, crate::diag::PathType, Option<String>)> {
+        self.transport.peer_paths().await
+    }
+
+    /// This node's home relay url, if any (spec IR-0303 §5.3).
+    #[must_use]
+    pub fn relay_url(&self) -> Option<String> {
+        self.transport.relay_url()
+    }
+
     /// Force the managed peer manager to reconcile against the **current** fold now,
     /// rather than waiting for the next tick / fold-change detection (spec §5 test
     /// hook). A no-op for an unmanaged node (one spawned via [`Node::spawn`]).

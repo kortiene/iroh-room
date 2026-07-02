@@ -540,8 +540,7 @@ pub async fn fetch(
         let _ = node.shutdown().await;
         crate::bail_coded!(
             ErrorCode::NoSuchFile,
-            "no such file {file_id_str} in room {room_id}; has it been shared and synced? try \
-             running `room tail` first"
+            "no such file {file_id_str} in room {room_id}"
         );
     };
 
@@ -564,8 +563,7 @@ pub async fn fetch(
         crate::bail_coded!(
             ErrorCode::BlobUnavailable,
             "file {file_id_str} is currently unavailable: no peer holding it is online. There \
-             is no central inbox and no guaranteed offline delivery — ask a provider to run \
-             `iroh-rooms room tail {room_id}`, then retry `file fetch`"
+             is no central inbox and no guaranteed offline delivery"
         );
     }
 
@@ -631,14 +629,12 @@ pub async fn fetch(
             FetchFailure::Unauthorized => crate::bail_coded!(
                 ErrorCode::PeerUnauthorized,
                 "file {file_id_str} could not be fetched: every provider refused the \
-                 connection — this identity ({self_id}) is not an active member from their \
-                 view. Ask the admin to confirm your membership has synced, then retry"
+                 connection — this identity ({self_id}) is not an active member from their view"
             ),
             FetchFailure::Unavailable => crate::bail_coded!(
                 ErrorCode::BlobUnavailable,
                 "file {file_id_str} is currently unavailable: no peer holding it is online. \
-                 There is no central inbox and no guaranteed offline delivery — ask a \
-                 provider to run `iroh-rooms room tail {room_id}`, then retry `file fetch`"
+                 There is no central inbox and no guaranteed offline delivery"
             ),
         }
     };

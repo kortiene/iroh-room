@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use iroh::endpoint::{presets, Connection, VarInt};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_rooms_core::sync::{Outgoing, PeerId, SyncTransport};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -312,6 +312,19 @@ impl NetTransport {
         }
     }
 
+    /// This node's home relay url, if any (spec IR-0303 §5.3) — the first
+    /// [`TransportAddr::Relay`] in the local dialable address. Diagnostic only
+    /// (§18.1 "clear connection state"); `None` in [`NetMode::Loopback`] (relay is
+    /// disabled) or before the endpoint has homed a relay.
+    #[must_use]
+    pub fn relay_url(&self) -> Option<String> {
+        let addr = self.endpoint_addr().ok()?;
+        addr.addrs.iter().find_map(|a| match a {
+            TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        })
+    }
+
     /// Start (or restart) a dial-with-backoff loop toward `addr`. Returns
     /// immediately; the loop keeps the link alive until the transport is dropped.
     pub fn connect_to(&self, addr: EndpointAddr) {
@@ -345,6 +358,21 @@ impl NetTransport {
     #[must_use]
     pub fn peer_state(&self, device: EndpointId) -> Option<PeerConnState> {
         self.shared.table.state_of(device)
+    }
+
+    /// Per-peer live path classification (direct/relay/mixed/none) + relay url, read
+    /// from iroh's `remote_info` for each known peer (spec IR-0303 §5.3). Diagnostic
+    /// only, off any hot path — meant for `--verbose` callers. An `offline`/
+    /// `unauthorized` peer has no active transport and honestly classifies as
+    /// [`crate::diag::PathType::None`] rather than blocking or guessing.
+    pub async fn peer_paths(&self) -> Vec<(EndpointId, crate::diag::PathType, Option<String>)> {
+        let mut out = Vec::new();
+        for (device, _) in self.peer_entries() {
+            let info = self.endpoint.remote_info(device).await;
+            let (path_type, relay_url) = crate::diag::classify_remote_info(info.as_ref());
+            out.push((device, path_type, relay_url));
+        }
+        out
     }
 
     /// Subscribe to the live [`ConnEvent`] transition stream (§4.5).

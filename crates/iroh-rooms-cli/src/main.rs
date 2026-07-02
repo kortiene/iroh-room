@@ -31,6 +31,13 @@ fn main() -> ExitCode {
             // falls back to the generic `error:` line and exit 1.
             if let Some(code) = error::code_of(&err) {
                 eprintln!("error[{}]: {err:#}", code.code());
+                // IR-0303 §5.1: a second, additive stderr line naming the concrete
+                // next step — secret-free by construction (a fixed template). The
+                // machine surface above is unchanged; scripts matching `^error\[`
+                // or branching on `$?` are unaffected.
+                if let Some(next) = code.next_action() {
+                    eprintln!("next: {next}");
+                }
                 ExitCode::from(code.exit_code())
             } else {
                 eprintln!("error: {err:#}");

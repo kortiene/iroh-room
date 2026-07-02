@@ -70,7 +70,7 @@ impl Profile {
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 crate::bail_coded!(
                     crate::error::ErrorCode::IdentityNotFound,
-                    "no identity in {}; run `iroh-rooms identity create --name <name>`",
+                    "no identity in {}",
                     home.display()
                 );
             }
@@ -139,7 +139,7 @@ impl SecretKeys {
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 crate::bail_coded!(
                     crate::error::ErrorCode::IdentityNotFound,
-                    "no identity in {}; run `iroh-rooms identity create --name <name>`",
+                    "no identity in {}",
                     home.display()
                 );
             }

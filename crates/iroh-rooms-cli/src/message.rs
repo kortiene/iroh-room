@@ -44,8 +44,8 @@ use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
     Admission, AdmissionView, AllowlistAdmission, BlobServeConfig, ConnEvent,
-    JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState, PeerEntry, PeerManager,
-    SnapshotAdmission, DEFAULT_TICK,
+    JoinBootstrapAdmission, NetConfig, NetMode, Node, PathType, PeerConnState, PeerEntry,
+    PeerManager, SnapshotAdmission, DEFAULT_TICK,
 };
 
 use crate::display::{self, display_names, iso8601_utc, short_id};
@@ -423,6 +423,7 @@ pub async fn tail(
     limit: u32,
     accept_joins: bool,
     loopback: bool,
+    verbose: bool,
 ) -> Result<()> {
     let peer_addrs = parse_peers(peers)?;
 
@@ -504,6 +505,9 @@ pub async fn tail(
         }
     }
     println!("room: {room_id}");
+    if verbose {
+        print_diagnostics(&node).await;
+    }
 
     // ---- Display loop: poll the timeline + surface the §16.3 connection panel. ----
     let mut seen: BTreeSet<EventId> = BTreeSet::new();
@@ -565,6 +569,7 @@ pub async fn members_status(
     peers: &[String],
     timeout: Duration,
     loopback: bool,
+    verbose: bool,
 ) -> Result<()> {
     let peer_addrs = parse_peers(peers)?;
 
@@ -625,6 +630,9 @@ pub async fn members_status(
     }
 
     print_members_status(&node, &snapshot, self_device, &removed_ids, &left_ids);
+    if verbose {
+        print_diagnostics(&node).await;
+    }
 
     node.shutdown()
         .await
@@ -664,6 +672,70 @@ fn print_members_status(
         );
     }
     println!("{}", roster_summary(&node.peer_entries()));
+}
+
+/// Render the `--verbose` network-diagnostics block (spec IR-0303 §5.3): the local
+/// dialable address + relay url, one `diag: peer …` line per known peer with its
+/// live direct/relay/mixed/none path classification (read from iroh's
+/// `remote_info`, never inferred from latency), and an aggregate `diag: transport
+/// …` summary. stderr-only and additive — the default (non-`--verbose`) output is
+/// byte-identical without it (§18.5 "hide networking details unless needed").
+///
+/// Diagnostic only, never a trust input (mirrors [`OfflineReason`]): an
+/// `offline`/`unauthorized` peer has no active transport and honestly renders
+/// `path=none` rather than as reachable (§16.4 honesty).
+async fn print_diagnostics(node: &Node) {
+    let local_addrs = node
+        .endpoint_addr()
+        .ok()
+        .map(|addr| {
+            addr.ip_addrs()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|s| !s.is_empty());
+    eprintln!(
+        "diag: local id={} direct={} relay={}",
+        node.id(),
+        local_addrs.as_deref().unwrap_or("none"),
+        node.relay_url().as_deref().unwrap_or("none"),
+    );
+
+    let entries: HashMap<EndpointId, PeerEntry> = node.peer_entries().into_iter().collect();
+    let (mut direct, mut relay, mut mixed) = (0u32, 0u32, 0u32);
+    let (mut connected, mut offline, mut unauthorized) = (0u32, 0u32, 0u32);
+    for (device, path_type, relay_url) in node.peer_paths().await {
+        let entry = entries.get(&device);
+        let identity = entry
+            .and_then(|e| e.identity)
+            .map_or_else(|| "unknown".to_owned(), |id| short_id(&id));
+        let state_label = entry.map_or("unknown", |e| e.state.label());
+        eprintln!(
+            "diag: peer {identity} device={} state={state_label} path={} relay={}",
+            short_device(&device),
+            path_type.label(),
+            relay_url.as_deref().unwrap_or("none"),
+        );
+        match path_type {
+            PathType::Direct => direct += 1,
+            PathType::Relay => relay += 1,
+            PathType::Mixed => mixed += 1,
+            PathType::None => {}
+        }
+        if let Some(entry) = entry {
+            match entry.state {
+                PeerConnState::Connected => connected += 1,
+                PeerConnState::Offline => offline += 1,
+                PeerConnState::Unauthorized => unauthorized += 1,
+                PeerConnState::Connecting => {}
+            }
+        }
+    }
+    eprintln!(
+        "diag: transport connected={connected} (direct={direct} relay={relay} mixed={mixed}) \
+         offline={offline} unauthorized={unauthorized}"
+    );
 }
 
 /// The connection field for one member row: `self` for us, `n/a` for an invited-only
@@ -891,7 +963,7 @@ pub(crate) fn fold_room(
     if ids.is_empty() {
         crate::bail_coded!(
             crate::error::ErrorCode::RoomNotFound,
-            "no room {} in {}; run `iroh-rooms room create` or join an invite first",
+            "no room {} in {}",
             room_id,
             home.display()
         );

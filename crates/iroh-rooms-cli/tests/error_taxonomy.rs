@@ -24,6 +24,20 @@
 //!                              `ticket_truncated_*`, `ticket_bad_checksum_*`
 //!   Auth / exit 3 (AC3)      — `wrong_identity_*`
 //!   AC3 secret hygiene       — `corrupted_ticket_never_echoes_token_or_secret`
+//!
+//! IR-0303 (issue #38) extends this suite with the additive `next:` render line and
+//! the coded-argument uniformity fix — the human half of the same surface:
+//!   AC1 next: line           — `coded_failure_renders_error_then_a_single_next_action_line`,
+//!                              `representative_coded_failures_each_render_a_next_action`,
+//!                              `room_not_found_renders_the_one_canonical_next_action`,
+//!                              `file_share_missing_path_renders_a_next_action`,
+//!                              `file_share_too_large_renders_a_next_action`
+//!   AC2 machine surface      — `code_without_a_next_action_emits_no_next_line`,
+//!                              `uncoded_failure_emits_no_next_line`,
+//!                              `file_fetch_bad_timeout_exits_2_with_coded_line`
+//!   §5.3 verbose guard       — `members_verbose_requires_status`,
+//!                              `room_tail_accepts_verbose_and_parses_room_id_first`,
+//!                              `room_tail_verbose_conflicts_with_offline`
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -410,5 +424,358 @@ fn corrupted_ticket_never_echoes_token_or_secret() {
     assert!(
         stderr.contains("error[ticket_"),
         "a redacted, coded ticket error must still be rendered; got: {stderr}"
+    );
+}
+
+// ── IR-0303 AC1: the additive `next:` actionable-step render line (spec §5.1) ──
+//
+// Issue #38 adds a second stderr line, `next: <action>`, under every coded failure
+// whose `ErrorCode::next_action()` is `Some` — the human "what do I do now" half of
+// the taxonomy surface. These tests pin the *render contract* (main.rs) that the
+// `src/error.rs` unit tests cannot reach: that the line is actually emitted, is
+// singular (no double next-step after the §5.1 message migration), and never
+// perturbs the machine surface the taxonomy issue promised (the first stderr line
+// still starts `error[`, the exit code is unchanged). All cases are pre-IO /
+// offline — no node is brought up.
+
+/// The number of `next:` lines on `stderr` (each a distinct actionable step). The
+/// render contract emits at most one; the migration rule (spec §5.1) forbids two.
+fn count_next_lines(stderr: &str) -> usize {
+    stderr.lines().filter(|l| l.starts_with("next:")).count()
+}
+
+/// Run a command to completion and return `(exit_code, stderr)` for line-shape
+/// assertions the `assert_cmd` predicate API cannot express directly.
+fn run_stderr(home: &TempDir, args: &[&str]) -> (Option<i32>, String) {
+    let out = cmd(home).args(args).output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A coded failure whose code is user-actionable renders `error[<code>]:` as the
+/// **first** stderr line and, immediately after it, exactly one `next: <action>`
+/// line — the AC1 surface. The machine line is unchanged (greppable `^error\[`),
+/// and the exit code is still the code's category (Usage / 2 here).
+#[test]
+fn coded_failure_renders_error_then_a_single_next_action_line() {
+    let home = TempDir::new().unwrap();
+    let (code, stderr) = run_stderr(&home, &["identity", "show"]);
+
+    assert_eq!(code, Some(2), "identity_not_found is Usage / exit 2");
+    let mut lines = stderr.lines();
+    let first = lines.next().unwrap_or_default();
+    assert!(
+        first.starts_with("error[identity_not_found]:"),
+        "the machine line must be first and greppable; got first line: {first:?}"
+    );
+    // The `next:` line follows immediately (this message is single-line) …
+    let second = lines.next().unwrap_or_default();
+    assert!(
+        second.starts_with("next:"),
+        "a `next:` line must immediately follow the coded error; got: {second:?}"
+    );
+    // … names the concrete action (migrated out of the trimmed message) …
+    assert!(
+        second.contains("identity create"),
+        "the next: line must name the actionable step; got: {second:?}"
+    );
+    // … and is the *only* one (no double next-step; spec §5.1 migration rule).
+    assert_eq!(
+        count_next_lines(&stderr),
+        1,
+        "exactly one next: line must be emitted; got:\n{stderr}"
+    );
+}
+
+/// AC1 breadth: a representative coded failure from each of several categories —
+/// Usage (`invalid_room_id`, `room_not_found`) and Ticket (`ticket_bad_prefix`) —
+/// each renders the `error[<code>]:` line first and a single following `next:`
+/// line, with the exit code unchanged. Table-driven so a regression in any one
+/// code's rendering is caught in one place.
+#[test]
+fn representative_coded_failures_each_render_a_next_action() {
+    let unknown_room = format!("blake3:{}", "0".repeat(64));
+    let cases: &[(&[&str], &str, i32)] = &[
+        (&["room", "members", "notaroomid"], "invalid_room_id", 2),
+        (&["room", "members", &unknown_room], "room_not_found", 2),
+        (&["room", "join", "nothello"], "ticket_bad_prefix", 5),
+    ];
+    for (args, expected_code, expected_exit) in cases {
+        let home = TempDir::new().unwrap();
+        let (code, stderr) = run_stderr(&home, args);
+        assert_eq!(
+            code,
+            Some(*expected_exit),
+            "`{args:?}` must exit {expected_exit} for {expected_code}"
+        );
+        let first = stderr.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with(&format!("error[{expected_code}]:")),
+            "`{args:?}` must render error[{expected_code}] first; got: {first:?}"
+        );
+        assert_eq!(
+            count_next_lines(&stderr),
+            1,
+            "`{args:?}` must render exactly one next: line; got:\n{stderr}"
+        );
+    }
+}
+
+/// The §5.1 "`room_not_found` fix": the `room members` offline path (which bottoms
+/// out at the `room.rs` bare-message site) now renders the single, canonical
+/// `RoomNotFound` next action — the same string every other `room_not_found` site
+/// shares. Pins the *rendered* consistency the `src/error.rs` unit test asserts at
+/// the API level, closing the loop from emitter to terminal.
+#[test]
+fn room_not_found_renders_the_one_canonical_next_action() {
+    let home = TempDir::new().unwrap();
+    let unknown = format!("blake3:{}", "0".repeat(64));
+    let (code, stderr) = run_stderr(&home, &["room", "members", &unknown]);
+    assert_eq!(code, Some(2), "room_not_found is Usage / exit 2");
+    let next = stderr
+        .lines()
+        .find(|l| l.starts_with("next:"))
+        .expect("room_not_found must carry a next: line");
+    // Distinctive phrase from the single `RoomNotFound.next_action()` template.
+    assert!(
+        next.contains("join an invite ticket first"),
+        "the canonical room_not_found next action must be rendered; got: {next:?}"
+    );
+}
+
+/// AC1 breadth (spec §8 #3): a `file share` of a **missing** path renders the coded
+/// `error[no_such_file]:` machine line **first** and, additively, exactly one
+/// `next:` line naming the concrete step — the file-share half of the §2.2 gap
+/// IR-0303 filled (before this issue `no_such_file` was a bare message with no fix).
+/// Needs an identity + room so the membership gate passes and `classify_path` is
+/// actually reached; the failure is offline (no node is brought up).
+#[test]
+fn file_share_missing_path_renders_a_next_action() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+    let missing = home.path().join("does-not-exist.txt");
+    let (code, stderr) = run_stderr(
+        &home,
+        &["file", "share", &room_id, missing.to_str().unwrap()],
+    );
+
+    assert_eq!(code, Some(2), "no_such_file is Usage / exit 2");
+    assert!(
+        stderr
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .starts_with("error[no_such_file]:"),
+        "the coded machine line must be first and greppable; got:\n{stderr}"
+    );
+    let next = stderr
+        .lines()
+        .find(|l| l.starts_with("next:"))
+        .expect("no_such_file must now carry a next: line (IR-0303 AC1)");
+    assert!(
+        next.contains("check the path"),
+        "the next: line must name the actionable step; got: {next:?}"
+    );
+    assert_eq!(
+        count_next_lines(&stderr),
+        1,
+        "exactly one next: line must be emitted; got:\n{stderr}"
+    );
+}
+
+/// AC1 breadth (spec §8 #3): a `file share` over the (test-lowered) size cap renders
+/// `error[file_too_large]:` first and exactly one following `next:` line ("split or
+/// compress"). The `IROH_ROOMS_MAX_SHARE_BYTES` seam hits the boundary without a huge
+/// fixture. Classified offline before any store/blob write, so no node is spun up.
+#[test]
+fn file_share_too_large_renders_a_next_action() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+    let big = home.path().join("big.bin");
+    std::fs::write(&big, vec![0u8; 64]).unwrap();
+
+    let out = cmd(&home)
+        .env("IROH_ROOMS_MAX_SHARE_BYTES", "1")
+        .args(["file", "share", &room_id])
+        .arg(&big)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "file_too_large is Usage / exit 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .starts_with("error[file_too_large]:"),
+        "the coded machine line must be first; got:\n{stderr}"
+    );
+    let next = stderr
+        .lines()
+        .find(|l| l.starts_with("next:"))
+        .expect("file_too_large must carry a next: line (IR-0303 AC1)");
+    assert!(
+        next.contains("split or compress"),
+        "the next: line must name the actionable step; got: {next:?}"
+    );
+    assert_eq!(
+        count_next_lines(&stderr),
+        1,
+        "exactly one next: line must be emitted; got:\n{stderr}"
+    );
+}
+
+/// AC2 (machine surface intact): a coded failure whose `next_action()` is `None`
+/// (`invalid_argument`) still renders the `error[<code>]:` line and exits with its
+/// category, but emits **no** `next:` line — the `if let Some(next)` suppression in
+/// `main.rs`. Guards against a regression that would print an empty/`next:` line for
+/// context-only codes.
+#[test]
+fn code_without_a_next_action_emits_no_next_line() {
+    let home = TempDir::new().unwrap();
+    let (code, stderr) = run_stderr(
+        &home,
+        &["room", "join", "anytoken", "--timeout", "notaduration"],
+    );
+    assert_eq!(code, Some(2), "invalid_argument is Usage / exit 2");
+    assert!(
+        stderr.starts_with("error[invalid_argument]:"),
+        "the coded line must still render; got: {stderr}"
+    );
+    assert_eq!(
+        count_next_lines(&stderr),
+        0,
+        "a None-next_action code must not emit a next: line; got:\n{stderr}"
+    );
+}
+
+/// AC2 negative: the uncoded long-tail fallback (`error:` with no `[code]`) never
+/// carries a `next:` line — the actionable step is a property of an `ErrorCode`, and
+/// an uncoded failure has none. Pins that the `next:` machinery is reached only on
+/// the coded arm of `main.rs`.
+#[test]
+fn uncoded_failure_emits_no_next_line() {
+    let home = TempDir::new().unwrap();
+    let (code, stderr) = run_stderr(&home, &["room", "create", ""]);
+    assert_eq!(code, Some(1), "an uncoded failure exits 1");
+    assert!(
+        stderr.starts_with("error:") && !stderr.contains("error["),
+        "the uncoded fallback must render `error:` with no [code]; got: {stderr}"
+    );
+    assert_eq!(
+        count_next_lines(&stderr),
+        0,
+        "an uncoded failure must not emit a next: line; got:\n{stderr}"
+    );
+}
+
+// ── IR-0303 AC2 uniformity: the `file fetch --timeout` coded-argument fix (§2.2) ─
+
+/// A malformed `--timeout` on **`file fetch`** now emits the coded
+/// `error[invalid_argument]:` line and exits `2`, matching its four sibling timeout
+/// sites (`room join`/`send`/`members`/`agent status`). Before IR-0303 this one site
+/// (`cli.rs:538`) parsed with a bare `?`, so a bad value took the uncoded `error:` /
+/// exit-1 path — breaking the "every bad argument is `invalid_argument` / exit 2"
+/// contract scripts rely on. The timeout is parsed pre-IO (after `parse_room_id`),
+/// so this needs no identity, room, or reachable provider. Regression guard.
+#[test]
+fn file_fetch_bad_timeout_exits_2_with_coded_line() {
+    let home = TempDir::new().unwrap();
+    let room = format!("blake3:{}", "0".repeat(64));
+    cmd(&home)
+        .args([
+            "file",
+            "fetch",
+            &room,
+            "file_deadbeef",
+            "--timeout",
+            "notaduration",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("error[invalid_argument]:"));
+}
+
+// ── IR-0303 §5.3: `--verbose` is guarded to `--status` on `room members` ───────
+
+/// `room members --verbose` without `--status` is rejected (clap `requires`), so the
+/// opt-in `diag:` block is only ever produced by the node-bearing status path (spec
+/// §5.3 "guard: only meaningful with --status"; OQ-6). A bad combination is a usage
+/// error (exit 2) naming the missing `--status`, not a silently-ignored flag. The
+/// live `diag:` rendering itself is a two-peer / loopback concern (e2e phase).
+#[test]
+fn members_verbose_requires_status() {
+    let home = TempDir::new().unwrap();
+    let room = format!("blake3:{}", "0".repeat(64));
+    let (code, stderr) = run_stderr(&home, &["room", "members", &room, "--verbose"]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a bad flag combination is a clap usage error / exit 2"
+    );
+    assert!(
+        stderr.contains("--status"),
+        "the error must name the required --status flag; got: {stderr}"
+    );
+}
+
+/// §5.3: `--verbose` is wired onto **`room tail`** too (spec adds it to both status
+/// commands), and `parse_room_id` runs before any node is brought up. So
+/// `room tail <malformed-id> --verbose` fails fast with the coded
+/// `error[invalid_room_id]:` line (exit 2) — which proves clap *accepted* `--verbose`
+/// on tail (a missing flag would instead be a clap "unexpected argument" usage error)
+/// *and* that the id is parsed pre-node, without ever spinning up the live tail loop.
+/// The live `diag:` rendering itself stays a loopback / two-peer (e2e) concern.
+#[test]
+fn room_tail_accepts_verbose_and_parses_room_id_first() {
+    let home = TempDir::new().unwrap();
+    let (code, stderr) = run_stderr(&home, &["room", "tail", "notaroomid", "--verbose"]);
+
+    assert_eq!(code, Some(2), "a malformed room id is Usage / exit 2");
+    assert!(
+        stderr.contains("error[invalid_room_id]:"),
+        "`--verbose` must be a recognized tail flag and the id parsed pre-node; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap must accept `--verbose` on tail, not reject it as unknown; got:\n{stderr}"
+    );
+    // invalid_room_id is user-actionable, so exactly one next: line accompanies it.
+    assert_eq!(
+        count_next_lines(&stderr),
+        1,
+        "invalid_room_id carries one next: line; got:\n{stderr}"
+    );
+}
+
+/// §5.3 guard: on `room tail`, `--verbose` is a *live-view* flag clap declares
+/// `conflicts_with = "offline"` (the diagnostics read a running node's transport; an
+/// `--offline` local read has none to classify). `room tail <id> --verbose --offline`
+/// is therefore a clap usage error (exit 2) naming the conflicting flags — pinning the
+/// declared guard so a future edit can't silently allow the meaningless combination.
+/// The conflict is caught at parse time, before dispatch, so no node is brought up.
+#[test]
+fn room_tail_verbose_conflicts_with_offline() {
+    let home = TempDir::new().unwrap();
+    let room = format!("blake3:{}", "0".repeat(64));
+    let (code, stderr) = run_stderr(&home, &["room", "tail", &room, "--verbose", "--offline"]);
+
+    assert_eq!(
+        code,
+        Some(2),
+        "a conflicting flag combination is a clap usage error / exit 2"
+    );
+    assert!(
+        stderr.contains("--verbose") && stderr.contains("--offline"),
+        "the error must name the conflicting --verbose/--offline flags; got:\n{stderr}"
     );
 }
