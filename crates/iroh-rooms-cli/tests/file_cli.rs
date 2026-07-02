@@ -32,6 +32,23 @@
 //!   empty file    — a 0-byte file can be shared (exits 0, size: 0 bytes)
 //!   MIME guessing — extension-derived MIME type visible at the CLI level
 //!   unix-only: chmod 000 → exits nonzero, message contains "permission denied"
+//!
+//! `file fetch` failure states (IR-0205 §8 test plan) — the deterministic/offline
+//! tier only; the live-transfer splits (`peer_unauthorized`, `hash_mismatch`) are
+//! e2e:
+//!   pre-node gates — invalid file id / bad --timeout / no identity / unknown room
+//!                    / malformed --peer: each fails before any node bring-up
+//!   invalid arg    — malformed id / unsupported `blob_format` → `error[invalid_argument]:`
+//!                    exit 2 (coded, not the pre-IR-0205 generic exit 1)
+//!   non-member     — known room, inactive caller → `error[not_a_member]:` exit 3
+//!                    (AC2: unauthorized is distinct from unavailable; pre-node)
+//!   unavailable    — self-only provider (empty set after self-skip, the early
+//!                    pre-loop bail) → `error[blob_unavailable]:` exit 6 + PRD
+//!                    §14 language (AC1/AC4)
+//!   unavailable, loop path — a real, non-self, never-online provider named and
+//!                    genuinely dialed at an unbound loopback port → the *other*
+//!                    `blob_unavailable` call site (post-loop, tally-classified),
+//!                    within the bounded `--timeout`, no hang (AC1/AC4)
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -86,6 +103,37 @@ fn extract_field<'a>(output: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Seed `<home>/rooms.db` with a genesis event for a room whose admin is a
+/// *different* identity than the CLI user. The room is then known locally (so
+/// `file fetch`'s `fold_room` succeeds), but the caller is not an active member —
+/// the offline way to reach `fetch`'s membership pre-check without a second live
+/// node. Mirrors `pipe_cli.rs::seed_genesis_only`. Returns the `room_id` string.
+fn seed_foreign_room(
+    home: &TempDir,
+    identity_seed: [u8; 32],
+    device_seed: [u8; 32],
+    nonce: [u8; 16],
+) -> String {
+    use iroh_rooms_core::event::build_room_created;
+    use iroh_rooms_core::event::keys::SigningKey;
+    use iroh_rooms_core::event::signed::SignedEvent;
+    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms_core::store::EventStore;
+
+    let id_key = SigningKey::from_seed(&identity_seed);
+    let dev_key = SigningKey::from_seed(&device_seed);
+    let genesis_wire =
+        build_room_created(&id_key, &dev_key, "Other Room", &nonce, 1_750_000_000_000);
+    let room_id = SignedEvent::decode(&genesis_wire.signed)
+        .expect("genesis decodes")
+        .room_id;
+    let ctx = ValidationContext::for_room(room_id);
+    let genesis_v = validate_wire_bytes(&genesis_wire.to_bytes(), &ctx).expect("genesis valid");
+    let mut store = EventStore::open(&home.path().join("rooms.db")).expect("open store to seed");
+    store.insert(&genesis_v).expect("insert genesis");
+    room_id.to_string()
 }
 
 /// A syntactically valid `blake3:<hex>` room id (64 hex chars = 32 bytes) that
@@ -1135,12 +1183,15 @@ const VALID_FILE_ID: &str = "file_00000000000000000000000000000000";
 #[test]
 fn fetch_invalid_file_id_exits_nonzero() {
     // `parse_file_id` is the very first thing `file fetch` does — a malformed id
-    // fails before identity load or any node bring-up.
+    // fails before identity load or any node bring-up. IR-0205 codes this path as
+    // `invalid_argument` (exit 2), so a script sees a pinned `error[<code>]:` line
+    // and a Usage-category exit, not the pre-IR-0205 generic `error:`/exit 1.
     let home = TempDir::new().unwrap();
     cmd(&home)
         .args(["file", "fetch", FAKE_ROOM_ID, "not-a-valid-file-id"])
         .assert()
-        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("error[invalid_argument]:"))
         .stderr(predicate::str::contains("invalid file id"));
 }
 
@@ -1285,15 +1336,257 @@ fn fetch_unsupported_blob_format_exits_nonzero_and_writes_nothing() {
     drop(store);
 
     let file_id_handle = format!("file_{}", hex::encode(file_id));
+    // IR-0205 codes the format gate as `invalid_argument` (exit 2, Usage): a build
+    // limitation the user's argument cannot fix — distinct from the connectivity
+    // `blob_unavailable` and never a generic `error:`/exit 1 (spec §5.6 / OQ-4).
     cmd(&home)
         .args(["file", "fetch", &room_id_str, &file_id_handle, "--loopback"])
         .assert()
-        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("error[invalid_argument]:"))
         .stderr(predicate::str::contains("hash_seq"))
         .stderr(predicate::str::contains("raw only"));
 
     assert!(
         !home.path().join("downloads").exists(),
         "an unsupported-format rejection must write nothing to the downloads dir"
+    );
+}
+
+// ── file fetch — the honest terminal failure states (IR-0205 §5.1 / AC1+AC2+AC4)
+//
+// These prove the three headline states are *distinct*, *coded*, and *script-
+// friendly* at the process boundary, using only the deterministic/offline tier:
+//
+//   * non-member  → `error[not_a_member]:`  exit 3 (Auth)         — pre-node, no IO
+//   * self-only   → `error[blob_unavailable]:` exit 6 (Connectivity)
+//
+// The remaining online splits (a live provider that refuses at connect →
+// `peer_unauthorized`; a served-but-corrupt blob → `hash_mismatch`) need two live
+// processes and belong to the two-peer e2e tier, not here.
+
+/// AC2 — "unauthorized" is a distinct, coded state, never the connectivity-class
+/// "unavailable". A caller who is not an active member of a *known* room is refused
+/// by `fetch`'s membership pre-check **before any node is brought up**, so this is
+/// fully deterministic and offline. The pinned `error[not_a_member]:` line + exit
+/// `3` (Auth) is what a script branches on; nothing is written to disk.
+#[test]
+fn fetch_non_member_is_refused_with_not_a_member_code() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    // A room whose genesis a *different* identity authored: known locally (the fold
+    // succeeds) but the CLI caller never joined, so `snapshot.is_active` is false.
+    let room_id = seed_foreign_room(&home, [0xF0; 32], [0xF1; 32], [0xFA; 16]);
+
+    cmd(&home)
+        .args(["file", "fetch", &room_id, VALID_FILE_ID])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("error[not_a_member]:"))
+        .stderr(predicate::str::contains("only an active member can fetch"))
+        // AC3 (script-friendly): the failure is reported on stderr only; stdout
+        // stays clean so `2>/dev/null` yields an empty saved-path stream.
+        .stdout(predicate::str::is_empty());
+
+    assert!(
+        !home.path().join("downloads").exists(),
+        "a non-member fetch must write nothing to the downloads dir"
+    );
+}
+
+/// AC1 + AC4 — with no *other* provider online, `file fetch` reports the honest
+/// availability limitation (`error[blob_unavailable]:`, exit 6 Connectivity) in
+/// PRD §14 language, not a generic failure. We reach the empty-provider-set branch
+/// deterministically and offline: the caller shares a file (so the only asserted
+/// provider is the caller's own device) and then fetches it — `resolve_providers`
+/// skips self, leaving no reachable provider. `--loopback` keeps the ephemeral node
+/// off any real network, and because the reference is already local there is no
+/// sync-wait or transfer timeout to burn — the empty set bails immediately.
+#[test]
+fn fetch_self_only_provider_is_unavailable_with_prd_language() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+
+    // Share a file so a `file.shared` reference exists locally whose sole provider
+    // is this node's own device (the `file share` default provider set).
+    let src = write_file(
+        home.path(),
+        "report.txt",
+        b"availability follows the providers",
+    );
+    let share_out = cmd(&home)
+        .args(["file", "share", &room_id, &src])
+        .output()
+        .unwrap();
+    assert!(
+        share_out.status.success(),
+        "share must succeed to seed a reference"
+    );
+    let share_stdout = String::from_utf8_lossy(&share_out.stdout);
+    let file_id = extract_field(&share_stdout, "file_id")
+        .expect("file share must print a file_id")
+        .to_owned();
+
+    cmd(&home)
+        .args(["file", "fetch", &room_id, &file_id, "--loopback"])
+        .assert()
+        .code(6)
+        .stderr(predicate::str::contains("error[blob_unavailable]:"))
+        .stderr(predicate::str::contains("is currently unavailable"))
+        // AC4: PRD §14 availability language — no queue, no eventual delivery.
+        .stderr(predicate::str::contains("no central inbox"))
+        .stderr(predicate::str::contains("no guaranteed offline delivery"))
+        // Clear retry guidance (§3.2 point 6 / PRD §16 UX req 1): the message
+        // names the concrete next step — a provider running `room tail` — rather
+        // than implying an automatic queue or eventual delivery.
+        .stderr(predicate::str::contains("room tail"))
+        .stderr(predicate::str::contains("retry"))
+        // AC3 (script-friendly): stdout stays clean; the coded line is on stderr.
+        .stdout(predicate::str::is_empty());
+
+    assert!(
+        !home.path().join("downloads").exists(),
+        "an unavailable fetch must write nothing to the downloads dir"
+    );
+}
+
+/// AC1 + AC4, second code path — the *loop-exhausted* `blob_unavailable` arm
+/// (`file.rs::fetch`'s post-loop `tally.classify() => FetchFailure::Unavailable`
+/// branch), distinct from `fetch_self_only_provider_is_unavailable_with_prd_language`
+/// above, which only reaches the *earlier*, separate `providers.is_empty()` bail
+/// before the per-provider loop ever runs. Here a real, syntactically valid,
+/// non-self provider device is named — so `resolve_providers` returns one address
+/// and the loop actually dials it — but nobody listens at the given loopback
+/// socket, so the dial genuinely fails and `Node::fetch_file` reports
+/// `FetchOutcome::Unavailable` within the bounded `--timeout` (mirrors
+/// `iroh-rooms-net/tests/blob_e2e.rs::offline_provider_is_reported_unavailable_within_timeout`
+/// at the CLI-process boundary, and the same "real endpoint id, unbound loopback
+/// port" technique `error_taxonomy_e2e.rs::join_to_an_unreachable_peer_exits_6_no_admin_reachable`
+/// already uses for a deterministic, single-process, never-answered dial). This
+/// proves the *other* `blob_unavailable` call site — reached only when at least
+/// one provider was actually attempted and unreachable — renders the identical
+/// coded state, and never hangs past the timeout.
+#[test]
+fn fetch_unreachable_named_provider_is_unavailable_within_timeout() {
+    use iroh_rooms_core::event::build_file_shared;
+    use iroh_rooms_core::event::content::EventType;
+    use iroh_rooms_core::event::ids::{HashRef, RoomId};
+    use iroh_rooms_core::event::keys::SigningKey;
+    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms_core::store::EventStore;
+
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id_str = create_room(&home);
+    let room_id: RoomId = room_id_str
+        .parse()
+        .expect("room create must print a parseable room id");
+
+    // Reconstruct the caller's own identity/device signing keys (the author of
+    // the seeded event, and an already-active member) from the profile the CLI
+    // just wrote — same technique as the unsupported-format seeding test above.
+    let secret_raw = std::fs::read_to_string(home.path().join("identity.secret"))
+        .expect("identity.secret must exist after identity create");
+    let secret_v: serde_json::Value =
+        serde_json::from_str(&secret_raw).expect("identity.secret must be valid JSON");
+    let seed_bytes = |field: &str| -> [u8; 32] {
+        let hex_str = secret_v[field].as_str().expect("seed field present");
+        <[u8; 32]>::try_from(hex::decode(hex_str).expect("seed is valid hex").as_slice())
+            .expect("seed is 32 bytes")
+    };
+    let identity_key = SigningKey::from_seed(&seed_bytes("identity_secret"));
+    let device_key = SigningKey::from_seed(&seed_bytes("device_secret"));
+
+    // A distinct, never-online device — a real key, not the caller's own, so
+    // `resolve_providers` does not filter it out as self.
+    let ghost_provider_device = SigningKey::from_seed(&[0xEEu8; 32]).device_key();
+    let ghost_endpoint_id = iroh::EndpointId::from_bytes(ghost_provider_device.as_bytes())
+        .expect("a device key is a valid iroh endpoint id");
+
+    // Seed a `file.shared` naming only the ghost device as provider, parented on
+    // the room's genesis (the only event in a fresh room).
+    let mut store = EventStore::open(&home.path().join("rooms.db")).expect("open rooms.db to seed");
+    let genesis_id = store
+        .by_type(&room_id, EventType::RoomCreated)
+        .expect("read room.created events")
+        .first()
+        .expect("a fresh room has a genesis event")
+        .event_id;
+    let file_id = [0x88u8; 16];
+    let wire = build_file_shared(
+        &identity_key,
+        &device_key,
+        &room_id,
+        file_id,
+        "ghost.bin",
+        "application/octet-stream",
+        2048,
+        HashRef::from_bytes([0xDDu8; 32]),
+        Some("raw"),
+        &[ghost_provider_device],
+        &[genesis_id],
+        1,
+    );
+    let validated = validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room_id))
+        .expect("a file.shared naming a real-but-offline provider still validates statelessly");
+    store.insert(&validated).expect("seed the file.shared");
+    drop(store);
+
+    // A real endpoint id at a loopback port nobody listens on — port 1 is
+    // privileged/unbindable and never used by this suite's live-node tests, so
+    // the dial fails deterministically rather than racing a free-port reuse.
+    let dead_peer = format!("{ghost_endpoint_id}@127.0.0.1:1");
+    let file_id_handle = format!("file_{}", hex::encode(file_id));
+
+    let fetch = cmd(&home)
+        .args([
+            "file",
+            "fetch",
+            &room_id_str,
+            &file_id_handle,
+            "--peer",
+            &dead_peer,
+            "--timeout",
+            "1s",
+            "--loopback",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&fetch.stderr);
+    assert_eq!(
+        fetch.status.code(),
+        Some(6),
+        "an unreachable named provider must exit 6 (Connectivity); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("error[blob_unavailable]:"),
+        "must render the pinned blob_unavailable code; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("is currently unavailable"),
+        "must use the same honest-unavailable wording as the empty-provider path; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("no central inbox") && stderr.contains("no guaranteed offline delivery"),
+        "AC4: PRD §14 availability language; stderr:\n{stderr}"
+    );
+    // The differentiator from the self-only-provider test: this diagnostic only
+    // appears when the per-provider loop actually attempted a dial (proving the
+    // *loop-exhausted* bail_coded arm fired, not the earlier empty-set bail).
+    assert!(
+        stderr.contains("unreachable"),
+        "must carry the per-provider 'unreachable' diagnostic, proving the loop \
+         actually attempted the dial; stderr:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&fetch.stdout).is_empty(),
+        "AC3: stdout stays clean on failure"
+    );
+    assert!(
+        !home.path().join("downloads").exists(),
+        "an unavailable fetch must write nothing to the downloads dir"
     );
 }
