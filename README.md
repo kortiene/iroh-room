@@ -956,6 +956,33 @@ agent" doc comment into a runnable program:
   built example binary against an in-process admin node and asserts its
   signed `agent.status` appears in the room tail — the issue's Test Plan.
 
+The **developer-preview release-readiness checklist** has landed at
+[`RELEASE-READINESS.md`](RELEASE-READINESS.md) (issue #41 / IR-0306),
+mirroring `PHASE-0-GO-NO-GO.md`'s once-off Phase 0 gate at preview cadence —
+turning "is this build ready?" into a mechanized gate instead of an
+honor-system checkbox:
+
+- A fill-in-per-build checklist: a P0 test taxonomy across protocol,
+  integration, pipe security, blob verification, and agent flow; every known
+  MVP limitation stated up front (Gate A pending, no cloud inbox, unencrypted
+  local storage, no invite revocation, the live-tail display gap, the 100 MiB
+  code cap vs. the PRD's 25 MB metric target, …); the security warnings a
+  shipping build must actually print/enforce; a dependency/churn review; a
+  `docs/getting-started.md` demo-verification pass with the PRD §17.2 DX
+  timings; and a fenced release-notes template.
+- `scripts/release-readiness.sh` — a manual, release-time gate (not wired
+  into CI) that runs `scripts/verify.sh` plus the `#[ignore]`-gated loopback
+  online tiers and prints a single `release-readiness: READY` / `NOT READY`
+  verdict from real exit codes. `READY` is reachable only on the all-green
+  path, and `--skip-online` forces a loud non-zero exit — a preview cannot be
+  marked ready while a P0 test is failing.
+- Proven by `crates/iroh-rooms-cli/tests/release_readiness_docs.rs`
+  (deterministic; asserts every required section exists and guards against
+  the checklist's online-tier table drifting from the script's own tier list)
+  and `release_readiness_e2e.rs` (drives the real script against faked
+  `verify.sh`/online-tier boundaries to prove the READY/NOT-READY exit-code
+  wiring).
+
 ## Repository Layout
 
 ```text
@@ -968,6 +995,7 @@ crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`,
 crates/spike-transport/   Throwaway gossip-vs-full-mesh transport comparison (`transport-probe`, IR-0006)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate
+scripts/release-readiness.sh  Manual developer-preview release gate (see RELEASE-READINESS.md)
 specs/                    Implementation specs produced during planning
 ```
 
@@ -978,6 +1006,21 @@ scripts/verify.sh
 ```
 
 The gate runs formatting, Clippy, and tests across the workspace.
+
+## Release readiness
+
+Before cutting a developer preview build, run the release-readiness gate:
+
+```bash
+scripts/release-readiness.sh
+```
+
+It runs `scripts/verify.sh` plus the `#[ignore]`-gated loopback online tiers
+and prints a `release-readiness: READY` / `NOT READY` verdict from real exit
+codes — a preview cannot be marked ready while a P0 test is failing. See
+[`RELEASE-READINESS.md`](RELEASE-READINESS.md) for the full checklist (known
+limitations, security warnings, dependency/churn review, demo verification,
+and the release-notes template).
 
 ## Backlog
 
