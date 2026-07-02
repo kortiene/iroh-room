@@ -50,7 +50,9 @@
 //! `non_canonical_encoding` → §2; `id_mismatch` → §3/§6; `bad_signature` → §5/§6;
 //! `unbound_device` → membership (`unbound_device_is_rejected`); `not_a_member`
 //! → §13; `insufficient_role` → §14; `room_id_mismatch` → §4/§7; `invalid_content`
-//! → serialization; `expired_invite` → §15/§19; `bad_capability` → §15;
+//! → serialization (incl. the `file.shared` semantic-bounds vectors,
+//! `invalid_content_file_shared_*` / `valid_file_shared_*` — IR-0203);
+//! `expired_invite` → §15/§19; `bad_capability` → §15;
 //! `too_many_parents`, `not_genesis_descended` → serialization.
 //! Ignored (1): `duplicate` → §8. Advisory flags (3): `clock_skew` → §20;
 //! `equivocation` → §12 (admin-fork detection pointer: `sync_convergence.rs`);

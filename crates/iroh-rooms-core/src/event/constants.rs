@@ -36,6 +36,19 @@ pub const MAX_MESSAGE_BODY_BYTES: usize = 16_384;
 /// `std::fs::Metadata::len`.
 pub const MAX_SHARED_FILE_BYTES: u64 = 104_857_600;
 
+/// Maximum byte length of a `file.shared` display `name`. 255 matches the common
+/// POSIX `NAME_MAX` and is far above any realistic file name; a longer name is
+/// rejected as `invalid_content` at the stateless boundary.
+pub const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Maximum byte length of a `file.shared` `mime_type`. Registered media types are
+/// short; 255 bounds the field without fighting long parameterized types.
+pub const MAX_MIME_TYPE_BYTES: usize = 255;
+
+/// Maximum number of asserted `providers` (`EndpointId`s) on a `file.shared`.
+/// MVP rooms are ~3 members; 16 is a generous bound that blocks an unbounded array.
+pub const MAX_FILE_PROVIDERS: usize = 16;
+
 /// The only accepted logical `schema_version` for MVP (Event Protocol §2).
 pub const SCHEMA_VERSION: u64 = 1;
 

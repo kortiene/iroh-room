@@ -9,6 +9,9 @@
 
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::cbor::{self, CborValue};
+use iroh_rooms_core::event::constants::{
+    MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES,
+};
 use iroh_rooms_core::event::content::{Content, EventType, RoomCreated};
 use iroh_rooms_core::event::ids::RoomId;
 use iroh_rooms_core::event::keys::DeviceKey;
@@ -625,6 +628,281 @@ fn invalid_content_room_created_wrong_admins() {
         validate_signed(cbor::encode(&map)),
         Err(RejectReason::InvalidContent)
     );
+}
+
+// ===========================================================================
+// `file.shared` semantic-bounds vectors (IR-0203 / issue #28 AC4). Each vector
+// perturbs exactly one field of an otherwise-canonical, all-fields-valid
+// `file.shared` content map built by `file_shared_content`.
+// ===========================================================================
+
+/// A canonical, all-fields-valid `file.shared` content map. `overrides` replaces
+/// (by key) or appends the field(s) under test, so each vector below perturbs a
+/// single rule while every other field stays valid.
+fn file_shared_content(overrides: Vec<(&str, CborValue)>) -> CborValue {
+    let mut entries: Vec<(String, CborValue)> = vec![
+        ("file_id".to_owned(), CborValue::Bytes(vec![0xf1; 16])),
+        ("name".to_owned(), CborValue::Text("report.pdf".to_owned())),
+        (
+            "mime_type".to_owned(),
+            CborValue::Text("application/pdf".to_owned()),
+        ),
+        ("size_bytes".to_owned(), CborValue::Uint(1024)),
+        ("blob_hash".to_owned(), CborValue::Bytes(vec![0xab; 32])),
+    ];
+    for (key, value) in overrides {
+        if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = value;
+        } else {
+            entries.push((key.to_owned(), value));
+        }
+    }
+    CborValue::Map(entries)
+}
+
+fn file_shared_result(overrides: Vec<(&str, CborValue)>) -> Result<ValidatedEvent, RejectReason> {
+    parts_result(
+        1,
+        "file.shared",
+        file_shared_content(overrides),
+        vec![dummy_prev()],
+    )
+}
+
+#[test]
+fn invalid_content_file_shared_empty_name() {
+    assert_eq!(
+        file_shared_result(vec![("name", CborValue::Text(String::new()))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_over_length_name() {
+    let long = "x".repeat(MAX_FILE_NAME_BYTES + 1);
+    assert_eq!(
+        file_shared_result(vec![("name", CborValue::Text(long))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_control_char_name() {
+    assert_eq!(
+        file_shared_result(vec![("name", CborValue::Text("a\nb".to_owned()))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_empty_mime() {
+    assert_eq!(
+        file_shared_result(vec![("mime_type", CborValue::Text(String::new()))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_over_length_mime() {
+    // Stays well-formed (`type/subtype`) so only the length bound is exercised.
+    let long = format!("application/{}", "x".repeat(MAX_MIME_TYPE_BYTES));
+    assert_eq!(
+        file_shared_result(vec![("mime_type", CborValue::Text(long))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_malformed_mime() {
+    for bad in ["notamime", "text/"] {
+        assert_eq!(
+            file_shared_result(vec![("mime_type", CborValue::Text(bad.to_owned()))]),
+            Err(RejectReason::InvalidContent),
+            "mime_type {bad:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn invalid_content_file_shared_size_over_cap() {
+    // Just over the cap.
+    assert_eq!(
+        file_shared_result(vec![(
+            "size_bytes",
+            CborValue::Uint(MAX_SHARED_FILE_BYTES + 1)
+        )]),
+        Err(RejectReason::InvalidContent)
+    );
+    // The absurd-size vector this issue exists to close.
+    assert_eq!(
+        file_shared_result(vec![("size_bytes", CborValue::Uint(u64::MAX))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_empty_providers_array() {
+    assert_eq!(
+        file_shared_result(vec![("providers", CborValue::Array(vec![]))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_too_many_providers() {
+    let providers: Vec<CborValue> = (0..=MAX_FILE_PROVIDERS)
+        .map(|i| {
+            let byte = u8::try_from(i).expect("index fits in u8");
+            CborValue::Bytes(vec![byte; 32])
+        })
+        .collect();
+    assert_eq!(
+        file_shared_result(vec![("providers", CborValue::Array(providers))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_unknown_key() {
+    assert_eq!(
+        file_shared_result(vec![("surprise", CborValue::Uint(1))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_wrong_length_file_id() {
+    assert_eq!(
+        file_shared_result(vec![("file_id", CborValue::Bytes(vec![0xf1; 15]))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_wrong_length_blob_hash() {
+    assert_eq!(
+        file_shared_result(vec![("blob_hash", CborValue::Bytes(vec![0xab; 31]))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_file_shared_bad_blob_format_enum() {
+    assert_eq!(
+        file_shared_result(vec![("blob_format", CborValue::Text("tarball".to_owned()))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn valid_file_shared_round_trips() {
+    // Boundary-succeeds proof: `name` at exactly `MAX_FILE_NAME_BYTES` and
+    // `size_bytes` at exactly `MAX_SHARED_FILE_BYTES` both still validate.
+    let name = "x".repeat(MAX_FILE_NAME_BYTES);
+    let validated = file_shared_result(vec![
+        ("name", CborValue::Text(name.clone())),
+        ("size_bytes", CborValue::Uint(MAX_SHARED_FILE_BYTES)),
+    ])
+    .expect("a fully-valid file.shared at the caps must validate");
+    match validated.event.content {
+        Content::FileShared(f) => {
+            assert_eq!(f.name, name);
+            assert_eq!(f.size_bytes, MAX_SHARED_FILE_BYTES);
+            assert_eq!(f.mime_type, "application/pdf");
+        }
+        other => panic!("expected FileShared content, got {other:?}"),
+    }
+}
+
+#[test]
+fn valid_file_shared_max_providers_round_trips() {
+    // Accept-side boundary for `providers`: exactly `MAX_FILE_PROVIDERS` entries
+    // must validate — guarding the `len() > MAX_FILE_PROVIDERS` bound against an
+    // off-by-one (`>=`) regression — and both the providers and an explicit
+    // valid `blob_format` must survive into the parsed `FileShared`. This is the
+    // positive counterpart to `invalid_content_file_shared_too_many_providers`
+    // (MAX + 1 rejects), `_empty_providers_array` (0 rejects), and
+    // `_bad_blob_format_enum`, none of which exercise the accept path.
+    let providers: Vec<CborValue> = (0..MAX_FILE_PROVIDERS)
+        .map(|i| {
+            let byte = u8::try_from(i).expect("index fits in u8");
+            CborValue::Bytes(vec![byte; 32])
+        })
+        .collect();
+    let validated = file_shared_result(vec![
+        ("providers", CborValue::Array(providers)),
+        ("blob_format", CborValue::Text("hash_seq".to_owned())),
+    ])
+    .expect("a file.shared with exactly MAX_FILE_PROVIDERS providers must validate");
+    match validated.event.content {
+        Content::FileShared(f) => {
+            let ps = f
+                .providers
+                .expect("a non-empty providers array must survive validation");
+            assert_eq!(
+                ps.len(),
+                MAX_FILE_PROVIDERS,
+                "all MAX_FILE_PROVIDERS providers must be preserved through parse"
+            );
+            assert_eq!(
+                f.blob_format.as_deref(),
+                Some("hash_seq"),
+                "an explicit valid blob_format must be preserved through parse"
+            );
+        }
+        other => panic!("expected FileShared content, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_content_file_shared_whitespace_mime() {
+    // The two `malformed_mime` vectors both fail on *structure* (missing/empty
+    // subtype). This one is structurally `type/subtype` but contains an internal
+    // space, so it can only be rejected by `is_well_formed_mime`'s ASCII/
+    // whitespace branch — proving that branch is reachable through the full
+    // `parse_file_shared` path, not merely in the module-level unit test.
+    for bad in ["text/pl ain", "application/ pdf"] {
+        assert_eq!(
+            file_shared_result(vec![("mime_type", CborValue::Text(bad.to_owned()))]),
+            Err(RejectReason::InvalidContent),
+            "whitespace mime_type {bad:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn invalid_content_file_shared_multibyte_name_over_cap() {
+    // The `name` cap is a *byte* length (`str::len`), not a character count.
+    // 64 four-byte characters is 256 bytes (> MAX_FILE_NAME_BYTES = 255) but only
+    // 64 chars — a `chars().count()` regression would wrongly accept it. None of
+    // the chars is a control char, so this exercises the length bound alone.
+    let name = "🚀".repeat(64);
+    assert_eq!(name.len(), 256);
+    assert_eq!(name.chars().count(), 64);
+    assert!(name.len() > MAX_FILE_NAME_BYTES);
+    assert_eq!(
+        file_shared_result(vec![("name", CborValue::Text(name))]),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn valid_file_shared_mime_at_cap_round_trips() {
+    // Accept-side boundary for `mime_type`: a well-formed value of exactly
+    // `MAX_MIME_TYPE_BYTES` must validate — the positive counterpart to
+    // `invalid_content_file_shared_over_length_mime`, guarding the length bound
+    // against an off-by-one (`>=`) regression that would reject the exact cap.
+    let mime = format!(
+        "application/{}",
+        "x".repeat(MAX_MIME_TYPE_BYTES - "application/".len())
+    );
+    assert_eq!(mime.len(), MAX_MIME_TYPE_BYTES);
+    let validated = file_shared_result(vec![("mime_type", CborValue::Text(mime.clone()))])
+        .expect("a well-formed mime_type at exactly the cap must validate");
+    match validated.event.content {
+        Content::FileShared(f) => assert_eq!(f.mime_type, mime),
+        other => panic!("expected FileShared content, got {other:?}"),
+    }
 }
 
 #[test]

@@ -18,7 +18,8 @@ use blake3::Hasher;
 use super::binding::DeviceBinding;
 use super::cbor::CborValue;
 use super::constants::{
-    DIGEST_LEN, INVITE_CONTEXT, MAX_MESSAGE_BODY_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
+    DIGEST_LEN, INVITE_CONTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MESSAGE_BODY_BYTES,
+    MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
 };
 use super::ids::{EventId, HashRef, RoomId};
 use super::keys::{DeviceKey, IdentityKey};
@@ -691,12 +692,37 @@ fn parse_message_text(f: &mut Fields<'_>) -> Result<MessageText, RejectReason> {
 
 fn parse_file_shared(f: &mut Fields<'_>) -> Result<FileShared, RejectReason> {
     let file_id = f.require_bytes::<SHORT_ID_LEN>("file_id")?;
-    let name = f.require_text("name")?.to_owned();
-    let mime_type = f.require_text("mime_type")?.to_owned();
+
+    let name = f.require_text("name")?;
+    if name.is_empty() || name.len() > MAX_FILE_NAME_BYTES || name.chars().any(char::is_control) {
+        return Err(RejectReason::InvalidContent);
+    }
+    let name = name.to_owned();
+
+    let mime_type = f.require_text("mime_type")?;
+    if mime_type.is_empty()
+        || mime_type.len() > MAX_MIME_TYPE_BYTES
+        || !is_well_formed_mime(mime_type)
+    {
+        return Err(RejectReason::InvalidContent);
+    }
+    let mime_type = mime_type.to_owned();
+
     let size_bytes = f.require_uint("size_bytes")?;
+    if size_bytes > MAX_SHARED_FILE_BYTES {
+        return Err(RejectReason::InvalidContent);
+    }
+
     let blob_hash = HashRef::from_bytes(f.require_bytes::<DIGEST_LEN>("blob_hash")?);
     let blob_format = f.opt_enum("blob_format", BLOB_FORMATS)?;
+
     let providers = f.opt_device_array("providers")?;
+    if let Some(ps) = &providers {
+        if ps.is_empty() || ps.len() > MAX_FILE_PROVIDERS {
+            return Err(RejectReason::InvalidContent);
+        }
+    }
+
     Ok(FileShared {
         file_id,
         name,
@@ -706,6 +732,21 @@ fn parse_file_shared(f: &mut Fields<'_>) -> Result<FileShared, RejectReason> {
         blob_format,
         providers,
     })
+}
+
+/// Minimal MIME well-formedness: `type/subtype`, both non-empty, ASCII, no
+/// whitespace or control chars, exactly one `/`. Deliberately permissive on the
+/// subtype tail (parameters, `+suffix`) — strict RFC-6838 tokenization is out of
+/// scope for MVP.
+fn is_well_formed_mime(s: &str) -> bool {
+    if !s.is_ascii() || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let mut parts = s.splitn(2, '/');
+    match (parts.next(), parts.next()) {
+        (Some(t), Some(sub)) => !t.is_empty() && !sub.is_empty() && !sub.contains('/'),
+        _ => false,
+    }
 }
 
 fn parse_pipe_opened(f: &mut Fields<'_>) -> Result<PipeOpened, RejectReason> {
@@ -929,4 +970,57 @@ impl<'a> Fields<'a> {
 fn fixed_bytes<const N: usize>(value: &CborValue) -> Result<[u8; N], RejectReason> {
     let bytes = value.as_bytes().ok_or(RejectReason::InvalidContent)?;
     <[u8; N]>::try_from(bytes).map_err(|_| RejectReason::InvalidContent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_well_formed_mime;
+
+    #[test]
+    fn is_well_formed_mime_accepts_real_types() {
+        for ok in [
+            "text/plain",
+            "application/pdf",
+            "image/svg+xml",
+            "application/vnd.api+json",
+        ] {
+            assert!(is_well_formed_mime(ok), "expected {ok:?} to be well-formed");
+        }
+    }
+
+    #[test]
+    fn is_well_formed_mime_rejects_malformed_strings() {
+        for bad in [
+            "",
+            "plain",
+            "/plain",
+            "text/",
+            "text//plain",
+            "text/ plain",
+            "tex t/plain",
+            "text/plaín",
+        ] {
+            assert!(!is_well_formed_mime(bad), "expected {bad:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn is_well_formed_mime_rejects_control_chars() {
+        // A control char in a mime type is caught *only* by `is_well_formed_mime`
+        // (unlike `name`, which has its own explicit `char::is_control` guard in
+        // `parse_file_shared`). Cover both a whitespace control (`\t`, `\n`) and
+        // DEL (`\u{7f}`), which is a control char that is NOT whitespace — so it
+        // exercises the `is_control()` branch specifically, not just whitespace.
+        for bad in [
+            "text/pl\tain",
+            "text/plain\n",
+            "text/pl\u{7f}ain",
+            "\u{7f}/plain",
+        ] {
+            assert!(
+                !is_well_formed_mime(bad),
+                "expected control-char mime {bad:?} to be rejected"
+            );
+        }
+    }
 }
