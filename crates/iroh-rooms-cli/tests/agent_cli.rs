@@ -711,3 +711,194 @@ fn agent_invite_data_dir_isolation() {
         "rooms.db must NOT appear in home_b after an agent invite issued in home_a"
     );
 }
+
+// ── `agent status` (IR-0208 §11 L5): offline, deterministic CLI boundary ────────
+// The room creator is an active admin, so no invite/join dance is needed to post.
+// These cover the four Test-Plan cases — valid, invalid progress, non-member, and
+// display in the offline room tail — at the process boundary (exit codes + output).
+
+/// A well-formed 16-byte artifact file-id handle (32 hex chars). Advisory: no
+/// existence check is performed, so any well-formed handle is accepted (D5).
+const ARTIFACT_HEX: &str = "abababababababababababababababab";
+
+/// AC1 (persisted) at the CLI: a valid `agent status` from the room admin exits 0
+/// and reports the guaranteed local persistence (`stored: yes`) plus a `status:`
+/// event id and a `delivered:` line (0, stored locally only — no peers online).
+#[test]
+fn agent_status_valid_exits_zero_and_reports_stored() {
+    let home = TempDir::new().unwrap();
+    create_identity_named(&home, "Alice");
+    let room_id = create_room(&home);
+
+    let out = cmd(&home)
+        .args([
+            "agent",
+            "status",
+            &room_id,
+            "running_tests",
+            "--message",
+            "running the integration suite",
+            "--progress",
+            "40",
+            "--artifact",
+            ARTIFACT_HEX,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a valid agent status must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        extract_field(&stdout, "stored"),
+        Some("yes"),
+        "the guaranteed local persistence must be reported: {stdout}"
+    );
+    let event_id = extract_field(&stdout, "status").expect("a status: <event_id> line");
+    assert!(
+        event_id.starts_with("blake3:"),
+        "the status line must carry a blake3 event id: {event_id}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.starts_with("delivered:")),
+        "a delivered: line must be present: {stdout}"
+    );
+}
+
+/// AC3 at the CLI: `--progress 101` is a usage error (exit 2) and leaves rooms.db
+/// unchanged — the pre-IO friendly bound in `agent::status`.
+#[test]
+fn agent_status_progress_over_100_exits_two() {
+    let home = TempDir::new().unwrap();
+    create_identity_named(&home, "Alice");
+    let room_id = create_room(&home);
+    let db_before = std::fs::metadata(home.path().join("rooms.db")).map_or(0, |m| m.len());
+
+    cmd(&home)
+        .args(["agent", "status", &room_id, "running", "--progress", "101"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("progress"));
+
+    let db_after = std::fs::metadata(home.path().join("rooms.db")).map_or(0, |m| m.len());
+    assert_eq!(
+        db_before, db_after,
+        "rooms.db must not change when --progress is out of range (pre-IO gate)"
+    );
+}
+
+/// A non-integer / negative `--progress` is a clap usage error (also exit 2),
+/// rejected before any IO.
+#[test]
+fn agent_status_non_integer_progress_is_a_usage_error() {
+    let home = TempDir::new().unwrap();
+    create_identity_named(&home, "Alice");
+    let room_id = create_room(&home);
+
+    for bad in ["-1", "1.5", "abc"] {
+        cmd(&home)
+            .args(["agent", "status", &room_id, "running", "--progress", bad])
+            .assert()
+            .failure()
+            .code(2);
+    }
+}
+
+/// AC2 at the CLI: a non-member (owns a copy of the room log but is not the admin)
+/// cannot post a status — exit 3 (auth) and rooms.db is left unchanged.
+#[test]
+fn agent_status_by_non_member_exits_three() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+
+    // Alice creates the room (admin in home_a).
+    create_identity_named(&home_a, "Alice");
+    let room_id = create_room(&home_a);
+
+    // Bob has his own identity and a copy of the room store, but is not a member.
+    create_identity_named(&home_b, "Bob");
+    std::fs::copy(
+        home_a.path().join("rooms.db"),
+        home_b.path().join("rooms.db"),
+    )
+    .expect("copy rooms.db into home_b");
+    let db_before = std::fs::metadata(home_b.path().join("rooms.db")).map_or(0, |m| m.len());
+
+    cmd(&home_b)
+        .args(["agent", "status", &room_id, "running"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("member"));
+
+    let db_after = std::fs::metadata(home_b.path().join("rooms.db")).map_or(0, |m| m.len());
+    assert_eq!(
+        db_before, db_after,
+        "rooms.db must be unchanged when a non-member's status is rejected (AC2)"
+    );
+}
+
+/// The Test-Plan's "display in room tail": after posting, a separate offline
+/// `room tail` process renders the row in both text and `--json` form, surfacing
+/// `state`, `message`, `progress`, and the artifact handles (AC4 present-case).
+#[test]
+fn agent_status_displays_in_offline_tail() {
+    let home = TempDir::new().unwrap();
+    create_identity_named(&home, "Alice");
+    let room_id = create_room(&home);
+
+    cmd(&home)
+        .args([
+            "agent",
+            "status",
+            &room_id,
+            "running_tests",
+            "--message",
+            "suite in progress",
+            "--progress",
+            "40",
+            "--artifact",
+            ARTIFACT_HEX,
+        ])
+        .assert()
+        .success();
+
+    // Text tail — the free-form summary carries state / progress / artifact count.
+    cmd(&home)
+        .args(["room", "tail", &room_id, "--offline"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state=running_tests"))
+        .stdout(predicate::str::contains("progress=40%"))
+        .stdout(predicate::str::contains("artifacts=1"));
+
+    // JSON tail — the structured row exposes typed fields, artifacts as handles.
+    let out = cmd(&home)
+        .args(["room", "tail", &room_id, "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "offline tail --json must succeed");
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("tail --json emits a JSON array");
+    let rows = value.as_array().expect("tail --json is an array");
+    let row = rows
+        .iter()
+        .find(|r| r["event_type"] == "agent.status")
+        .expect("an agent.status row must be present in the tail");
+
+    assert_eq!(row["state"], "running_tests", "state field: {row}");
+    assert_eq!(row["message"], "suite in progress", "message field: {row}");
+    assert_eq!(row["progress"], 40, "progress field as an integer: {row}");
+    let artifacts = row["artifacts"]
+        .as_array()
+        .expect("artifacts must be a JSON array");
+    assert_eq!(artifacts.len(), 1, "one artifact handle: {row}");
+    assert_eq!(
+        artifacts[0].as_str(),
+        Some(format!("file_{ARTIFACT_HEX}").as_str()),
+        "the artifact renders as its file_<hex> handle (round-trips into file fetch)"
+    );
+}

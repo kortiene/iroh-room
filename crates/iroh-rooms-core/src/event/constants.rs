@@ -49,6 +49,18 @@ pub const MAX_MIME_TYPE_BYTES: usize = 255;
 /// MVP rooms are ~3 members; 16 is a generous bound that blocks an unbounded array.
 pub const MAX_FILE_PROVIDERS: usize = 16;
 
+/// Maximum UTF-8 byte length of an `agent.status` `status` label (Event Protocol
+/// §7). A short free-form label (e.g. `"running_tests"`), not a chat body.
+pub const MAX_STATUS_LABEL_BYTES: usize = 64;
+
+/// Maximum UTF-8 byte length of an `agent.status` `message` (Event Protocol §7).
+/// A status note, not a chat transcript.
+pub const MAX_STATUS_MESSAGE_BYTES: usize = 4096;
+
+/// Maximum number of `agent.status` `related_artifact_ids` entries (Event
+/// Protocol §7). Mirrors [`MAX_FILE_PROVIDERS`].
+pub const MAX_ARTIFACT_REFS: usize = 16;
+
 /// The only accepted logical `schema_version` for MVP (Event Protocol §2).
 pub const SCHEMA_VERSION: u64 = 1;
 

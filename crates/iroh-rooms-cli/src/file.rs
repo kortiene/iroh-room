@@ -673,8 +673,10 @@ pub fn print_fetch(summary: &FetchSummary) {
 }
 
 /// Parse a `file_<32-hex>` handle (or, tolerantly, bare 32-hex) into 16 bytes —
-/// the inverse of `file_handle` (spec §5.1 / OQ-8).
-fn parse_file_id(s: &str) -> Result<[u8; SHORT_ID_LEN]> {
+/// the inverse of `file_handle` (spec §5.1 / OQ-8). `pub(crate)` so other nouns
+/// that accept a file-id handle (`agent status --artifact`) reuse this codec
+/// verbatim rather than re-implementing it (spec IR-0208 D6).
+pub(crate) fn parse_file_id(s: &str) -> Result<[u8; SHORT_ID_LEN]> {
     let trimmed = s.trim();
     let hex_part = trimmed.strip_prefix("file_").unwrap_or(trimmed);
     if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -892,8 +894,10 @@ fn provider_token(held: Option<bool>) -> &'static str {
 }
 
 /// The CLI file handle for a 16-byte `file_id`: `file_<32-hex>` (spec OQ-6 — matches
-/// the PRD `file_…` shape and the getting-started walkthrough).
-fn file_handle(file_id: &[u8; SHORT_ID_LEN]) -> String {
+/// the PRD `file_…` shape and the getting-started walkthrough). `pub(crate)` so
+/// `agent.status` display (`room tail`) round-trips artifact ids through the same
+/// handle form (spec IR-0208 OQ3).
+pub(crate) fn file_handle(file_id: &[u8; SHORT_ID_LEN]) -> String {
     format!("file_{}", hex::encode(file_id))
 }
 

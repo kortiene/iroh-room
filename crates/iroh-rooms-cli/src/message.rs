@@ -32,13 +32,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::build_message_text;
-use iroh_rooms_core::event::constants::{MAX_MESSAGE_BODY_BYTES, MAX_PREV_EVENTS};
+use iroh_rooms_core::event::constants::{MAX_MESSAGE_BODY_BYTES, MAX_PREV_EVENTS, SHORT_ID_LEN};
 use iroh_rooms_core::event::content::{Content, EventType};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey};
 use iroh_rooms_core::event::signed::SignedEvent;
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+use iroh_rooms_core::event::{build_agent_status, build_message_text};
 use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, Role, RoomMembership, Status};
 use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
@@ -216,6 +216,173 @@ pub async fn send(
         delivered,
         attempted,
     })
+}
+
+/// The result of an `agent status`, for the caller to present (parallel to
+/// [`SendSummary`]).
+pub struct StatusSummary {
+    /// The authored status event's id.
+    pub event_id: EventId,
+    /// The room the status belongs to.
+    pub room_id: RoomId,
+    /// The author's identity (`sender_id`).
+    pub sender_id: IdentityKey,
+    /// Number of connected peers the frame was pushed to (possibly zero).
+    pub delivered: usize,
+    /// Number of active peers we tried to reach.
+    pub attempted: usize,
+}
+
+/// Send a signed `agent.status` to `room_id`: build it, self-validate, persist it
+/// locally (the guarantee), then best-effort push it to connected peers. Mirrors
+/// [`send`] with the `agent.status` builder substituted (spec IR-0208 D4); see
+/// `send` for the availability model and error semantics.
+///
+/// # Errors
+/// Fails — leaving the store untouched on every pre-persist path — if no local
+/// identity exists, if the room is unknown, if the caller is not an active
+/// member, on a store error, or — as an internal-bug guard — if the freshly built
+/// status fails self-validation. A failure to reach peers is **not** an error: it
+/// is reported, exit 0. Caller-facing field validation (`status`/`message` caps,
+/// `progress > 100`, artifact handles) happens upstream in `agent::status`.
+#[allow(clippy::too_many_arguments)] // mirrors send; each arg is a distinct CLI input
+pub async fn send_agent_status(
+    home: &Path,
+    room_id: &RoomId,
+    status: &str,
+    message: Option<&str>,
+    progress_pct: Option<u64>,
+    related_artifact_ids: &[[u8; SHORT_ID_LEN]],
+    peers: &[String],
+    timeout: Duration,
+    loopback: bool,
+) -> Result<StatusSummary> {
+    let peer_addrs = parse_peers(peers)?;
+
+    // Load the signing secrets (also re-checks them against the public profile).
+    let secret = identity::SecretKeys::load(home)?;
+    let sender_id = secret.identity.identity_key();
+
+    // ---- Fold the persisted log: confirm the room exists and we are Active. ----
+    let db_path = home.join(DB_FILE);
+    let mut store = EventStore::open(&db_path)
+        .with_context(|| format!("could not open event store at {}", db_path.display()))?;
+    let (mut membership, snapshot) = fold_room(&store, home, room_id)?;
+    if !snapshot.is_active(&sender_id) {
+        crate::bail_coded!(
+            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            "you are not an active member of room {room_id}; only an active member can post a \
+             status (this identity is {sender_id})"
+        );
+    }
+
+    // ---- prev_events = current room heads, bounded per §6 (D8). ----
+    let heads = select_heads(&store, room_id)?;
+
+    // ---- Build + self-validate. We do NOT persist here: the engine's `publish`
+    // path persists (InsertOutcome::Inserted) and fans out, and a duplicate insert
+    // would suppress that fan-out. A final guaranteed insert below covers the case
+    // where the live push never runs (mirrors `send`). ----
+    let created_at = clock::now_ms();
+    let wire = build_agent_status(
+        &secret.identity,
+        &secret.device,
+        room_id,
+        status,
+        message,
+        related_artifact_ids,
+        progress_pct,
+        &heads,
+        created_at,
+    );
+    let wire_bytes = wire.to_bytes();
+    let ctx = ValidationContext::for_room(*room_id);
+    let validated = validate_wire_bytes(&wire_bytes, &ctx)
+        .map_err(|reason| {
+            anyhow!(
+                "internal error: freshly built agent.status failed validation ({})",
+                reason.code()
+            )
+        })
+        .coded(crate::error::ErrorCode::Internal)?;
+    let event_id = validated.event_id;
+    match membership.ingest(validated.clone()) {
+        Ingest::Accepted { .. } => {}
+        Ingest::Rejected { reason, .. } => crate::bail_coded!(
+            crate::error::ErrorCode::Internal,
+            "internal error: freshly built agent.status was rejected by the fold ({})",
+            reason.code()
+        ),
+        Ingest::Buffered { .. } => {
+            crate::bail_coded!(
+                crate::error::ErrorCode::Internal,
+                "internal error: freshly built agent.status is causally incomplete"
+            )
+        }
+    }
+
+    // ---- Plan the dial set: active members' devices minus our own (D5/D7). ----
+    let self_device = endpoint_id_of(secret.device.device_key())?;
+    let dial_set = build_dial_set(&snapshot, self_device, &peer_addrs);
+    let attempted = dial_set.len();
+
+    let delivered = if dial_set.is_empty() {
+        // No other active member to reach: persist locally only (the guarantee).
+        store
+            .insert(&validated)
+            .with_context(|| format!("could not persist status to {}", db_path.display()))?;
+        0
+    } else {
+        // Best-effort live push: the engine's `publish` persists AND fans out.
+        let mode = net_mode(loopback);
+        let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
+        let admission = build_admission(&snapshot);
+        let delivered = match run_push(
+            store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(err) => {
+                eprintln!("warning: live delivery unavailable: {err:#}");
+                0
+            }
+        };
+        // Guarantee local persistence regardless of the push outcome (idempotent):
+        // a duplicate if `publish` already stored it, an insert otherwise.
+        let mut store = EventStore::open(&db_path)
+            .with_context(|| format!("could not reopen event store at {}", db_path.display()))?;
+        store
+            .insert(&validated)
+            .with_context(|| format!("could not persist status to {}", db_path.display()))?;
+        delivered
+    };
+
+    Ok(StatusSummary {
+        event_id,
+        room_id: *room_id,
+        sender_id,
+        delivered,
+        attempted,
+    })
+}
+
+/// Print a [`StatusSummary`] as labeled, script-friendly lines (mirrors
+/// [`print_send`]).
+pub fn print_status(summary: &StatusSummary) {
+    println!("status: {}", summary.event_id);
+    println!("room:   {}", summary.room_id);
+    println!("from:   {}", summary.sender_id);
+    println!("stored: yes");
+    if summary.delivered == 0 {
+        if summary.attempted == 0 {
+            println!("delivered: 0 (no other members to reach — stored locally only)");
+        } else {
+            println!("delivered: 0 (no peers online — stored locally only)");
+        }
+    } else {
+        println!("delivered: {} connected peer(s)", summary.delivered);
+    }
 }
 
 /// Print a [`SendSummary`] as labeled, script-friendly lines (spec §5 step 6).

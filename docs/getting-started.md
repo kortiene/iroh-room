@@ -69,11 +69,14 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   format note: `--tcp` requires an IP address (`127.0.0.1:3000`, not `localhost:3000`).
 >   `pipe close` now takes a bare `<PIPE_ID>` — the room is inferred from the local log; pass
 >   `--room <ROOM_ID>` only to disambiguate a pipe id shared across rooms.
-> - **Step 7** (`iroh-rooms agent status`) is **scaffold** — the `agent.status` content type
->   exists but the binary does not yet expose a command to author one (tracked as a sibling
->   follow-up to issue #31 / IR-0206). **Expected output** blocks for Step 7 are *illustrative*
->   (consistent with `PRD.v0.3.md` §16 but not yet captured from a real run). `agent invite`
->   (Step 3) is implemented and runnable.
+> - **Step 7** (`iroh-rooms agent status`) is implemented and runnable as of issue #33 /
+>   IR-0208. Output blocks are reconciled against the shipped binary and show the actual
+>   format. Posting is **not** role-gated — any active member may post, matching spike §7 — but
+>   the demo uses the invited agent (Step 3) to demonstrate the intended workflow. The status,
+>   an optional `--message`, an optional integer `--progress <0..100>`, and repeatable
+>   `--artifact <FILE_ID>` references are all rendered by the **offline** `room tail --offline`
+>   read; live-streaming rendering of `agent.status` is a known display gap (Step 4's live
+>   `room tail` renders only `message.text` today).
 > - **Issue #24 / IR-0109** adds the Phase 1A two-peer integration test suite
 >   (`crates/iroh-rooms-cli/tests/two_peer_e2e.rs`). The CI tier (offline-backbone and
 >   restart-persistence tests) runs automatically via `cargo test`. The full online tier —
@@ -776,19 +779,38 @@ Alice's endpoint dies, but the pipe shows open in `pipe list` until an owner/adm
 **Command** (Terminal C — Agent):
 
 ```bash
-# Substitute <ROOM_ID>.
-iroh-rooms agent status <ROOM_ID> "Running integration tests…"
+# Substitute <ROOM_ID>. --message, --progress, and --artifact are all optional.
+iroh-rooms agent status <ROOM_ID> "running_tests" \
+  --message "Running integration tests" \
+  --progress 40
 ```
 
-**Expected output** — Alice and Bob see it in `room tail` (illustrative):
+**Expected output:**
 
 ```text
-[12:05:18] build-agent (agent): Running integration tests…
+status: blake3:<event-id-hex>
+room:   <ROOM_ID>
+from:   <AGENT_ID>
+stored: yes
+delivered: 0 (no peers online — stored locally only)
+```
+
+Alice or Bob then read it back with the offline tail (the display surface of record for this
+step — see the note above about the live-tail gap):
+
+```bash
+# Substitute <ROOM_ID>.
+iroh-rooms room tail <ROOM_ID> --offline
+```
+
+```text
+event=blake3:<event-id-hex> type=agent.status lamport=<n> from=<agent-id-8-hex> role=agent status=active at=<iso8601>  state=running_tests text="Running integration tests" progress=40%
 ```
 
 **What this proves / verify:** the `agent.status` event is signed by the **agent's own key**
 (spike §7). The agent is a first-class participant but not implicitly trusted — it could only
-post because it was explicitly invited in Step 3 (spike §3.5; PRD §13.3).
+post because it was explicitly invited in Step 3 (spike §3.5; PRD §13.3). A non-member's status
+is rejected `not_a_member` — the same `gate_active_member` check every other content event uses.
 
 ---
 
