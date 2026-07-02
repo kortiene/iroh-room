@@ -550,6 +550,25 @@ impl SyncEngine {
         Ok(false)
     }
 
+    /// The set of BLAKE3-256 blob hashes referenced by a valid `file.shared` in the
+    /// validated set — the Blob Plane serve gate's per-hash authorization source
+    /// (IR-0204 spec §5.3). Read-only over the store, like [`pipe_opened`](Self::pipe_opened);
+    /// the gate decision itself belongs to the caller.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read or decode failure.
+    pub fn file_shared_hashes(&self) -> Result<BTreeSet<[u8; 32]>, SyncError> {
+        let mut hashes = BTreeSet::new();
+        for se in self.store.by_type(&self.room_id, EventType::FileShared)? {
+            let event = crate::event::signed::SignedEvent::decode(&se.wire.signed)
+                .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            if let Content::FileShared(f) = event.content {
+                hashes.insert(*f.blob_hash.as_bytes());
+            }
+        }
+        Ok(hashes)
+    }
+
     /// The admin-completeness verdict the access planes consult (spec D6).
     #[must_use]
     pub fn completeness(&self) -> Completeness {

@@ -615,10 +615,8 @@ Blob Plane and making `iroh-rooms file share` operational:
   (determinism, all-field round-trip, stateless validation, golden event id, signature verifies
   under device key).
 - **The serve/fetch half** — `file fetch`, the `iroh-blobs` serve ALPN with the spike's
-  two-gate ACL, live broadcast of the `file.shared` frame at share time, and honest
-  "no-provider" unavailability — is **deliberately out of scope** and tracked separately.
-  Until it lands a shared blob is held locally and shown as `provider: you (local)` in
-  `file list`; peers that have not yet imported it see `provider: reference-only`.
+  two-gate ACL, and honest "no-provider" unavailability — was **deliberately out of scope**
+  here and landed as the IR-0204 follow-up below.
 
 **`file.shared` validation hardening** has landed in `crates/iroh-rooms-core::event`
 (issue #28 / IR-0203), closing the one gap #27 left open: `parse_file_shared` now enforces
@@ -684,15 +682,48 @@ panel distinguishing the two live, while `peer_offline` / `peer_unauthorized` ar
 command-failure twins (e.g. `pipe connect`). A clock-skewed but otherwise valid event is a
 `warning[clock_skew]` advisory only — it is still accepted, ordered, and displayed.
 
+**File fetch and verification** — the serve + fetch half of the Blob Plane — has landed in
+`crates/iroh-rooms-net` and `crates/iroh-rooms-cli` (issue #29 / IR-0204), closing the gap
+#27/#28 left open and completing the PRD §9.2 file-sharing journey:
+
+- **Serve plane** — the `iroh-blobs` ALPN is now a third `.accept()` on the shared `Router`
+  (`net::blob::serve::spawn_blob_gate`), gated by a fold-derived two-gate ACL
+  (`BlobAclView`): Gate 1 admits a connect only from a QUIC/TLS-proven `endpoint_id` bound to a
+  currently-active member; Gate 2 serves a hash only if it is referenced by a valid
+  `file.shared` in the room (from the new `SyncEngine::file_shared_hashes`); push and observe
+  are always denied. `iroh-rooms room tail` is the "provider stays online" surface — it opts
+  a session into serving the blobs it holds; the pump's existing reconciler refreshes the ACL
+  cell on every membership **or** newly-synced-`file.shared` change (tracked independently of
+  the membership fold-change detector, since a content event never changes `AdmissionView`).
+- **`iroh-rooms file fetch <ROOM_ID> <FILE_ID> [--out <PATH>] [--peer …] [--timeout <DUR>]`** —
+  resolves the `file.shared` reference (syncing it first if absent), discovers providers from
+  `file.shared.providers` (default: the author's device), dials each in order over the
+  ACL-gated blobs ALPN, and requires the assembled bytes' independently recomputed BLAKE3-256
+  equal the declared hash before saving — `iroh-blobs` bao verified streaming already rejects
+  tampered bytes for the requested hash in transit; the recompute additionally catches a
+  `file.shared` that declares a hash different from what it references. A hash mismatch is a
+  hard stop (never falls through to another provider); an unauthorized peer is denied at the
+  provider's connect gate; an unavailable provider is reported honestly within the bounded
+  `--timeout` (default 30s), never a hang. The peer-supplied `name` is sanitized to a safe
+  basename (path-traversal guard) before it ever touches the filesystem. On success the CLI
+  prints `saved:`, `verified:`, `size:`, and `provider:`; the verified bytes are also
+  best-effort re-imported into the local blob store so the fetcher becomes a provider too.
+- `net::blob::fetch::fetch_blob` / `FetchOutcome` (`Fetched | DeniedAtConnect | DeniedPerHash |
+  HashMismatch | Unavailable`) is the verified-fetch client, lifted from the `spike-blobs`
+  spike (#13 / IR-0009) essentially verbatim and re-pointed at the real fold instead of a fixed
+  fixture — no new authorization model, event schema, or crate version.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
 Phase 1A two-peer integration test, the hardened recent-history sync, file import, the CLI
 error taxonomy, and agent identity) are all landed.
+
+Phase 1A two-peer integration test, the hardened recent-history sync, and the full Blob Plane —
+import, serve, and fetch) are all landed.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
-Gate E memo (#15). The remaining feature work is the file serve/fetch half (`file fetch`,
-blob serving ALPN, and peer delivery) and agent status (both tracked separately).
+Gate E memo (#15). The remaining feature work is agent status (tracked separately).
 
 The **D1 transport decision is now measurement-closed** (issue #10 / IR-0006):
 `spike-transport` built minimal full-mesh and `iroh-gossip` backends behind one

@@ -1,4 +1,6 @@
-//! [`BlobStore`] — the Blob Plane's durable local content store (IR-0202).
+//! [`BlobStore`] — the Blob Plane's durable local content store (IR-0202) — plus
+//! the serve gate ([`serve`]) and verified fetch client ([`fetch`]) that close the
+//! serve/fetch half of the Blob Plane (IR-0204).
 //!
 //! A thin, persistent wrapper over an [`iroh_blobs`] filesystem store
 //! ([`FsStore`]) rooted at `<home>/blobs/`. It is the **producer/import** half of
@@ -7,7 +9,7 @@
 //! answers "does this node hold hash `H`?" for provider-status reads. The bytes are
 //! never carried on the room log — only the `file.shared` **reference** is
 //! (PRD §9.2). All `iroh_blobs` types are isolated behind this wrapper so a version
-//! bump touches one file (spec R1); the raw `[u8; 32]` hash crosses the crate
+//! bump touches one module (spec R1); the raw `[u8; 32]` hash crosses the crate
 //! boundary, never `iroh_blobs::Hash`.
 //!
 //! ## Confirmed `iroh-blobs 0.103.0` persistent-store API (spec §6.1 / Step 0)
@@ -27,25 +29,42 @@
 //!   *complete* blob (it maps `BlobStatus::Complete`), which survives restart.
 //! - **Hash:** the store's content hash is BLAKE3-256 (`iroh_blobs::Hash`), the same
 //!   digest the spike relied on; `Hash::as_bytes()` yields the raw `[u8; 32]`.
-//!
-//! ## Out of scope (the follow-up serve/fetch issue — spec §4.3)
-//!
-//! Serving these blobs to peers over the `iroh-blobs` ALPN with the spike's
-//! two-gate ACL (`spike-blobs/src/net.rs::spawn_event_gate`), the consumer
-//! `file fetch` with receiver-side BLAKE3 recompute, and any live broadcast of the
-//! `file.shared` frame are **not** built here. This wrapper imports and records
-//! local provider status; it never serves bytes.
+//! - **Serve (IR-0204 §5.3/§6.1):** [`BlobsProtocol::new`]`(&store, Some(events))`
+//!   builds the ALPN handler over a `&Store` — `FsStore: Deref<Target = Store>`, so
+//!   passing `&self.store` here coerces automatically. [`BlobStore::serve_handler`]
+//!   is the single place that constructs it, keeping `iroh_blobs::BlobsProtocol`
+//!   behind this wrapper too.
 
 use std::io::{self, Read};
 use std::path::Path;
+use std::time::Duration;
 
+use iroh_blobs::provider::events::EventSender;
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::Hash;
+use iroh_blobs::{BlobsProtocol, Hash};
+
+pub mod fetch;
+pub mod serve;
+
+pub use fetch::{fetch_blob, FetchOutcome};
+pub use serve::spawn_blob_gate;
 
 /// Buffer size for the streaming BLAKE3 recompute. Bounds worst-case memory
 /// regardless of file size (the size cap is a policy bound, not a memory one).
 /// Kept a stack-friendly 8 `KiB` so it stays well under clippy's stack-array bound.
 const RECOMPUTE_CHUNK: usize = 8 * 1024;
+
+/// How long [`BlobStore::open`] waits to acquire the store's exclusive on-disk
+/// lock before giving up with [`BlobError::Locked`].
+///
+/// The underlying `iroh-blobs` `FsStore` takes an exclusive `redb` lock while
+/// open; a second open of the same directory (a concurrent `file list` /
+/// `file share` while a `room tail` provider holds the store) **blocks
+/// indefinitely** — it neither errors nor times out on its own. Bounding the
+/// wait turns that silent deadlock into an actionable error. Kept comfortably
+/// larger than a healthy open (milliseconds) so it never trips a legitimate
+/// same-process reopen after a clean [`BlobStore::close`].
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The outcome of a successful [`BlobStore::import_path`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,15 +91,28 @@ impl BlobStore {
     ///
     /// # Errors
     /// [`BlobError::Open`] if the directory cannot be created or the store cannot
-    /// be opened.
+    /// be opened; [`BlobError::Locked`] if the store's exclusive on-disk lock is
+    /// not acquired within [`OPEN_TIMEOUT`] (another live process — typically a
+    /// `room tail` provider — is holding the same store open).
     pub async fn open(dir: &Path) -> Result<Self, BlobError> {
+        Self::open_with_timeout(dir, OPEN_TIMEOUT).await
+    }
+
+    /// [`BlobStore::open`] with an explicit lock-acquisition timeout (the seam the
+    /// lock-contention test drives with a short bound; production uses
+    /// [`OPEN_TIMEOUT`]).
+    async fn open_with_timeout(dir: &Path, timeout: Duration) -> Result<Self, BlobError> {
         // Defensive: `FsStore::load` creates the required directories, but ensuring
         // the root exists first keeps the failure mode a clear "could not create
         // dir" rather than a store-internal error.
         std::fs::create_dir_all(dir)
             .map_err(|e| BlobError::Open(format!("could not create {}: {e}", dir.display())))?;
-        let store = FsStore::load(dir)
+        // `FsStore::load` blocks forever if another process holds the exclusive
+        // lock, so bound it: a timeout means the lock is held elsewhere, not that
+        // the store is broken — surface that as `Locked` so callers can degrade.
+        let store = tokio::time::timeout(timeout, FsStore::load(dir))
             .await
+            .map_err(|_| BlobError::Locked(dir.display().to_string()))?
             .map_err(|e| BlobError::Open(e.to_string()))?;
         Ok(Self { store })
     }
@@ -142,6 +174,16 @@ impl BlobStore {
             .map_err(|e| BlobError::Status(e.to_string()))
     }
 
+    /// Build the `iroh-blobs` protocol handler serving this store's blobs over the
+    /// blobs ALPN, gated by `events` (the two-gate ACL from
+    /// [`serve::spawn_blob_gate`]). Keeps `iroh_blobs::BlobsProtocol` behind this
+    /// wrapper (spec R1); `FsStore` is a cheap, `Clone`-able handle, so the returned
+    /// protocol keeps working after this call returns.
+    #[must_use]
+    pub fn serve_handler(&self, events: EventSender) -> BlobsProtocol {
+        BlobsProtocol::new(&self.store, Some(events))
+    }
+
     /// Flush and cleanly close the store, releasing its exclusive on-disk lock.
     ///
     /// The underlying `iroh-blobs` filesystem store holds an exclusive lock on its
@@ -187,6 +229,11 @@ fn blake3_file(path: &Path) -> io::Result<([u8; 32], u64)> {
 pub enum BlobError {
     /// The durable store could not be created/opened at the given directory.
     Open(String),
+    /// The store's exclusive on-disk lock could not be acquired within the open
+    /// timeout — another live process (typically a `room tail` provider) is
+    /// holding the same store open. Distinct from [`BlobError::Open`] so callers
+    /// (a concurrent `file list`) can degrade gracefully instead of failing hard.
+    Locked(String),
     /// The source file could not be read for the independent recompute.
     Read(String),
     /// Importing the blob into the store failed.
@@ -209,6 +256,11 @@ impl core::fmt::Display for BlobError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Open(e) => write!(f, "blob_store_open_error: {e}"),
+            Self::Locked(dir) => write!(
+                f,
+                "blob_store_locked: another process is using the blob store at {dir} \
+                 (is `room tail` running on this home?); try again once it exits"
+            ),
             Self::Read(e) => write!(f, "blob_read_error: {e}"),
             Self::Import(e) => write!(f, "blob_import_error: {e}"),
             Self::Close(e) => write!(f, "blob_store_close_error: {e}"),
@@ -223,10 +275,65 @@ impl core::fmt::Display for BlobError {
 
 impl std::error::Error for BlobError {}
 
+/// The gate's live view of authorization (IR-0204 spec §5.3): the two collections
+/// [`serve::spawn_blob_gate`]'s two-gate ACL consults per message — the production
+/// analog of `spike-blobs::acl::AuthContext`. Fail-closed: [`BlobAclView::empty`]
+/// denies every connect and every hash until a real fold snapshot is folded in.
+#[derive(Debug, Clone, Default)]
+pub struct BlobAclView {
+    active_devices: std::collections::HashSet<iroh::EndpointId>,
+    referenced_hashes: std::collections::HashSet<[u8; 32]>,
+}
+
+impl BlobAclView {
+    /// An empty view — fail-closed: every device and every hash is denied until
+    /// populated.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build the view from the current membership snapshot's active members
+    /// (Gate 1) and the room's referenced blob hashes (Gate 2, from
+    /// [`iroh_rooms_core::sync::SyncEngine::file_shared_hashes`]).
+    #[must_use]
+    pub fn from_snapshot(
+        snapshot: &iroh_rooms_core::membership::MembershipSnapshot,
+        referenced_hashes: &std::collections::BTreeSet<[u8; 32]>,
+    ) -> Self {
+        let mut active_devices = std::collections::HashSet::new();
+        for m in snapshot.active_members() {
+            if let Some(dev) = m.device {
+                if let Ok(id) = iroh::EndpointId::from_bytes(dev.as_bytes()) {
+                    active_devices.insert(id);
+                }
+            }
+        }
+        Self {
+            active_devices,
+            referenced_hashes: referenced_hashes.iter().copied().collect(),
+        }
+    }
+
+    /// Gate 1 predicate: is `device` a currently active member's bound device?
+    #[must_use]
+    pub fn is_active(&self, device: iroh::EndpointId) -> bool {
+        self.active_devices.contains(&device)
+    }
+
+    /// Gate 2 predicate: is `hash` referenced by a valid `file.shared` in the room?
+    #[must_use]
+    pub fn is_referenced(&self, hash: &[u8; 32]) -> bool {
+        self.referenced_hashes.contains(hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{blake3_file, BlobError, BlobStore};
+    use super::{blake3_file, BlobAclView, BlobError, BlobStore};
+    use std::collections::BTreeSet;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Write `bytes` to `<dir>/<name>` and return the path.
@@ -309,6 +416,29 @@ mod tests {
         reopened.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn open_on_a_held_store_reports_locked_within_the_timeout() {
+        // The FsStore holds an exclusive on-disk lock; a second open of the same
+        // dir blocks indefinitely (it never errors or times out on its own). `open`
+        // bounds that wait and surfaces `Locked`, so a concurrent `file list` /
+        // `file share` degrades instead of deadlocking. Uses a short timeout so the
+        // test stays fast.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("blobs");
+        let held = BlobStore::open(&dir).await.unwrap();
+
+        match BlobStore::open_with_timeout(&dir, Duration::from_millis(300)).await {
+            Err(BlobError::Locked(_)) => {}
+            Err(other) => panic!("a held store must report Locked, not {other}"),
+            Ok(_) => panic!("a second open while the store is held must not succeed"),
+        }
+
+        // Once the holder closes, the lock is released and a fresh open succeeds.
+        held.close().await.unwrap();
+        let reopened = BlobStore::open(&dir).await.unwrap();
+        reopened.close().await.unwrap();
+    }
+
     #[test]
     fn blake3_file_streams_large_input_across_chunks() {
         // A payload spanning multiple RECOMPUTE_CHUNK reads must hash identically to
@@ -326,6 +456,9 @@ mod tests {
         assert!(BlobError::Open("x".into())
             .to_string()
             .starts_with("blob_store_open_error:"));
+        assert!(BlobError::Locked("/x/blobs".into())
+            .to_string()
+            .starts_with("blob_store_locked:"));
         assert!(BlobError::Read("x".into())
             .to_string()
             .starts_with("blob_read_error:"));
@@ -372,5 +505,71 @@ mod tests {
             matches!(err, BlobError::Import(_)),
             "expected BlobError::Import for a missing source path, got: {err}"
         );
+    }
+
+    // ── BlobAclView (IR-0204 §5.3) ───────────────────────────────────────────
+
+    fn endpoint_id(seed: u8) -> iroh::EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn empty_view_is_fail_closed() {
+        let view = BlobAclView::empty();
+        assert!(!view.is_active(endpoint_id(1)));
+        assert!(!view.is_referenced(&[0u8; 32]));
+    }
+
+    #[test]
+    fn from_snapshot_active_member_device_is_active() {
+        use iroh_rooms_core::event::binding::DeviceBinding;
+        use iroh_rooms_core::event::content::{Content, EventType, RoomCreated};
+        use iroh_rooms_core::event::keys::SigningKey;
+        use iroh_rooms_core::event::signed::{self, SignedEvent};
+        use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+        use iroh_rooms_core::event::wire::WireEvent;
+        use iroh_rooms_core::membership::RoomMembership;
+
+        let id_sk = SigningKey::from_seed(&[0x11; 32]);
+        let dev_sk = SigningKey::from_seed(&[0x91; 32]);
+        let nonce = [0x22u8; 16];
+        let room_id = signed::derive_room_id(&id_sk.identity_key(), &nonce, 0);
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id,
+            sender_id: id_sk.identity_key(),
+            device_id: dev_sk.device_key(),
+            event_type: EventType::RoomCreated,
+            created_at: 0,
+            prev_events: vec![],
+            content: Content::RoomCreated(RoomCreated {
+                room_name: "acl-test".to_owned(),
+                room_nonce: nonce,
+                admins: vec![id_sk.identity_key()],
+                device_binding: DeviceBinding::create(&room_id, &id_sk, dev_sk.device_key()),
+            }),
+        };
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, &dev_sk);
+        let wire = WireEvent::seal(csb, sig);
+        let validated =
+            validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room_id))
+                .expect("genesis must validate");
+        let snapshot = RoomMembership::from_events(room_id, [validated]).snapshot();
+
+        let referenced: BTreeSet<[u8; 32]> = [[0xAB; 32]].into_iter().collect();
+        let view = BlobAclView::from_snapshot(&snapshot, &referenced);
+
+        let admin_endpoint = iroh::EndpointId::from_bytes(dev_sk.device_key().as_bytes()).unwrap();
+        assert!(
+            view.is_active(admin_endpoint),
+            "admin device must be active"
+        );
+        assert!(
+            !view.is_active(endpoint_id(0xFF)),
+            "unknown device must not be active"
+        );
+        assert!(view.is_referenced(&[0xAB; 32]));
+        assert!(!view.is_referenced(&[0xCD; 32]));
     }
 }

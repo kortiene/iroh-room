@@ -27,6 +27,13 @@
 //! | AC4 — pipe works for authorized peer | `authorized_pipe_forwards_bytes` | gated (`#[ignore]`) |
 //! | AC5 — unauthorized connection denied | `unauthorized_pipe_connection_denied` | gated (`#[ignore]`) |
 //!
+//! Also gated here (same rationale, same rendezvous shape): issue #29 (IR-0204)
+//! "file fetch and verification" AC1/AC4 — `authorized_file_fetch_saves_and_verifies_blob`
+//! proves `file fetch` against a `room tail`-hosted provider through the real
+//! binary; the exhaustive AC1–AC5 matrix (valid fetch, hash mismatch, denied at
+//! connect, denied per-hash, unavailable) is the CI-tier, always-green
+//! `iroh-rooms-net/tests/blob_e2e.rs`.
+//!
 //! The CI tier is deterministic and network-free (offline reads/writes over
 //! `rooms.db`) so it can never flake `scripts/verify.sh`. The online tier needs two
 //! live loopback processes to rendezvous, so it is `#[ignore]`-gated and run with the
@@ -1135,4 +1142,105 @@ async fn unauthorized_pipe_connection_denied() {
         0,
         "AC5: the owner must never connect to the echo target for a denied member"
     );
+}
+
+// ══ file fetch (IR-0204 / issue #29): CLI-level proof on top of the always-green
+// Node-API `iroh-rooms-net/tests/blob_e2e.rs` suite ═════════════════════════════
+
+/// Write `bytes` to `<dir>/<name>` and return the absolute path string (ported
+/// from `tests/file_cli.rs`).
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write fixture file");
+    path.to_string_lossy().into_owned()
+}
+
+/// AC1/AC4 (issue #29) — an authorized active member fetches a file an online
+/// provider serves, driven through the real `iroh-rooms` binary: Alice `file
+/// share`s a file offline, then hosts `room tail` (which opts every managed
+/// session into serving the blobs it holds, IR-0204 spec §5.3/§6.6); Bob,
+/// converged into the same room, runs `file fetch` against Alice's advertised
+/// address and must print `saved:`/`verified:`, with the saved bytes equal to
+/// the original content and the verified hash equal to the one `file share`
+/// declared. Every AC is *also* covered green-in-CI at the Node-API layer by
+/// `iroh-rooms-net/tests/blob_e2e.rs` (valid fetch / hash mismatch / denied at
+/// connect / denied per-hash / unavailable), so gating this CLI tier loses no
+/// guaranteed coverage — it adds product-level coverage on top (mirrors the pipe
+/// tier's rationale above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+async fn authorized_file_fetch_saves_and_verifies_blob() {
+    let c = converge_two_member_room();
+
+    let content = b"the quick brown fox jumps over the lazy dog";
+    let src_dir = TempDir::new().expect("source dir");
+    let src_path = write_file(src_dir.path(), "fox.txt", content);
+
+    // Alice imports the file and authors its file.shared reference offline.
+    let share = one_shot(c.alice_home.path(), &["file", "share", &c.room, &src_path]);
+    assert!(
+        share.status.success(),
+        "alice's file share must succeed; stderr: {}",
+        String::from_utf8_lossy(&share.stderr)
+    );
+    let share_stdout = String::from_utf8_lossy(&share.stdout);
+    let file_id = extract_field(&share_stdout, "file_id")
+        .expect("file share must print a file_id")
+        .to_owned();
+    let declared_hash = extract_field(&share_stdout, "hash")
+        .expect("file share must print a hash")
+        .to_owned();
+
+    // Alice hosts `room tail`, which turns her session into a blob provider.
+    let alice_tail = ChildSession::spawn(
+        c.alice_home.path(),
+        &["room", "tail", &c.room, "--loopback"],
+    );
+    let listening = alice_tail
+        .wait_for_line("listening:", WAIT)
+        .unwrap_or_else(|err| panic!("alice tail never advertised a listening address: {err}"));
+    let alice_addr = parse_listening(&listening);
+
+    // Bob fetches into an isolated output directory.
+    let out_dir = TempDir::new().expect("fetch output dir");
+    let out_dir_str = out_dir.path().to_string_lossy().into_owned();
+    let fetch = one_shot(
+        c.bob_home.path(),
+        &[
+            "file",
+            "fetch",
+            &c.room,
+            &file_id,
+            "--out",
+            &out_dir_str,
+            "--peer",
+            &alice_addr,
+            "--loopback",
+        ],
+    );
+    assert!(
+        fetch.status.success(),
+        "bob's file fetch must succeed; stderr: {}",
+        String::from_utf8_lossy(&fetch.stderr)
+    );
+    let fetch_stdout = String::from_utf8_lossy(&fetch.stdout);
+    let saved_path = extract_field(&fetch_stdout, "saved")
+        .expect("file fetch must print a saved path")
+        .to_owned();
+    let verified_hash = extract_field(&fetch_stdout, "verified")
+        .expect("file fetch must print a verified hash")
+        .to_owned();
+
+    assert_eq!(
+        verified_hash, declared_hash,
+        "AC1: the verified hash must equal the hash file share declared"
+    );
+    let saved_bytes = std::fs::read(&saved_path)
+        .unwrap_or_else(|err| panic!("saved file at {saved_path} must be readable: {err}"));
+    assert_eq!(
+        saved_bytes, content,
+        "AC4: the saved bytes must equal the original shared content"
+    );
+
+    drop(alice_tail);
 }

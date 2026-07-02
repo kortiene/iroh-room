@@ -43,8 +43,9 @@ use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, Role, RoomMembersh
 use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
-    Admission, AdmissionView, AllowlistAdmission, ConnEvent, JoinBootstrapAdmission, NetConfig,
-    NetMode, Node, PeerConnState, PeerEntry, PeerManager, SnapshotAdmission, DEFAULT_TICK,
+    Admission, AdmissionView, AllowlistAdmission, BlobServeConfig, ConnEvent,
+    JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState, PeerEntry, PeerManager,
+    SnapshotAdmission, DEFAULT_TICK,
 };
 
 use crate::display::{self, display_names, iso8601_utc, short_id};
@@ -304,6 +305,13 @@ pub async fn tail(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
+    // `room tail` is the canonical "provider stays online" surface (IR-0204 spec
+    // §5.3 / §6.6): opt this session into serving the blobs it holds. The blob
+    // gate's accepted/rejected decisions ride the same `AuditSink` handed to the
+    // node; `StderrAudit` renders the `blob.serve.*` vocabulary alongside the
+    // taxonomy lines — otherwise those lines would be silently dropped (the CLI
+    // installs no `tracing` subscriber).
+    let blobs_dir = home.join(crate::file::BLOBS_DIR);
     let node = Node::spawn_room(
         secret_key,
         admission,
@@ -313,6 +321,7 @@ pub async fn tail(
         DEFAULT_TICK,
         peer_addrs,
         admission_cell,
+        Some(BlobServeConfig { blobs_dir }),
     )
     .await
     .context("could not bring up the network node")?;
@@ -423,6 +432,7 @@ pub async fn members_status(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
+    // A short-lived connection-status query need not serve blobs (spec §6.6).
     let node = Node::spawn_room(
         secret_key,
         admission,
@@ -432,6 +442,7 @@ pub async fn members_status(
         DEFAULT_TICK,
         peer_addrs,
         admission_cell,
+        None,
     )
     .await
     .context("could not bring up the network node")?;
@@ -814,9 +825,14 @@ fn print_new_reject_warnings(logs: &[String], seen: &mut usize) {
 }
 
 /// A short, human-friendly device id: the first 8 chars of the endpoint id.
-fn short_device(device: &EndpointId) -> String {
+pub(crate) fn short_device(device: &EndpointId) -> String {
     let s = device.to_string();
     s.get(..8).unwrap_or(&s).to_owned()
+}
+
+/// A short, human-scannable prefix of a BLAKE3 hash for a one-line audit record.
+pub(crate) fn short_hash(hash: [u8; 32]) -> String {
+    hex::encode(hash).chars().take(8).collect()
 }
 
 // ---------------------------------------------------------------------------

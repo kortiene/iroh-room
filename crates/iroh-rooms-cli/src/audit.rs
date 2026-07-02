@@ -13,7 +13,9 @@
 
 use iroh::EndpointId;
 use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_net::{AuditSink, RejectCause};
+use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+
+use crate::message::{short_device, short_hash};
 
 /// Renders [`AuditSink`] callbacks as stable, greppable stderr lines.
 #[derive(Debug, Clone, Copy, Default)]
@@ -63,6 +65,24 @@ impl AuditSink for StderrAudit {
              not rejected"
         );
     }
+
+    fn blob_serve_accepted(&self, peer: EndpointId, hash: [u8; 32]) {
+        // `blob.serve.accepted` is the stable, greppable audit line (IR-0204 §7).
+        eprintln!(
+            "blob.serve.accepted peer={} hash={}",
+            short_device(&peer),
+            short_hash(hash)
+        );
+    }
+
+    fn blob_serve_rejected(&self, peer: EndpointId, cause: BlobDenyCause, hash: Option<[u8; 32]>) {
+        eprintln!(
+            "blob.serve.rejected:{} peer={}{}",
+            cause.code(),
+            short_device(&peer),
+            hash.map_or_else(String::new, |h| format!(" hash={}", short_hash(h)))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -70,7 +90,9 @@ mod tests {
     use super::StderrAudit;
     use iroh::SecretKey;
     use iroh_rooms_core::event::keys::IdentityKey;
-    use iroh_rooms_net::{AuditSink, RejectCause};
+    use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+
+    use crate::message::{short_device, short_hash};
 
     fn device(seed: u8) -> iroh::EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
@@ -88,5 +110,19 @@ mod tests {
         sink.event_rejected(device(1), 3);
         sink.deauthorized(device(1));
         sink.event_flagged(device(1), "clock_skew");
+        sink.blob_serve_accepted(device(1), [0x22; 32]);
+        sink.blob_serve_rejected(device(1), BlobDenyCause::NotActive, Some([0x22; 32]));
+        sink.blob_serve_rejected(device(1), BlobDenyCause::PushDenied, None);
+    }
+
+    #[test]
+    fn blob_serve_lines_key_on_the_same_short_device_and_hash_as_message_tail() {
+        let hash = [0x33; 32];
+        assert_eq!(short_hash(hash), "33333333");
+        assert_eq!(short_device(&device(1)), device(1).to_string()[..8]);
+
+        let sink = StderrAudit;
+        sink.blob_serve_accepted(device(1), hash);
+        sink.blob_serve_rejected(device(1), BlobDenyCause::NotReferenced, Some(hash));
     }
 }

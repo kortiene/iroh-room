@@ -16,11 +16,14 @@
 //! connection state); the pump keeps the engine accessible without ever sharing a
 //! `&mut SyncEngine` across tasks.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
+use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::content::{Content, PipeOpened};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
@@ -36,6 +39,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::admission::{Admission, AdmissionView};
 use crate::audit::AuditSink;
+use crate::blob::{self, BlobAclView, BlobStore, FetchOutcome};
 use crate::manager::PeerManager;
 use crate::peer::peer_id;
 use crate::pipe::alpn::{PIPE_ALPN, PIPE_ALPN_STR};
@@ -47,6 +51,17 @@ use crate::pipe::{
 };
 use crate::state::{ConnEvent, PeerConnState, PeerEntry};
 use crate::transport::{Inbound, NetConfig, NetTransport, Shared};
+
+/// The extra input a managed room session needs to also serve the blobs it holds
+/// over the `iroh-blobs` ALPN (IR-0204 spec §5.3). Opt-in: `None` on
+/// [`Node::spawn_room`] keeps the session a pure event-plane member (unchanged
+/// behavior); `room tail` is the canonical "provider stays online" surface that
+/// supplies this.
+#[derive(Debug, Clone)]
+pub struct BlobServeConfig {
+    /// The durable local blob store directory (`<home>/blobs/`).
+    pub blobs_dir: PathBuf,
+}
 
 /// Default anti-entropy tick (drives `on_tick` re-pulls + reconnect catch-up).
 pub const DEFAULT_TICK: Duration = Duration::from_millis(250);
@@ -76,6 +91,8 @@ struct RoomConfig {
     /// The live admission cell the pump refreshes each fold change; the session's
     /// admission gate reads it on the accept hot path.
     admission_cell: Arc<Mutex<AdmissionView>>,
+    /// Present only when this session also serves blobs (IR-0204 spec §5.3).
+    blob: Option<BlobServeConfig>,
 }
 
 /// The pump-owned reconciler that keeps the dial set and the admission cell in step
@@ -86,16 +103,43 @@ struct RoomReconciler {
     /// The last admission view we reconciled against — the cheap fold-change
     /// detector. `None` forces the next reconcile (initial + `reconcile_now`).
     last: Option<AdmissionView>,
+    /// Present only for a blob-serving session; the live cell the blob gate reads
+    /// on its accept/request hot path (IR-0204 spec §5.3).
+    blob_acl_cell: Option<Arc<Mutex<BlobAclView>>>,
+    /// The last referenced-hash set folded into `blob_acl_cell`. Tracked
+    /// **independently** of `last` (the admission fold-change detector): a new
+    /// `file.shared` is a content event that never changes `AdmissionView`, so
+    /// gating this refresh on `last` would starve Gate 2 of newly-shared files
+    /// (memory: membership-snapshot equality is vacuous over content events).
+    last_referenced: Option<BTreeSet<[u8; 32]>>,
 }
 
 impl RoomReconciler {
-    /// Reconcile **only if** the membership-relevant projection of the fold changed
-    /// since the last reconcile. Idempotent otherwise (no dial churn, no admission
-    /// swap). Called after every fold-mutating pump step and on each tick.
+    /// Reconcile the dial set / admission cell when the membership-relevant
+    /// projection of the fold changed, and — independently — the blob ACL cell
+    /// (if this session serves blobs) whenever membership OR the referenced-hash
+    /// set changed. Idempotent when neither changed. Called after every
+    /// fold-mutating pump step and on each tick.
     fn maybe_reconcile(&mut self, engine: &SyncEngine) {
         let snapshot = engine.snapshot();
         let view = AdmissionView::from_snapshot(&snapshot, &engine.fail_closed_subjects());
-        if self.last.as_ref() == Some(&view) {
+        let membership_changed = self.last.as_ref() != Some(&view);
+
+        if let Some(blob_cell) = &self.blob_acl_cell {
+            // Fail-closed on a store read error: an empty referenced set denies
+            // every hash rather than risk serving one it can no longer prove.
+            let referenced = engine.file_shared_hashes().unwrap_or_default();
+            let hashes_changed = self.last_referenced.as_ref() != Some(&referenced);
+            if membership_changed || hashes_changed {
+                *blob_cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    BlobAclView::from_snapshot(&snapshot, &referenced);
+                self.last_referenced = Some(referenced);
+            }
+        }
+
+        if !membership_changed {
             return; // no membership-relevant change since last reconcile
         }
         // Refresh admission first so the accept gate is never *more* permissive than
@@ -113,6 +157,7 @@ impl RoomReconciler {
     /// the natural fold-change detection).
     fn force_reconcile(&mut self, engine: &SyncEngine) {
         self.last = None;
+        self.last_referenced = None;
         self.maybe_reconcile(engine);
     }
 }
@@ -137,6 +182,12 @@ pub struct Node {
     pipe_sessions: Arc<PipeSessions>,
     pipe_audit: Arc<dyn PipeAuditSink>,
     pipe_watcher: JoinHandle<()>,
+    /// The durable blob store, present only when this session serves blobs
+    /// (IR-0204 spec §5.3). Closed on [`Node::shutdown`] to flush and release its
+    /// exclusive on-disk lock.
+    blob_store: Option<BlobStore>,
+    /// The blob-plane serve gate's decision loop, aborted on [`Node::shutdown`].
+    blob_gate: Option<JoinHandle<()>>,
 }
 
 impl Node {
@@ -209,8 +260,16 @@ impl Node {
     /// the manager owns dialing. `addr_hints` are the operator's `--peer` addresses
     /// used to resolve each device deterministically (loopback/LAN).
     ///
+    /// `blob`, when supplied, turns this session into a blob provider (IR-0204
+    /// spec §5.3): it opens the durable store at `blob.blobs_dir`, gates the
+    /// `iroh-blobs` ALPN with the two-gate ACL sourced from the live fold + the
+    /// room's `file.shared` set, and chains it onto the shared `Router`. `None`
+    /// keeps this session a pure event-plane member (unchanged behavior) —
+    /// `room tail` is the canonical caller that supplies it.
+    ///
     /// # Errors
-    /// Returns an error if the endpoint fails to bind.
+    /// Returns an error if the endpoint fails to bind, or if `blob` is supplied
+    /// and its store directory cannot be opened.
     #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
     pub async fn spawn_room(
         secret: SecretKey,
@@ -221,6 +280,7 @@ impl Node {
         tick: Duration,
         addr_hints: Vec<EndpointAddr>,
         admission_cell: Arc<Mutex<AdmissionView>>,
+        blob: Option<BlobServeConfig>,
     ) -> Result<Self> {
         Self::spawn_inner(
             secret,
@@ -232,6 +292,7 @@ impl Node {
             Some(RoomConfig {
                 addr_hints,
                 admission_cell,
+                blob,
             }),
             None,
         )
@@ -272,8 +333,36 @@ impl Node {
         });
         let pipe_handler = PipeProtocolHandler::new(handler_state);
 
-        let mut transport =
-            NetTransport::bind(secret, admission, audit, cfg, Some(pipe_handler)).await?;
+        // The blob-plane serve gate (IR-0204 spec §5.3): opt-in via a managed room
+        // session's `BlobServeConfig`. Built before the transport binds so the
+        // gated `BlobsProtocol` handler can be chained onto the same router the
+        // event/pipe ALPNs share (one Endpoint, many planes).
+        let blob_cfg = room.as_ref().and_then(|r| r.blob.clone());
+        let (blobs_handler, blob_store, blob_gate, blob_acl_cell) = match blob_cfg {
+            Some(cfg) => {
+                let store = BlobStore::open(&cfg.blobs_dir).await.map_err(|e| {
+                    anyhow!(
+                        "could not open the blob store at {}: {e}",
+                        cfg.blobs_dir.display()
+                    )
+                })?;
+                let acl_cell = Arc::new(Mutex::new(BlobAclView::empty()));
+                let (events, gate) = blob::spawn_blob_gate(acl_cell.clone(), audit.clone());
+                let handler = store.serve_handler(events);
+                (Some(handler), Some(store), Some(gate), Some(acl_cell))
+            }
+            None => (None, None, None, None),
+        };
+
+        let mut transport = NetTransport::bind(
+            secret,
+            admission,
+            audit,
+            cfg,
+            Some(pipe_handler),
+            blobs_handler,
+        )
+        .await?;
         let inbound_rx = transport
             .take_inbound()
             .ok_or_else(|| anyhow!("inbound receiver already taken"))?;
@@ -288,6 +377,7 @@ impl Node {
             Some(RoomConfig {
                 addr_hints,
                 admission_cell,
+                ..
             }) => {
                 let manager = Arc::new(PeerManager::new(
                     shared.clone(),
@@ -299,6 +389,8 @@ impl Node {
                     manager: manager.clone(),
                     cell: admission_cell,
                     last: None,
+                    blob_acl_cell,
+                    last_referenced: None,
                 };
                 (Some(manager), Some(reconciler))
             }
@@ -336,6 +428,8 @@ impl Node {
             pipe_sessions,
             pipe_audit,
             pipe_watcher,
+            blob_store,
+            blob_gate,
         })
     }
 
@@ -706,8 +800,30 @@ impl Node {
         self.pipe_sessions.len()
     }
 
-    /// Gracefully stop: drain the pump, stop the pipe watcher, and shut the
-    /// transport's router down.
+    /// **Fetch** `hash` from `provider_addr` over the blobs ALPN on this node's
+    /// shared endpoint, requiring the assembled bytes' independent BLAKE3-256
+    /// equal `declared` (IR-0204 spec §5.4). Bounded by `timeout`; an offline or
+    /// denying provider yields a non-[`Fetched`](FetchOutcome::Fetched) outcome,
+    /// never a hang. A pure consumer call — this node need not itself serve blobs.
+    pub async fn fetch_file(
+        &self,
+        provider_addr: EndpointAddr,
+        hash: [u8; 32],
+        declared: [u8; 32],
+        timeout: Duration,
+    ) -> (FetchOutcome, Option<Bytes>) {
+        blob::fetch_blob(
+            &self.transport.endpoint(),
+            provider_addr,
+            hash,
+            declared,
+            timeout,
+        )
+        .await
+    }
+
+    /// Gracefully stop: drain the pump, stop the pipe watcher, stop serving blobs
+    /// (if this session did), and shut the transport's router down.
     ///
     /// # Errors
     /// Propagates [`NetTransport::shutdown`].
@@ -718,6 +834,8 @@ impl Node {
             pump,
             peer_manager,
             pipe_watcher,
+            blob_store,
+            blob_gate,
             ..
         } = self;
         let (tx, rx) = oneshot::channel();
@@ -730,7 +848,21 @@ impl Node {
         }
         pump.abort();
         pipe_watcher.abort();
-        transport.shutdown().await
+        if let Some(gate) = blob_gate {
+            gate.abort();
+        }
+        // `NetTransport::shutdown` calls `Router::shutdown`, which awaits every
+        // registered `ProtocolHandler::shutdown` — including `BlobsProtocol`'s,
+        // which already flushes and releases the store's exclusive on-disk lock
+        // (iroh_blobs `net_protocol::BlobsProtocol::shutdown` calls
+        // `store.shutdown()`) before the router closes the endpoint. So the
+        // store is already durably closed by the time this returns; do NOT also
+        // call `BlobStore::close` here — the store's actor is already gone by
+        // then, so a second shutdown fails with a stale-channel error. Just drop
+        // the handle.
+        transport.shutdown().await?;
+        drop(blob_store);
+        Ok(())
     }
 }
 
