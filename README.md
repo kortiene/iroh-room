@@ -16,8 +16,9 @@ The product and protocol source-of-truth documents are:
 
 [`docs/getting-started.md`](docs/getting-started.md) is the copy-pasteable demo walkthrough:
 identity → room → invite/join → message → file → live pipe → agent status, with a
-troubleshooting guide and the availability model. It is drafted against the planned CLI MVP
-(see issue #34) and becomes runnable end-to-end once that CLI lands.
+troubleshooting guide and the availability model. Every step is implemented and reconciled
+against the shipped binary, and the whole two-humans-plus-one-agent flow it describes is
+proven end-to-end by the automated `full_demo_e2e.rs` suite (issue #34 / IR-0209, below).
 
 ## Current Status
 
@@ -771,12 +772,41 @@ or authorization behaviour changes, only how `file fetch` *names* an already-lan
   (`peer_unauthorized`, and `hash_mismatch`'s CLI-level rendering) stay on the `#[ignore]`-gated
   two-peer e2e tier / existing `blob_e2e.rs` + unit coverage, per `two_peer_e2e.rs`'s notes.
 
+The **full two-humans-plus-one-agent demo integration test** has landed in
+`crates/iroh-rooms-cli/tests/full_demo_e2e.rs` (issue #34 / IR-0209), the PRD §19 Phase 1B
+deliverable 8 — the product-level proof that PRD §6's full ten-step demo runs as a single flow
+across three isolated participants (two humans and an agent), driven through the real
+`iroh-rooms` binary, without a central application server:
+
+- **Tiered by CI reliability:** a deterministic, network-free CI tier (the full offline
+  backbone; restart-validation over every MVP event type — type/count, per-field content, and
+  the post-departure membership fold; the agent-posts-but-has-no-admin-privilege pair) always
+  runs in `cargo test`. An `#[ignore]`-gated online tier drives the whole cast live: three-way
+  membership convergence, a signed message, a live agent-status push, dual file fetch+verify,
+  an authorized/denied live-pipe pair, and a restart check against the wire-delivered log.
+- **All five acceptance criteria covered**, each with a product-level CLI assertion in this
+  suite *and* a green-in-CI lower-layer backstop (the Node-API e2e suites and the two existing
+  CLI online suites, `two_peer_e2e.rs` / `agent_e2e.rs`), so gating the online tier loses no
+  guaranteed coverage.
+- **Executable transcript:** the suite's centerpiece, `full_demo_two_humans_one_agent`, drives
+  every step of `docs/getting-started.md`'s demo through the binary in causal order, asserting
+  each printed line inline — the automated counterpart to that guide's manual walkthrough.
+- Purely additive: no production code, CLI surface, event schema, or migration changed; every
+  command the suite drives already shipped.
+
+Run the gated online tier locally (loopback only; no relay, no external tools; serialized to
+avoid port/resource contention across three live processes):
+
+```bash
+cargo test -p iroh-rooms-cli --test full_demo_e2e -- --ignored --test-threads=1
+```
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the Phase 1A
 two-peer integration test, the hardened recent-history sync, agent identity, agent status, the
-CLI error taxonomy, and the full Blob Plane — import, serve, fetch, and honest availability
-reporting) are all landed.
+CLI error taxonomy, the full Blob Plane — import, serve, fetch, and honest availability
+reporting — and the Phase 1B full-demo integration test) are all landed.
 
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
