@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
 use crate::error::{CodedResultExt, ErrorCode};
-use crate::{file, identity, invite, join, message, paths, pipe, room};
+use crate::{agent, file, identity, invite, join, message, paths, pipe, room};
 
 /// Local-first rooms over iroh — local identity and device management.
 #[derive(Debug, Parser)]
@@ -55,6 +55,31 @@ enum Command {
     File {
         #[command(subcommand)]
         action: FileAction,
+    },
+    /// Invite and (later) drive agent participants.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentAction {
+    /// Invite a known agent identity into a room as an `agent`-role member.
+    Invite {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The agent's identity id (64-char lowercase hex from its `identity show`).
+        agent_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Optional expiry as <int>{s|m|h|d}, e.g. 24h.
+        #[arg(long)]
+        expires: Option<String>,
     },
 }
 
@@ -358,6 +383,26 @@ pub fn run() -> Result<()> {
         Command::Room { action } => dispatch_room(&home, action)?,
         Command::Pipe { action } => dispatch_pipe(&home, action)?,
         Command::File { action } => dispatch_file(&home, action)?,
+        Command::Agent { action } => dispatch_agent(&home, action)?,
+    }
+    Ok(())
+}
+
+/// Dispatch the `agent` subcommands (kept out of [`run`] so each dispatcher stays
+/// small and readable, mirroring [`dispatch_file`]).
+fn dispatch_agent(home: &std::path::Path, action: AgentAction) -> Result<()> {
+    match action {
+        AgentAction::Invite {
+            room_id,
+            agent_id,
+            expires,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            // `agent::invite` validates agent_id/expires before any IO, so a bad
+            // invocation leaves the store untouched (delegates to `invite::invite`).
+            let summary = agent::invite(home, &room_id, &agent_id, expires.as_deref())?;
+            invite::print_invite(&summary);
+        }
     }
     Ok(())
 }

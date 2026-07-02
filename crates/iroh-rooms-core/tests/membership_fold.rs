@@ -1807,3 +1807,180 @@ fn ancestor_view_wrong_room_id_fails_closed() {
         "correct room_id must resolve Bob's bound device"
     );
 }
+
+// --------------------------------------------------------------------------
+// Agent identity (IR-0206): an agent is an ordinary principal, admitted only by
+// an explicit admin invite + join, and never implicitly trusted. These pin the
+// four ACs at the protocol layer; the agent noun's CLI surface is a pure façade
+// over the same events (see iroh-rooms-cli/tests/agent_cli.rs).
+// --------------------------------------------------------------------------
+
+/// AC3 (no implicit access, fold layer): an agent-key content event whose ancestor
+/// view holds **no** live invite for that key is rejected `NotAMember`. The parent
+/// is present (genesis), so the rejection is for non-membership, not a missing
+/// parent (per the `member-message-ancestor-view-gate` guidance). The agent leaves
+/// no trace in membership state.
+#[test]
+fn uninvited_agent_content_rejected_not_a_member() {
+    let alice = Principal::new(0x01);
+    let agent = Principal::new(0x50);
+    let (gen_ev, room) = genesis(&alice);
+    let mut m = RoomMembership::new(room);
+    m.ingest(gen_ev.clone());
+
+    // The agent — never invited — tries to post, citing the real genesis head.
+    let msg = message(
+        &agent,
+        &agent.dev,
+        room,
+        &[gen_ev.event_id],
+        "agent status: online",
+        T0 + 1,
+    );
+    assert_rejected(&m.ingest(msg), &RejectReason::NotAMember);
+    assert!(
+        m.snapshot().member(&agent.identity()).is_none(),
+        "an un-invited agent must not appear in membership state"
+    );
+}
+
+/// AC3 (invite ≠ access): a live admin invite alone does **not** grant an agent the
+/// right to author content. An agent that is `Invited` but has never `joined`
+/// authors a message citing its own invite; the fold rejects it `NotAMember`
+/// because the author is not `Active` in the ancestor view. The agent remains
+/// `Invited` with role `Agent` and no bound device — proving the join step is a
+/// hard gate, not a formality.
+#[test]
+fn invited_but_unjoined_agent_cannot_post() {
+    let alice = Principal::new(0x01);
+    let agent = Principal::new(0x50);
+    let (gen_ev, room) = genesis(&alice);
+    let mut m = RoomMembership::new(room);
+    m.ingest(gen_ev.clone());
+
+    let inv = invite(
+        &alice,
+        room,
+        &[gen_ev.event_id],
+        [0x01; 16],
+        [0x42; 16],
+        agent.identity(),
+        "agent",
+        None,
+        T0 + 1,
+    );
+    m.ingest(inv.clone());
+
+    // Agent has an invite but never joined → still not Active.
+    let snap = m.snapshot();
+    assert_eq!(snap.status(&agent.identity()), Some(Status::Invited));
+    assert_eq!(snap.role(&agent.identity()), Some(Role::Agent));
+    assert_eq!(
+        snap.member(&agent.identity()).and_then(|mem| mem.device),
+        None,
+        "an invited-not-joined agent has no bound device"
+    );
+
+    // Posting content while merely Invited is rejected for non-membership,
+    // authorization failing before any device-binding check.
+    let msg = message(
+        &agent,
+        &agent.dev,
+        room,
+        &[inv.event_id],
+        "premature",
+        T0 + 2,
+    );
+    assert_rejected(&m.ingest(msg), &RejectReason::NotAMember);
+}
+
+/// AC4 (one protocol model): a human member and an agent, each admitted through the
+/// identical `member.invited` → `member.joined` path, resolve to `Member` records
+/// that differ **only** in `role`. Both are `Active`, both carry their own identity
+/// and a bound device — the agent is a first-class participant on the same
+/// substrate, distinguished by the role string alone.
+#[test]
+fn agent_and_human_members_differ_only_by_role() {
+    let alice = Principal::new(0x01);
+    let human = Principal::new(0x10);
+    let agent = Principal::new(0x50);
+    let (gen_ev, room) = genesis(&alice);
+    let mut m = RoomMembership::new(room);
+    m.ingest(gen_ev.clone());
+
+    // Admit the human as `member`.
+    let inv_h = invite(
+        &alice,
+        room,
+        &[gen_ev.event_id],
+        [0x01; 16],
+        [0x42; 16],
+        human.identity(),
+        "member",
+        None,
+        T0 + 1,
+    );
+    m.ingest(inv_h.clone());
+    let join_h = join(
+        &human,
+        room,
+        &[inv_h.event_id],
+        [0x01; 16],
+        [0x42; 16],
+        "member",
+        T0 + 2,
+    );
+    m.ingest(join_h.clone());
+
+    // Admit the agent as `agent` through the identical path.
+    let inv_a = invite(
+        &alice,
+        room,
+        &[join_h.event_id],
+        [0x02; 16],
+        [0x43; 16],
+        agent.identity(),
+        "agent",
+        None,
+        T0 + 3,
+    );
+    m.ingest(inv_a.clone());
+    let join_a = join(
+        &agent,
+        room,
+        &[inv_a.event_id],
+        [0x02; 16],
+        [0x43; 16],
+        "agent",
+        T0 + 4,
+    );
+    m.ingest(join_a);
+
+    let snap = m.snapshot();
+    let human_member = snap.member(&human.identity()).expect("human is a member");
+    let agent_member = snap.member(&agent.identity()).expect("agent is a member");
+
+    // The role is the sole distinguishing attribute of the resolved records.
+    assert_eq!(human_member.role, Role::Member);
+    assert_eq!(agent_member.role, Role::Agent);
+    assert_ne!(human_member.role, agent_member.role);
+
+    // Every *other* structural field is the same kind for both: Active status and a
+    // present, principal-specific bound device.
+    assert_eq!(human_member.status, Status::Active);
+    assert_eq!(agent_member.status, Status::Active);
+    assert_eq!(human_member.status, agent_member.status);
+    assert_eq!(human_member.device, Some(human.device()));
+    assert_eq!(agent_member.device, Some(agent.device()));
+    assert_eq!(human_member.identity, human.identity());
+    assert_eq!(agent_member.identity, agent.identity());
+
+    // Normalizing the role away, the two records become field-for-field identical
+    // in shape (same status + both device-bound) — the "same protocol model" (AC4).
+    assert!(
+        human_member.status == agent_member.status
+            && human_member.device.is_some()
+            && agent_member.device.is_some(),
+        "human and agent members share one model, differing only by role"
+    );
+}

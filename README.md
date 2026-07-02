@@ -634,6 +634,25 @@ golden vectors) stays byte-identical and valid. Because `EventStore::insert` is 
 reached for validated events, an invalid `file.shared` — however it arrives, from a local
 build or a remote peer — can never be persisted and therefore never appears in `file list`.
 
+**Agent identity** has landed in `crates/iroh-rooms-cli` (issue #31 / IR-0206), adding the
+first-class `agent invite` noun the PRD documents:
+
+- `iroh-rooms agent invite <ROOM_ID> <AGENT_ID> [--expires <DURATION>]` — a thin, delegating
+  wrapper over the landed key-bound invite path (`room invite --invitee <AGENT_ID> --role
+  agent`, IR-0103): same admin gate, same `capability_hash`, same `member.invited` builder,
+  same ticket codec, same IR-0110 error codes. It draws no new authorization decision and mints
+  no new event type — it exists so the agent is a discoverable, first-class CLI concept
+  (`PRD.v0.3.md` §15.8/§16) rather than a `--role` flag buried under `room invite`.
+- An agent is an ordinary principal: it is created with the same `identity create` a human
+  uses, and becomes a member solely through this admin-issued, key-bound invite plus its own
+  `room join` — there is no implicit room access and no distinct agent principal type. The
+  membership fold's `Role::Agent` (least-privileged in the `Agent < Member < Admin` lattice)
+  and `gate_active_member`'s `NotAMember` rejection of any non-invited principal were already
+  landed (IR-0008); this issue is a CLI surface plus explicit conformance proof, not new
+  protocol behavior.
+- `agent status` (the agent authoring an `agent.status` event) is a sibling follow-up; the
+  `AgentAction` enum reserves room for it.
+
 ### Error codes
 
 The `iroh-rooms` binary (issue #25 / IR-0110) renders every terminal command failure as a
@@ -668,8 +687,8 @@ command-failure twins (e.g. `pipe connect`). A clock-skewed but otherwise valid 
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
-Phase 1A two-peer integration test, the hardened recent-history sync, file import, and the CLI
-error taxonomy) are all landed.
+Phase 1A two-peer integration test, the hardened recent-history sync, file import, the CLI
+error taxonomy, and agent identity) are all landed.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is the file serve/fetch half (`file fetch`,
@@ -687,7 +706,7 @@ measured table and the decision memo.
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe subcommands; scaffold for agent)
+crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe, agent subcommands; agent status is scaffold)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)
