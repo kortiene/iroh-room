@@ -1143,6 +1143,10 @@ the CLI drives, split into a **stable** offline-protocol tier (on by default) an
 `crates/iroh-rooms/src/lib.rs` for the crate docs and stability policy, and
 `crates/iroh-rooms/examples/` for runnable examples mirroring this guide's steps — start with
 `cargo run -p iroh-rooms --example offline_author_and_validate`.
+`crates/iroh-rooms/examples/example_agent/` (issue #39 / IR-0304) is a minimal, runnable
+example agent — the SDK-driven, adapt-me-as-a-template evolution of this guide's Step 3 (join)
+and Step 7 (agent status) — with its own `README.md` covering the run flow and adaptation
+points.
 
 ## Next steps & references
 

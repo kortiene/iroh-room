@@ -58,7 +58,9 @@
 //! copy-pasteable walkthroughs mirroring `docs/getting-started.md`. Online
 //! examples (`03`–`07`) require `--features experimental` and two live peers
 //! to run; they always compile in CI, mirroring the crate's own
-//! `#[ignore]`-gated online test tier.
+//! `#[ignore]`-gated online test tier. `examples/example_agent/` (issue #39 /
+//! IR-0304) is a runnable, adapt-me-as-a-template agent driven by real
+//! command-line arguments — start with its co-located `README.md`.
 //!
 //! # Errors
 //!

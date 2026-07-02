@@ -52,3 +52,11 @@ hex = "0.4"
 # Ergonomic error context for the online examples' `main() -> Result<()>`.
 # Same 1.x line `iroh-rooms-net`/`-cli` already resolve.
 anyhow = "1"
+# Scratch identity-file directories for the example agent's gated e2e tier.
+# Same 3.x line `iroh-rooms-core`/`-net`/`-cli` already resolve.
+tempfile = "3"
+# Independently re-hash the `--artifact` fixture in the example agent's gated
+# e2e tier, to check the published `file.shared.blob_hash` against the actual
+# file bytes rather than only against the example's own claimed hash. Same 1.x
+# line `iroh-rooms-core`/`-net` already resolve.
+blake3 = "1"

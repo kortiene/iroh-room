@@ -2103,11 +2103,13 @@ name = "iroh-rooms"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "getrandom 0.4.3",
  "hex",
  "iroh",
  "iroh-rooms-core",
  "iroh-rooms-net",
+ "tempfile",
  "tokio",
 ]
 
