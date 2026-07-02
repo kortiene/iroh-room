@@ -46,6 +46,7 @@
 //! | AC3 — file content hash verifies | inside `full_demo_two_humans_one_agent` | gated (`#[ignore]`) |
 //! | AC4 — pipe access explicitly authorized | `authorized_pipe_forwards_bytes_three_party` | gated (`#[ignore]`) |
 //! | AC4 — unauthorized connection denied | `unauthorized_member_pipe_denied` | gated (`#[ignore]`) |
+//! | IR-0305 — agent-as-presenter pipe scenario (guide Scenario B) | `agent_presenter_pipe_forwards_bytes_to_reviewer` | gated (`#[ignore]`) |
 //! | AC5 — agent posts status, no admin privilege | `agent_posts_status_but_has_no_admin_privilege` | CI (`#[test]`) |
 //! | three-way convergence (support) | `three_way_membership_converges` | gated (`#[ignore]`) |
 //! | harness self-guards | `child_session_captures_output`, `child_session_captures_stderr` | CI (`#[test]`) |
@@ -1735,6 +1736,90 @@ async fn unauthorized_member_pipe_denied() {
         echo_count.load(Ordering::SeqCst),
         0,
         "AC4: the owner must never connect to the echo target for the denied agent"
+    );
+}
+
+/// IR-0305 (issue #40) Scenario B — the agent, not a human, is the pipe
+/// *presenter*: `docs/live-pipe-preview.md`'s agent-generated-preview scenario
+/// claims the mechanics are "identical to Scenario A" because the agent is a
+/// first-class principal, but every other online-tier pipe test above always
+/// casts Alice (a human) as the exposing owner. This is the missing positive
+/// proof for the inverted cast: the Agent runs `pipe expose` allowing Bob,
+/// Bob (the reviewer) connects, and bytes round-trip through the agent-owned
+/// pipe exactly as they do for a human owner — the guide's "identical to
+/// Scenario A" claim is not just asserted, it is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "three live loopback processes; run with --ignored --test-threads=1"]
+async fn agent_presenter_pipe_forwards_bytes_to_reviewer() {
+    let c = converge_three_member_room();
+    let (echo_addr, echo_count) = spawn_echo_server().await;
+    let echo_str = echo_addr.to_string();
+
+    // The Agent — not Alice — exposes the preview target, allowing Bob only.
+    let expose = ChildSession::spawn(
+        c.agent_home.path(),
+        &[
+            "pipe",
+            "expose",
+            &c.room,
+            "--tcp",
+            &echo_str,
+            "--allow",
+            &c.bob_id,
+            "--label",
+            "agent-preview",
+            "--loopback",
+        ],
+    );
+    let pipe_line = expose
+        .wait_for_line("pipe_id:", WAIT)
+        .unwrap_or_else(|err| panic!("agent's pipe expose never announced a pipe_id: {err}"));
+    let pipe_id = extract_field(&pipe_line, "pipe_id")
+        .expect("agent's pipe expose must print a pipe_id")
+        .to_owned();
+    let expose_stdout = expose.stdout_snapshot();
+    let listening = expose_stdout
+        .lines()
+        .find(|l| l.contains("listening:"))
+        .expect("agent's pipe expose must print a listening address");
+    let agent_addr = parse_listening(listening);
+
+    let connect = ChildSession::spawn(
+        c.bob_home.path(),
+        &[
+            "pipe",
+            "connect",
+            &c.room,
+            &pipe_id,
+            "--local",
+            "0",
+            "--peer",
+            &agent_addr,
+            "--loopback",
+        ],
+    );
+    let forwarding = connect
+        .wait_for_line("forwarding:", WAIT)
+        .unwrap_or_else(|err| panic!("bob's pipe connect never bound a local port: {err}"));
+    let local = parse_forwarding(&forwarding);
+
+    let echoed = tokio::time::timeout(WAIT, async {
+        let mut client = TcpStream::connect(local).await.expect("connect local port");
+        client.write_all(b"ping").await.expect("write ping");
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.expect("read echo");
+        buf
+    })
+    .await
+    .expect("reviewer round-trip through the agent-owned pipe within budget");
+
+    assert_eq!(
+        &echoed, b"ping",
+        "IR-0305 Scenario B: bytes must echo back through the agent-owned pipe"
+    );
+    assert!(
+        echo_count.load(Ordering::SeqCst) >= 1,
+        "IR-0305 Scenario B: the agent-as-owner must have connected to the preview target"
     );
 }
 

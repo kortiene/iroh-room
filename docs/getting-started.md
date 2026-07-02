@@ -704,6 +704,9 @@ The Live Pipe is the most powerful — and riskiest — feature: it exposes a **
 to an authorized room peer. Authorization is explicit (`--allow <ID>`), the local bind
 defaults to loopback, and the pipe closes when its owner process exits.
 
+> For a task-focused guide with an agent scenario and a public-tunnel comparison, see
+> [`live-pipe-preview.md`](./live-pipe-preview.md).
+
 Start a throwaway local service to expose (Terminal A — Alice). This serves the current
 directory on loopback port 3000; stop it later with `Ctrl-C`:
 
@@ -734,9 +737,9 @@ label: pipe
 allow: 9f12…4ac1
 listening: <ENDPOINT_ID>@<ip:port>
 tip: share this address with connectors via --peer
-pipe_id: 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
-connectors run: iroh-rooms pipe connect blake3:… 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f --local <PORT>
-close it with: iroh-rooms pipe close 8hd3b29e1f4a7c0d2e5b6f8a9c1d3e4f
+pipe_id: 09a73f56578cd313b647f1ca0df29ea0
+connectors run: iroh-rooms pipe connect blake3:… 09a73f56578cd313b647f1ca0df29ea0 --local <PORT>
+close it with: iroh-rooms pipe close 09a73f56578cd313b647f1ca0df29ea0
 serving the pipe; press Ctrl-C to close it...
 ```
 
@@ -1143,6 +1146,9 @@ the CLI drives, split into a **stable** offline-protocol tier (on by default) an
 
 ## Next steps & references
 
+- [`live-pipe-preview.md`](./live-pipe-preview.md) — a task-focused guide to the Live Pipe
+  expose/connect/close workflow, including an agent-generated preview scenario and a neutral
+  comparison against public tunnels.
 - `PRD.v0.3.md` — product requirements and MVP scope (§6 demo, §14 availability, §15 journeys,
   §16 CLI, §17.2 DX metrics).
 - `PHASE-0-SPIKE.md` — protocol design: §1 identity/keys, §5 pipe/blob authorization, §6

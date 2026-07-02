@@ -27,6 +27,12 @@ proven end-to-end by the automated `full_demo_e2e.rs` suite (issue #34 / IR-0209
 membership contract — the byte-level rules for building or auditing an interoperable peer,
 without reading the whole `PHASE-0-SPIKE.md`.
 
+## Live Pipe Preview
+
+[`docs/live-pipe-preview.md`](docs/live-pipe-preview.md) is a task-focused guide to sharing a
+local dev-server or agent-generated preview with one authorized room peer — the
+expose/connect/close flow, an agent scenario, and a neutral comparison against public tunnels.
+
 ## Current Status
 
 The **canonical signed event model** has landed in `iroh-rooms-core::event`
