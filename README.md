@@ -34,6 +34,33 @@ Room Event Plane builds on:
 - 70 conformance tests including byte-exact golden vectors (242-byte CSB, `event_id`,
   signature, `room_id_A/B`).
 
+**Direct unit + property/fuzz tests for the strict CBOR reader** (risk R1) have
+landed in `iroh-rooms-core` and `iroh-rooms-net` (issue #45, an IR-0002
+follow-up filed by the #6 review), closing the two test-coverage gaps that
+review flagged but did not block on — the reader was previously exercised only
+indirectly, through paths that collapse every `CborError` into one
+`RejectReason::NonCanonicalEncoding`:
+
+- 25 inline unit tests in `cbor.rs`'s `#[cfg(test)] mod tests`: one case per
+  `CborError` variant (all 14, asserting the exact variant, including the
+  oversized-declared-length preallocation guard), accept-path + round-trip
+  coverage for all five `CborValue` kinds, shortest-form width boundaries,
+  canonical map-key ordering (length-first tiebreak), and nesting depth at
+  `MAX_DEPTH` (accept) / `MAX_DEPTH + 1` (reject).
+- `crates/iroh-rooms-core/tests/cbor_property.rs` — a `proptest`-driven
+  robustness suite: no-panic/typed-result over arbitrary bytes for both
+  `decode_canonical` and `validate_wire_bytes`, the canonical round-trip
+  invariant (`decode(encode(x)) == canonical(x)`), encoder-output-is-always-
+  accepted-by-the-reader, and an exhaustive single-bit-flip tamper-evidence
+  test over a genuinely valid signed `WireEvent`.
+- `crates/iroh-rooms-net/tests/malformed_cbor_e2e.rs` — proves the same
+  guarantee on the live QUIC receive path rather than as a pure function call:
+  an admitted peer's hostile raw bytes never crash or wedge a `Node`'s sync
+  pump and never pollute its store, and the node still correctly ingests a
+  valid frame sent right after.
+- `proptest = "1"` added to `iroh-rooms-core`'s `[dev-dependencies]` only
+  (dev-only, no runtime dependency added); no production code changed.
+
 The **protocol conformance test suite** has landed in
 `crates/iroh-rooms-core/tests/` (issue #7 / IR-0003). This is the §-indexed,
 traceable conformance binary the `PHASE-0-SPIKE.md` Spike Plan Gate B and Gate D

@@ -4,8 +4,10 @@
 //!
 //! These pin the byte-exact, independently-reproduced golden values (cast keys
 //! from seeds, 242-byte CSB, `event_id`, signature, `room_id_A/B`, tampered id)
-//! and exercise each issue acceptance criterion through the public API. The
-//! broader negative corpus and property/fuzz tests are added separately.
+//! and exercise each issue acceptance criterion through the public API. Direct
+//! unit tests for the strict CBOR reader live in `cbor.rs`'s inline
+//! `#[cfg(test)] mod tests`; property tests live in `tests/cbor_property.rs`
+//! (spec `strict-cbor-reader-unit-property-fuzz-tests.md`, risk R1).
 
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::cbor::{self, CborValue};
