@@ -37,6 +37,10 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   both commands are reconciled against the shipped binary and show the actual format. Note
 >   that the admin must keep `room tail --accept-joins <ROOM_ID>` running while the joiner
 >   executes `room join` — see the step instructions below.
+>   As of issue #31 / IR-0206, inviting the agent uses the first-class `iroh-rooms agent
+>   invite <ROOM_ID> <AGENT_ID>` noun — a thin, delegating wrapper over `room invite
+>   --invitee <AGENT_ID> --role agent` (byte-identical `member.invited`, same ticket, same
+>   error codes) — instead of the `--role agent` flag on `room invite`.
 > - **Step 4** (`iroh-rooms room send` / `iroh-rooms room tail`) is implemented and runnable
 >   as of issue #20 / IR-0105. Both commands work against the shipped binary and the output
 >   blocks below are reconciled to its actual format. The full two-human exchange is now
@@ -64,9 +68,11 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   implemented** — the serve/fetch half is a tracked follow-up. After sharing, the file is
 >   held locally; peers can see the reference via `file list` (with `provider: reference-only`)
 >   but cannot yet fetch the bytes. The `file fetch` block in Step 5 remains *illustrative*.
-> - **Step 7** — `agent` is scaffold — the binary does not recognise it yet. **Expected output**
->   blocks for Step 7 are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
->   captured from a real run).
+> - **Step 7** (`iroh-rooms agent status`) is **scaffold** — the `agent.status` content type
+>   exists but the binary does not yet expose a command to author one (tracked as a sibling
+>   follow-up to issue #31 / IR-0206). **Expected output** blocks for Step 7 are *illustrative*
+>   (consistent with `PRD.v0.3.md` §16 but not yet captured from a real run). `agent invite`
+>   (Step 3) is implemented and runnable.
 > - **Issue #24 / IR-0109** adds the Phase 1A two-peer integration test suite
 >   (`crates/iroh-rooms-cli/tests/two_peer_e2e.rs`). The CI tier (offline-backbone and
 >   restart-persistence tests) runs automatically via `cargo test`. The full online tier —
@@ -80,8 +86,6 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >
 > - The data-directory override (`--data-dir` flag and `IROH_ROOMS_HOME` env var) is
 >   confirmed by the shipped binary — use these exactly as documented.
-> - A few details for later commands are still pending and are flagged inline as
->   **[reconcile]**: the exact `agent invite`/join syntax.
 > - **The merged binary is the source of truth.** If you are running against the real
 >   binary and an output differs from any block in this guide, trust the binary and file
 >   the divergence.
@@ -361,8 +365,9 @@ next: run `iroh-rooms room members blake3:…` or `iroh-rooms room tail blake3:�
 
 ```bash
 # Substitute <ROOM_ID> from Step 2 and <AGENT_ID> from the agent's identity show (Step 1).
-# --role agent grants the agent role; omit --expires for a non-expiring invite.
-iroh-rooms room invite <ROOM_ID> --invitee <AGENT_ID> --role agent
+# `agent invite` grants the agent role; omit --expires for a non-expiring invite. It is a
+# thin wrapper over `room invite --invitee <AGENT_ID> --role agent` (same event, same ticket).
+iroh-rooms agent invite <ROOM_ID> <AGENT_ID>
 ```
 
 **Expected output**:
