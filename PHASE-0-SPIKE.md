@@ -21,7 +21,20 @@ Both decisions were adversarially verified against the actual mid-2026 stack (ir
 
 ## ADR-1: Event Transport — iroh-gossip Swarm vs. Full-Mesh Direct QUIC
 
-- **Status:** Proposed (decision recommended) — **confirmed by adversarial verification.**
+- **Status:** **Adopted — ratified by measurement (IR-0006, #10).** Confirmed
+  by adversarial verification at design time and, since, by the Day-4
+  measured comparison below.
+
+> **COMPLETE (IR-0006):** D1 measured — **ADR-1 ratified**: full-mesh direct
+> QUIC remains the Room Event Plane transport; `iroh-gossip` is not adopted
+> for the load-bearing log (parked as an optional off-critical-path
+> liveness/admin-tip carrier, exactly as already specified below). All five
+> ADR-1 comparison dimensions (propagation latency, reconnect behavior,
+> late-join history gap, auth/admission model, implementation complexity)
+> were measured at N=2..5 on deterministic loopback and confirm the
+> recommendation; none were disproven. Findings and the measured comparison
+> table are in `crates/spike-transport/NOTES.md`.
+
 - **Scope:** Room Event Plane transport for ≤5-person private rooms (PRD v0.3 §9.1, §17.1.13).
 - **Related:** ADR-2 (event log + sync).
 
@@ -850,6 +863,19 @@ Front-loaded because it is hand-rolled regardless of D1/D2, and a subtle canonic
 
 **Decision criterion (folds into Gate C):** default per this document is **full-mesh** (ordered, reliable, authenticated streams; HyParView/PlumTree buy nothing at N≤5; admission control is native). Gossip wins only if mesh dial/maintenance proves materially harder than expected; gossip may still be retained as an optional best-effort liveness/notify + admin-tip channel. Decision must cite measured numbers.
 
+> **COMPLETE (IR-0006):** GATE GO — D1 measured, **ADR-1 ratified**: mesh
+> converges to full set equality at N=2..5 with propagation latency
+> statistically indistinguishable from gossip's (both 15–18 ms per-event,
+> confirming "gossip buys nothing at N≤5" rather than "gossip is slower");
+> gossip late-join gap confirmed at 11/11 (mesh's late-join gap is also
+> 11/11 raw, but the same link trivially carries a backfill pull, per ADR-1
+> §4); mesh admission-before-`accept_bi()` confirmed and corroborates
+> `iroh-rooms-net` T2; gossip's open topic admits an interloper with no
+> auth check. No measured surprise crossed the Day-4 flip trigger. Residual
+> Open Decision 13 (admin-tip carrier) resolved: mesh `AdminTip` control
+> frame only for MVP. Full findings and the measured table in
+> `crates/spike-transport/NOTES.md`.
+
 ### Day 5 — Decision 2: iroh-docs vs. hand-rolled reconciliation (sync substrate)
 
 The genuinely hard primitive is range-based set reconciliation on reconnect. Log *semantics* (causal DAG, `(lamport, event_id)` order, membership fold, attribute merge) are hand-rolled either way; D2 is purely **how the opaque signed `WireEvent` set converges.**
@@ -941,7 +967,11 @@ These are the items that **genuinely cannot be settled within the spike** — ei
 10. **`iroh-blobs 0.103` vs `0.35` for shipping.** 0.103 has the modern events ACL on iroh 1.0 but is maintainer-labeled pre-production; 0.35 is "production" but on iroh 0.35 with **no** events ACL. The spike validates the 0.103 ACL path; the production-line choice is an MVP-time call.
 11. **Cross-version schema skew can cause same-set divergence.** "Unknown critical field ⇒ reject" means a peer on new software accepts an event an old-software peer rejects during any rollout — they then hold different validated sets from identical wire events. The MVP needs either strict lock-step versioning or an explicit forward-compat policy plus shared test vectors before any second schema version ships. Not resolvable while only `schema_version = 1` exists.
 12. **D1/D2 are recommended, not measured-yet.** Both recommendations (mesh, hand-roll) are adversarially confirmed at the *design* level, but Gate A/C require the Day-1/4/5 measurements to confirm hole-punching success and that the chosen sync path actually converges a reconnected peer on real NATs. A NO-GO at Gate A (no usable path on a real symmetric-NAT pair) would force a relay-infrastructure decision the spike cannot pre-make.
-13. **`admin_seq` / admin-tip advertisement transport.** Whether admin-tip advertisement rides the mesh pull RPC, an optional gossip liveness channel, or both, is a Day-4 measurement-informed choice; the *mechanism* is specified (§0) but the *carrier* is open.
+    > **D1 half measured (IR-0006):** the transport decision is now
+    > measurement-backed — see the ADR-1 annotation above and
+    > `crates/spike-transport/NOTES.md`. D2 (iroh-docs vs. hand-roll) remains
+    > recommended-but-not-measured pending Day 5.
+13. ~~**`admin_seq` / admin-tip advertisement transport.** Whether admin-tip advertisement rides the mesh pull RPC, an optional gossip liveness channel, or both, is a Day-4 measurement-informed choice; the *mechanism* is specified (§0) but the *carrier* is open.~~ **Decided (IR-0006):** the mesh `SyncMessage::AdminTip` control frame on the existing authenticated link is sufficient for MVP; gossip's liveness-topic carrier is prototyped and measured (freshness 3–6 ms vs. mesh's 18–21 ms on a 2-node loopback probe) but not adopted — the freshness gap is immaterial at MVP scale and a gossip tip is, by construction, a weaker-trust unauthenticated hint that can only ever trigger a re-check on the authenticated mesh path. Revisit only if a much larger room makes mesh's O(n²) control-frame fanout costly. Rationale in `crates/spike-transport/NOTES.md` §5.
 14. **Phase-5 sync substrate (iroh-docs vs. build Meyer RBSR vs. p2panda).** Deferred by design. The spike parks iroh-docs as the leading candidate (with the `m/`+`c/` prefix-free-key mapping ready) but the real decision arrives only when full divergent-history reconciliation enters scope.
 
 ---

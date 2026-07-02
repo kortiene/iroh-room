@@ -675,6 +675,14 @@ remains is the manual two-host execution and the Gate-A go/no-go verdict that fe
 Gate E memo (#15). The remaining feature work is the file serve/fetch half (`file fetch`,
 blob serving ALPN, and peer delivery) and agent status (both tracked separately).
 
+The **D1 transport decision is now measurement-closed** (issue #10 / IR-0006):
+`spike-transport` built minimal full-mesh and `iroh-gossip` backends behind one
+trait, measured all five ADR-1 comparison dimensions at N=2..5 on
+deterministic loopback, and ratified ADR-1 — full-mesh remains the Room Event
+Plane transport; gossip is parked as an optional off-critical-path
+liveness/admin-tip carrier. See `crates/spike-transport/NOTES.md` for the
+measured table and the decision memo.
+
 ## Repository Layout
 
 ```text
@@ -683,6 +691,7 @@ crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe subcommands; sc
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)
+crates/spike-transport/   Throwaway gossip-vs-full-mesh transport comparison (`transport-probe`, IR-0006)
 .adw/                     Switchyard / ADW project pack
 scripts/verify.sh         Local and CI verification gate
 specs/                    Implementation specs produced during planning

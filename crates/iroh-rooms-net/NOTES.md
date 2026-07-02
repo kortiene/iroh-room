@@ -195,3 +195,8 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
   (`crates/spike-nat` / `nat-probe`, IR-0012) with a full runbook; what remains is
   the manual two-host execution (substrate probe + this carrier's confirmation
   pass) and pasting the results table here.
+- ~~ADR-1 mesh choice validated only on this landed loopback carrier, not
+  measured against gossip.~~ **Closed by IR-0006** (#10): `spike-transport`
+  measured full-mesh against a minimal `iroh-gossip` backend at N=2..5 and
+  ratified ADR-1 (mesh admission-before-bytes corroborates T2 above; see
+  `crates/spike-transport/NOTES.md` for the measured table and decision).
