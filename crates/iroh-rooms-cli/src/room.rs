@@ -462,7 +462,14 @@ fn content_summary(content: &Content) -> String {
                 .message
                 .as_ref()
                 .map_or_else(String::new, |m| format!(" text={m:?}"));
-            format!("state={}{msg}", c.status)
+            let progress = c
+                .progress_pct
+                .map_or_else(String::new, |p| format!(" progress={p}%"));
+            let artifacts = c
+                .related_artifact_ids
+                .as_ref()
+                .map_or_else(String::new, |a| format!(" artifacts={}", a.len()));
+            format!("state={}{msg}{progress}{artifacts}", c.status)
         }
     }
 }
@@ -530,6 +537,15 @@ fn content_fields(content: &Content) -> Map<String, Value> {
             m.insert("state".into(), json!(c.status));
             if let Some(msg) = &c.message {
                 m.insert("message".into(), json!(msg));
+            }
+            if let Some(pct) = c.progress_pct {
+                m.insert("progress".into(), json!(pct));
+            }
+            if let Some(ids) = &c.related_artifact_ids {
+                if !ids.is_empty() {
+                    let handles: Vec<String> = ids.iter().map(crate::file::file_handle).collect();
+                    m.insert("artifacts".into(), json!(handles));
+                }
             }
         }
     }
@@ -927,6 +943,52 @@ mod tests {
     }
 
     #[test]
+    fn content_fields_agent_status_includes_progress_and_artifacts_when_set() {
+        // AC4 display: `progress` is a uint; `artifacts` is a JSON array of the
+        // `file_<hex>` handles a reader can feed straight back into `file fetch`.
+        let content = Content::AgentStatus(AgentStatus {
+            status: "building".to_string(),
+            message: None,
+            related_artifact_ids: Some(vec![[0xaa; 16], [0xbb; 16]]),
+            progress_pct: Some(40),
+        });
+        let fields = content_fields(&content);
+        assert_eq!(
+            fields["progress"].as_u64(),
+            Some(40),
+            "progress must serialize as an integer percent"
+        );
+        let artifacts = fields["artifacts"]
+            .as_array()
+            .expect("artifacts must be a JSON array");
+        assert_eq!(artifacts.len(), 2, "both artifact ids are surfaced");
+        assert_eq!(
+            artifacts[0].as_str(),
+            Some(crate::file::file_handle(&[0xaa; 16]).as_str()),
+            "each artifact renders as its file_<hex> handle"
+        );
+    }
+
+    #[test]
+    fn content_fields_agent_status_omits_progress_and_artifacts_when_none() {
+        let content = Content::AgentStatus(AgentStatus {
+            status: "idle".to_string(),
+            message: None,
+            related_artifact_ids: None,
+            progress_pct: None,
+        });
+        let fields = content_fields(&content);
+        assert!(
+            !fields.contains_key("progress"),
+            "progress must be absent when None"
+        );
+        assert!(
+            !fields.contains_key("artifacts"),
+            "artifacts must be absent when None"
+        );
+    }
+
+    #[test]
     fn content_fields_pipe_closed_has_lowercase_hex_pipe_id() {
         let content = Content::PipeClosed(PipeClosed {
             pipe_id: [0xab; 16],
@@ -1029,6 +1091,54 @@ mod tests {
         assert!(
             summary.contains("state=running"),
             "summary for AgentStatus must contain state=<status>: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn content_summary_agent_status_appends_message_progress_and_artifacts() {
+        // L6: after the stable `state=` prefix the free-form tail appends
+        // `text=<message>`, `progress=<n>%`, and `artifacts=<count>` when each
+        // optional is set — the half of the display extension the content_fields
+        // tests don't cover.
+        let content = Content::AgentStatus(AgentStatus {
+            status: "running_tests".to_string(),
+            message: Some("suite in progress".to_string()),
+            related_artifact_ids: Some(vec![[0xaa; 16], [0xbb; 16]]),
+            progress_pct: Some(40),
+        });
+        let summary = content_summary(&content);
+        assert!(
+            summary.starts_with("state=running_tests"),
+            "the stable state= prefix must lead the summary: {summary:?}"
+        );
+        assert!(
+            summary.contains("text=\"suite in progress\""),
+            "an optional message renders as text=<message>: {summary:?}"
+        );
+        assert!(
+            summary.contains("progress=40%"),
+            "progress renders as progress=<n>%: {summary:?}"
+        );
+        assert!(
+            summary.contains("artifacts=2"),
+            "the artifact count (not the ids) renders as artifacts=<count>: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn content_summary_agent_status_omits_optional_tail_when_none() {
+        // A bare status has no `text=`/`progress=`/`artifacts=` tail: the summary is
+        // exactly `state=<status>` (omit-when-empty, mirrors the content_fields case).
+        let content = Content::AgentStatus(AgentStatus {
+            status: "idle".to_string(),
+            message: None,
+            related_artifact_ids: None,
+            progress_pct: None,
+        });
+        let summary = content_summary(&content);
+        assert_eq!(
+            summary, "state=idle",
+            "a bare status summary must be exactly state=<status>: {summary:?}"
         );
     }
 

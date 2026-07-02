@@ -1,11 +1,17 @@
-//! Online two-peer e2e coverage for agent identity (IR-0206 / issue #31).
+//! Online two-peer e2e coverage for agent identity (IR-0206 / issue #31) and
+//! agent status (IR-0208 / issue #33).
 //!
-//! `crates/iroh-rooms-cli/tests/agent_cli.rs` proves the four ACs offline
-//! (invite → `status: invited`), and its module doc explicitly defers the
-//! online **join** half — an agent redeeming its ticket and converging to
-//! `role: agent, status: active` on both peers — to "the e2e phase", following
-//! the `two_peer_e2e.rs` `#[ignore]` loopback convention. This file is that
-//! deferred coverage.
+//! `crates/iroh-rooms-cli/tests/agent_cli.rs` proves the four IR-0206 ACs
+//! offline (invite → `status: invited`) and the IR-0208 Test Plan's four cases
+//! (valid status, invalid progress, non-member rejection, offline-tail
+//! display) — all deterministic, network-free. Both module docs explicitly
+//! defer their online half to "the e2e phase", following the
+//! `two_peer_e2e.rs` `#[ignore]` loopback convention. This file is that
+//! deferred coverage: an agent redeeming its ticket and converging to `role:
+//! agent, status: active` on both peers, and — building on that — a live
+//! `agent status` push that actually crosses the wire to a still-online peer
+//! and durably persists there, not merely the guaranteed local write every
+//! offline test already covers.
 //!
 //! ## Network stack
 //!
@@ -19,6 +25,7 @@
 //! | Coverage | Test | Tier |
 //! |---|---|---|
 //! | AC2 (agent join converges, both peers agree) | `agent_joins_and_converges_with_agent_role` | gated (`#[ignore]`) |
+//! | IR-0208 online delivery + durable receive-side persistence | `agent_status_delivers_online_and_persists_on_peer` | gated (`#[ignore]`) |
 //!
 //! This is network-dependent (two live loopback processes must rendezvous), so
 //! it follows the same `#[ignore]`-gated tier as the rest of the online
@@ -404,5 +411,147 @@ fn agent_joins_and_converges_with_agent_role() {
         admin_set, expected,
         "the converged roster must be {{admin admin/active, agent agent/active}} — \
          the agent role survives the wire round-trip, not just the local fold"
+    );
+}
+
+/// IR-0208 online delivery + durable receive-side persistence: after the agent
+/// joins (as above), it posts a signed `agent status` while the admin's `room
+/// tail` session is still live and reachable at the same loopback address.
+/// `agent status` always brings up its own short-lived node (it never reuses
+/// the join's connection), so a real fresh dial + admission check happens here.
+///
+/// This asserts two things the offline `agent_cli.rs`/`agent.rs` suites cannot:
+/// that the live push actually **connects** (`delivered: 1 connected peer(s)`,
+/// not the "no peers online" fallback every offline test exercises), and that
+/// the admin's *own*, separate, offline `room tail --json` process durably
+/// shows the row the receive path stored — proving persistence on the
+/// receiving end, not just an echo of the sender's local claim.
+#[test]
+#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+#[allow(clippy::too_many_lines)] // one linear invite-join-push-persist narrative; splitting fragments it
+fn agent_status_delivers_online_and_persists_on_peer() {
+    let admin_home = TempDir::new().expect("admin home");
+    let agent_home = TempDir::new().expect("agent home");
+    identity_create(&admin_home, "Alice");
+    identity_create(&agent_home, "build-agent");
+    let agent_id = identity_id(&agent_home);
+    let room = room_create(&admin_home, "Agent Status E2E Room");
+
+    let ticket = agent_invite(&admin_home, &room, &agent_id);
+
+    // Admin hosts the provisional join-bootstrap window and advertises her address.
+    let admin_tail = ChildSession::spawn(
+        admin_home.path(),
+        &["room", "tail", &room, "--accept-joins", "--loopback"],
+    );
+    let listening = admin_tail
+        .wait_for_line("listening:", WAIT)
+        .unwrap_or_else(|err| panic!("admin tail never advertised a listening address: {err}"));
+    let admin_addr = parse_listening(&listening);
+
+    // The agent redeems its ticket, dialing the admin deterministically over loopback.
+    let join = one_shot(
+        agent_home.path(),
+        &["room", "join", &ticket, "--peer", &admin_addr, "--loopback"],
+    );
+    assert!(
+        join.status.success(),
+        "agent join must succeed; stderr: {}",
+        String::from_utf8_lossy(&join.stderr)
+    );
+    wait_until_member_status(&admin_home, &room, &agent_id, "active", WAIT);
+
+    // The agent — still online — pushes a signed status straight at the admin's
+    // still-listening tail session, over a fresh ephemeral connection.
+    let status = one_shot(
+        agent_home.path(),
+        &[
+            "agent",
+            "status",
+            &room,
+            "running_tests",
+            "--message",
+            "suite in progress",
+            "--progress",
+            "40",
+            "--peer",
+            &admin_addr,
+            "--loopback",
+            "--timeout",
+            "10s",
+        ],
+    );
+    assert!(
+        status.status.success(),
+        "agent status must succeed; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_stdout.contains("delivered: 1 connected peer(s)"),
+        "the status push must actually connect to the still-online admin, not \
+         merely fall back to local-only persistence; got:\n{status_stdout}"
+    );
+
+    // The tail child persists asynchronously on receipt — poll before tearing it
+    // down (mirrors the join-convergence wait above), then stop it so the
+    // following read is a genuinely separate, offline process over rooms.db.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let out = one_shot(
+            admin_home.path(),
+            &["room", "tail", &room, "--offline", "--json"],
+        );
+        assert!(
+            out.status.success(),
+            "admin offline tail --json must succeed"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("tail --json emits a JSON array");
+        if value
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["event_type"] == "agent.status"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the admin never durably persisted the pushed agent.status within {WAIT:?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    drop(admin_tail);
+
+    // A final read confirms the row's fields survive independently of the live
+    // session — the admin's own offline projection of what it received.
+    let read = one_shot(
+        admin_home.path(),
+        &["room", "tail", &room, "--offline", "--json"],
+    );
+    assert!(
+        read.status.success(),
+        "admin offline tail --json must succeed"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&read.stdout).expect("tail --json emits a JSON array");
+    let rows = value.as_array().expect("tail --json is an array");
+    let row = rows
+        .iter()
+        .find(|r| r["event_type"] == "agent.status")
+        .unwrap_or_else(|| {
+            panic!("admin must durably persist the pushed agent.status row: {value}")
+        });
+
+    assert_eq!(row["state"], "running_tests", "state field: {row}");
+    assert_eq!(row["message"], "suite in progress", "message field: {row}");
+    assert_eq!(row["progress"], 40, "progress field: {row}");
+    assert_eq!(
+        row["from"],
+        agent_id.get(..8).unwrap_or(&agent_id),
+        "authored by the agent identity (short-id attribution): {row}"
+    );
+    assert_eq!(
+        row["role"], "agent",
+        "the receive-path fold attributes the row to the agent role: {row}"
     );
 }

@@ -82,6 +82,38 @@ enum AgentAction {
         #[arg(long)]
         expires: Option<String>,
     },
+    /// Post a signed status update to the room (any active member may post).
+    Status {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// A short free-form status label (1..=64 bytes), e.g. `running_tests`.
+        status: String,
+        /// An optional human-readable message (<=4096 bytes).
+        #[arg(long)]
+        message: Option<String>,
+        /// Optional progress percent, an integer 0..=100.
+        #[arg(long)]
+        progress: Option<u64>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Related artifact file id, repeatable: file_<32-hex> (from `file share`
+        /// / `file list`) or bare 32-hex.
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Best-effort connect timeout as <int>{ms|s|m}, e.g. 5s.
+        #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
+        timeout: String,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -431,6 +463,35 @@ fn dispatch_agent(home: &std::path::Path, action: AgentAction) -> Result<()> {
             // invocation leaves the store untouched (delegates to `invite::invite`).
             let summary = agent::invite(home, &room_id, &agent_id, expires.as_deref())?;
             invite::print_invite(&summary);
+        }
+        AgentAction::Status {
+            room_id,
+            status,
+            message,
+            progress,
+            artifacts,
+            peers,
+            timeout,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            // Parse the timeout before any IO so a bad value writes nothing.
+            let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
+            // `agent::status` validates status/message/progress/artifacts before
+            // any IO, then runs the online-best-effort push in a scoped runtime
+            // (mirrors `room send`).
+            let summary = runtime()?.block_on(agent::status(
+                home,
+                &room_id,
+                &status,
+                message.as_deref(),
+                progress,
+                &artifacts,
+                &peers,
+                timeout,
+                loopback,
+            ))?;
+            message::print_status(&summary);
         }
     }
     Ok(())

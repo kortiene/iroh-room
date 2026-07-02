@@ -648,8 +648,18 @@ first-class `agent invite` noun the PRD documents:
   and `gate_active_member`'s `NotAMember` rejection of any non-invited principal were already
   landed (IR-0008); this issue is a CLI surface plus explicit conformance proof, not new
   protocol behavior.
-- `agent status` (the agent authoring an `agent.status` event) is a sibling follow-up; the
-  `AgentAction` enum reserves room for it.
+- `iroh-rooms agent status <ROOM_ID> <STATUS> [--message <TEXT>] [--progress <0..100>]
+  [--artifact <FILE_ID>...]` (issue #33 / IR-0208) posts a signed `agent.status` event: build →
+  self-validate → persist locally (guaranteed) → best-effort push to connected peers, the same
+  offline-first/online-best-effort contract as `room send`. Posting is **not** role-gated — any
+  active member may post (`gate_active_member`, matching spike §7 "any current member") — the
+  CLI noun is a discoverable surface, not a new authorization tier. `status`/`message` are
+  bounded (64/4096 UTF-8 bytes) and `related_artifact_ids` (via repeatable `--artifact
+  file_<hex>`, the same handle codec `file share`/`file fetch` use) is capped at 16 entries and
+  rejected empty-but-present, mirroring `file.shared`'s trust-boundary bounds. The offline `room
+  tail [--offline] [--json]` read renders the full row (`state`, `message`, `progress`,
+  `artifacts`); the live streaming `room tail` renders only `message.text` today (a known
+  display gap, deferred).
 
 **The agent invite flow** has been proven end-to-end by a dedicated conformance suite
 (issue #32 / IR-0207), closing the one gap IR-0206 deliberately deferred — AC3, "agent
@@ -764,13 +774,13 @@ or authorization behaviour changes, only how `file fetch` *names* an already-lan
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the Phase 1A
-two-peer integration test, the hardened recent-history sync, agent identity, the CLI error
-taxonomy, and the full Blob Plane — import, serve, fetch, and honest availability reporting)
-are all landed.
+two-peer integration test, the hardened recent-history sync, agent identity, agent status, the
+CLI error taxonomy, and the full Blob Plane — import, serve, fetch, and honest availability
+reporting) are all landed.
 
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
-Gate E memo (#15). The remaining feature work is agent status (tracked separately).
+Gate E memo (#15).
 
 The **D1 transport decision is now measurement-closed** (issue #10 / IR-0006):
 `spike-transport` built minimal full-mesh and `iroh-gossip` backends behind one
@@ -784,7 +794,7 @@ measured table and the decision memo.
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe, agent subcommands; agent status is scaffold)
+crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe, agent subcommands)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)

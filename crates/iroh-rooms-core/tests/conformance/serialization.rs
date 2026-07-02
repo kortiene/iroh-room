@@ -10,7 +10,8 @@
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::cbor::{self, CborValue};
 use iroh_rooms_core::event::constants::{
-    MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES,
+    MAX_ARTIFACT_REFS, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MIME_TYPE_BYTES,
+    MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES,
 };
 use iroh_rooms_core::event::content::{Content, EventType, RoomCreated};
 use iroh_rooms_core::event::ids::RoomId;
@@ -579,6 +580,167 @@ fn invalid_content_agent_status_pct_over_100() {
     assert_eq!(
         parts_result(1, "agent.status", content, vec![dummy_prev()]),
         Err(RejectReason::InvalidContent)
+    );
+}
+
+// ── agent.status D1 field bounds (spec IR-0208 §4 D1 / §11 L2) ──────────────
+// The strict parser tightens the untrusted `status` / `message` /
+// `related_artifact_ids` fields to the same trust-boundary bounds the sibling
+// content types carry. Each rejection surfaces as `InvalidContent`; the boundary
+// accepts prove the caps admit exactly the fixtures the builder/CLI produce.
+
+/// A 16-byte artifact id as raw CBOR bytes (a well-formed `bstr[16]` element).
+fn artifact16(byte: u8) -> CborValue {
+    CborValue::Bytes(vec![byte; 16])
+}
+
+/// An `agent.status` content map from `(key, value)` entries (declaration order;
+/// the encoder canonicalizes).
+fn agent_status_content(entries: Vec<(&str, CborValue)>) -> CborValue {
+    CborValue::Map(
+        entries
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
+    )
+}
+
+fn agent_status_result(content: CborValue) -> Result<ValidatedEvent, RejectReason> {
+    parts_result(1, "agent.status", content, vec![dummy_prev()])
+}
+
+#[test]
+fn invalid_content_agent_status_empty_status() {
+    let content = agent_status_content(vec![("status", CborValue::Text(String::new()))]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_over_cap_status() {
+    let content = agent_status_content(vec![(
+        "status",
+        CborValue::Text("a".repeat(MAX_STATUS_LABEL_BYTES + 1)),
+    )]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_control_char_status() {
+    // A control char (BEL) in the label — it renders directly into the tail.
+    let content = agent_status_content(vec![("status", CborValue::Text("run\u{0007}ning".into()))]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_over_cap_message() {
+    let content = agent_status_content(vec![
+        ("status", CborValue::Text("running".into())),
+        (
+            "message",
+            CborValue::Text("m".repeat(MAX_STATUS_MESSAGE_BYTES + 1)),
+        ),
+    ]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_empty_artifact_array() {
+    // An empty array must be omitted (§7 omit-when-empty), never encoded as `[]`.
+    let content = agent_status_content(vec![
+        ("status", CborValue::Text("running".into())),
+        ("related_artifact_ids", CborValue::Array(vec![])),
+    ]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_over_cap_artifact_array() {
+    let ids = (0..=MAX_ARTIFACT_REFS)
+        .map(|i| artifact16(u8::try_from(i).unwrap()))
+        .collect();
+    let content = agent_status_content(vec![
+        ("status", CborValue::Text("running".into())),
+        ("related_artifact_ids", CborValue::Array(ids)),
+    ]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_wrong_length_artifact() {
+    // `related_artifact_ids` elements are `bstr[16]`; a 15-byte element is invalid.
+    let content = agent_status_content(vec![
+        ("status", CborValue::Text("running".into())),
+        (
+            "related_artifact_ids",
+            CborValue::Array(vec![CborValue::Bytes(vec![0u8; 15])]),
+        ),
+    ]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn invalid_content_agent_status_unknown_key() {
+    // An unrecognized content key is a hard reject (Fields::finish).
+    let content = agent_status_content(vec![
+        ("status", CborValue::Text("running".into())),
+        ("bogus", CborValue::Uint(1)),
+    ]);
+    assert_eq!(
+        agent_status_result(content),
+        Err(RejectReason::InvalidContent)
+    );
+}
+
+#[test]
+fn agent_status_status_at_cap_is_accepted() {
+    let content = agent_status_content(vec![(
+        "status",
+        CborValue::Text("a".repeat(MAX_STATUS_LABEL_BYTES)),
+    )]);
+    assert!(
+        agent_status_result(content).is_ok(),
+        "a status label exactly at the cap must be accepted"
+    );
+}
+
+#[test]
+fn agent_status_message_and_artifacts_at_cap_are_accepted() {
+    let ids = (0..MAX_ARTIFACT_REFS)
+        .map(|i| artifact16(u8::try_from(i).unwrap()))
+        .collect();
+    let content = agent_status_content(vec![
+        ("status", CborValue::Text("running".into())),
+        (
+            "message",
+            CborValue::Text("m".repeat(MAX_STATUS_MESSAGE_BYTES)),
+        ),
+        ("related_artifact_ids", CborValue::Array(ids)),
+        ("progress_pct", CborValue::Uint(100)),
+    ]);
+    assert!(
+        agent_status_result(content).is_ok(),
+        "message/artifacts exactly at the caps (with progress=100) must be accepted"
     );
 }
 

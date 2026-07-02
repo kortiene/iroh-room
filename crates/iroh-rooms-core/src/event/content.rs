@@ -18,8 +18,9 @@ use blake3::Hasher;
 use super::binding::DeviceBinding;
 use super::cbor::CborValue;
 use super::constants::{
-    DIGEST_LEN, INVITE_CONTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MESSAGE_BODY_BYTES,
-    MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
+    DIGEST_LEN, INVITE_CONTEXT, MAX_ARTIFACT_REFS, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
+    MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES,
+    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
 };
 use super::ids::{EventId, HashRef, RoomId};
 use super::keys::{DeviceKey, IdentityKey};
@@ -787,9 +788,30 @@ fn parse_pipe_closed(f: &mut Fields<'_>) -> Result<PipeClosed, RejectReason> {
 }
 
 fn parse_agent_status(f: &mut Fields<'_>) -> Result<AgentStatus, RejectReason> {
-    let status = f.require_text("status")?.to_owned();
-    let message = f.opt_text("message")?.map(ToOwned::to_owned);
+    let status = f.require_text("status")?;
+    if status.is_empty()
+        || status.len() > MAX_STATUS_LABEL_BYTES
+        || status.chars().any(char::is_control)
+    {
+        return Err(RejectReason::InvalidContent);
+    }
+    let status = status.to_owned();
+
+    let message = f.opt_text("message")?;
+    if let Some(m) = message {
+        if m.len() > MAX_STATUS_MESSAGE_BYTES {
+            return Err(RejectReason::InvalidContent);
+        }
+    }
+    let message = message.map(ToOwned::to_owned);
+
     let related_artifact_ids = f.opt_short_id_array("related_artifact_ids")?;
+    if let Some(ids) = &related_artifact_ids {
+        if ids.is_empty() || ids.len() > MAX_ARTIFACT_REFS {
+            return Err(RejectReason::InvalidContent);
+        }
+    }
+
     let progress_pct = f.opt_uint("progress_pct")?;
     if let Some(pct) = progress_pct {
         if pct > 100 {

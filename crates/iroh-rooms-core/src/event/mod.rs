@@ -30,6 +30,8 @@
 //!   removal event ([`removed::build_member_removed`], §7).
 //! * [`file`] — pure assembly of a signed member [`content::FileShared`] blob
 //!   reference event ([`file::build_file_shared`], §7).
+//! * [`status`] — pure assembly of a signed member [`content::AgentStatus`]
+//!   status-update event ([`status::build_agent_status`], §7).
 //! * [`validate`] — the stateless [`validate::validate_wire_bytes`] pipeline
 //!   (§6) returning a [`validate::ValidatedEvent`] or a typed [`RejectReason`].
 //! * [`reject`] — the [`RejectReason`] / [`Flag`] taxonomy (§8) and the deferred
@@ -56,6 +58,7 @@ pub mod pipe;
 pub mod reject;
 pub mod removed;
 pub mod signed;
+pub mod status;
 pub mod validate;
 pub mod wire;
 
@@ -74,6 +77,7 @@ pub use pipe::{build_pipe_closed, build_pipe_opened};
 pub use reject::{Flag, MembershipOracle, RejectReason};
 pub use removed::build_member_removed;
 pub use signed::SignedEvent;
+pub use status::build_agent_status;
 pub use validate::{
     validate_wire_bytes, validate_with_membership, ValidatedEvent, ValidationContext,
 };
