@@ -24,6 +24,18 @@
 //! AC2 (wrong identity key) is pre-IO and is covered by the CLI unit tests
 //! (`join_cli.rs`) and by the membership-fold tests (`membership_fold.rs`).
 //!
+//! ## IR-0207 (issue #32) — agent-role mirrors
+//!
+//! `gate_join` never branches on `role`, so `agent_bad_capability_secret_join_not_accepted`
+//! and `agent_expired_invite_join_not_accepted` re-run AC3/AC4 with the invite and
+//! join built at `role = "agent"` (`build_admin_room`/`build_member_joined`'s `role`
+//! flipped, everything else identical) — the Node-layer half of IR-0207's "agent join
+//! is rejected without valid capability", pinning that an agent gets no different
+//! capability verification than a human. The CLI-surface half (corrupt/truncated/
+//! wrong-identity agent tickets, which fail pre-IO) lives in
+//! `iroh-rooms-cli/tests/agent_invite_flow.rs`; these two are the online cases that
+//! require a live admin's fold to render a verdict.
+//!
 //! Every await is bounded (via `wait_until_contains` / a manual `timeout`) so a
 //! wiring bug fails fast rather than hanging CI (mirrors `message_e2e` / `pipe_e2e`).
 
@@ -123,11 +135,12 @@ struct RoomSetup {
 }
 
 /// Build the admin's room: genesis (admin = admin) + a single `member.invited`
-/// for `joiner_identity`. `expires_at` is `None` for the normal case and
-/// `Some(T0 + 1)` for the expiry test.
+/// for `joiner_identity` with the given `role`. `expires_at` is `None` for the
+/// normal case and `Some(T0 + 1)` for the expiry test.
 fn build_admin_room(
     admin: &Principal,
     joiner_identity: IdentityKey,
+    role: &str,
     expires_at: Option<u64>,
 ) -> RoomSetup {
     let room_id = signed::derive_room_id(&admin.identity(), &NONCE, T0);
@@ -161,7 +174,7 @@ fn build_admin_room(
         content: Content::MemberInvited(MemberInvited {
             invite_id: INV_ID,
             capability_hash: capability_hash(&room_id, &INV_ID, &INV_SECRET),
-            role: "member".to_owned(),
+            role: role.to_owned(),
             invitee_key: joiner_identity,
             expires_at,
             invitee_hint: None,
@@ -286,7 +299,7 @@ async fn valid_join_both_peers_show_joiner_active() {
     let admin = Principal::new(0x01);
     let joiner = Principal::new(0x10);
 
-    let setup = build_admin_room(&admin, joiner.identity(), None);
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
     let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
@@ -369,7 +382,7 @@ async fn bad_capability_secret_join_not_accepted() {
     let admin = Principal::new(0x01);
     let joiner = Principal::new(0x10);
 
-    let setup = build_admin_room(&admin, joiner.identity(), None);
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
     let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
@@ -430,6 +443,79 @@ async fn bad_capability_secret_join_not_accepted() {
     joiner_node.shutdown().await.expect("shutdown joiner");
 }
 
+/// IR-0207 (#32) AC3 — the `agent`-role mirror of `bad_capability_secret_join_not_accepted`.
+/// Identical to the test above except the invite and the join are both built at
+/// `role = "agent"` instead of `"member"`: since `gate_join` computes
+/// `capability_hash` and compares it without ever inspecting `role`, an agent's
+/// wrong-secret join is rejected by the exact same `BadCapability` verdict a
+/// human's is — proving "the same capability verification as a human peer" at the
+/// Node layer, not just asserting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_bad_capability_secret_join_not_accepted() {
+    let admin = Principal::new(0x01);
+    let joiner = Principal::new(0x10);
+
+    let setup = build_admin_room(&admin, joiner.identity(), "agent", None);
+
+    let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+
+    joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+
+    joiner_node
+        .wait_until_contains(setup.genesis_event_id, WAIT)
+        .await
+        .expect("joiner pulled genesis");
+    joiner_node
+        .wait_until_contains(setup.invite_dag_id, WAIT)
+        .await
+        .expect("joiner pulled invite");
+
+    let heads = joiner_node.heads().await.expect("joiner heads");
+    let binding = DeviceBinding::create(&setup.room_id, &joiner.id, joiner.device_key());
+    // Build join with the WRONG secret (INV_ID is correct; only the secret differs).
+    let join_wire = build_member_joined(
+        &joiner.id,
+        &joiner.dev,
+        &setup.room_id,
+        &INV_ID,
+        &WRONG_SECRET, // ← wrong: gate_join rejects BadCapability
+        "agent",
+        binding,
+        None,
+        &heads,
+        T0 + 1_000,
+    );
+
+    // node.publish succeeds (stateless-valid); the fold rejects the event with
+    // BadCapability and does not store it, so there is no event_id to wait for
+    // in either peer's store.
+    joiner_node
+        .publish(join_wire.to_bytes())
+        .await
+        .expect("publish member.joined");
+
+    // Allow a brief settling window so any in-flight engine work completes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // AC3: admin's fold must not show the agent as Active (gate_join → BadCapability).
+    let admin_snap = admin_node.snapshot().await.expect("admin snapshot");
+    assert!(
+        !admin_snap.is_active(&joiner.identity()),
+        "IR-0207 AC3: admin must NOT show the agent as Active when capability_secret is wrong"
+    );
+
+    // AC3: joiner's own fold reaches the same deterministic verdict.
+    let joiner_snap = joiner_node.snapshot().await.expect("joiner snapshot");
+    assert!(
+        !joiner_snap.is_active(&joiner.identity()),
+        "IR-0207 AC3: agent must NOT show itself as Active when its own secret is wrong"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    joiner_node.shutdown().await.expect("shutdown joiner");
+}
+
 // ── AC4 — expired invite ─────────────────────────────────────────────────────
 
 /// AC4: An invite with `expires_at = T0 + 1` (set before the join's `created_at
@@ -447,7 +533,7 @@ async fn expired_invite_join_not_accepted() {
     let joiner = Principal::new(0x10);
 
     // Invite expires at T0+1; the join will have created_at = T0+1_000 (after expiry).
-    let setup = build_admin_room(&admin, joiner.identity(), Some(T0 + 1));
+    let setup = build_admin_room(&admin, joiner.identity(), "member", Some(T0 + 1));
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
     let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
@@ -506,6 +592,77 @@ async fn expired_invite_join_not_accepted() {
     joiner_node.shutdown().await.expect("shutdown joiner");
 }
 
+/// IR-0207 (#32) AC3/AC4 — the `agent`-role mirror of `expired_invite_join_not_accepted`.
+/// Identical to the test above except the invite and the join are both built at
+/// `role = "agent"` instead of `"member"`: expiry is a log-timestamp comparison
+/// (`join.created_at > invite.expires_at`) that never inspects `role`, so an
+/// expired agent invite is rejected by the exact same `ExpiredInvite` verdict a
+/// human's is. Deterministic (injected timestamps, no sleep/wall-clock read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_expired_invite_join_not_accepted() {
+    let admin = Principal::new(0x01);
+    let joiner = Principal::new(0x10);
+
+    // Invite expires at T0+1; the join will have created_at = T0+1_000 (after expiry).
+    let setup = build_admin_room(&admin, joiner.identity(), "agent", Some(T0 + 1));
+
+    let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+
+    joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+
+    joiner_node
+        .wait_until_contains(setup.genesis_event_id, WAIT)
+        .await
+        .expect("joiner pulled genesis");
+    joiner_node
+        .wait_until_contains(setup.invite_dag_id, WAIT)
+        .await
+        .expect("joiner pulled (expired) invite");
+
+    let heads = joiner_node.heads().await.expect("joiner heads");
+    let binding = DeviceBinding::create(&setup.room_id, &joiner.id, joiner.device_key());
+    // join.created_at = T0+1_000 > invite.expires_at = T0+1 → ExpiredInvite.
+    let join_wire = build_member_joined(
+        &joiner.id,
+        &joiner.dev,
+        &setup.room_id,
+        &INV_ID,
+        &INV_SECRET, // correct secret; expiry alone rejects it
+        "agent",
+        binding,
+        None,
+        &heads,
+        T0 + 1_000, // ← after invite.expires_at (T0+1)
+    );
+
+    // node.publish succeeds (stateless-valid); the fold rejects the event with
+    // ExpiredInvite and does not store it, so there is no event_id to wait for.
+    joiner_node
+        .publish(join_wire.to_bytes())
+        .await
+        .expect("publish member.joined");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // AC4: admin's fold rejects the join with ExpiredInvite; agent not Active.
+    let admin_snap = admin_node.snapshot().await.expect("admin snapshot");
+    assert!(
+        !admin_snap.is_active(&joiner.identity()),
+        "IR-0207 AC4: admin must NOT show the agent as Active when the invite is expired"
+    );
+
+    // AC4: joiner's fold independently reaches the same verdict (convergent).
+    let joiner_snap = joiner_node.snapshot().await.expect("joiner snapshot");
+    assert!(
+        !joiner_snap.is_active(&joiner.identity()),
+        "IR-0207 AC4: agent must NOT show itself as Active when the invite is expired (deterministic)"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    joiner_node.shutdown().await.expect("shutdown joiner");
+}
+
 // ── Bootstrap seam: provisional peer cannot pull non-membership events ────────
 
 /// Security regression: a provisional peer that tries to pull non-membership
@@ -531,7 +688,7 @@ async fn provisional_peer_does_not_receive_chat_events() {
     let admin = Principal::new(0x01);
     let joiner = Principal::new(0x10);
 
-    let setup = build_admin_room(&admin, joiner.identity(), None);
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     // Seed the admin with the room log.
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;

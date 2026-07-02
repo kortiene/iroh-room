@@ -922,6 +922,11 @@ reason codes are stable identifiers also written to the local audit log.
   (exit `3`) before any network dial; a ticket with no admin discovery hint and no `--peer`
   given reports `error[no_discovery_hint]` (exit `2`).
 
+  This applies identically to an agent's ticket: the codec and `gate_join` never branch on
+  role, so a corrupted, wrong-identity, wrong-secret, or expired ticket minted by `agent
+  invite` is rejected with the exact same codes as one minted by `room invite` (issue #32 /
+  IR-0207, which pins the parity with agent-flavored regression tests).
+
 - **Next action:** ask the admin for a fresh `room invite` (re-issue, optionally with a longer
   `--expires`). There is no native revocation, so a re-issue is the fix.
 

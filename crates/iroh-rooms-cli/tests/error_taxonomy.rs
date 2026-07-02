@@ -102,12 +102,23 @@ fn admin_invite_ticket(home_admin: &TempDir, invitee_hex: &str) -> String {
     extract_ticket(&stdout).expect("ticket must appear in `room invite` output")
 }
 
-/// Flip the final base32 character of a ticket, breaking its trailing checksum
-/// while keeping the length/version byte intact (a realistic copy-paste garble).
+/// Corrupt a ticket so it **deterministically** fails its trailing BLAKE3 checksum
+/// (`ticket_bad_checksum`) while staying a fully base32-decodable token — a realistic
+/// single-character copy-paste garble.
+///
+/// We flip a character in the **middle** of the base32 body (after the `roomtkt1`
+/// prefix), which always maps to a payload byte. A naive *last*-char flip is flaky
+/// (~1/32): the final char carries the RFC-4648 canonical zero-padding bits, so when
+/// the minted ticket happens to end in `a`, flipping to `b` sets a padding bit and a
+/// strict decoder reports `ticket_bad_base32`, not a checksum failure. The *first*
+/// char decodes into the version byte, which is checked before the checksum. A middle
+/// char dodges both: it alters one payload byte with the version byte and length
+/// intact, so the appended checksum no longer matches.
 fn corrupt_last_char(ticket: &str) -> String {
+    let prefix_len = "roomtkt1".len();
     let mut chars: Vec<char> = ticket.chars().collect();
-    let last = chars.len() - 1;
-    chars[last] = if chars[last] == 'a' { 'b' } else { 'a' };
+    let mid = prefix_len + (chars.len() - prefix_len) / 2;
+    chars[mid] = if chars[mid] == 'a' { 'b' } else { 'a' };
     chars.into_iter().collect()
 }
 

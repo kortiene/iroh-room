@@ -651,6 +651,29 @@ first-class `agent invite` noun the PRD documents:
 - `agent status` (the agent authoring an `agent.status` event) is a sibling follow-up; the
   `AgentAction` enum reserves room for it.
 
+**The agent invite flow** has been proven end-to-end by a dedicated conformance suite
+(issue #32 / IR-0207), closing the one gap IR-0206 deliberately deferred — AC3, "agent
+join is rejected without valid capability" — asserted *through the agent surface*
+rather than assumed from the role-agnostic design. No production code changed:
+`agent invite`, `room join`, and `gate_join` were already role-agnostic and already
+landed (IR-0206/IR-0103/IR-0104).
+
+- `crates/iroh-rooms-cli/tests/agent_invite_flow.rs` packages the issue's four
+  Test-Plan legs in one traceable file: admin invite and non-admin rejection are thin
+  re-assertions (the exhaustive matrix stays in `agent_cli.rs`), and the new coverage
+  is the ticket-rejection leg — a corrupted or truncated agent ticket rejected
+  `ticket_*`/exit 5, and an agent ticket redeemed under the wrong identity rejected
+  `wrong_identity`/exit 3, both pre-IO with no membership persisted.
+- **Code-identity parity tests** mint an `agent`-role ticket and a `member`-role ticket
+  from the same admin, corrupt or misredeem them identically, and assert the IR-0110
+  code and exit category match byte-for-byte — the durable guard that a future
+  refactor cannot special-case the `agent` role without failing a test.
+- `crates/iroh-rooms-net/tests/join_e2e.rs` gained `agent`-role mirrors of
+  `bad_capability_secret_join_not_accepted` / `expired_invite_join_not_accepted` — the
+  online half of AC3 (wrong capability secret, expired invite), deterministic and
+  always-green since it drives two in-process `Node`s rather than a live loopback
+  session.
+
 ### Error codes
 
 The `iroh-rooms` binary (issue #25 / IR-0110) renders every terminal command failure as a
