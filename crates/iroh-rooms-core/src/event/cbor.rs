@@ -404,3 +404,315 @@ impl CborValue {
         }
     }
 }
+
+// Direct unit tests for the strict reader (risk R1 — spec
+// `strict-cbor-reader-unit-property-fuzz-tests.md` §5). One crafted input per
+// `CborError` variant asserting the exact variant, plus accept-path and
+// boundary cases. Property/fuzz tests live separately in
+// `tests/cbor_property.rs`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Decode a hex fixture (spaces allowed for readability) into raw bytes.
+    fn hx(s: &str) -> Vec<u8> {
+        hex::decode(s.replace(' ', "")).expect("valid hex fixture")
+    }
+
+    // ---- One case per `CborError` variant (14). ----
+
+    #[test]
+    fn unexpected_eof_on_short_bytes_payload() {
+        // bstr(3) declares 3 bytes; only 2 follow.
+        assert_eq!(
+            decode_canonical(&hx("43 01 02")),
+            Err(CborError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn unexpected_eof_on_truncated_head() {
+        // 24-form head with no following argument byte.
+        assert_eq!(decode_canonical(&hx("18")), Err(CborError::UnexpectedEof));
+    }
+
+    #[test]
+    fn unexpected_eof_guards_oversized_declared_length_without_allocating() {
+        // bstr(32) declares 32 bytes; only 5 are present. `checked_len` must
+        // reject this before any allocation of the declared length — the
+        // concrete R1/DoS preallocation guard.
+        let mut bytes = hx("58 20");
+        bytes.extend_from_slice(&[1, 2, 3, 4, 5]);
+        assert_eq!(decode_canonical(&bytes), Err(CborError::UnexpectedEof));
+    }
+
+    #[test]
+    fn trailing_data_after_complete_item() {
+        for input in ["00 00", "a0 00"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::TrailingData),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn indefinite_length_is_rejected() {
+        // Major-0 indefinite (invalid on its own), plus every indefinite
+        // container form (bstr/tstr/array/map).
+        for input in ["1f", "5f", "7f", "9f", "bf"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::IndefiniteLength),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_shortest_int_at_every_width() {
+        for input in [
+            "18 17",                      // 1-byte form of 23 (fits immediate).
+            "19 00 ff",                   // 2-byte form of 255 (fits 1-byte).
+            "1a 00 00 ff ff",             // 4-byte form of 65535 (fits 2-byte).
+            "1b 00 00 00 00 ff ff ff ff", // 8-byte form of 2^32-1 (fits 4-byte).
+        ] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::NonShortestInt),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_shortest_int_enforced_on_length_fields_too() {
+        // bstr length 23 written in the 1+1 (24-form) instead of immediate —
+        // proves shortest-form applies to lengths, not just integer values
+        // (D4: `read_head` enforces this for every item head).
+        assert_eq!(
+            decode_canonical(&hx("58 17")),
+            Err(CborError::NonShortestInt)
+        );
+    }
+
+    #[test]
+    fn negative_integer_is_rejected() {
+        for input in ["20", "38 63"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::NegativeInteger),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_additional_info_is_rejected() {
+        for input in ["1c", "1d", "1e"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::ReservedAdditionalInfo),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_is_rejected_before_any_payload_is_read() {
+        // Major-6 dispatches immediately (D4) — tag 0, no payload bytes needed.
+        assert_eq!(decode_canonical(&hx("c0")), Err(CborError::Tag));
+    }
+
+    #[test]
+    fn float_or_simple_is_rejected() {
+        // Immediate simple values (false/true/null/undefined) and the 1-byte
+        // form (info 24, value > 23). Deliberately NOT f9/fa/fb (float16/32/64),
+        // whose payload could trip the shortest-form check first (D4).
+        for input in ["f4", "f5", "f6", "f7", "f8 ff"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::FloatOrSimple),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_text_map_key_is_rejected() {
+        for input in ["a1 00 00", "a1 41 61 00"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::NonTextMapKey),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsorted_map_key_is_rejected() {
+        // "b" then "a" — plain descending order.
+        assert_eq!(
+            decode_canonical(&hx("a2 61 62 00 61 61 00")),
+            Err(CborError::UnsortedMapKey)
+        );
+        // "aa" (len 2) then "b" (len 1) — violates length-first tiebreak even
+        // though "aa" > "b" bytewise is irrelevant; length must sort first.
+        assert_eq!(
+            decode_canonical(&hx("a2 62 61 61 00 61 62 00")),
+            Err(CborError::UnsortedMapKey)
+        );
+    }
+
+    #[test]
+    fn duplicate_map_key_is_rejected() {
+        assert_eq!(
+            decode_canonical(&hx("a2 61 61 00 61 61 00")),
+            Err(CborError::DuplicateMapKey)
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        for input in ["62 ff ff", "a1 62 ff ff 00"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::InvalidUtf8),
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_exceeded_one_past_the_cap() {
+        // MAX_DEPTH + 1 nested single-element arrays; the innermost leaf would
+        // be read at depth MAX_DEPTH + 1 — one past the cap.
+        let mut bytes = vec![0x81u8; MAX_DEPTH + 1];
+        bytes.push(0x00);
+        assert_eq!(decode_canonical(&bytes), Err(CborError::DepthExceeded));
+    }
+
+    #[test]
+    fn length_overflow_on_huge_declared_count() {
+        // map(*) count 2^63; `checked_len`'s `n.checked_mul(2)` overflows a
+        // 64-bit `usize` before any allocation is attempted.
+        assert_eq!(
+            decode_canonical(&hx("bb 80 00 00 00 00 00 00 00")),
+            Err(CborError::LengthOverflow)
+        );
+    }
+
+    // ---- Accept paths + round-trip, for all five `CborValue` kinds. ----
+
+    #[test]
+    fn uint_boundaries_accept_and_round_trip() {
+        let cases = [
+            ("00", 0u64),
+            ("17", 23),
+            ("18 18", 24),
+            ("18 ff", 255),
+            ("19 01 00", 256),
+            ("19 ff ff", 65_535),
+            ("1a 00 01 00 00", 65_536),
+            ("1b 00 00 00 01 00 00 00 00", 1u64 << 32),
+        ];
+        for (input, expected) in cases {
+            let bytes = hx(input);
+            let value = decode_canonical(&bytes).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(value, CborValue::Uint(expected), "input {input}");
+            assert_eq!(encode(&value), bytes, "round-trip for {input}");
+        }
+    }
+
+    #[test]
+    fn bytes_accept_and_round_trip() {
+        for (input, expected) in [("40", vec![]), ("43 01 02 03", vec![1u8, 2, 3])] {
+            let bytes = hx(input);
+            let value = decode_canonical(&bytes).unwrap();
+            assert_eq!(value, CborValue::Bytes(expected));
+            assert_eq!(encode(&value), bytes);
+        }
+    }
+
+    #[test]
+    fn text_accept_and_round_trip() {
+        for (input, expected) in [("60", ""), ("65 68 65 6c 6c 6f", "hello")] {
+            let bytes = hx(input);
+            let value = decode_canonical(&bytes).unwrap();
+            assert_eq!(value, CborValue::Text(expected.to_owned()));
+            assert_eq!(encode(&value), bytes);
+        }
+    }
+
+    #[test]
+    fn array_accept_and_round_trip() {
+        let empty = hx("80");
+        assert_eq!(decode_canonical(&empty).unwrap(), CborValue::Array(vec![]));
+        assert_eq!(encode(&CborValue::Array(vec![])), empty);
+
+        let bytes = hx("82 01 02");
+        let expected = CborValue::Array(vec![CborValue::Uint(1), CborValue::Uint(2)]);
+        assert_eq!(decode_canonical(&bytes).unwrap(), expected);
+        assert_eq!(encode(&expected), bytes);
+    }
+
+    #[test]
+    fn map_accept_and_round_trip() {
+        let empty = hx("a0");
+        assert_eq!(decode_canonical(&empty).unwrap(), CborValue::Map(vec![]));
+        assert_eq!(encode(&CborValue::Map(vec![])), empty);
+
+        let one = hx("a1 61 61 01");
+        let one_expected = CborValue::Map(vec![("a".to_owned(), CborValue::Uint(1))]);
+        assert_eq!(decode_canonical(&one).unwrap(), one_expected);
+        assert_eq!(encode(&one_expected), one);
+
+        let two = hx("a2 61 61 01 61 62 02");
+        let two_expected = CborValue::Map(vec![
+            ("a".to_owned(), CborValue::Uint(1)),
+            ("b".to_owned(), CborValue::Uint(2)),
+        ]);
+        assert_eq!(decode_canonical(&two).unwrap(), two_expected);
+        assert_eq!(encode(&two_expected), two);
+    }
+
+    #[test]
+    fn nesting_at_max_depth_is_accepted() {
+        // The boundary counterpart to `depth_exceeded_one_past_the_cap`: exactly
+        // MAX_DEPTH nested arrays, leaf read at depth MAX_DEPTH, must be accepted.
+        let mut bytes = vec![0x81u8; MAX_DEPTH];
+        bytes.push(0x00);
+        let value = decode_canonical(&bytes).expect("MAX_DEPTH nesting must be accepted");
+        assert_eq!(encode(&value), bytes);
+    }
+
+    // ---- Canonical map ordering (encoder side). ----
+
+    #[test]
+    fn encoder_sorts_scrambled_map_keys_into_canonical_order() {
+        let scrambled = CborValue::Map(vec![
+            ("b".to_owned(), CborValue::Uint(2)),
+            ("a".to_owned(), CborValue::Uint(1)),
+        ]);
+        assert_eq!(encode(&scrambled), hx("a2 61 61 01 61 62 02"));
+    }
+
+    #[test]
+    fn encoder_orders_shorter_key_before_longer_key() {
+        // "z" (len 1) must sort before "aa" (len 2) under length-first order,
+        // even though 'z' > 'a' bytewise.
+        let value = CborValue::Map(vec![
+            ("aa".to_owned(), CborValue::Uint(2)),
+            ("z".to_owned(), CborValue::Uint(1)),
+        ]);
+        let decoded = decode_canonical(&encode(&value)).unwrap();
+        assert_eq!(
+            decoded,
+            CborValue::Map(vec![
+                ("z".to_owned(), CborValue::Uint(1)),
+                ("aa".to_owned(), CborValue::Uint(2)),
+            ])
+        );
+    }
+}

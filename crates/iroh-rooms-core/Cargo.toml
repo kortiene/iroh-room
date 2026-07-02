@@ -61,4 +61,7 @@ rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 [dev-dependencies]
 # Temporary directory / file creation for file-backed store e2e tests.
 tempfile = "3"
+# Property-based robustness/round-trip tests for the strict CBOR reader (risk
+# R1, IR-0002 follow-up). Dev-only so validate-only consumers stay lean.
+proptest = "1"
 
