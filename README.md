@@ -20,6 +20,12 @@ troubleshooting guide and the availability model. Every step is implemented and 
 against the shipped binary, and the whole two-humans-plus-one-agent flow it describes is
 proven end-to-end by the automated `full_demo_e2e.rs` suite (issue #34 / IR-0209, below).
 
+## Protocol
+
+[`docs/protocol.md`](docs/protocol.md) is the implementer reference for the wire/signature/
+membership contract — the byte-level rules for building or auditing an interoperable peer,
+without reading the whole `PHASE-0-SPIKE.md`.
+
 ## Current Status
 
 The **canonical signed event model** has landed in `iroh-rooms-core::event`
