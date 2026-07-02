@@ -13,6 +13,12 @@
 //!   close: no such pipe in any room             → `pipe_close_absent_pipe_exits_nonzero_with_hint`
 //!   close: --help shows `<PIPE_ID>` only         → `pipe_close_help_shows_pipe_id_not_room_id`
 //!   list: unknown room → fails                  → `pipe_list_unknown_room_exits_nonzero`
+//!
+//!   IR-0305 doc-backing (`docs/live-pipe-preview.md` §4.7 case 2 — non-member,
+//!   `error[peer_unauthorized]`, exit 3, checked locally before any dial):
+//!   expose: non-member refused                   → `pipe_expose_non_member_is_refused`
+//!   connect: non-member refused                  → `pipe_connect_non_member_is_refused`
+//!   close: non-member refused                    → `pipe_close_non_member_is_refused`
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -577,10 +583,20 @@ fn pipe_list_closed_pipe_is_not_shown() {
         .stdout(predicate::str::contains("no open pipes"));
 }
 
-// ── pipe expose: non-member error ─────────────────────────────────────────────
+// ── pipe expose/connect/close: non-member error (IR-0305 doc-backing) ─────────
+//
+// `docs/live-pipe-preview.md`'s "Unauthorized access behavior" section documents,
+// verbatim, that a caller who is not an active member of the room is turned away
+// **locally, before any dial** by `pipe connect` (and `pipe expose` / `pipe
+// close`) with the coded line `error[peer_unauthorized]: you are not an active
+// member of room …` and exit code `3`. All three commands reach this check via a
+// purely local `fold_room` + `snapshot.is_active` lookup (see `pipe.rs::expose`,
+// `::connect`, `::close`) before any network IO, so the case is deterministic and
+// needs no live node — these three tests pin the guide's exact claim per command.
 
 /// `pipe expose` with a caller who is NOT an active member of the room must fail
-/// with an actionable "not an active member" error (issue AC1 / spec §13.2.1).
+/// with the coded `error[peer_unauthorized]:` line, exit `3`, and an actionable
+/// "not an active member" message (issue AC1 / spec §13.2.1; guide §4.7 case 2).
 /// The room exists in the local store (so `fold_room` succeeds) but the CLI
 /// identity is not the room admin/member.
 #[test]
@@ -591,7 +607,7 @@ fn pipe_expose_non_member_is_refused() {
     // Seed a room whose admin is a different identity (not the CLI user).
     let room_id_str = seed_genesis_only(&home, [0xF0; 32], [0xF1; 32], [0xFA; 16]);
 
-    cmd(&home)
+    let out = cmd(&home)
         .args([
             "pipe",
             "expose",
@@ -601,9 +617,96 @@ fn pipe_expose_non_member_is_refused() {
             "--allow",
             &fake_allow_id(),
         ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not an active member"));
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a non-member `pipe expose` must exit 3 (Auth); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("error[peer_unauthorized]:"),
+        "must render the coded peer_unauthorized line the guide quotes; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not an active member"),
+        "must explain why in plain language; stderr: {stderr}"
+    );
+}
+
+/// `pipe connect` with a caller who is NOT an active member of the room must fail
+/// the same way as `pipe expose` above — this is the guide's headline
+/// AC3/§4.7-case-2 example, and the check happens before `pipe connect` ever
+/// resolves the pipe id or dials a peer, so an arbitrary well-formed pipe id is
+/// enough to reach it.
+#[test]
+fn pipe_connect_non_member_is_refused() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+
+    let room_id_str = seed_genesis_only(&home, [0xF2; 32], [0xF3; 32], [0xFB; 16]);
+    let arbitrary_pipe_id = "c".repeat(32);
+
+    let out = cmd(&home)
+        .args([
+            "pipe",
+            "connect",
+            &room_id_str,
+            &arbitrary_pipe_id,
+            "--local",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a non-member `pipe connect` must exit 3 (Auth); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("error[peer_unauthorized]:"),
+        "must render the coded peer_unauthorized line the guide quotes; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not an active member"),
+        "must explain why in plain language; stderr: {stderr}"
+    );
+}
+
+/// `pipe close` with a caller who is NOT an active member of the room must also
+/// fail with `error[peer_unauthorized]:` / exit `3`, distinct from the
+/// non-owner/non-admin *active*-member case already covered by
+/// `pipe_close_by_a_non_owner_non_admin_member_exits_3_peer_unauthorized` in
+/// `error_taxonomy_e2e.rs`. `--room` bypasses pipe-id-based room inference, so no
+/// pipe needs to exist for the caller to reach the membership check.
+#[test]
+fn pipe_close_non_member_is_refused() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+
+    let room_id_str = seed_genesis_only(&home, [0xF4; 32], [0xF5; 32], [0xFC; 16]);
+    let arbitrary_pipe_id = "d".repeat(32);
+
+    let out = cmd(&home)
+        .args(["pipe", "close", &arbitrary_pipe_id, "--room", &room_id_str])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a non-member `pipe close` must exit 3 (Auth); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("error[peer_unauthorized]:"),
+        "must render the coded peer_unauthorized line the guide quotes; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not an active member"),
+        "must explain why in plain language; stderr: {stderr}"
+    );
 }
 
 // ── pipe expose: optional flag argument parsing ───────────────────────────────
