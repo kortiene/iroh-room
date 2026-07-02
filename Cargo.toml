@@ -13,6 +13,12 @@ members = [
   # loopback self-check passes — but CI cannot prove NAT traversal (that is the
   # manual two-host run documented in `crates/spike-nat/NOTES.md`).
   "crates/spike-nat",
+  # Throwaway spike (IR-0006): the `transport-probe` gossip-vs-full-mesh
+  # transport comparison harness (Spike Plan Day 4). Kept in the workspace so
+  # CI proves it builds and its loopback self-check passes — every claim it
+  # measures is CI-reproducible (unlike spike-nat, this spike needs no real
+  # network). See `crates/spike-transport/NOTES.md` for the decision memo.
+  "crates/spike-transport",
 ]
 resolver = "2"
 

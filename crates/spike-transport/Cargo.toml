@@ -1,0 +1,55 @@
+# Throwaway spike crate (IR-0006). The `transport-probe` harness: a minimal
+# full-mesh backend and a minimal `iroh-gossip` backend behind one trait,
+# driving the same signed `WireEvent` payloads through both over N=2..5
+# in-process loopback nodes, measuring propagation latency, reconnect
+# behavior, late-join history gap, admission model, and implementation
+# complexity (`PHASE-0-SPIKE.md` ADR-1 / Spike Plan Day 4). It MUST NOT be
+# depended on by the shipping crates (`iroh-rooms-core` / `iroh-rooms-cli` /
+# `iroh-rooms-net`). See `NOTES.md` for the API reconciliation, the measured
+# comparison table, and the decision memo.
+[package]
+name = "spike-transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack has a higher
+# MSRV than the workspace-declared value (mirrors spike-nat / spike-blobs).
+publish = false
+
+[lib]
+name = "spike_transport"
+path = "src/lib.rs"
+
+[[bin]]
+name = "transport-probe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `sync` (which enables `store`) gives us `WireEvent`/`EventId`/the public
+# event builders for the shared workload, and `SyncMessage::AdminTip` for the
+# Residual-13 admin-tip-carrier probe (§7.7).
+iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
+# The exact pin the shipping carrier (`iroh-rooms-net`) and the other spikes run on.
+iroh = "=1.0.1"
+# The D1 candidate. Reconciled against `iroh 1.0.1` first (NOTES.md §2): this
+# exact pin resolves and builds cleanly against `iroh = "=1.0.1"` with zero
+# API drift found in the surface this spike uses.
+iroh-gossip = "=0.101.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+async-trait = "0.1"
+# `GossipReceiver`'s `Stream` impl; `.next()` needs `StreamExt` in scope.
+futures-util = "0.3"
+# The gossip broadcast payload type (`GossipSender::broadcast`).
+bytes = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
