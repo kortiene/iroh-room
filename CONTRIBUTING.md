@@ -86,3 +86,7 @@ The gate currently runs:
 1. `cargo fmt --all --check`
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace --all-targets --all-features`
+4. `cargo test -p iroh-rooms --doc` (the SDK façade's module doctests; `--all-targets` above
+   does not run doctests)
+5. `cargo build -p iroh-rooms --examples` (the façade's `examples/` under default/stable
+   features; `--all-features` above already covers the `experimental`-feature build)

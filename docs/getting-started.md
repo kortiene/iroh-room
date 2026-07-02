@@ -1130,6 +1130,17 @@ Gate A (NAT/relay) for the connectivity model. This variant is not required to p
 
 ---
 
+## Using it as a library
+
+Everything this guide walks through with the `iroh-rooms` binary is also reachable as a Rust
+library: `crates/iroh-rooms` is the public Rust SDK façade (issue #36 / IR-0301) — a curated,
+stability-tiered re-export of the same `identity` / `room` / `events` / `files` / `pipes` surface
+the CLI drives, split into a **stable** offline-protocol tier (on by default) and an
+**experimental** online-runtime tier (`--features experimental`). See
+`crates/iroh-rooms/src/lib.rs` for the crate docs and stability policy, and
+`crates/iroh-rooms/examples/` for runnable examples mirroring this guide's steps — start with
+`cargo run -p iroh-rooms --example offline_author_and_validate`.
+
 ## Next steps & references
 
 - `PRD.v0.3.md` — product requirements and MVP scope (§6 demo, §14 availability, §15 journeys,
@@ -1137,5 +1148,6 @@ Gate A (NAT/relay) for the connectivity model. This variant is not required to p
 - `PHASE-0-SPIKE.md` — protocol design: §1 identity/keys, §5 pipe/blob authorization, §6
   invite capabilities, §7 event-type registry, §8 rejection/flag taxonomy.
 - `CONTRIBUTING.md` — workflow, branch naming, and the `scripts/verify.sh` quality gate.
+- `docs/sdk-coverage.md` — the Rust SDK façade's coverage audit against the CLI's own usage.
 - Backlog: the Phase 0 epic and engineering slices live in
   [GitHub Issues](https://github.com/kortiene/iroh-room/issues).

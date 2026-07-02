@@ -23,7 +23,7 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh_rooms_core::event::keys::SigningKey;
+use iroh_rooms::identity::SigningKey;
 use zeroize::{Zeroize, Zeroizing};
 
 /// File name of the public identity profile.

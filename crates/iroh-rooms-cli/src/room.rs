@@ -15,13 +15,11 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh_rooms_core::event::build_room_created;
-use iroh_rooms_core::event::content::Content;
-use iroh_rooms_core::event::ids::RoomId;
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::event::signed::{self, SignedEvent};
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::membership::{MembershipSnapshot, Role, RoomMembership};
+use iroh_rooms::events::{validate_wire_bytes, Content, SignedEvent, ValidationContext};
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::{
+    build_room_created, derive_room_id, MembershipSnapshot, Role, RoomId, RoomMembership,
+};
 use iroh_rooms_core::store::EventStore;
 use serde_json::{json, Map, Value};
 
@@ -98,7 +96,7 @@ pub fn create(home: &Path, name: &str) -> Result<CreateSummary> {
     let created_at = clock::now_ms();
 
     let sender_id = secret.identity.identity_key();
-    let room_id = signed::derive_room_id(&sender_id, &room_nonce, created_at);
+    let room_id = derive_room_id(&sender_id, &room_nonce, created_at);
 
     let wire = build_room_created(
         &secret.identity,

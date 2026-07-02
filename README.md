@@ -5,8 +5,9 @@ iroh. The MVP target is a CLI-first room where two humans and one agent can
 exchange signed messages, share a verified artifact, expose a private live TCP
 pipe, and keep room data locally without a central application server.
 
-This repository is currently in Phase 0: technical spike and MVP foundation.
-The product and protocol source-of-truth documents are:
+The Phase 0/1 technical spike and MVP foundation are complete (see "Current
+Status" below); the repository is now in Phase 2, "Developer Preview." The
+product and protocol source-of-truth documents are:
 
 - `PRD.v0.3.md` — current product requirements and MVP scope.
 - `PHASE-0-SPIKE.md` — protocol design, ADRs, spike plan, and residual risks.
@@ -888,12 +889,48 @@ Plane transport; gossip is parked as an optional off-critical-path
 liveness/admin-tip carrier. See `crates/spike-transport/NOTES.md` for the
 measured table and the decision memo.
 
+Phase 2 ("Developer Preview") opens with the **public Rust SDK façade**,
+landed in the new `crates/iroh-rooms` crate (issue #36 / IR-0301) — the first
+change since the Phase-0/1 loop above closed the MVP that adds a new
+consumer-facing surface rather than a new runtime capability:
+
+- `iroh-rooms` re-exports the already-shipped `iroh-rooms-core`/`iroh-rooms-net`
+  surface through five domain modules — `identity`, `room`, `events`, `files`,
+  `pipes` — plus an `experimental` cargo-feature-gated namespace for the
+  online runtime (`session`, `sync`, `store`, `blob`, `pipe_runtime`).
+  Re-exports, not re-wraps: a façade type and its `core`/`net` original are
+  the identical type, so mixing the façade with a direct `core`/`net`
+  dependency never produces two incompatible copies of the same type.
+- **Stable = offline/deterministic protocol, experimental = online runtime**
+  is the organizing split: the default-features **stable** tier is exactly
+  the conformance-tested, byte-stable layer (event authoring/validation, the
+  membership fold, the ticket codec), so its API shape implies no post-MVP
+  capability (no multi-device, no call plane, no availability layer) by
+  construction; every **experimental** item is feature-gated and doc-marked
+  `Experimental (unstable API)`.
+- `examples/` (`01_identity` … `07_agent_status`, plus
+  `offline_author_and_validate`) mirror `docs/getting-started.md`'s demo
+  end-to-end as compilable, runnable programs, and every stable module also
+  carries doctests. `scripts/verify.sh` now runs `cargo test -p iroh-rooms
+  --doc` and builds every example under default features (both otherwise
+  skipped by the existing `--all-targets` run).
+- `crates/iroh-rooms-cli` migrated its offline authoring path (`identity`,
+  `room` create/members, `invite`, and the `build_*` call sites in
+  `message`/`file`) to import through the façade instead of
+  `iroh-rooms-core` directly — proof the boundary is real, not just
+  documented. `docs/sdk-coverage.md` is the full audit: every symbol the CLI
+  imports from `core`/`net` maps to a façade path, with none left over.
+- `iroh-rooms-core` and `iroh-rooms-net` gained a doc note marking themselves
+  implementation crates and pointing at the façade as the supported entry
+  point; neither crate's behavior changed.
+
 ## Repository Layout
 
 ```text
 crates/iroh-rooms-core/   Core protocol and domain library
 crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe, agent subcommands)
 crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
+crates/iroh-rooms/        Public Rust SDK façade (IR-0301): curated, stability-tiered re-exports + examples/
 crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
 crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)
 crates/spike-transport/   Throwaway gossip-vs-full-mesh transport comparison (`transport-probe`, IR-0006)

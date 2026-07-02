@@ -10,6 +10,12 @@
 //! Ed25519 signing/verification under `device_id`, the [`event::WireEvent`]
 //! envelope, strict per-type content validation, and the stateless
 //! [`event::validate::validate_wire_bytes`] pipeline.
+//!
+//! **This is an implementation crate.** The supported SDK entry point is the
+//! `iroh-rooms` façade (issue #36 / IR-0301), which re-exports a curated,
+//! documented, stability-tiered subset of this crate's surface. Depend on
+//! this crate directly only for advanced use; every item here may change
+//! without the façade's `0.x` stability policy.
 
 pub mod event;
 
