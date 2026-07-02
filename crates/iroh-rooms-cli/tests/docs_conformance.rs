@@ -1098,3 +1098,138 @@ fn guide_states_zero_peer_send_is_success_not_failure() {
          not failure; spec §5.5)"
     );
 }
+
+// ── IR-0303 (issue #38): next-action reference + verbose diagnostics docs gate ──
+//
+// AC1/AC2/AC4 add a *human* half to the taxonomy docs the #25 gates above do not
+// cover: a per-code **Next action** reference in the README (the counterpart to
+// `ErrorCode::next_action()`), the additive `next: <action>` render-line contract,
+// and a **Verbose network diagnostics** section documenting the opt-in `--verbose`
+// / `diag:` block. These gates keep the docs in lockstep with the emitter so a
+// script/human reader can trust the reference (spec §5.2/§5.5, Step 6).
+
+/// The distinctive next-action phrase each user-actionable code carries in the
+/// README reference table, kept identical to the `&'static str` templates pinned by
+/// `src/error.rs::next_action`. A missing row (or drifted wording) breaks the gate.
+/// Structural/crypto codes and the context-only codes (`internal`/`invalid_argument`)
+/// have no next action, so they are intentionally absent.
+const NEXT_ACTION_PHRASES: &[(&str, &str)] = &[
+    ("identity_not_found", "identity create"),
+    ("invalid_room_id", "copy the room id"),
+    ("room_not_found", "join an invite ticket first"),
+    ("no_such_file", "check the path"),
+    ("permission_denied", "read permissions"),
+    ("file_too_large", "split or compress"),
+    ("no_discovery_hint", "--peer <admin-addr>"),
+    ("not_a_member", "complete `room join` first"),
+    ("insufficient_role", "with the intended role"),
+    ("expired_invite", "fresh `room invite`"),
+    ("bad_capability", "re-issue the invite"),
+    ("wrong_identity", "identity show"),
+    ("peer_unauthorized", "membership has synced"),
+    ("hash_mismatch", "do not trust this file"),
+    ("no_admin_reachable", "--accept-joins"),
+    ("peer_offline", "come online"),
+    ("blob_unavailable", "retry `file fetch`"),
+];
+
+#[test]
+fn readme_error_code_reference_names_a_next_action_per_actionable_code() {
+    // AC1/AC2 (spec §5.2): the README carries a per-code reference table with a
+    // **Next action** column, and every user-actionable code names its concrete
+    // step there — the documented counterpart to the emitter.
+    let content = readme();
+    assert!(
+        content.contains("| Code | Category | Exit | Meaning | Next action |"),
+        "README must carry the IR-0303 per-code reference table with a `Next action` column"
+    );
+    let mut missing: Vec<&str> = Vec::new();
+    for (code, phrase) in NEXT_ACTION_PHRASES {
+        // Each code must have a documented next action naming the concrete step.
+        if !content.contains(code) || !content.contains(phrase) {
+            missing.push(code);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "README reference is missing a documented next action for: {missing:?} \
+         (add/repair the row, or update NEXT_ACTION_PHRASES if the template changed)"
+    );
+}
+
+#[test]
+fn readme_documents_the_next_action_render_contract() {
+    // AC2: the `next:` line is documented as *additive* — it never replaces the
+    // machine `error[<code>]:` line, so a script matching `^error\[` or branching on
+    // `$?` is unaffected. Pin that the README spells this out (spec §5.1 OQ-1).
+    let content = readme();
+    assert!(
+        content.contains("next: <action>"),
+        "README must document the `next: <action>` render line (IR-0303 §5.1)"
+    );
+    assert!(
+        content.contains("additive"),
+        "README must state the `next:` line is additive (does not change the machine surface)"
+    );
+}
+
+#[test]
+fn readme_and_guide_document_verbose_diagnostics_vocabulary() {
+    // AC4 (spec §5.3/§5.5, Step 6c): both docs must document the opt-in `--verbose`
+    // diagnostics surface with the exact greppable vocabulary the CLI renders — the
+    // `diag:` prefix and the four `path=` classifications — so a reader can map the
+    // output. Asserted over README and guide together.
+    for (name, content) in [("README.md", readme()), ("getting-started.md", guide())] {
+        for token in ["--verbose", "diag:", "path=direct", "relay="] {
+            assert!(
+                content.contains(token),
+                "{name} must document the verbose-diagnostics token `{token}` (IR-0303 §5.3)"
+            );
+        }
+        // The four path classifications must all be named so their meaning is documented.
+        for label in ["direct", "relay", "mixed", "none"] {
+            assert!(
+                content.contains(label),
+                "{name} must document the `{label}` path classification (IR-0303 §5.3)"
+            );
+        }
+    }
+}
+
+#[test]
+fn guide_has_a_verbose_network_diagnostics_section() {
+    // AC4: the getting-started guide must carry a dedicated Verbose network
+    // diagnostics subsection (spec §5.5) showing how to run it and reading the block.
+    let content = guide();
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("verbose network diagnostics"),
+        "guide must contain a `Verbose network diagnostics` section (IR-0303 §5.5)"
+    );
+    assert!(
+        content.contains("room members <ROOM_ID> --status --verbose")
+            || content.contains("--status --verbose"),
+        "guide must show how to run the verbose status command (IR-0303 §5.3)"
+    );
+}
+
+#[test]
+fn guide_states_verbose_diagnostics_leak_no_secrets_and_grant_no_trust() {
+    // AC3 (docs half): the verbose section must state the `diag:` block carries no
+    // secret (private key / ticket secret / payload) and is diagnostic-only — never
+    // an authorization input (spec §5.4/§9). The no-leak invariant is enforced in
+    // code by the e2e no-leak test; here we gate that the docs make the promise.
+    let content = guide();
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("never contain a private key")
+            || (lower.contains("diag:") && lower.contains("secret")),
+        "guide's verbose section must state the diag: block leaks no private key/secret (AC3)"
+    );
+    assert!(
+        lower.contains("never feeds an authorization decision")
+            || lower.contains("diagnostic only")
+            || lower.contains("never a trust input"),
+        "guide must state the diagnostics are advisory only, never an authorization input"
+    );
+}

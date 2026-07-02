@@ -898,9 +898,15 @@ reason codes are stable identifiers also written to the local audit log.
   Alice's row if she cannot be reached within the timeout.
 
   `pipe connect` is the one command in this list that actually fails when the
-  target is offline: it prints `error[peer_offline]: the pipe owner is unreachable:
-  …` and exits `6` (issue #25 / IR-0110 §5.7) — the command-failure twin of the
-  connection panel's `offline` state.
+  target is offline: it prints the two-line shape (issue #25 / IR-0110 §5.7 / issue
+  #38 / IR-0303) and exits `6` — the command-failure twin of the connection panel's
+  `offline` state:
+
+  ```text
+  error[peer_offline]: the pipe owner is unreachable: …
+  next: ask the owner to come online (run `room tail <ROOM_ID>`), then retry; or
+  pass `--peer <owner-addr>`
+  ```
 
 - **Next action:** bring the peer back online and retry. Nothing is queued anywhere;
   delivery resumes only when both peers are online together. The `reason` field
@@ -939,6 +945,8 @@ reason codes are stable identifiers also written to the local audit log.
 
   ```text
   error[ticket_bad_checksum]: invite ticket failed its checksum (corrupted on copy-paste?)
+  next: check the whole ticket was copied (no truncation/whitespace); if it persists, ask
+  the admin for a fresh `room invite`
   ```
 
   A ticket that decodes fine but whose capability secret or identity does not match the
@@ -947,6 +955,7 @@ reason codes are stable identifiers also written to the local audit log.
 
   ```text
   error[bad_capability]: this ticket's secret or identity does not match the invite (bad_capability)
+  next: ask the admin to re-issue the invite for your identity id
   ```
 
   A ticket bound to a different identity than Bob's own reports `error[wrong_identity]`
@@ -970,8 +979,9 @@ reason codes are stable identifiers also written to the local audit log.
   `6` (issue #25 / IR-0110 §5.5) — distinct from any authorization rejection:
 
   ```text
-  error[no_admin_reachable]: could not bootstrap the room membership within 10s; is the room
-  admin online and accepting joins? Pass `--peer <admin-addr>` for a deterministic dial.
+  error[no_admin_reachable]: could not bootstrap the room membership within 10s
+  next: ask the admin to run `room tail <ROOM_ID> --accept-joins`, then retry; or pass
+  `--peer <admin-addr>`
   ```
 
 - **Next action:** have the admin start `iroh-rooms room tail <ROOM_ID> --accept-joins` and
@@ -987,8 +997,8 @@ reason codes are stable identifiers also written to the local audit log.
 
   ```text
   error[blob_unavailable]: file file_…2c is currently unavailable: no peer holding it is online.
-  There is no central inbox and no guaranteed offline delivery — ask a provider to run
-  `iroh-rooms room tail <ROOM_ID>`, then retry `file fetch`
+  There is no central inbox and no guaranteed offline delivery
+  next: ask a peer that holds the file to run `room tail <ROOM_ID>`, then retry `file fetch`
   ```
 
   The fetch fails within the bounded per-provider timeout (`--timeout`, default 30s) — never a
@@ -1001,8 +1011,8 @@ reason codes are stable identifiers also written to the local audit log.
 
     ```text
     error[peer_unauthorized]: file file_…2c could not be fetched: every provider refused the
-    connection — this identity (…) is not an active member from their view. Ask the admin to
-    confirm your membership has synced, then retry
+    connection — this identity (…) is not an active member from their view
+    next: ask the admin to confirm your membership has synced, then retry
     ```
 
     exits `3` (Auth).
@@ -1014,6 +1024,8 @@ reason codes are stable identifiers also written to the local audit log.
     error[hash_mismatch]: integrity check FAILED: fetched bytes hash blake3:… but the reference
     declares blake3:…; refusing to save (the file reference or a provider may be corrupt — do
     not trust this file)
+    next: do not trust this file; the reference or a provider may be corrupt — ask for a
+    fresh `file share`
     ```
 
     exits `4` (Integrity); nothing is saved.
@@ -1054,6 +1066,39 @@ Every reason code above (and a few more — `wrong_identity`, `no_discovery_hint
   inbound event whose timestamp is far from local time. The event is still accepted, ordered,
   and displayed; the session still exits `0`.
 - `room send` reaching zero reachable peers is availability, not failure: it always exits `0`.
+- Every `error[<code>]:` line is immediately followed by a `next: <action>` stderr line naming
+  the concrete next step (issue #38 / IR-0303) — the two-line shape shown throughout this
+  section. It is a second, additive line; the `error[<code>]:` prefix and exit code above are
+  unchanged, so a script matching `^error\[` or branching on `$?` still works.
+
+### Verbose network diagnostics
+
+`room members <ROOM_ID> --status --verbose` (`-v`) and `room tail <ROOM_ID> --verbose` append a
+stderr-only `diag:` block (issue #38 / IR-0303, §18.1/§18.5) — hidden unless you ask for it, so
+the default output is unchanged. It surfaces the network facts you need to self-diagnose a P2P
+failure: your own dialable address(es) + home relay url, and each known peer's live path —
+`direct` (a hole-punched UDP path — the good case), `relay` (relayed only — it works, just
+slower / usually behind NAT), `mixed` (both currently active — not yet fully hole-punched), or
+`none` (no active transport at all — always true for an `offline` or `unauthorized` peer, which
+never renders as reachable):
+
+```text
+$ iroh-rooms room members <ROOM_ID> --status --verbose
+room: blake3:…
+admin: …
+member: … role=admin status=active conn=self
+member: … role=member status=active conn=connected
+peers: 1 connected, 0 offline, 0 unauthorized
+diag: local id=<endpoint_id> direct=192.168.1.20:45001 relay=none
+diag: peer 9a0211bd device=7f3a2c1b state=connected path=direct relay=none
+diag: transport connected=1 (direct=1 relay=0 mixed=0) offline=0 unauthorized=0
+```
+
+The `diag:` lines never contain a private key, a ticket secret, or a message payload — only
+public identifiers (an `EndpointId`/`IdentityKey`), connection-state labels, IP socket
+addresses, and relay URLs, the same secret-free guarantee every other error/warning line makes.
+Path type is read directly from iroh's live transport state, never inferred from latency, and is
+diagnostic only — it never feeds an authorization decision.
 
 ---
 

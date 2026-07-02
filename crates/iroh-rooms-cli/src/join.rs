@@ -120,10 +120,8 @@ pub async fn join(
         // the on-log `gate_join` (key binding) remains the convergent authority.
         crate::bail_coded!(
             ErrorCode::WrongIdentity,
-            "this invite ticket is bound to a different identity ({}); your identity is {}. \
-             Ask the admin to invite {} instead.",
+            "this invite ticket is bound to a different identity ({}); your identity is {}",
             ticket.invitee_key,
-            self_id,
             self_id
         );
     }
@@ -134,7 +132,7 @@ pub async fn join(
         crate::bail_coded!(
             ErrorCode::NoDiscoveryHint,
             "the invite ticket carries no admin discovery hint; cannot reach the room admin to \
-             bootstrap the join (pass `--peer <admin-addr>`)"
+             bootstrap the join"
         );
     }
 
@@ -382,10 +380,7 @@ async fn wait_for_invited(
     polled.map_err(|_| {
         crate::error::CliError::new(
             ErrorCode::NoAdminReachable,
-            format!(
-                "could not bootstrap the room membership within {timeout:?}; is the room admin \
-                 online and accepting joins? Pass `--peer <admin-addr>` for a deterministic dial."
-            ),
+            format!("could not bootstrap the room membership within {timeout:?}"),
         )
         .into()
     })

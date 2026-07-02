@@ -139,6 +139,91 @@ impl ErrorCode {
     pub fn exit_code(&self) -> u8 {
         self.category().exit_code()
     }
+
+    /// A stable, secret-free next step for a human — the "what do I do now" line
+    /// (spec IR-0303 §5.1). `None` for codes where the call-site message already
+    /// carries all the context there is (`internal`, `invalid_argument`), or where
+    /// no generic action applies (a structural/crypto reject). Every arm returns a
+    /// fixed `&'static str` template — no interpolation — so this is structurally
+    /// incapable of leaking a secret; runtime detail (paths, ids, a resolved
+    /// `--peer`) stays in the [`CliError`] message, not here.
+    #[must_use]
+    pub fn next_action(&self) -> Option<&'static str> {
+        match self {
+            Self::IdentityNotFound => {
+                Some("run `iroh-rooms identity create --name <name>` first")
+            }
+            Self::InvalidRoomId => Some(
+                "copy the room id from `room create` / `room members` (form `blake3:<hex>`)",
+            ),
+            Self::RoomNotFound => {
+                Some("run `iroh-rooms room create <name>`, or join an invite ticket first")
+            }
+            Self::NoSuchFile => Some(
+                "check the path for `file share`, or run `file list` / `room tail` first \
+                 to sync the reference for `file fetch`",
+            ),
+            Self::PermissionDenied => {
+                Some("check the file's read permissions, or share a copy you can read")
+            }
+            Self::FileTooLarge => {
+                Some("the MVP share limit is fixed; split or compress the file")
+            }
+            Self::NoDiscoveryHint => {
+                Some("pass `--peer <admin-addr>` (the ticket carried no discovery hint)")
+            }
+            Self::NoAdminReachable => Some(
+                "ask the admin to run `room tail <ROOM_ID> --accept-joins`, then retry; \
+                 or pass `--peer <admin-addr>`",
+            ),
+            Self::PeerOffline(_) => Some(
+                "ask the owner to come online (run `room tail <ROOM_ID>`), then retry; \
+                 or pass `--peer <owner-addr>`",
+            ),
+            Self::PeerUnauthorized => {
+                Some("ask the admin to confirm your membership has synced, then retry")
+            }
+            Self::WrongIdentity => {
+                Some("ask the admin to re-issue the invite for your identity id (`identity show`)")
+            }
+            Self::BlobUnavailable => Some(
+                "ask a peer that holds the file to run `room tail <ROOM_ID>`, then retry `file fetch`",
+            ),
+            Self::HashMismatch => Some(
+                "do not trust this file; the reference or a provider may be corrupt — \
+                 ask for a fresh `file share`",
+            ),
+            Self::Ticket(_) => Some(
+                "check the whole ticket was copied (no truncation/whitespace); if it persists, \
+                 ask the admin for a fresh `room invite`",
+            ),
+            Self::Reject(r) => reject_next_action(r),
+            Self::InvalidArgument | Self::Internal => None, // context is in the message
+        }
+    }
+}
+
+/// The `next_action()` for a §8 [`RejectReason`] (spec IR-0303 §5.1): the five
+/// authorization-layer reasons are user-fixable; every other named reason today is
+/// a structural/crypto rejection, which is not something a user can act on — `None`.
+/// `RejectReason` is `#[non_exhaustive]`, so an unrecognized future reason
+/// conservatively falls through to `None` too, until this table is extended.
+fn reject_next_action(r: &RejectReason) -> Option<&'static str> {
+    match r {
+        RejectReason::ExpiredInvite => {
+            Some("ask the admin for a fresh `room invite` (optionally with a longer `--expires`)")
+        }
+        RejectReason::BadCapability => {
+            Some("ask the admin to re-issue the invite for your identity id")
+        }
+        RejectReason::InsufficientRole => {
+            Some("ask the admin to invite you with the intended role")
+        }
+        RejectReason::NotAMember | RejectReason::UnboundDevice => {
+            Some("ask the admin to invite you and complete `room join` first")
+        }
+        _ => None,
+    }
 }
 
 impl From<RejectReason> for ErrorCode {
@@ -558,5 +643,116 @@ mod tests {
         let err = call_bail_coded().unwrap_err();
         assert_eq!(super::code_of(&err), Some(ErrorCode::RoomNotFound));
         assert_eq!(err.to_string(), "no room blake3:ab");
+    }
+
+    // ── ErrorCode::next_action() (spec IR-0303 §5.1) ──────────────────────────
+
+    #[test]
+    fn every_user_actionable_code_has_a_non_empty_next_action() {
+        for code in [
+            ErrorCode::IdentityNotFound,
+            ErrorCode::InvalidRoomId,
+            ErrorCode::RoomNotFound,
+            ErrorCode::NoSuchFile,
+            ErrorCode::PermissionDenied,
+            ErrorCode::FileTooLarge,
+            ErrorCode::NoDiscoveryHint,
+            ErrorCode::NoAdminReachable,
+            ErrorCode::PeerOffline(OfflineReason::Unreachable),
+            ErrorCode::PeerUnauthorized,
+            ErrorCode::WrongIdentity,
+            ErrorCode::BlobUnavailable,
+            ErrorCode::HashMismatch,
+            ErrorCode::Ticket(TicketError::BadChecksum),
+        ] {
+            let action = code.next_action();
+            assert!(
+                action.is_some_and(|s| !s.is_empty()),
+                "{code:?} must have a non-empty next_action"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_and_invalid_argument_have_no_generic_next_action() {
+        // Their context lives entirely in the call-site message.
+        assert_eq!(ErrorCode::Internal.next_action(), None);
+        assert_eq!(ErrorCode::InvalidArgument.next_action(), None);
+    }
+
+    #[test]
+    fn user_fixable_reject_reasons_have_a_next_action() {
+        for reason in [
+            RejectReason::ExpiredInvite,
+            RejectReason::BadCapability,
+            RejectReason::InsufficientRole,
+            RejectReason::NotAMember,
+            RejectReason::UnboundDevice,
+        ] {
+            let action = ErrorCode::Reject(reason.clone()).next_action();
+            assert!(
+                action.is_some_and(|s| !s.is_empty()),
+                "{reason:?} must have a non-empty next_action"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_reject_reasons_have_no_next_action() {
+        // Crypto/structural rejects are not something a user can act on.
+        for reason in [
+            RejectReason::BadSignature,
+            RejectReason::IdMismatch,
+            RejectReason::NonCanonicalEncoding,
+        ] {
+            assert_eq!(ErrorCode::Reject(reason).next_action(), None);
+        }
+    }
+
+    #[test]
+    fn room_not_found_has_one_consistent_next_action_regardless_of_call_site() {
+        // Spec §5.1 "room_not_found fix": all three sites collapse to the same
+        // rendering once the message is trimmed and the step comes from here.
+        assert_eq!(
+            ErrorCode::RoomNotFound.next_action(),
+            Some("run `iroh-rooms room create <name>`, or join an invite ticket first")
+        );
+    }
+
+    #[test]
+    fn no_next_action_string_contains_a_secret_looking_token() {
+        // Belt-and-suspenders (spec §5.1 Step 1c): every next_action is a fixed
+        // literal, but pin that none of them accidentally embeds anything that
+        // looks like a long base32/hex run (a secret would never legitimately
+        // appear here since the strings never interpolate).
+        let all_codes = [
+            ErrorCode::IdentityNotFound,
+            ErrorCode::InvalidRoomId,
+            ErrorCode::RoomNotFound,
+            ErrorCode::NoSuchFile,
+            ErrorCode::PermissionDenied,
+            ErrorCode::FileTooLarge,
+            ErrorCode::NoDiscoveryHint,
+            ErrorCode::NoAdminReachable,
+            ErrorCode::PeerOffline(OfflineReason::Unreachable),
+            ErrorCode::PeerUnauthorized,
+            ErrorCode::WrongIdentity,
+            ErrorCode::BlobUnavailable,
+            ErrorCode::HashMismatch,
+            ErrorCode::Ticket(TicketError::BadChecksum),
+        ];
+        for code in all_codes {
+            if let Some(action) = code.next_action() {
+                let longest_alnum_run = action
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    longest_alnum_run < 16,
+                    "{code:?}'s next_action contains a suspiciously long token: {action}"
+                );
+            }
+        }
     }
 }
