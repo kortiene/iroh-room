@@ -86,6 +86,19 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
 >   ```
 >   Every step in this guide that is runnable (Steps 1–6) is exercised by the suite.
+> - **Issue #34 / IR-0209** adds the Phase 1B full-demo integration test suite
+>   (`crates/iroh-rooms-cli/tests/full_demo_e2e.rs`) — the executable transcript of this whole
+>   guide with the full three-party cast (two humans plus one agent), driving every command
+>   this guide documents through the real binary. The CI tier (offline backbone,
+>   restart-validation across every MVP event type, and the agent-posts-but-has-no-admin-
+>   privilege pair) runs automatically via `cargo test`. The full online tier — three-way
+>   membership convergence, a live agent status push, dual file fetch+verify, and the
+>   authorized/unauthorized live-pipe pair — is `#[ignore]`-gated; run it locally with:
+>   ```bash
+>   cargo test -p iroh-rooms-cli --test full_demo_e2e -- --ignored --test-threads=1
+>   ```
+>   Every step in this guide (Steps 1–7, plus the optional restart check) is exercised by the
+>   suite.
 >
 > General notes:
 >
