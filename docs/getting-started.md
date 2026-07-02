@@ -1,5 +1,9 @@
 # Getting Started: the Iroh Rooms demo
 
+See also: [`docs/protocol.md`](protocol.md) for the byte-level protocol contract (wire format,
+signatures, membership fold, reason codes) if you're implementing or auditing a peer rather
+than just running the demo.
+
 This guide walks you, from a clean checkout and a fresh local data directory, through the
 full Iroh Rooms MVP flow on a single machine:
 

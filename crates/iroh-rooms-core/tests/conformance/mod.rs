@@ -60,10 +60,19 @@
 //!
 //! The [`taxonomy`] gate (`every_reason_and_flag_is_covered_or_deferred`) enforces
 //! that this table stays complete (AC5); `DEFERRED` is empty.
+//!
+//! ## `docs/protocol.md` reconciliation (IR-0302 / #37)
+//!
+//! [`docs_reference`] is the drift gate for the implementer reference doc: it
+//! embeds `docs/protocol.md` (`include_str!`) and asserts the doc's reason/flag
+//! codes, `constants.rs` bounds + context strings, Tier-1 golden ids, and
+//! vector→test map all still match this suite and the landed code — the "runnable
+//! & reconciled" half of the doc's own acceptance criteria.
 
 pub mod fixtures;
 
 mod advisory;
+mod docs_reference;
 mod idempotency_ordering;
 mod membership;
 mod serialization;

@@ -200,6 +200,10 @@ This is a *deliberately scoped* hand-roll: we build the easy, MVP-sized sync and
 
 # Event Protocol
 
+> `docs/protocol.md` is the condensed implementer view of this section and Membership &
+> Ordering below — read it first if you just need to build or audit a conforming peer; this
+> document stays the normative source for byte-level values and the decision rationale.
+
 This section defines the wire- and signature-level contract for every event in the Room Event Plane. It is normative: an event that does not satisfy these rules MUST be rejected. All multi-byte integers in derivations are big-endian unless stated otherwise. The golden test vector in Protocol Test Vectors §1 is authoritative for byte-level conformance (independently reproduced during this spike).
 
 ## 1. Identity and Key Model
