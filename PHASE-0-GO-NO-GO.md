@@ -295,6 +295,13 @@ and ADR-1/ADR-2; the Gate A two-host run is a P0 blocking exit condition
 before any external preview or before this CONDITIONAL GO can be upgraded to
 an unconditional GO.
 
+The "before any external preview" gate above is now mechanized at preview
+cadence by [`RELEASE-READINESS.md`](RELEASE-READINESS.md) (IR-0306): its
+Sign-off records Gate A's status per candidate build (still tracked as P1 —
+pending, non-blocking for a *developer* preview — pointing at the same
+`crates/spike-nat/results/results.md`), while `scripts/release-readiness.sh`
+mechanizes the P0 test gate this memo's Gates B–E are drawn from.
+
 ---
 
 ## 8. Evidence / traceability matrix

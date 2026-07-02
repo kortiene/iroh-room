@@ -90,3 +90,22 @@ The gate currently runs:
    does not run doctests)
 5. `cargo build -p iroh-rooms --examples` (the façade's `examples/` under default/stable
    features; `--all-features` above already covers the `experimental`-feature build)
+
+## Cutting a Developer Preview
+
+`scripts/verify.sh` gates every pull request, but it does not run the flaky,
+resource-heavy `#[ignore]`-gated online test tiers (real loopback processes
+and sockets). Before cutting a developer preview build, additionally run:
+
+```bash
+scripts/release-readiness.sh
+```
+
+This runs `scripts/verify.sh` plus every P0 online tier and prints a single
+`release-readiness: READY` / `NOT READY` verdict from real exit codes — a
+preview cannot be marked ready while a P0 test is failing. Work through
+[`RELEASE-READINESS.md`](RELEASE-READINESS.md) for the full checklist (pipe
+security, blob verification, and agent flow review; known MVP limitations;
+security warnings; dependency/churn review; demo verification against
+`docs/getting-started.md`; and the release-notes template), and paste the
+verdict line into its Sign-off section.
