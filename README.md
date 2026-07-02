@@ -930,6 +930,32 @@ consumer-facing surface rather than a new runtime capability:
   implementation crates and pointing at the façade as the supported entry
   point; neither crate's behavior changed.
 
+The **example agent** has landed in `crates/iroh-rooms/examples/example_agent/`
+(issue #39 / IR-0304), turning `07_agent_status.rs`'s "seed for an example
+agent" doc comment into a runnable program:
+
+- A minimal, arg-driven Rust program that drives a room entirely **through the
+  SDK's `experimental` tier** (`Node::spawn`, `node.publish(...)`, …) — not by
+  shelling out to the `iroh-rooms` binary — demonstrating the intended
+  third-party integration model.
+- Sets up its own local identity (`example_agent identity`, no central-service
+  credentials), joins a room by the ticket an admin issues with
+  `agent invite` (`example_agent join --ticket … --peer …`), posts one or more
+  signed `agent.status` updates, and can optionally share one artifact via
+  `--artifact <PATH>` (`file.shared`).
+- Its capabilities are explicit and limited to the room membership its invite
+  ticket granted: admission is seeded solely from the ticket's discovery hint,
+  it joins at the least-privileged `agent` role, and it authors only
+  `member.joined`/`agent.status`/(optional) `file.shared` — never anything
+  implying admin authority. A co-located `README.md` states this posture
+  plainly and gives a line-referenced guide for adapting the example into a
+  real agent integration.
+- Proven by a new `crates/iroh-rooms/tests/example_agent_e2e.rs`: a
+  deterministic CI tier (identity persistence round-trip, offline event
+  authoring/validation) plus an `#[ignore]`-gated loopback tier that runs the
+  built example binary against an in-process admin node and asserts its
+  signed `agent.status` appears in the room tail — the issue's Test Plan.
+
 ## Repository Layout
 
 ```text

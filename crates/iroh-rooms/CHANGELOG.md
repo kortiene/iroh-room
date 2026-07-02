@@ -5,6 +5,13 @@ All notable changes to the `iroh-rooms` SDK façade are documented here. See
 changes only on a minor bump (with an entry here and a deprecation window
 where feasible); the **experimental** tier may change on any release.
 
+## Unreleased
+
+- Added `examples/example_agent/` (issue #39 / IR-0304): a minimal, runnable
+  example agent driven by real command-line arguments — the adapt-me-as-a-
+  template evolution of `07_agent_status.rs` — plus a co-located `README.md`
+  and a gated integration test. Docs-and-examples only; no SDK surface change.
+
 ## 0.1.0 — initial surface (IR-0301)
 
 Initial developer-preview release. Defines the SDK boundary:
