@@ -44,7 +44,7 @@ use iroh_rooms_net::{
 };
 use serde_json::json;
 
-use crate::error::CodedResultExt;
+use crate::error::{CodedResultExt, ErrorCode};
 use crate::message::{
     build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
     select_heads, DB_FILE,
@@ -414,6 +414,50 @@ pub struct FetchSummary {
     pub provider: EndpointId,
 }
 
+/// Tally of per-provider fetch outcomes across the loop below, used to classify
+/// the terminal failure honestly when no provider served the bytes (spec IR-0205
+/// §5.2 — the unauthorized-vs-unavailable split). Not a trust input; purely for
+/// reporting which coded terminal state to render.
+#[derive(Default)]
+struct FetchTally {
+    /// Provider reachable but refused the connection (an authorization wall).
+    denied_at_connect: usize,
+    /// Provider reachable, active, but not serving this hash (an availability gap).
+    denied_per_hash: usize,
+    /// Provider offline / timed out (an availability gap).
+    unreachable: usize,
+    /// Total non-fetch, non-hash-mismatch attempts tallied above.
+    attempted: usize,
+}
+
+/// The honest terminal classification when no provider served the bytes (spec
+/// IR-0205 §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFailure {
+    /// Every reachable provider refused the connection — an authorization wall,
+    /// not an availability gap.
+    Unauthorized,
+    /// At least one provider was unreachable or reachable-but-not-serving, and
+    /// none authorized+served — the honest MVP-limitation state.
+    Unavailable,
+}
+
+impl FetchTally {
+    /// `Unauthorized` iff every attempted provider was `DeniedAtConnect` — the one
+    /// outcome that is a pure authorization signal. Any availability gap in the mix
+    /// (an unreachable or per-hash-denying provider) makes the honest headline
+    /// "unavailable", since a holder may still come online later. An empty tally
+    /// (no providers attempted) is also `Unavailable`.
+    #[must_use]
+    fn classify(&self) -> FetchFailure {
+        if self.attempted > 0 && self.denied_at_connect == self.attempted {
+            FetchFailure::Unauthorized
+        } else {
+            FetchFailure::Unavailable
+        }
+    }
+}
+
 /// Fetch a shared file from an available provider, verify its content hash, and
 /// save it locally (spec §5.2): resolve the `file.shared` reference (syncing it
 /// if absent), discover providers from its metadata, dial each in order over the
@@ -438,7 +482,7 @@ pub async fn fetch(
     loopback: bool,
 ) -> Result<FetchSummary> {
     // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
-    let file_id = parse_file_id(file_id_str)?;
+    let file_id = parse_file_id(file_id_str).coded(ErrorCode::InvalidArgument)?;
     let peer_addrs = parse_peers(peers)?;
 
     // ---- Identity + membership (mirrors `pipe connect` / `room send`). ----
@@ -449,7 +493,8 @@ pub async fn fetch(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
-        bail!(
+        crate::bail_coded!(
+            ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can fetch \
              files (this identity is {self_id})"
         );
@@ -493,7 +538,8 @@ pub async fn fetch(
 
     let Some((shared, author_device)) = file_ref else {
         let _ = node.shutdown().await;
-        bail!(
+        crate::bail_coded!(
+            ErrorCode::NoSuchFile,
             "no such file {file_id_str} in room {room_id}; has it been shared and synced? try \
              running `room tail` first"
         );
@@ -503,7 +549,8 @@ pub async fn fetch(
     if let Some(format) = shared.blob_format.as_deref() {
         if format != BLOB_FORMAT_RAW {
             let _ = node.shutdown().await;
-            bail!(
+            crate::bail_coded!(
+                ErrorCode::InvalidArgument,
                 "file {file_id_str} uses blob_format={format}, which this version cannot fetch \
                  (raw only)"
             );
@@ -514,13 +561,19 @@ pub async fn fetch(
     let providers = resolve_providers(&shared, author_device, self_device, &peer_addrs);
     if providers.is_empty() {
         let _ = node.shutdown().await;
-        bail!("file {file_id_str} is currently unavailable: no provider holding it is online");
+        crate::bail_coded!(
+            ErrorCode::BlobUnavailable,
+            "file {file_id_str} is currently unavailable: no peer holding it is online. There \
+             is no central inbox and no guaranteed offline delivery — ask a provider to run \
+             `iroh-rooms room tail {room_id}`, then retry `file fetch`"
+        );
     }
 
     // ---- Sequential per-provider fetch loop (spec §5.2 step 7). ----
     let declared = *shared.blob_hash.as_bytes();
     let mut fetched = None;
     let mut hash_mismatch: Option<String> = None;
+    let mut tally = FetchTally::default();
     for provider_addr in &providers {
         let (outcome, data) = node
             .fetch_file(provider_addr.clone(), declared, declared, timeout)
@@ -531,12 +584,16 @@ pub async fn fetch(
                 break;
             }
             FetchOutcome::DeniedAtConnect => {
+                tally.denied_at_connect += 1;
+                tally.attempted += 1;
                 eprintln!(
                     "provider {} denied the connection (are you an active member?)",
                     short_endpoint(provider_addr.id)
                 );
             }
             FetchOutcome::DeniedPerHash => {
+                tally.denied_per_hash += 1;
+                tally.attempted += 1;
                 eprintln!(
                     "provider {} will not serve this hash",
                     short_endpoint(provider_addr.id)
@@ -550,6 +607,8 @@ pub async fn fetch(
                 break;
             }
             FetchOutcome::Unavailable => {
+                tally.unreachable += 1;
+                tally.attempted += 1;
                 eprintln!("provider {} unreachable", short_endpoint(provider_addr.id));
             }
         }
@@ -557,16 +616,31 @@ pub async fn fetch(
 
     if let Some(got) = hash_mismatch {
         let _ = node.shutdown().await;
-        bail!(
+        crate::bail_coded!(
+            ErrorCode::HashMismatch,
             "integrity check FAILED: fetched bytes hash blake3:{got} but the reference declares \
-             {}; refusing to save",
+             {}; refusing to save (the file reference or a provider may be corrupt — do not \
+             trust this file)",
             shared.blob_hash
         );
     }
 
     let Some((data, provider_id)) = fetched else {
         let _ = node.shutdown().await;
-        bail!("file {file_id_str} is currently unavailable: no provider holding it is online");
+        match tally.classify() {
+            FetchFailure::Unauthorized => crate::bail_coded!(
+                ErrorCode::PeerUnauthorized,
+                "file {file_id_str} could not be fetched: every provider refused the \
+                 connection — this identity ({self_id}) is not an active member from their \
+                 view. Ask the admin to confirm your membership has synced, then retry"
+            ),
+            FetchFailure::Unavailable => crate::bail_coded!(
+                ErrorCode::BlobUnavailable,
+                "file {file_id_str} is currently unavailable: no peer holding it is online. \
+                 There is no central inbox and no guaranteed offline delivery — ask a \
+                 provider to run `iroh-rooms room tail {room_id}`, then retry `file fetch`"
+            ),
+        }
     };
 
     node.shutdown()
@@ -966,7 +1040,7 @@ mod tests {
         classify_path, default_name, downloads_dir, effective_max_share_bytes, file_handle,
         guess_mime, parse_file_id, provider_label, provider_token, resolve_output_path,
         resolve_providers, sanitize_name, save_atomic, short_endpoint, validate_mime,
-        validate_share_name, DOWNLOADS_ENV, MAX_SHARE_BYTES_ENV,
+        validate_share_name, FetchFailure, FetchTally, DOWNLOADS_ENV, MAX_SHARE_BYTES_ENV,
     };
     use iroh::{EndpointAddr, EndpointId, SecretKey};
     use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
@@ -1541,6 +1615,87 @@ mod tests {
             0,
             "with no hint the address is bare (discovery resolves it)"
         );
+    }
+
+    // ── FetchTally::classify (spec IR-0205 §5.2 — the AC2 unauthorized-vs-
+    // unavailable split) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_all_denied_at_connect_is_unauthorized() {
+        let tally = FetchTally {
+            denied_at_connect: 2,
+            attempted: 2,
+            ..FetchTally::default()
+        };
+        assert_eq!(tally.classify(), FetchFailure::Unauthorized);
+    }
+
+    #[test]
+    fn classify_all_unreachable_is_unavailable() {
+        let tally = FetchTally {
+            unreachable: 2,
+            attempted: 2,
+            ..FetchTally::default()
+        };
+        assert_eq!(tally.classify(), FetchFailure::Unavailable);
+    }
+
+    #[test]
+    fn classify_mixed_denied_and_unreachable_is_unavailable() {
+        // One pure authorization refusal plus one availability gap: any gap in the
+        // mix keeps the honest headline "unavailable" (spec R1).
+        let tally = FetchTally {
+            denied_at_connect: 1,
+            unreachable: 1,
+            attempted: 2,
+            ..FetchTally::default()
+        };
+        assert_eq!(tally.classify(), FetchFailure::Unavailable);
+    }
+
+    #[test]
+    fn classify_all_denied_per_hash_is_unavailable() {
+        let tally = FetchTally {
+            denied_per_hash: 2,
+            attempted: 2,
+            ..FetchTally::default()
+        };
+        assert_eq!(tally.classify(), FetchFailure::Unavailable);
+    }
+
+    #[test]
+    fn classify_zero_attempted_is_unavailable() {
+        assert_eq!(FetchTally::default().classify(), FetchFailure::Unavailable);
+    }
+
+    #[test]
+    fn classify_denied_connect_and_per_hash_mix_is_unavailable() {
+        // A connection refusal (a pure authz wall) mixed with a per-hash denial
+        // (an availability gap — the provider is up but has not synced/does not
+        // hold the reference): since not *every* attempt was `DeniedAtConnect`,
+        // the honest headline stays "unavailable" (spec R1 — any availability gap
+        // in the mix wins). Distinct from the denied+unreachable mix above.
+        let tally = FetchTally {
+            denied_at_connect: 1,
+            denied_per_hash: 1,
+            attempted: 2,
+            ..FetchTally::default()
+        };
+        assert_eq!(tally.classify(), FetchFailure::Unavailable);
+    }
+
+    #[test]
+    fn classify_single_denied_at_connect_is_unauthorized() {
+        // The smallest all-refused case: exactly one provider, reachable, refused
+        // the connection — the pure authorization signal, so `Unauthorized` (never
+        // "unavailable"). Guards the `attempted > 0 && denied_at_connect ==
+        // attempted` boundary at attempted == 1.
+        let tally = FetchTally {
+            denied_at_connect: 1,
+            attempted: 1,
+            ..FetchTally::default()
+        };
+        assert_eq!(tally.classify(), FetchFailure::Unauthorized);
     }
 
     // ── save_atomic (spec §5.2 step 8) ────────────────────────────────────────

@@ -34,6 +34,28 @@
 //! connect, denied per-hash, unavailable) is the CI-tier, always-green
 //! `iroh-rooms-net/tests/blob_e2e.rs`.
 //!
+//! Issue #30 (IR-0205) "file unavailable state in the CLI" adds one more gated
+//! test — `every_provider_refused_is_peer_unauthorized` — proving the aggregate
+//! classifier's `peer_unauthorized` split (AC2) through a real two-node connect
+//! denial, on top of `file_cli.rs`'s already-CI-green offline splits
+//! (non-member pre-check → `not_a_member`; self-only provider set →
+//! `blob_unavailable`). The remaining IR-0205 headline state, `hash_mismatch`,
+//! has **no** CLI-level online test here: `file.rs::fetch` always calls
+//! `Node::fetch_file` with the same value for both `fetch_hash` and
+//! `declared_hash` (the value the `file.shared` reference declares), and
+//! `iroh-blobs`' content-addressed transfer guarantees the received bytes hash
+//! to whatever was requested — so a real two-CLI-process transfer can never
+//! disagree with itself. The two-hash split that manufactures a genuine
+//! mismatch is a Node-API-level seam (`iroh-rooms-net::fetch_blob`'s
+//! `fetch_hash`/`declared_hash` parameters), already exercised by the
+//! CI-tier, always-green `declared_hash_mismatch_is_rejected` in
+//! `iroh-rooms-net/tests/blob_e2e.rs`; the CLI's own coded rendering of that
+//! outcome is pinned by `error.rs`'s `hash_mismatch_is_integrity_exit_4` /
+//! `headline_fetch_failure_codes_are_pairwise_distinct` unit tests. Adding a
+//! CLI-process test here would require either a production-code seam solely
+//! for testing (out of IR-0205's explicit no-protocol-change scope) or a
+//! contrived non-representative setup, so this gap is intentional.
+//!
 //! The CI tier is deterministic and network-free (offline reads/writes over
 //! `rooms.db`) so it can never flake `scripts/verify.sh`. The online tier needs two
 //! live loopback processes to rendezvous, so it is `#[ignore]`-gated and run with the
@@ -1243,4 +1265,152 @@ async fn authorized_file_fetch_saves_and_verifies_blob() {
     );
 
     drop(alice_tail);
+}
+
+// ══ file fetch failure states (IR-0205 / issue #30): CLI-level proof of the
+// aggregate classifier's live split, on top of the CI-green offline splits in
+// `file_cli.rs` (`not_a_member`, `blob_unavailable`) ═══════════════════════════
+
+/// AC2 (issue #30) — every reachable provider refuses at connect
+/// (`error[peer_unauthorized]:`, exit 3), distinct from `blob_unavailable`
+/// (the self-only-provider case above) and from the pre-check `not_a_member`
+/// (`file_cli.rs::fetch_non_member_is_refused_with_not_a_member_code`, fully
+/// offline). The CLI ships no member-removal/leave command, so there is no way
+/// to make an *already-active* Room-A member fail Room A's own connect gate —
+/// this instead drives a real Gate 1 denial deterministically by pointing the
+/// sole named provider at a peer from a wholly unrelated room: Bob is a
+/// genuine active member of Room A (Alice's converged room), but the seeded
+/// `file.shared` names Charlie's device as its only provider, and Charlie is
+/// running `room tail` for his own separate Room C, which Bob was never
+/// invited to. `message::tail` scopes both the room-event admission and the
+/// blob-serving connect gate to the tailed room's own snapshot (seeded before
+/// the node ever accepts a connection, so there is no reconcile race), so
+/// Charlie denies Bob at connect every time — a deterministic, non-racy proof
+/// of `FetchTally::classify`'s `Unauthorized` arm via the real network path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+#[allow(clippy::too_many_lines)] // one linear converge-seed-fetch-assert flow; splitting hurts readability
+async fn every_provider_refused_is_peer_unauthorized() {
+    use iroh_rooms_core::event::build_file_shared;
+    use iroh_rooms_core::event::content::EventType;
+    use iroh_rooms_core::event::ids::{HashRef, RoomId};
+    use iroh_rooms_core::event::keys::SigningKey;
+    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms_core::store::EventStore;
+
+    let c = converge_two_member_room();
+
+    // Charlie: a wholly separate identity and room, never touched by Alice or Bob.
+    let charlie_home = TempDir::new().expect("charlie home");
+    identity_create(&charlie_home, "Charlie");
+    let charlie_room = room_create(&charlie_home, "Charlie's Own Room");
+    let charlie_tail = ChildSession::spawn(
+        charlie_home.path(),
+        &["room", "tail", &charlie_room, "--loopback"],
+    );
+    let charlie_listening = charlie_tail
+        .wait_for_line("listening:", WAIT)
+        .unwrap_or_else(|err| panic!("charlie tail never advertised an address: {err}"));
+    let charlie_addr = parse_listening(&charlie_listening);
+
+    // Reconstruct signing keys from the profiles the CLI already wrote (mirrors
+    // `file_cli.rs`'s seeding helper): Alice authors the seeded reference, and
+    // Charlie's device is the (unrelated) provider it names.
+    let signing_keys = |home: &TempDir| -> (SigningKey, SigningKey) {
+        let secret_raw = std::fs::read_to_string(home.path().join("identity.secret"))
+            .expect("identity.secret must exist after identity create");
+        let secret_v: serde_json::Value =
+            serde_json::from_str(&secret_raw).expect("identity.secret must be valid JSON");
+        let seed = |field: &str| -> [u8; 32] {
+            let hex_str = secret_v[field].as_str().expect("seed field present");
+            <[u8; 32]>::try_from(hex::decode(hex_str).expect("seed is valid hex").as_slice())
+                .expect("seed is 32 bytes")
+        };
+        (
+            SigningKey::from_seed(&seed("identity_secret")),
+            SigningKey::from_seed(&seed("device_secret")),
+        )
+    };
+    let (alice_identity_key, alice_device_key) = signing_keys(&c.alice_home);
+    let (_, charlie_device_signing) = signing_keys(&charlie_home);
+    let charlie_device = charlie_device_signing.device_key();
+
+    // Seed a `file.shared` directly into Bob's own log — the same technique
+    // `file_cli.rs::fetch_unsupported_blob_format_exits_nonzero_and_writes_nothing`
+    // uses to reach a fetch gate deterministically: authored by Alice (an
+    // active admin of Room A, so it stateless-validates), parented on Room A's
+    // genesis, naming Charlie's device as the sole provider. The declared hash
+    // is arbitrary — Gate 1 denies Bob before any hash is ever negotiated.
+    let room_id: RoomId = c.room.parse().expect("room id must parse");
+    let mut store =
+        EventStore::open(&c.bob_home.path().join("rooms.db")).expect("open bob's store to seed");
+    let genesis_id = store
+        .by_type(&room_id, EventType::RoomCreated)
+        .expect("read room.created events")
+        .first()
+        .expect("bob's synced log has room A's genesis")
+        .event_id;
+    let file_id = [0x99u8; 16];
+    let wire = build_file_shared(
+        &alice_identity_key,
+        &alice_device_key,
+        &room_id,
+        file_id,
+        "ghost.bin",
+        "application/octet-stream",
+        4096,
+        HashRef::from_bytes([0xCCu8; 32]),
+        Some("raw"),
+        &[charlie_device],
+        &[genesis_id],
+        1,
+    );
+    let validated = validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room_id))
+        .expect("a file.shared naming an unrelated provider still validates statelessly");
+    store.insert(&validated).expect("seed the file.shared");
+    drop(store);
+
+    let file_id_handle = format!("file_{}", hex::encode(file_id));
+    let fetch = one_shot(
+        c.bob_home.path(),
+        &[
+            "file",
+            "fetch",
+            &c.room,
+            &file_id_handle,
+            "--peer",
+            &charlie_addr,
+            "--loopback",
+        ],
+    );
+
+    assert!(
+        !fetch.status.success(),
+        "a fetch whose only named provider refuses at connect must fail"
+    );
+    assert_eq!(
+        fetch.status.code(),
+        Some(3),
+        "peer_unauthorized is an Auth-category failure (exit 3)"
+    );
+    let stderr = String::from_utf8_lossy(&fetch.stderr);
+    assert!(
+        stderr.contains("error[peer_unauthorized]:"),
+        "must render the pinned peer_unauthorized code, distinct from \
+         blob_unavailable/not_a_member; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("every provider refused the connection"),
+        "must name the aggregate refusal (AC2); stderr:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&fetch.stdout).is_empty(),
+        "AC3: stdout stays clean on failure"
+    );
+    assert!(
+        !c.bob_home.path().join("downloads").exists(),
+        "a peer_unauthorized fetch must write nothing to the downloads dir"
+    );
+
+    drop(charlie_tail);
 }

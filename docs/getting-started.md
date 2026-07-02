@@ -56,41 +56,33 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   (`peers: N connected, M offline, K unauthorized`) each time a peer's state changes.
 >   `room members <ROOM_ID> --status` is also available to query live connection state
 >   from a short-lived node without keeping a session running.
+> - **Step 5** (`iroh-rooms file share | list | fetch`) is implemented and runnable as of
+>   issue #29 / IR-0204, completing the Blob Plane #27 / IR-0202 started, with `file fetch`'s
+>   failure states made honest and coded by issue #30 / IR-0205 (see
+>   [Unavailable file](#unavailable-file) in Troubleshooting). Output blocks for all three
+>   commands are reconciled against the shipped binary and show the actual format. `file
+>   fetch` requires a provider to be online and serving — run `room tail` on the provider's
+>   terminal, which now also serves the blobs it holds over the ACL-gated `iroh-blobs` ALPN.
 > - **Step 6** (`iroh-rooms pipe expose | connect | close | list`) is implemented and runnable
 >   as of issue #14 / IR-0010, reconciled to the PRD canonical surface by issue #23 / IR-0108.
 >   Output blocks are reconciled against the shipped binary and show the actual format. One
 >   format note: `--tcp` requires an IP address (`127.0.0.1:3000`, not `localhost:3000`).
 >   `pipe close` now takes a bare `<PIPE_ID>` — the room is inferred from the local log; pass
 >   `--room <ROOM_ID>` only to disambiguate a pipe id shared across rooms.
-> - **Step 5** (`iroh-rooms file share` / `iroh-rooms file list`) is implemented and runnable
->   as of issue #27 / IR-0202. Output blocks for both commands are reconciled against the
->   shipped binary and show the actual format. Note that `file fetch` is **not yet
->   implemented** — the serve/fetch half is a tracked follow-up. After sharing, the file is
->   held locally; peers can see the reference via `file list` (with `provider: reference-only`)
->   but cannot yet fetch the bytes. The `file fetch` block in Step 5 remains *illustrative*.
 > - **Step 7** (`iroh-rooms agent status`) is **scaffold** — the `agent.status` content type
 >   exists but the binary does not yet expose a command to author one (tracked as a sibling
 >   follow-up to issue #31 / IR-0206). **Expected output** blocks for Step 7 are *illustrative*
 >   (consistent with `PRD.v0.3.md` §16 but not yet captured from a real run). `agent invite`
 >   (Step 3) is implemented and runnable.
-
-> - **Step 5** (`iroh-rooms file share | list | fetch`) is implemented and runnable as of
->   issue #29 / IR-0204, completing the Blob Plane #27 / IR-0202 started. Output blocks for
->   all three commands are reconciled against the shipped binary and show the actual format.
->   `file fetch` requires a provider to be online and serving — run `room tail` on the
->   provider's terminal, which now also serves the blobs it holds over the ACL-gated
->   `iroh-blobs` ALPN.
-> - **Step 7** — `agent` is scaffold — the binary does not recognise it yet. **Expected output**
->   blocks for Step 7 are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
->   captured from a real run).
 > - **Issue #24 / IR-0109** adds the Phase 1A two-peer integration test suite
 >   (`crates/iroh-rooms-cli/tests/two_peer_e2e.rs`). The CI tier (offline-backbone and
 >   restart-persistence tests) runs automatically via `cargo test`. The full online tier —
->   membership convergence and live pipe — is `#[ignore]`-gated; run it locally with:
+>   membership convergence, live pipe, and authorized/unauthorized file fetch — is
+>   `#[ignore]`-gated; run it locally with:
 >   ```bash
 >   cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
 >   ```
->   Every step in this guide that is runnable (Steps 1–4, Step 6) is exercised by the suite.
+>   Every step in this guide that is runnable (Steps 1–6) is exercised by the suite.
 >
 > General notes:
 >
@@ -951,19 +943,41 @@ reason codes are stable identifiers also written to the local audit log.
 
 - **Reproduce:** with Alice (the only provider — she is not running `room tail`, or her process
   is stopped), have Bob run `file fetch`.
-- **CLI reports** (PRD §9.2, §15.6 #6):
+- **CLI reports** (PRD §9.2, §14, §15.6 #6) a coded, script-branchable line and exits `6`
+  (Connectivity):
 
   ```text
-  file file_…2c is currently unavailable: no provider holding it is online
+  error[blob_unavailable]: file file_…2c is currently unavailable: no peer holding it is online.
+  There is no central inbox and no guaranteed offline delivery — ask a provider to run
+  `iroh-rooms room tail <ROOM_ID>`, then retry `file fetch`
   ```
 
   The fetch fails within the bounded per-provider timeout (`--timeout`, default 30s) — never a
-  hang. A hash mismatch is reported differently and distinctly (an integrity failure, not an
-  availability one):
+  hang. Nothing is written to the downloads directory.
 
-  ```text
-  integrity check FAILED: fetched bytes hash blake3:… but the reference declares blake3:…; refusing to save
-  ```
+  Two adjacent states are reported distinctly, never folded into `blob_unavailable`:
+
+  - **Every reachable provider refuses the connection** (an authorization wall, not an
+    availability gap — e.g. a provider whose ACL has not synced this identity in yet):
+
+    ```text
+    error[peer_unauthorized]: file file_…2c could not be fetched: every provider refused the
+    connection — this identity (…) is not an active member from their view. Ask the admin to
+    confirm your membership has synced, then retry
+    ```
+
+    exits `3` (Auth).
+
+  - **Hash mismatch** — the assembled bytes' independently recomputed BLAKE3-256 does not match
+    the reference's declared hash (a content-integrity failure, not an availability one):
+
+    ```text
+    error[hash_mismatch]: integrity check FAILED: fetched bytes hash blake3:… but the reference
+    declares blake3:…; refusing to save (the file reference or a provider may be corrupt — do
+    not trust this file)
+    ```
+
+    exits `4` (Integrity); nothing is saved.
 
 - **Next action:** have a peer that holds the file run `iroh-rooms room tail <ROOM_ID>`, then
   retry `file fetch`. MVP has no pinning or always-on node — availability follows the providers.
@@ -988,8 +1002,9 @@ events (spike §5, PRD §13.2) — inspect it to see exactly why a connection wa
 ### Stable error/warning lines and exit codes
 
 Every reason code above (and a few more — `wrong_identity`, `no_discovery_hint`,
-`no_admin_reachable`, `peer_offline`, `peer_unauthorized`, `blob_unavailable`) is rendered on
-**stderr** in one pinned shape a script can grep or branch on (issue #25 / IR-0110):
+`no_admin_reachable`, `peer_offline`, `peer_unauthorized`, `blob_unavailable`,
+`hash_mismatch`) is rendered on **stderr** in one pinned shape a script can grep or branch on
+(issue #25 / IR-0110):
 
 - A terminal command failure prints `error[<code>]: <message>` and exits with a small,
   documented category code (`2` = usage, `3` = auth, `4` = integrity, `5` = ticket,

@@ -690,9 +690,9 @@ failure (the long tail of prose errors not yet adopted into the taxonomy) still 
 | `1` | Internal | unexpected / uncoded internal error | `internal`, any uncoded failure |
 | `2` | Usage | bad input or environment | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
 | `3` | Auth | authorization / capability denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `wrong_identity`, `peer_unauthorized` |
-| `4` | Integrity | crypto / structural rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch` |
+| `4` | Integrity | crypto / structural rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch` |
 | `5` | Ticket | ticket decode failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
-| `6` | Connectivity | reachability / availability | `no_admin_reachable`, `peer_offline`, `blob_unavailable` (reserved for the serve/fetch follow-up) |
+| `6` | Connectivity | reachability / availability | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
 
 The taxonomy **wraps** the already-pinned protocol/net vocabulary rather than re-listing it:
 `bad_signature`/`not_a_member`/… reuse `RejectReason::code()` verbatim (so `room join` and a
@@ -736,14 +736,38 @@ command-failure twins (e.g. `pipe connect`). A clock-skewed but otherwise valid 
   spike (#13 / IR-0009) essentially verbatim and re-pointed at the real fold instead of a fixed
   fixture — no new authorization model, event schema, or crate version.
 
+**Honest file-unavailable state** has landed in `crates/iroh-rooms-cli` (issue #30 / IR-0205),
+a CLI-only, additive follow-up to #29/IR-0204 — no protocol, event schema, network, serve/fetch,
+or authorization behaviour changes, only how `file fetch` *names* an already-landed outcome:
+
+- `file fetch`'s terminal failure is now one of three distinct, coded, script-branchable states
+  instead of a bare `bail!`/exit 1: `error[blob_unavailable]:` (exit 6, Connectivity — no
+  reachable provider served the bytes), `error[peer_unauthorized]:` (exit 3, Auth — every
+  reachable provider refused the connection) or `error[not_a_member]:` (exit 3, Auth — the
+  caller itself is not an active member, checked before any node bring-up), and
+  `error[hash_mismatch]:` (exit 4, Integrity — the new CLI-native code; a fetched blob's
+  independently recomputed BLAKE3-256 disagrees with the reference's declared hash).
+- A `FetchTally`/`FetchFailure::classify()` aggregate over the per-provider loop's outcomes
+  (`DeniedAtConnect` / `DeniedPerHash` / `Unavailable`) decides `Unauthorized` only when
+  *every* attempted provider refused the connection; any availability gap in the mix (an
+  unreachable or per-hash-denying provider) keeps the honest headline `Unavailable`, since a
+  holder may still come online later.
+- `ErrorCode::BlobUnavailable` (defined ahead of time in IR-0110, previously unconstructed and
+  `#[allow(dead_code)]`) is now live — this issue is what emits it. Both unavailable messages
+  carry the PRD §14 availability language verbatim (no central inbox, no guaranteed offline
+  delivery) and name the concrete next step (`iroh-rooms room tail <ROOM_ID>`, then retry).
+- CLI tests cover the deterministic/offline tier (`file_cli.rs`: non-member pre-check,
+  self-only-provider and loop-exhausted `blob_unavailable`); the two live splits
+  (`peer_unauthorized`, and `hash_mismatch`'s CLI-level rendering) stay on the `#[ignore]`-gated
+  two-peer e2e tier / existing `blob_e2e.rs` + unit coverage, per `two_peer_e2e.rs`'s notes.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
-room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
-Phase 1A two-peer integration test, the hardened recent-history sync, file import, the CLI
-error taxonomy, and agent identity) are all landed.
+room-read CLI, the iroh transport, the live pipe, the peer connection manager, the Phase 1A
+two-peer integration test, the hardened recent-history sync, agent identity, the CLI error
+taxonomy, and the full Blob Plane — import, serve, fetch, and honest availability reporting)
+are all landed.
 
-Phase 1A two-peer integration test, the hardened recent-history sync, and the full Blob Plane —
-import, serve, and fetch) are all landed.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is agent status (tracked separately).

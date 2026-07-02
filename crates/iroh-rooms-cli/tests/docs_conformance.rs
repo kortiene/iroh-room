@@ -957,6 +957,7 @@ const ALL_ERROR_CODES: &[&str] = &[
     "too_many_parents",
     "not_genesis_descended",
     "room_id_mismatch",
+    "hash_mismatch",
     // Ticket (exit 5)
     "ticket_bad_prefix",
     "ticket_bad_base32",
@@ -1047,20 +1048,21 @@ fn readme_documents_every_exit_category() {
 }
 
 #[test]
-fn readme_marks_blob_unavailable_as_reserved() {
-    // Spec §5.10 / §3.3: `blob_unavailable` is defined now but only *emitted* by the
-    // future `file fetch`; the table must flag it reserved so a reader does not expect
-    // it from any landed command yet.
+fn readme_documents_blob_unavailable_as_emitted() {
+    // Spec IR-0205 §5.5/§6 Step 4: `blob_unavailable` is now emitted by `file fetch`
+    // (the honest no-online-provider terminal state), not merely reserved ahead of
+    // that command. The table must no longer flag it reserved, or a reader would
+    // wrongly believe no landed command produces it.
     let content = readme();
     assert!(
         content.contains("blob_unavailable"),
-        "README must document the reserved `blob_unavailable` code"
+        "README must document the `blob_unavailable` code"
     );
     let lower = content.to_lowercase();
     assert!(
-        lower.contains("reserved"),
-        "README Error codes section must mark `blob_unavailable` as reserved for the \
-         serve/fetch follow-up (spec §5.10)"
+        !lower.contains("reserved"),
+        "README Error codes section must not mark `blob_unavailable` as reserved — \
+         `file fetch` (IR-0205) now emits it"
     );
 }
 

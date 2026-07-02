@@ -25,14 +25,6 @@ use iroh_rooms_core::event::RejectReason;
 use iroh_rooms_core::ticket::TicketError;
 use iroh_rooms_net::OfflineReason;
 
-/// The reserved advisory message for [`ErrorCode::BlobUnavailable`] (spec §5.10,
-/// scope item 5) — defined now, ahead of the serve/fetch follow-up issue, so a
-/// future `file fetch` only has to *emit* the code, not invent its wording. Unused
-/// until that command lands (explicitly out of scope here — spec §3.3).
-#[allow(dead_code)]
-pub const BLOB_UNAVAILABLE_MESSAGE: &str =
-    "no reachable provider holds this file yet (peer fetch is not implemented in this build)";
-
 /// The unified CLI-facing failure taxonomy (spec §5.1). Wrapped arms
 /// ([`Self::Reject`], [`Self::Ticket`]) delegate their [`code`](Self::code) to the
 /// already-pinned source enum; the CLI never re-lists or renames a §8 code.
@@ -64,12 +56,15 @@ pub enum ErrorCode {
     /// The ticket carries no admin discovery hint and no `--peer` was given (AC3).
     NoDiscoveryHint,
 
-    /// No reachable provider holds the requested blob. Reserved for the `file
-    /// fetch` serve/fetch follow-up issue — defined now so the code + exit category
-    /// are pinned ahead of that phase. Not yet constructed anywhere: `file fetch`
-    /// is explicitly out of scope for this issue (spec §3.3).
-    #[allow(dead_code)]
+    /// No reachable provider holds the requested blob within the fetch timeout —
+    /// the honest MVP availability limitation (PRD §14: no central inbox, no
+    /// guaranteed offline delivery). Emitted by `file fetch` (spec IR-0205 §5.1).
     BlobUnavailable,
+
+    /// A fetched blob's independently recomputed BLAKE3-256 does not match the
+    /// `file.shared` reference's declared hash — a content-integrity failure, not
+    /// an availability or authorization one (spec IR-0205 §5.4).
+    HashMismatch,
 
     /// `--room-id`/positional room id argument does not parse (`blake3:<hex>`).
     InvalidRoomId,
@@ -104,6 +99,7 @@ impl ErrorCode {
             Self::WrongIdentity => "wrong_identity",
             Self::NoDiscoveryHint => "no_discovery_hint",
             Self::BlobUnavailable => "blob_unavailable",
+            Self::HashMismatch => "hash_mismatch",
             Self::InvalidRoomId => "invalid_room_id",
             Self::InvalidArgument => "invalid_argument",
             Self::NoSuchFile => "no_such_file",
@@ -129,6 +125,7 @@ impl ErrorCode {
             | Self::RoomNotFound
             | Self::NoDiscoveryHint => ErrorCategory::Usage,
             Self::WrongIdentity | Self::PeerUnauthorized => ErrorCategory::Auth,
+            Self::HashMismatch => ErrorCategory::Integrity,
             Self::Reject(reason) => reject_category(reason),
             Self::Ticket(_) => ErrorCategory::Ticket,
             Self::NoAdminReachable | Self::PeerOffline(_) | Self::BlobUnavailable => {
@@ -315,6 +312,7 @@ mod tests {
         assert_eq!(ErrorCode::WrongIdentity.code(), "wrong_identity");
         assert_eq!(ErrorCode::NoDiscoveryHint.code(), "no_discovery_hint");
         assert_eq!(ErrorCode::BlobUnavailable.code(), "blob_unavailable");
+        assert_eq!(ErrorCode::HashMismatch.code(), "hash_mismatch");
         assert_eq!(ErrorCode::InvalidRoomId.code(), "invalid_room_id");
         assert_eq!(ErrorCode::InvalidArgument.code(), "invalid_argument");
         assert_eq!(ErrorCode::NoSuchFile.code(), "no_such_file");
@@ -439,6 +437,53 @@ mod tests {
         assert_eq!(ErrorCode::WrongIdentity.category(), ErrorCategory::Auth);
     }
 
+    #[test]
+    fn hash_mismatch_is_integrity_exit_4() {
+        // Spec IR-0205 §5.4: the one new CLI-native integrity code, distinct from
+        // both `blob_unavailable` (Connectivity) and `peer_unauthorized`/
+        // `not_a_member` (Auth).
+        assert_eq!(ErrorCode::HashMismatch.code(), "hash_mismatch");
+        assert_eq!(ErrorCode::HashMismatch.category(), ErrorCategory::Integrity);
+        assert_eq!(ErrorCode::HashMismatch.exit_code(), 4);
+    }
+
+    #[test]
+    fn headline_fetch_failure_codes_are_pairwise_distinct() {
+        // Spec IR-0205 §5.1 / AC2 + the invalid-hash AC: `file fetch`'s three honest
+        // failure classes must be branchable on BOTH the string code AND the exit
+        // code — a script must never confuse "unavailable" (Connectivity, exit 6),
+        // "unauthorized" (Auth, exit 3), and "invalid hash" (Integrity, exit 4).
+        // Assert mutual distinctness on both axes in one place, so a future edit that
+        // collapses any pair (same code, or same exit) fails here rather than
+        // silently hiding one state behind another.
+        let unavailable = ErrorCode::BlobUnavailable;
+        let unauthorized = ErrorCode::PeerUnauthorized;
+        let invalid_hash = ErrorCode::HashMismatch;
+
+        // Distinct, pinned string codes.
+        assert_eq!(
+            [unavailable.code(), unauthorized.code(), invalid_hash.code()],
+            ["blob_unavailable", "peer_unauthorized", "hash_mismatch"]
+        );
+
+        // Distinct exit codes (Connectivity 6 ≠ Auth 3 ≠ Integrity 4).
+        assert_eq!(unavailable.exit_code(), 6);
+        assert_eq!(unauthorized.exit_code(), 3);
+        assert_eq!(invalid_hash.exit_code(), 4);
+        assert_ne!(unavailable.exit_code(), unauthorized.exit_code());
+        assert_ne!(unavailable.exit_code(), invalid_hash.exit_code());
+        assert_ne!(unauthorized.exit_code(), invalid_hash.exit_code());
+
+        // The not-active pre-check (`not_a_member`) shares the Auth exit (3) with
+        // `peer_unauthorized` — both are authorization walls — but keeps a distinct
+        // string code, so a script branching on the code still tells the two apart
+        // (spec §5.1 table: pre-check vs aggregate refusal).
+        let not_a_member = ErrorCode::Reject(RejectReason::NotAMember);
+        assert_eq!(not_a_member.code(), "not_a_member");
+        assert_eq!(not_a_member.exit_code(), 3);
+        assert_ne!(not_a_member.code(), unauthorized.code());
+    }
+
     // ── CodedResultExt / code_of ──────────────────────────────────────────────
 
     #[test]
@@ -491,22 +536,18 @@ mod tests {
     }
 
     #[test]
-    fn blob_unavailable_reserved_code_renders_via_cli_error() {
-        // Spec §5.10 / test #14: the reserved placeholder is fully wired at the taxonomy
-        // level (stable code, Connectivity exit 6, a secret-free reserved message) ahead
-        // of the serve/fetch issue that will *emit* it. Exercise the code + message now so
-        // that follow-up only swaps the construction site, not the contract.
+    fn blob_unavailable_renders_via_cli_error() {
+        // Spec IR-0205 §5.5: `blob_unavailable` is now emitted by `file fetch` with a
+        // context-specific message (file id / room interpolated at the call site), not
+        // a fixed reserved constant. Exercise the taxonomy-level contract directly.
         let err = anyhow::Error::new(CliError::new(
             ErrorCode::BlobUnavailable,
-            super::BLOB_UNAVAILABLE_MESSAGE,
+            "file file_deadbeef is currently unavailable: no peer holding it is online",
         ));
         let code = super::code_of(&err).expect("blob_unavailable must be a coded failure");
         assert_eq!(code.code(), "blob_unavailable");
         assert_eq!(code.category(), ErrorCategory::Connectivity);
         assert_eq!(code.exit_code(), 6);
-        // The reserved message is non-empty and never mentions a secret/token.
-        assert!(!super::BLOB_UNAVAILABLE_MESSAGE.is_empty());
-        assert_eq!(err.to_string(), super::BLOB_UNAVAILABLE_MESSAGE);
     }
 
     #[test]
