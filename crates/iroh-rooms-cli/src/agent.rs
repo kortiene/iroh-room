@@ -87,7 +87,9 @@ pub async fn status(
     }
     let related_artifact_ids = parse_artifacts(artifacts).coded(ErrorCode::InvalidArgument)?;
 
-    message::send_agent_status(
+    // Box::pin: CI's clippy (1.96) fires `large_futures` on this call; the
+    // send future carries the full net stack and exceeds the size threshold.
+    Box::pin(message::send_agent_status(
         home,
         room_id,
         status,
@@ -97,7 +99,7 @@ pub async fn status(
         peers,
         timeout,
         loopback,
-    )
+    ))
     .await
 }
 
