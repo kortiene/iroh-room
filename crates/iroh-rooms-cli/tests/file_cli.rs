@@ -1120,3 +1120,180 @@ fn share_mime_is_guessed_from_extension_at_cli_level() {
         "mime must be guessed as application/pdf for a .pdf file when --mime is omitted"
     );
 }
+
+// ── file fetch — pre-node argument & precondition gates (IR-0204 §8) ───────────
+//
+// These exercise the fast, deterministic failure paths that reject BEFORE any
+// network node is brought up: a bad file id / bad --timeout is caught pre-IO, a
+// missing identity and an unknown room are caught before the consumer node spawns.
+// The live transfer paths (valid fetch / hash mismatch / unavailable / unauthorized)
+// belong to the two-peer e2e tier, not here.
+
+/// A syntactically valid `file_<32-hex>` handle that resolves to no real file.
+const VALID_FILE_ID: &str = "file_00000000000000000000000000000000";
+
+#[test]
+fn fetch_invalid_file_id_exits_nonzero() {
+    // `parse_file_id` is the very first thing `file fetch` does — a malformed id
+    // fails before identity load or any node bring-up.
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["file", "fetch", FAKE_ROOM_ID, "not-a-valid-file-id"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid file id"));
+}
+
+#[test]
+fn fetch_bad_timeout_exits_nonzero_pre_io() {
+    // `--timeout` is parsed in the dispatcher before `file::fetch` runs, so a bad
+    // value writes nothing and dials nothing.
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args([
+            "file",
+            "fetch",
+            FAKE_ROOM_ID,
+            VALID_FILE_ID,
+            "--timeout",
+            "nope",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--timeout"));
+}
+
+#[test]
+fn fetch_no_identity_exits_nonzero() {
+    // With a valid id but no local identity, the fetch fails at secret load —
+    // still before the node comes up.
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["file", "fetch", FAKE_ROOM_ID, VALID_FILE_ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no identity"));
+}
+
+#[test]
+fn fetch_unknown_room_exits_nonzero() {
+    // A known identity fetching from a room that does not exist folds to an empty
+    // log and is rejected before any node bring-up.
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    cmd(&home)
+        .args(["file", "fetch", FAKE_ROOM_ID, VALID_FILE_ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no room"));
+}
+
+#[test]
+fn fetch_malformed_peer_exits_nonzero_pre_io() {
+    // `--peer` values are parsed (message::parse_peers) at the very top of
+    // `file::fetch`, right after the file id and before any identity load, store
+    // open, or node bring-up. A malformed endpoint id must therefore fail fast —
+    // even with no identity present — rather than dialing garbage.
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args([
+            "file",
+            "fetch",
+            FAKE_ROOM_ID,
+            VALID_FILE_ID,
+            "--peer",
+            "not-an-endpoint-id",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --peer"));
+}
+
+// ── file fetch: an unsupported blob_format is rejected before any provider dial
+// (spec §3.3 / §5.2 step 4 / §8 test plan) ─────────────────────────────────────
+//
+// `file share` always emits `blob_format = "raw"`, so the only way to reach this
+// gate at the CLI level is to seed a `hash_seq` `file.shared` directly into the
+// room's event store (the same `validate_wire_bytes -> EventStore` pipeline
+// `file share` itself uses — see `iroh-rooms-core/tests/file_shared_hashes.rs`).
+// Because the reference is already local, `fetch` finds it before any node
+// bring-up would be needed to sync it, so the format gate rejects deterministically
+// and offline (`--loopback` only guards the still-unconditional node spawn from
+// touching a real network).
+
+#[test]
+fn fetch_unsupported_blob_format_exits_nonzero_and_writes_nothing() {
+    use iroh_rooms_core::event::build_file_shared;
+    use iroh_rooms_core::event::content::EventType;
+    use iroh_rooms_core::event::ids::{HashRef, RoomId};
+    use iroh_rooms_core::event::keys::SigningKey;
+    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms_core::store::EventStore;
+
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id_str = create_room(&home);
+    let room_id: RoomId = room_id_str
+        .parse()
+        .expect("room create must print a parseable room id");
+
+    // Reconstruct the caller's identity/device signing keys from the profile the
+    // CLI just wrote, so the seeded event is authored by (and attributable to) an
+    // already-active member — the same device the room genesis bound.
+    let secret_raw = std::fs::read_to_string(home.path().join("identity.secret"))
+        .expect("identity.secret must exist after identity create");
+    let secret_v: serde_json::Value =
+        serde_json::from_str(&secret_raw).expect("identity.secret must be valid JSON");
+    let seed_bytes = |field: &str| -> [u8; 32] {
+        let hex_str = secret_v[field].as_str().expect("seed field present");
+        <[u8; 32]>::try_from(hex::decode(hex_str).expect("seed is valid hex").as_slice())
+            .expect("seed is 32 bytes")
+    };
+    let identity_key = SigningKey::from_seed(&seed_bytes("identity_secret"));
+    let device_key = SigningKey::from_seed(&seed_bytes("device_secret"));
+
+    // Seed a `file.shared` with `blob_format = "hash_seq"`, parented on the room's
+    // genesis (the only event in a fresh room).
+    let mut store = EventStore::open(&home.path().join("rooms.db")).expect("open rooms.db to seed");
+    let genesis_id = store
+        .by_type(&room_id, EventType::RoomCreated)
+        .expect("read room.created events")
+        .first()
+        .expect("a fresh room has a genesis event")
+        .event_id;
+
+    let file_id = [0x77u8; 16];
+    let wire = build_file_shared(
+        &identity_key,
+        &device_key,
+        &room_id,
+        file_id,
+        "collection.bin",
+        "application/octet-stream",
+        4096,
+        HashRef::from_bytes([0x99u8; 32]),
+        Some("hash_seq"),
+        &[],
+        &[genesis_id],
+        1,
+    );
+    let validated = validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room_id))
+        .expect("a hash_seq file.shared still passes stateless validation (spec §3.3)");
+    store
+        .insert(&validated)
+        .expect("seed the hash_seq file.shared");
+    drop(store);
+
+    let file_id_handle = format!("file_{}", hex::encode(file_id));
+    cmd(&home)
+        .args(["file", "fetch", &room_id_str, &file_id_handle, "--loopback"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hash_seq"))
+        .stderr(predicate::str::contains("raw only"));
+
+    assert!(
+        !home.path().join("downloads").exists(),
+        "an unsupported-format rejection must write nothing to the downloads dir"
+    );
+}

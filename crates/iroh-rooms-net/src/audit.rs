@@ -12,6 +12,34 @@ use iroh_rooms_core::event::keys::IdentityKey;
 
 use crate::admission::RejectCause;
 
+/// Why the blob-plane serve gate denied a connect or request (IR-0204 spec §7 —
+/// the `blob.serve.rejected:<cause>` vocabulary, mirroring
+/// [`PipeDenyCause`](crate::pipe::PipeDenyCause)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobDenyCause {
+    /// Gate 1: the connecting device is not a current active member.
+    NotActive,
+    /// Gate 2: the hash is not referenced by any valid `file.shared` in the room.
+    NotReferenced,
+    /// A push request was refused — the blobs ALPN never accepts writes.
+    PushDenied,
+    /// An observe request was refused — no store enumeration over the blobs ALPN.
+    ObserveDenied,
+}
+
+impl BlobDenyCause {
+    /// Stable lowercase reason string for the audit log (spec §7).
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotActive => "not_active",
+            Self::NotReferenced => "not_referenced",
+            Self::PushDenied => "push_denied",
+            Self::ObserveDenied => "observe_denied",
+        }
+    }
+}
+
 /// A local audit sink for transport admission and connection lifecycle events.
 ///
 /// Implementations must be cheap and non-blocking — these are called inline on
@@ -69,6 +97,23 @@ pub trait AuditSink: Send + Sync + 'static {
     /// connection is served the membership sub-DAG only (`kind` is the stable
     /// sync-message kind that was refused). Default: no-op.
     fn bootstrap_blocked(&self, _device: EndpointId, _kind: &'static str) {}
+
+    /// A gated blob fetch was served: `peer` requested `hash` over the blobs ALPN
+    /// and the two-gate ACL allowed it (IR-0204 spec §7 `blob.serve.accepted`).
+    /// Default: no-op, so existing sinks need not change.
+    fn blob_serve_accepted(&self, _peer: EndpointId, _hash: [u8; 32]) {}
+
+    /// A blob-plane connect or request was denied (spec §7
+    /// `blob.serve.rejected:<cause>`). `hash` is present only for a per-hash
+    /// denial (Gate 2); absent for a connect denial (Gate 1) or a push/observe
+    /// refusal. Default: no-op, so existing sinks need not change.
+    fn blob_serve_rejected(
+        &self,
+        _peer: EndpointId,
+        _cause: BlobDenyCause,
+        _hash: Option<[u8; 32]>,
+    ) {
+    }
 }
 
 /// The default audit sink: structured `tracing` events with stable reason codes.
@@ -176,11 +221,33 @@ impl AuditSink for TracingAudit {
             "dropped a non-membership request from a provisional join-bootstrap peer"
         );
     }
+
+    fn blob_serve_accepted(&self, peer: EndpointId, hash: [u8; 32]) {
+        // `blob.serve.accepted` is the stable, greppable audit line (spec §7).
+        tracing::info!(
+            reason = "blob.serve.accepted",
+            peer = %peer,
+            hash = %hex::encode(hash),
+            "served a gated blob fetch"
+        );
+    }
+
+    fn blob_serve_rejected(&self, peer: EndpointId, cause: BlobDenyCause, hash: Option<[u8; 32]>) {
+        // `blob.serve.rejected:<cause>` is the stable, greppable audit line (spec
+        // §7). WARN because a denied blob request is a security-relevant event.
+        tracing::warn!(
+            reason = "blob.serve.rejected",
+            cause = cause.code(),
+            peer = %peer,
+            hash = hash.map(hex::encode),
+            "rejected a blob-plane connect or request"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuditSink, TracingAudit};
+    use super::{AuditSink, BlobDenyCause, TracingAudit};
     use crate::admission::RejectCause;
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
@@ -260,5 +327,36 @@ mod tests {
         let a = TracingAudit;
         let _b = a.clone();
         let _ = TracingAudit;
+    }
+
+    // ── BlobDenyCause / blob.serve.* (IR-0204) ──────────────────────────────────
+
+    #[test]
+    fn blob_deny_cause_code_strings_are_stable() {
+        // These strings appear verbatim in the audit log (spec §7); changing them
+        // silently breaks log parsers and tooling.
+        assert_eq!(BlobDenyCause::NotActive.code(), "not_active");
+        assert_eq!(BlobDenyCause::NotReferenced.code(), "not_referenced");
+        assert_eq!(BlobDenyCause::PushDenied.code(), "push_denied");
+        assert_eq!(BlobDenyCause::ObserveDenied.code(), "observe_denied");
+    }
+
+    #[test]
+    fn tracing_audit_blob_serve_accepted_does_not_panic() {
+        TracingAudit.blob_serve_accepted(device(6), [0xAB; 32]);
+    }
+
+    #[test]
+    fn tracing_audit_blob_serve_rejected_all_causes_do_not_panic() {
+        let audit = TracingAudit;
+        for cause in [
+            BlobDenyCause::NotActive,
+            BlobDenyCause::NotReferenced,
+            BlobDenyCause::PushDenied,
+            BlobDenyCause::ObserveDenied,
+        ] {
+            audit.blob_serve_rejected(device(7), cause, Some([0xCD; 32]));
+            audit.blob_serve_rejected(device(7), cause, None);
+        }
     }
 }

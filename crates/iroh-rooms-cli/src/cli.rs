@@ -51,7 +51,8 @@ enum Command {
         #[command(subcommand)]
         action: PipeAction,
     },
-    /// Import files into the blob store and list a room's shared files.
+    /// Import files into the blob store, list a room's shared files, and fetch a
+    /// shared file from an available provider.
     File {
         #[command(subcommand)]
         action: FileAction,
@@ -86,7 +87,7 @@ enum AgentAction {
 #[derive(Debug, Subcommand)]
 enum FileAction {
     /// Import a local file into the blob store and author its `file.shared`
-    /// reference on the room log (offline; peers fetch it once serve/fetch lands).
+    /// reference on the room log (offline; peers fetch it via `file fetch`).
     Share {
         // Backticks would render literally in clap `--help`.
         #[allow(clippy::doc_markdown)]
@@ -112,6 +113,34 @@ enum FileAction {
         /// Emit a single JSON array instead of labeled lines.
         #[arg(long)]
         json: bool,
+    },
+    /// Fetch a shared file from an available provider, verify its content hash,
+    /// and save it locally.
+    Fetch {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The file handle printed by `file share` / `file list` (file_<32-hex>,
+        /// or bare 32-hex).
+        file_id: String,
+        /// Save target: a file path, a directory, or omitted for the downloads
+        /// directory ($`IROH_ROOMS_DOWNLOADS`, else <data-dir>/downloads/).
+        #[arg(long)]
+        out: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Per-provider connect+transfer timeout as <int>{ms|s|m}, e.g. 30s.
+        #[arg(long, default_value = crate::file::DEFAULT_FETCH_TIMEOUT)]
+        timeout: String,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
     },
 }
 
@@ -434,6 +463,28 @@ fn dispatch_file(home: &std::path::Path, action: FileAction) -> Result<()> {
             // Offline read; the scoped runtime only hosts the local blob-presence
             // query, not any network.
             runtime()?.block_on(file::list(home, &room_id, json))?;
+        }
+        FileAction::Fetch {
+            room_id,
+            file_id,
+            out,
+            peers,
+            timeout,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            // Parse the timeout before any IO so a bad value writes nothing.
+            let timeout = message::parse_timeout(&timeout)?;
+            let summary = runtime()?.block_on(file::fetch(
+                home,
+                &room_id,
+                &file_id,
+                out.as_deref(),
+                &peers,
+                timeout,
+                loopback,
+            ))?;
+            file::print_fetch(&summary);
         }
     }
     Ok(())

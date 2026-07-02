@@ -57,12 +57,12 @@ pub use admission::{
     RejectCause, SnapshotAdmission,
 };
 pub use alpn::EVENT_ALPN;
-pub use audit::{AuditSink, TracingAudit};
-pub use blob::{BlobError, BlobImport, BlobStore};
+pub use audit::{AuditSink, BlobDenyCause, TracingAudit};
+pub use blob::{BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
 pub use frame::{FrameError, MAX_FRAME_BYTES};
 pub use handler::EventProtocolHandler;
 pub use manager::PeerManager;
-pub use node::{Node, DEFAULT_TICK};
+pub use node::{BlobServeConfig, Node, DEFAULT_TICK};
 pub use pipe::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,
     TracingPipeAudit, PIPE_ALPN,

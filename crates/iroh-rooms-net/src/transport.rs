@@ -220,6 +220,10 @@ impl NetTransport {
     /// ACL identity, Membership §1) and spawn the `Router` with the event ALPN
     /// gated by `admission`.
     ///
+    /// `blobs_handler`, when supplied, chains the `iroh-blobs` ALPN as a third
+    /// `.accept()` on the same router (IR-0204 spec §5.3) — the established
+    /// one-endpoint-many-planes pattern already used for `pipe_handler`.
+    ///
     /// # Errors
     /// Returns an error if the endpoint fails to bind.
     pub async fn bind(
@@ -228,6 +232,7 @@ impl NetTransport {
         audit: Arc<dyn AuditSink>,
         cfg: NetConfig,
         pipe_handler: Option<PipeProtocolHandler>,
+        blobs_handler: Option<iroh_blobs::BlobsProtocol>,
     ) -> Result<Self> {
         let endpoint = match cfg.mode {
             NetMode::Loopback => Endpoint::builder(presets::Minimal)
@@ -264,6 +269,9 @@ impl NetTransport {
             .accept(EVENT_ALPN, EventProtocolHandler::new(shared.clone()));
         if let Some(pipe_handler) = pipe_handler {
             builder = builder.accept(PIPE_ALPN, pipe_handler);
+        }
+        if let Some(blobs_handler) = blobs_handler {
+            builder = builder.accept(iroh_blobs::ALPN, blobs_handler);
         }
         let router = builder.spawn();
 

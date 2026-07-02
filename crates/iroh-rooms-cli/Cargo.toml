@@ -62,6 +62,9 @@ zeroize = "1"
 # Ergonomic error context for the binary's top-level `Err -> stderr` mapping.
 # Already in `Cargo.lock`.
 anyhow = "1"
+# Independent BLAKE3-256 recompute for `file fetch`'s hash-mismatch diagnostic
+# (IR-0204 spec §7). Same 1.x line `iroh-rooms-net`/core already resolve.
+blake3 = "1"
 
 [dev-dependencies]
 # Spawn the built `iroh-rooms` binary and assert on stdout/stderr/exit code.
@@ -80,8 +83,6 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["store"] }
 # normal dependency of this crate, so this adds no new resolution — only the
 # `net`/`io-util` features those in-test sockets need on top of the runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
-# Independent BLAKE3 recompute in the `file share` hash-verification test (IR-0202).
-blake3 = "1"
 # Hex encoding/decoding used by the file_cli.rs hash-verification test. Already
 # a resolved crate in Cargo.lock (used by core and net).
 hex = "0.4"

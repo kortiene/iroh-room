@@ -46,6 +46,10 @@ iroh-blobs = "=0.103.0"
 # hash (spike NOTES.md §4 belt-and-suspenders — an internal-bug guard). Same 1.x
 # line `iroh-rooms-core` already resolves.
 blake3 = "1"
+# The verified-fetch client's return type (`iroh_blobs::get`'s buffered getter
+# yields `bytes::Bytes`, spike NOTES.md §4). Already resolved transitively via
+# `iroh-blobs`; named explicitly since `net::blob::fetch` is a public boundary.
+bytes = "1"
 # `net` adds `TcpStream`/`TcpListener` for the Live Pipe Plane's loopback
 # forwarding splice (IR-0010); `signal` lets the CLI publish `pipe.closed` on
 # Ctrl-C (owner-exit). No new external crate — only extra tokio features.

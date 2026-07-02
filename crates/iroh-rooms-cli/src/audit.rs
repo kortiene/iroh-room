@@ -13,7 +13,9 @@
 
 use iroh::EndpointId;
 use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_net::{AuditSink, RejectCause};
+use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+
+use crate::message::{short_device, short_hash};
 
 /// Renders [`AuditSink`] callbacks as stable, greppable stderr lines.
 #[derive(Debug, Clone, Copy, Default)]
@@ -63,6 +65,24 @@ impl AuditSink for StderrAudit {
              not rejected"
         );
     }
+
+    fn blob_serve_accepted(&self, peer: EndpointId, hash: [u8; 32]) {
+        // `blob.serve.accepted` is the stable, greppable audit line (IR-0204 §7).
+        eprintln!(
+            "blob.serve.accepted peer={} hash={}",
+            short_device(&peer),
+            short_hash(hash)
+        );
+    }
+
+    fn blob_serve_rejected(&self, peer: EndpointId, cause: BlobDenyCause, hash: Option<[u8; 32]>) {
+        eprintln!(
+            "blob.serve.rejected:{} peer={}{}",
+            cause.code(),
+            short_device(&peer),
+            hash.map_or_else(String::new, |h| format!(" hash={}", short_hash(h)))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -70,7 +90,9 @@ mod tests {
     use super::StderrAudit;
     use iroh::SecretKey;
     use iroh_rooms_core::event::keys::IdentityKey;
-    use iroh_rooms_net::{AuditSink, RejectCause};
+    use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+
+    use crate::message::{short_device, short_hash};
 
     fn device(seed: u8) -> iroh::EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()

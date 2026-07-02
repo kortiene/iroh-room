@@ -272,6 +272,7 @@ async fn spawn_room_node(
         DEFAULT_TICK,
         addr_hints,
         cell,
+        None,
     )
     .await
     .expect("spawn_room")

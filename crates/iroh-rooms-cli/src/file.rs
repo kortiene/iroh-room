@@ -1,55 +1,61 @@
-//! The Blob Plane CLI (import half): `iroh-rooms file share | list`
-//! (spec IR-0202 §5). A thin orchestrator over the landed primitives, the sibling
-//! of [`crate::message`] and [`crate::pipe`]:
+//! The Blob Plane CLI: `iroh-rooms file share | list | fetch` (spec IR-0202 §5,
+//! IR-0204 §5). A thin orchestrator over the landed primitives, the sibling of
+//! [`crate::message`] and [`crate::pipe`]:
 //!
-//! * `share` is the **producer/import** path (this issue's core deliverable): it
-//!   content-addresses a local file into the durable local blob store
-//!   ([`iroh_rooms_net::BlobStore`]), records this node as a local provider, then
-//!   authors + self-validates + persists a signed `file.shared` **reference** onto
-//!   the local log via the pure core builder
-//!   ([`build_file_shared`](iroh_rooms_core::event::build_file_shared)). It is
-//!   deliberately **offline**: the blob bytes are never carried on the log (PRD
-//!   §9.2), and the event propagates through the already-landed sync engine
+//! * `share` is the **producer/import** path: it content-addresses a local file
+//!   into the durable local blob store ([`iroh_rooms_net::BlobStore`]), records
+//!   this node as a local provider, then authors + self-validates + persists a
+//!   signed `file.shared` **reference** onto the local log via the pure core
+//!   builder ([`build_file_shared`](iroh_rooms_core::event::build_file_shared)).
+//!   It is deliberately **offline**: the blob bytes are never carried on the log
+//!   (PRD §9.2), and the event propagates through the already-landed sync engine
 //!   unchanged once peers reconcile. No network is contacted.
 //! * `list` is an **offline** read: for the room, it decodes every `file.shared`
 //!   event and reports each file's handle, name, size, hash, and **provider
 //!   status** — whether *this* node holds the blob (`you (local)`) or only the
 //!   reference (`reference-only`).
-//!
-//! ## The follow-up boundary (spec §4.3 — the serve/fetch issue)
-//!
-//! `file share` here **imports + references** but does not **serve or push**. The
-//! follow-up serve/fetch issue must: (a) add the `iroh-blobs` serve ALPN to the
-//! shared `Router` with the spike's two-gate ACL
-//! (`spike-blobs/src/net.rs::spawn_event_gate`); (b) add `file fetch <ROOM_ID>
-//! <FILE_ID>` with an independent receiver-side BLAKE3 recompute (spike §4);
-//! (c) optionally broadcast the `file.shared` frame at share time (the `room send`
-//! `run_push` analogue); and (d) map "no provider online" to honest "unavailable"
-//! CLI language (spike §5 / PRD §14). Until then a shared blob is held locally and
-//! `file list` reports `you (local)`.
+//! * `fetch` is the **consumer** path (IR-0204): resolve the `file.shared`
+//!   reference (syncing it if absent), discover a provider from the reference's
+//!   metadata, dial it as an authorized member over the ACL-gated blobs ALPN,
+//!   transfer the blob, independently verify BLAKE3-256 against the declared
+//!   hash, save the verified bytes, and print the saved path + verified hash. An
+//!   unauthorized peer is denied at the provider's room-ACL path (`net::blob`'s
+//!   two-gate serve, wired in via `room tail`'s [`iroh_rooms_net::BlobServeConfig`]);
+//!   an unavailable provider is reported honestly within a bounded timeout.
 
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use iroh::{EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::build_file_shared;
 use iroh_rooms_core::event::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
-use iroh_rooms_core::event::content::{Content, EventType};
+use iroh_rooms_core::event::content::{Content, EventType, FileShared};
 use iroh_rooms_core::event::ids::{HashRef, RoomId};
+use iroh_rooms_core::event::keys::DeviceKey;
 use iroh_rooms_core::event::signed::SignedEvent;
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
 use iroh_rooms_core::membership::Ingest;
-use iroh_rooms_core::store::EventStore;
-use iroh_rooms_net::BlobStore;
+use iroh_rooms_core::store::{EventStore, StoredEvent};
+use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
+use iroh_rooms_net::{
+    BlobError, BlobStore, FetchOutcome, NetConfig, Node, TracingAudit, DEFAULT_TICK,
+};
 use serde_json::json;
 
 use crate::error::CodedResultExt;
-use crate::message::{fold_room, select_heads, DB_FILE};
+use crate::message::{
+    build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
+    select_heads, DB_FILE,
+};
 use crate::{clock, identity, paths};
 
 /// Directory (under the data-directory home) rooting the durable blob store (spec
 /// §4.1 / §5.5). Lives inside the `0700` home; `file share` tightens it to `0700`.
-const BLOBS_DIR: &str = "blobs";
+/// `pub(crate)` so `message::tail` can pass the same path to
+/// [`iroh_rooms_net::BlobServeConfig`] (IR-0204 spec §6.6).
+pub(crate) const BLOBS_DIR: &str = "blobs";
 /// The only `blob_format` for MVP (spec §3.3 / §5.2 step 6); `hash_seq` is a
 /// follow-up (spike NOTES.md §6).
 const BLOB_FORMAT_RAW: &str = "raw";
@@ -58,6 +64,18 @@ const BLOB_FORMAT_RAW: &str = "raw";
 /// is intentionally absent from `--help` and the size error still names the
 /// effective cap. Ignored if unset/unparseable.
 const MAX_SHARE_BYTES_ENV: &str = "IROH_ROOMS_MAX_SHARE_BYTES";
+/// Default per-provider connect+transfer timeout for `file fetch` (spec §5.1 /
+/// OQ-4): larger than the 5s message/pipe default because a transfer can be up to
+/// the 100 MiB [`MAX_SHARED_FILE_BYTES`] cap.
+pub const DEFAULT_FETCH_TIMEOUT: &str = "30s";
+/// How long `file fetch` waits for an absent `file.shared` reference to sync
+/// before giving up (mirrors `pipe connect`'s `SYNC_WAIT`).
+const SYNC_WAIT: Duration = Duration::from_secs(10);
+/// Env var overriding the downloads directory `file fetch` saves to when `--out`
+/// is omitted (spec §5.6).
+const DOWNLOADS_ENV: &str = "IROH_ROOMS_DOWNLOADS";
+/// Downloads directory name under `<home>/` when [`DOWNLOADS_ENV`] is unset.
+const DOWNLOADS_DIR: &str = "downloads";
 
 /// The result of a successful `file share`, for the caller to present.
 pub struct FileShareSummary {
@@ -235,8 +253,9 @@ pub async fn share(
 }
 
 /// Print a [`FileShareSummary`] as labeled, script-friendly, secret-free lines
-/// (spec §6.4). The provider line is always `you (local)` — this node just imported
-/// the bytes; peer fetch is the follow-up serve/fetch issue (§4.3).
+/// (spec §6.4). The provider line is always `you (local)` — this node just
+/// imported the bytes; a peer fetches them once this node runs `room tail`
+/// (IR-0204 §5.3, the "provider stays online" surface).
 pub fn print_share(summary: &FileShareSummary) {
     println!("imported: {}", summary.source_display);
     println!("file_id: {}", file_handle(&summary.file_id));
@@ -248,17 +267,25 @@ pub fn print_share(summary: &FileShareSummary) {
     println!("room: {}", summary.room_id);
     println!("provider: you (local)");
     println!(
-        "next: run `iroh-rooms file list {}` (peers can fetch it once serve/fetch lands)",
-        summary.room_id
+        "next: run `iroh-rooms room tail {}` to serve it, then peers can \
+         `iroh-rooms file fetch {} {}`",
+        summary.room_id,
+        summary.room_id,
+        file_handle(&summary.file_id)
     );
 }
 
 /// List the room's shared files with provider status (spec §5.1 / §6.5). Offline:
 /// no node is brought up; the only async work is the local blob-presence query.
 ///
+/// If a concurrent `room tail` provider holds the durable blob store's exclusive
+/// lock on this home, provider status cannot be read; rather than deadlock, this
+/// warns on stderr and reports each file's provider as `unknown` (spec §6.6 — the
+/// provider-stays-online surface must coexist with listing).
+///
 /// # Errors
-/// An unknown room, a store read failure, a blob-store open failure, or (in JSON
-/// mode) an encoding failure.
+/// An unknown room, a store read failure, a blob-store open failure other than a
+/// held lock, or (in JSON mode) an encoding failure.
 pub async fn list(home: &Path, room_id: &RoomId, json: bool) -> Result<()> {
     let db_path = home.join(DB_FILE);
     let store = EventStore::open(&db_path)
@@ -274,15 +301,33 @@ pub async fn list(home: &Path, room_id: &RoomId, json: bool) -> Result<()> {
     // Provider status needs the durable blob store — but only open it if it already
     // exists. A pure `file list` on a node that has shared nothing must not create a
     // blob store as a side effect; every file simply reads `reference-only`.
+    //
+    // The store's on-disk lock is exclusive, so a concurrent `room tail` provider on
+    // this home holds it open. Rather than block forever waiting for that lock,
+    // `BlobStore::open` bounds the wait and returns `Locked`; degrade to `unknown`
+    // provider status with a stderr warning so the listing still completes.
     let blobs_dir = home.join(BLOBS_DIR);
-    let blob_store =
-        if blobs_dir.is_dir() {
-            Some(BlobStore::open(&blobs_dir).await.with_context(|| {
-                format!("could not open the blob store at {}", blobs_dir.display())
-            })?)
-        } else {
-            None
-        };
+    let (blob_store, store_locked) = if blobs_dir.is_dir() {
+        match BlobStore::open(&blobs_dir).await {
+            Ok(bs) => (Some(bs), false),
+            Err(BlobError::Locked(_)) => {
+                eprintln!(
+                    "warning: the blob store at {} is in use by another process (is \
+                     `room tail` running on this home?); provider status is reported as \
+                     unknown for this listing",
+                    blobs_dir.display()
+                );
+                (None, true)
+            }
+            Err(e) => {
+                return Err(anyhow!(e)).with_context(|| {
+                    format!("could not open the blob store at {}", blobs_dir.display())
+                });
+            }
+        }
+    } else {
+        (None, false)
+    };
 
     let mut rows: Vec<FileRow> = Vec::with_capacity(events.len());
     for se in &events {
@@ -292,9 +337,12 @@ pub async fn list(home: &Path, room_id: &RoomId, json: bool) -> Result<()> {
         let Content::FileShared(f) = ev.content else {
             continue;
         };
+        // `Some(true/false)` = definitively held / reference-only; `None` = unknown
+        // because the store lock is held elsewhere (`store_locked`).
         let held = match &blob_store {
-            Some(bs) => bs.has(*f.blob_hash.as_bytes()).await.unwrap_or(false),
-            None => false,
+            Some(bs) => Some(bs.has(*f.blob_hash.as_bytes()).await.unwrap_or(false)),
+            None if store_locked => None,
+            None => Some(false),
         };
         rows.push(FileRow {
             file_id: file_handle(&f.file_id),
@@ -339,34 +387,433 @@ pub async fn list(home: &Path, room_id: &RoomId, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// One `file list` row.
+/// One `file list` row. `held` is `Some(true)` when this node holds the blob,
+/// `Some(false)` when it holds only the reference, and `None` when provider status
+/// could not be determined (the store lock is held by a concurrent `room tail`).
 struct FileRow {
     file_id: String,
     name: String,
     size_bytes: u64,
     blob_hash: String,
-    held: bool,
+    held: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// fetch (IR-0204 §5.2)
+// ---------------------------------------------------------------------------
+
+/// The result of a successful `file fetch`, for the caller to present.
+pub struct FetchSummary {
+    /// Where the verified bytes were saved.
+    pub saved_path: PathBuf,
+    /// The verified BLAKE3-256 hash (equal to the declared `blob_hash`).
+    pub verified_hash: HashRef,
+    /// The fetched content's size in bytes.
+    pub size_bytes: u64,
+    /// The provider the blob was fetched from.
+    pub provider: EndpointId,
+}
+
+/// Fetch a shared file from an available provider, verify its content hash, and
+/// save it locally (spec §5.2): resolve the `file.shared` reference (syncing it
+/// if absent), discover providers from its metadata, dial each in order over the
+/// ACL-gated blobs ALPN, and require the assembled bytes' independent BLAKE3-256
+/// equal the declared hash before saving.
+///
+/// # Errors
+/// Fails — writing nothing to disk on every path — if the file id / `--out` is
+/// invalid (pre-IO), no local identity exists, the room is unknown, the caller is
+/// not an active member, the reference cannot be found (locally or after a bounded
+/// sync wait), its `blob_format` is not `raw`/absent, every provider denies or is
+/// unreachable, the assembled bytes fail the independent hash check (a hard stop —
+/// never falls through to another provider), or the verified bytes cannot be saved.
+#[allow(clippy::too_many_lines)] // one linear resolve-then-fetch-then-save flow; splitting hurts readability
+pub async fn fetch(
+    home: &Path,
+    room_id: &RoomId,
+    file_id_str: &str,
+    out: Option<&str>,
+    peers: &[String],
+    timeout: Duration,
+    loopback: bool,
+) -> Result<FetchSummary> {
+    // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
+    let file_id = parse_file_id(file_id_str)?;
+    let peer_addrs = parse_peers(peers)?;
+
+    // ---- Identity + membership (mirrors `pipe connect` / `room send`). ----
+    let secret = identity::SecretKeys::load(home)?;
+    let self_id = secret.identity.identity_key();
+    let db_path = home.join(DB_FILE);
+    let store = EventStore::open(&db_path)
+        .with_context(|| format!("could not open event store at {}", db_path.display()))?;
+    let (_, snapshot) = fold_room(&store, home, room_id)?;
+    if !snapshot.is_active(&self_id) {
+        bail!(
+            "you are not an active member of room {room_id}; only an active member can fetch \
+             files (this identity is {self_id})"
+        );
+    }
+
+    // ---- Resolve the file.shared reference locally first. ----
+    let local_events = store
+        .by_type(room_id, EventType::FileShared)
+        .with_context(|| format!("could not read file.shared events for room {room_id}"))?;
+    let mut file_ref = file_shared_in(&local_events, file_id);
+
+    // ---- Bring up an ephemeral consumer node: dial active members so a missing
+    // reference can sync and so providers see us as a connected member. ----
+    let self_device = endpoint_id_of(secret.device.device_key())?;
+    let admission = build_admission(&snapshot);
+    let dial_set = build_dial_set(&snapshot, self_device, &peer_addrs);
+    let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
+        .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
+    let cfg = NetConfig {
+        mode: net_mode(loopback),
+        ..NetConfig::default()
+    };
+    let node = Node::spawn(
+        secret_key,
+        std::sync::Arc::new(admission),
+        std::sync::Arc::new(TracingAudit),
+        engine,
+        cfg,
+        DEFAULT_TICK,
+    )
+    .await
+    .context("could not bring up the network node")?;
+    for addr in &dial_set {
+        node.connect_to(addr.clone());
+    }
+
+    if file_ref.is_none() {
+        file_ref = wait_for_file_shared(&node, file_id, SYNC_WAIT).await;
+    }
+
+    let Some((shared, author_device)) = file_ref else {
+        let _ = node.shutdown().await;
+        bail!(
+            "no such file {file_id_str} in room {room_id}; has it been shared and synced? try \
+             running `room tail` first"
+        );
+    };
+
+    // ---- Format gate: only `raw`/absent is fetchable (spec §3.3). ----
+    if let Some(format) = shared.blob_format.as_deref() {
+        if format != BLOB_FORMAT_RAW {
+            let _ = node.shutdown().await;
+            bail!(
+                "file {file_id_str} uses blob_format={format}, which this version cannot fetch \
+                 (raw only)"
+            );
+        }
+    }
+
+    // ---- Discover providers (spec §5.5): self is skipped. ----
+    let providers = resolve_providers(&shared, author_device, self_device, &peer_addrs);
+    if providers.is_empty() {
+        let _ = node.shutdown().await;
+        bail!("file {file_id_str} is currently unavailable: no provider holding it is online");
+    }
+
+    // ---- Sequential per-provider fetch loop (spec §5.2 step 7). ----
+    let declared = *shared.blob_hash.as_bytes();
+    let mut fetched = None;
+    let mut hash_mismatch: Option<String> = None;
+    for provider_addr in &providers {
+        let (outcome, data) = node
+            .fetch_file(provider_addr.clone(), declared, declared, timeout)
+            .await;
+        match outcome {
+            FetchOutcome::Fetched => {
+                fetched = data.map(|b| (b, provider_addr.id));
+                break;
+            }
+            FetchOutcome::DeniedAtConnect => {
+                eprintln!(
+                    "provider {} denied the connection (are you an active member?)",
+                    short_endpoint(provider_addr.id)
+                );
+            }
+            FetchOutcome::DeniedPerHash => {
+                eprintln!(
+                    "provider {} will not serve this hash",
+                    short_endpoint(provider_addr.id)
+                );
+            }
+            FetchOutcome::HashMismatch => {
+                hash_mismatch = Some(data.map_or_else(
+                    || "<unknown>".to_owned(),
+                    |b| hex::encode(blake3::hash(&b).as_bytes()),
+                ));
+                break;
+            }
+            FetchOutcome::Unavailable => {
+                eprintln!("provider {} unreachable", short_endpoint(provider_addr.id));
+            }
+        }
+    }
+
+    if let Some(got) = hash_mismatch {
+        let _ = node.shutdown().await;
+        bail!(
+            "integrity check FAILED: fetched bytes hash blake3:{got} but the reference declares \
+             {}; refusing to save",
+            shared.blob_hash
+        );
+    }
+
+    let Some((data, provider_id)) = fetched else {
+        let _ = node.shutdown().await;
+        bail!("file {file_id_str} is currently unavailable: no provider holding it is online");
+    };
+
+    node.shutdown()
+        .await
+        .context("could not shut down cleanly")?;
+
+    // ---- Save: sanitized name, atomic temp-then-rename (spec §5.6). ----
+    let target = resolve_output_path(home, out, &shared.name, file_id)?;
+    save_atomic(&target, &data)?;
+
+    // ---- Recommended: become a provider too (spec §5.7 / OQ-5), best-effort. ----
+    reprovide_best_effort(home, &target).await;
+
+    let size_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    Ok(FetchSummary {
+        saved_path: target,
+        verified_hash: shared.blob_hash,
+        size_bytes,
+        provider: provider_id,
+    })
+}
+
+/// Print a [`FetchSummary`] as labeled, script-friendly, secret-free lines (spec
+/// §7 AC4): stdout stays clean for scripting; diagnostics go to stderr.
+pub fn print_fetch(summary: &FetchSummary) {
+    println!("saved: {}", summary.saved_path.display());
+    println!("verified: {}", summary.verified_hash);
+    println!("size: {} bytes", summary.size_bytes);
+    println!("provider: {}", short_endpoint(summary.provider));
+}
+
+/// Parse a `file_<32-hex>` handle (or, tolerantly, bare 32-hex) into 16 bytes —
+/// the inverse of `file_handle` (spec §5.1 / OQ-8).
+fn parse_file_id(s: &str) -> Result<[u8; SHORT_ID_LEN]> {
+    let trimmed = s.trim();
+    let hex_part = trimmed.strip_prefix("file_").unwrap_or(trimmed);
+    if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid file id {s:?} (expected file_<32-hex> or 32 hex chars)");
+    }
+    let mut out = [0u8; SHORT_ID_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex_part[i * 2..i * 2 + 2], 16)
+            .map_err(|_| anyhow!("invalid file id {s:?}"))?;
+    }
+    Ok(out)
+}
+
+/// Find the `file.shared` matching `file_id` in `events`, returning its content
+/// plus the author's signing device (`file.shared.providers`' implicit default).
+fn file_shared_in(
+    events: &[StoredEvent],
+    file_id: [u8; SHORT_ID_LEN],
+) -> Option<(FileShared, DeviceKey)> {
+    for se in events {
+        if se.event_type != EventType::FileShared {
+            continue;
+        }
+        let Ok(ev) = SignedEvent::decode(&se.wire.signed) else {
+            continue;
+        };
+        let Content::FileShared(f) = ev.content else {
+            continue;
+        };
+        if f.file_id == file_id {
+            return Some((f, ev.device_id));
+        }
+    }
+    None
+}
+
+/// Wait (bounded) for `file_id`'s `file.shared` to sync into `node`'s validated
+/// set, polling its timeline (mirrors `pipe connect`'s `pipe.opened` wait).
+async fn wait_for_file_shared(
+    node: &Node,
+    file_id: [u8; SHORT_ID_LEN],
+    timeout: Duration,
+) -> Option<(FileShared, DeviceKey)> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Ok(events) = node.room_tail(u32::MAX).await {
+                if let Some(found) = file_shared_in(&events, file_id) {
+                    return found;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
+/// Resolve `file.shared.providers` (default `[author device]`) into dialable
+/// addresses, in as-listed order, skipping `self_device` (spec §5.5 — fetching
+/// from yourself is a no-op).
+fn resolve_providers(
+    shared: &FileShared,
+    author_device: DeviceKey,
+    self_device: EndpointId,
+    peer_addrs: &[EndpointAddr],
+) -> Vec<EndpointAddr> {
+    let devices: Vec<DeviceKey> = match &shared.providers {
+        Some(list) if !list.is_empty() => list.clone(),
+        _ => vec![author_device],
+    };
+    devices
+        .into_iter()
+        .filter_map(|dev| EndpointId::from_bytes(dev.as_bytes()).ok())
+        .filter(|id| *id != self_device)
+        .map(|id| {
+            peer_addrs
+                .iter()
+                .find(|a| a.id == id)
+                .cloned()
+                .unwrap_or_else(|| EndpointAddr::new(id))
+        })
+        .collect()
+}
+
+/// Resolve the save target for a fetched file (spec §5.6): `--out <FILE>` (exact
+/// path, refused if it already exists), `--out <DIR>` (existing dir or a value
+/// ending in a path separator; joined with the sanitized name), or the configured
+/// downloads directory when `--out` is omitted.
+fn resolve_output_path(
+    home: &Path,
+    out: Option<&str>,
+    name: &str,
+    file_id: [u8; SHORT_ID_LEN],
+) -> Result<PathBuf> {
+    let safe_name = sanitize_name(name, file_id);
+    let Some(spec) = out else {
+        let downloads = downloads_dir(home);
+        paths::ensure_dir(&downloads)?;
+        return Ok(downloads.join(safe_name));
+    };
+
+    let path = Path::new(spec);
+    let is_dir_target =
+        path.is_dir() || spec.ends_with('/') || spec.ends_with(std::path::MAIN_SEPARATOR);
+    if is_dir_target {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("could not create directory {}", path.display()))?;
+        return Ok(path.join(safe_name));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create directory {}", parent.display()))?;
+        }
+    }
+    if path.exists() {
+        bail!(
+            "refusing to overwrite existing file {} (pass a different --out)",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
+/// The configured downloads directory: [`DOWNLOADS_ENV`] if set to a non-empty
+/// value, else `<home>/downloads/`.
+fn downloads_dir(home: &Path) -> PathBuf {
+    std::env::var_os(DOWNLOADS_ENV)
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| home.join(DOWNLOADS_DIR), PathBuf::from)
+}
+
+/// Reduce a peer-supplied `file.shared.name` to a single safe basename (spec
+/// §5.6 — a path-traversal guard): keep only the final path component, strip
+/// control characters, and fall back to `file_<hex>` if the result would be
+/// empty, `.`, or `..`. Prevents a malicious `name` like
+/// `../../.ssh/authorized_keys` from escaping the target directory.
+fn sanitize_name(name: &str, file_id: [u8; SHORT_ID_LEN]) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        format!("file_{}", hex::encode(file_id))
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+/// Write `bytes` to `target` atomically: a temp file in the same directory, then
+/// rename (spec §5.2 step 8) — no partial/corrupt file is ever visible at
+/// `target`, and the temp file is removed on any failure.
+fn save_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+    let tmp = dir.join(format!(".{file_name}.part"));
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, target));
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("could not save to {}", target.display()));
+    }
+    Ok(())
+}
+
+/// After a verified fetch, best-effort import the saved bytes into the local
+/// `<home>/blobs/` store so this node becomes a provider too (spec §5.7 / OQ-5).
+/// Never fails the fetch — the file is already safely saved at `target`
+/// regardless of whether the re-provide import succeeds.
+async fn reprovide_best_effort(home: &Path, target: &Path) {
+    let blobs_dir = home.join(BLOBS_DIR);
+    if paths::ensure_dir(&blobs_dir).is_err() {
+        return;
+    }
+    let Ok(store) = BlobStore::open(&blobs_dir).await else {
+        return;
+    };
+    if let Ok(abs) = std::fs::canonicalize(target) {
+        let _ = store.import_path(&abs).await;
+    }
+    let _ = store.close().await;
+}
+
+/// A short, human-scannable prefix of an endpoint id for a diagnostic line.
+fn short_endpoint(device: EndpointId) -> String {
+    device.to_string().chars().take(8).collect()
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The human provider label for `file list` text output.
-fn provider_label(held: bool) -> &'static str {
-    if held {
-        "you (local)"
-    } else {
-        "reference-only"
+/// The human provider label for `file list` text output. `None` (store lock held
+/// elsewhere) reads `unknown (store in use)`.
+fn provider_label(held: Option<bool>) -> &'static str {
+    match held {
+        Some(true) => "you (local)",
+        Some(false) => "reference-only",
+        None => "unknown (store in use)",
     }
 }
 
-/// The stable provider token for `file list --json`.
-fn provider_token(held: bool) -> &'static str {
-    if held {
-        "local"
-    } else {
-        "reference-only"
+/// The stable provider token for `file list --json`. `None` (store lock held
+/// elsewhere) reads `unknown`.
+fn provider_token(held: Option<bool>) -> &'static str {
+    match held {
+        Some(true) => "local",
+        Some(false) => "reference-only",
+        None => "unknown",
     }
 }
 
@@ -516,12 +963,47 @@ fn guess_mime(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_path, default_name, effective_max_share_bytes, file_handle, guess_mime,
-        provider_label, provider_token, validate_mime, validate_share_name, MAX_SHARE_BYTES_ENV,
+        classify_path, default_name, downloads_dir, effective_max_share_bytes, file_handle,
+        guess_mime, parse_file_id, provider_label, provider_token, resolve_output_path,
+        resolve_providers, sanitize_name, save_atomic, short_endpoint, validate_mime,
+        validate_share_name, DOWNLOADS_ENV, MAX_SHARE_BYTES_ENV,
     };
+    use iroh::{EndpointAddr, EndpointId, SecretKey};
     use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
+    use iroh_rooms_core::event::content::FileShared;
+    use iroh_rooms_core::event::ids::HashRef;
+    use iroh_rooms_core::event::keys::{DeviceKey, SigningKey};
+    use std::net::SocketAddr;
     use std::path::Path;
     use tempfile::TempDir;
+
+    // ── fetch fixtures ────────────────────────────────────────────────────────
+
+    /// A valid device signing key from a one-byte seed (a real Ed25519 point, so
+    /// `EndpointId::from_bytes` on its bytes succeeds — `resolve_providers` relies
+    /// on that conversion).
+    fn device(seed: u8) -> DeviceKey {
+        SigningKey::from_seed(&[seed; 32]).device_key()
+    }
+
+    /// The `EndpointId` a `DeviceKey` resolves to (the identity resolution
+    /// `resolve_providers` performs internally).
+    fn endpoint_of(dev: DeviceKey) -> EndpointId {
+        EndpointId::from_bytes(dev.as_bytes()).expect("device key is a valid point")
+    }
+
+    /// A minimal `file.shared` reference with the given (optional) provider list.
+    fn file_shared_with(providers: Option<Vec<DeviceKey>>) -> FileShared {
+        FileShared {
+            file_id: [0x11; 16],
+            name: "report.pdf".to_owned(),
+            mime_type: "application/pdf".to_owned(),
+            size_bytes: 3,
+            blob_hash: HashRef::from_bytes([0xAB; 32]),
+            blob_format: Some("raw".to_owned()),
+            providers,
+        }
+    }
 
     // ── file_handle ───────────────────────────────────────────────────────────
 
@@ -581,10 +1063,12 @@ mod tests {
 
     #[test]
     fn provider_labels_are_stable() {
-        assert_eq!(provider_label(true), "you (local)");
-        assert_eq!(provider_label(false), "reference-only");
-        assert_eq!(provider_token(true), "local");
-        assert_eq!(provider_token(false), "reference-only");
+        assert_eq!(provider_label(Some(true)), "you (local)");
+        assert_eq!(provider_label(Some(false)), "reference-only");
+        assert_eq!(provider_label(None), "unknown (store in use)");
+        assert_eq!(provider_token(Some(true)), "local");
+        assert_eq!(provider_token(Some(false)), "reference-only");
+        assert_eq!(provider_token(None), "unknown");
     }
 
     // ── default_name ──────────────────────────────────────────────────────────
@@ -767,5 +1251,343 @@ mod tests {
             assert_eq!(effective_max_share_bytes(), MAX_SHARED_FILE_BYTES);
         }
         // Env var absent: also returns default. Already checked by the test above.
+    }
+
+    // ── parse_file_id (spec §5.1 / OQ-8) ──────────────────────────────────────
+
+    #[test]
+    fn parse_file_id_roundtrips_with_file_handle() {
+        // The CLI prints `file_<hex>`; `file fetch` must accept exactly that form.
+        let id = [0x3cu8; 16];
+        let handle = file_handle(&id);
+        assert_eq!(parse_file_id(&handle).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_file_id_accepts_bare_hex_and_trims_whitespace() {
+        let id = [0xabu8; 16];
+        let bare = hex::encode(id);
+        assert_eq!(
+            parse_file_id(&bare).unwrap(),
+            id,
+            "bare 32-hex is tolerated"
+        );
+        assert_eq!(
+            parse_file_id(&format!("  {bare}\n")).unwrap(),
+            id,
+            "leading/trailing whitespace is trimmed"
+        );
+    }
+
+    #[test]
+    fn parse_file_id_accepts_uppercase_hex() {
+        // is_ascii_hexdigit + from_str_radix(.,16) both accept uppercase; a user
+        // pasting an upper-cased handle must still resolve to the same 16 bytes.
+        let id = [0xabu8; 16];
+        let upper = hex::encode_upper(id);
+        assert_eq!(parse_file_id(&format!("file_{upper}")).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_file_id_rejects_malformed_input() {
+        assert!(parse_file_id("").is_err(), "empty is invalid");
+        assert!(
+            parse_file_id("file_").is_err(),
+            "prefix with no hex is invalid"
+        );
+        assert!(
+            parse_file_id(&"a".repeat(31)).is_err(),
+            "31 hex chars is the wrong length"
+        );
+        assert!(
+            parse_file_id(&"a".repeat(33)).is_err(),
+            "33 hex chars is the wrong length"
+        );
+        assert!(
+            parse_file_id(&"g".repeat(32)).is_err(),
+            "32 non-hex chars is invalid"
+        );
+    }
+
+    // ── sanitize_name (spec §5.6 / R5 — the path-traversal guard) ─────────────
+
+    #[test]
+    fn sanitize_name_keeps_a_plain_basename() {
+        assert_eq!(sanitize_name("report.pdf", [0u8; 16]), "report.pdf");
+        assert_eq!(sanitize_name("  spaced.txt  ", [0u8; 16]), "spaced.txt");
+    }
+
+    #[test]
+    fn sanitize_name_reduces_forward_slash_traversal_to_the_basename() {
+        // A malicious `file.shared.name` must never escape the target directory.
+        assert_eq!(sanitize_name("../../etc/passwd", [0u8; 16]), "passwd");
+        assert_eq!(sanitize_name("/abs/path/to/x", [0u8; 16]), "x");
+    }
+
+    #[test]
+    fn sanitize_name_reduces_backslash_traversal_to_the_basename() {
+        assert_eq!(sanitize_name("..\\..\\secret.txt", [0u8; 16]), "secret.txt");
+    }
+
+    #[test]
+    fn sanitize_name_strips_control_characters() {
+        // NUL / newline / tab are control chars and must be stripped from the name
+        // before it reaches the filesystem.
+        assert_eq!(sanitize_name("na\nme\t.txt", [0u8; 16]), "name.txt");
+    }
+
+    #[test]
+    fn sanitize_name_falls_back_to_file_hex_when_unsafe_or_empty() {
+        let id = [0xCDu8; 16];
+        let fallback = format!("file_{}", hex::encode(id));
+        assert_eq!(sanitize_name("", id), fallback, "empty name");
+        assert_eq!(sanitize_name(".", id), fallback, "current-dir name");
+        assert_eq!(sanitize_name("..", id), fallback, "parent-dir name");
+        assert_eq!(sanitize_name("dir/", id), fallback, "trailing separator");
+        assert_eq!(sanitize_name("\0", id), fallback, "control-only name");
+    }
+
+    // ── resolve_output_path (spec §5.6) ───────────────────────────────────────
+
+    #[test]
+    fn resolve_output_path_explicit_file_uses_the_exact_path_and_creates_parents() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("nested").join("out.bin");
+        let got = resolve_output_path(
+            tmp.path(),
+            Some(target.to_str().unwrap()),
+            "ignored",
+            [0u8; 16],
+        )
+        .unwrap();
+        assert_eq!(got, target, "an explicit --out file is used verbatim");
+        assert!(
+            target.parent().unwrap().is_dir(),
+            "missing parent dirs are created"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_refuses_to_overwrite_an_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("keep.bin");
+        std::fs::write(&existing, b"do not clobber").unwrap();
+        let err = resolve_output_path(tmp.path(), Some(existing.to_str().unwrap()), "n", [0u8; 16])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "must not clobber an existing --out file: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_existing_dir_joins_the_sanitized_name() {
+        let tmp = TempDir::new().unwrap();
+        let got = resolve_output_path(
+            tmp.path(),
+            Some(tmp.path().to_str().unwrap()),
+            "doc.txt",
+            [0u8; 16],
+        )
+        .unwrap();
+        assert_eq!(got, tmp.path().join("doc.txt"));
+    }
+
+    #[test]
+    fn resolve_output_path_trailing_separator_is_treated_as_a_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("downloads");
+        let spec = format!("{}/", dir.display());
+        let got = resolve_output_path(tmp.path(), Some(&spec), "doc.txt", [0u8; 16]).unwrap();
+        assert_eq!(got, dir.join("doc.txt"));
+        assert!(
+            dir.is_dir(),
+            "a value ending in a separator creates the dir"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_dir_target_cannot_be_escaped_by_a_traversal_name() {
+        // The security property AC/R5 protects: even a `../../../etc/passwd` name
+        // resolves to a single component inside the requested directory.
+        let tmp = TempDir::new().unwrap();
+        let got = resolve_output_path(
+            tmp.path(),
+            Some(tmp.path().to_str().unwrap()),
+            "../../../etc/passwd",
+            [0u8; 16],
+        )
+        .unwrap();
+        assert_eq!(got, tmp.path().join("passwd"));
+        assert_eq!(
+            got.parent().unwrap(),
+            tmp.path(),
+            "the resolved path must stay inside the target directory"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_omitted_uses_the_downloads_dir() {
+        // Only meaningful when the downloads override env is unset (CI baseline).
+        if std::env::var_os(DOWNLOADS_ENV).is_some() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let got = resolve_output_path(tmp.path(), None, "doc.txt", [0xABu8; 16]).unwrap();
+        assert_eq!(got, tmp.path().join("downloads").join("doc.txt"));
+        assert!(
+            tmp.path().join("downloads").is_dir(),
+            "the downloads dir is created on demand"
+        );
+    }
+
+    #[test]
+    fn downloads_dir_defaults_under_home_when_env_unset() {
+        if std::env::var_os(DOWNLOADS_ENV).is_some() {
+            return;
+        }
+        let home = Path::new("/some/home");
+        assert_eq!(downloads_dir(home), home.join("downloads"));
+    }
+
+    // ── resolve_providers (spec §5.5) ─────────────────────────────────────────
+
+    #[test]
+    fn resolve_providers_defaults_to_the_author_when_absent() {
+        let author = device(1);
+        let got = resolve_providers(&file_shared_with(None), author, endpoint_of(device(2)), &[]);
+        assert_eq!(
+            got.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![endpoint_of(author)],
+            "absent providers default to the author's device"
+        );
+    }
+
+    #[test]
+    fn resolve_providers_defaults_to_the_author_when_list_is_empty() {
+        let author = device(1);
+        let got = resolve_providers(
+            &file_shared_with(Some(vec![])),
+            author,
+            endpoint_of(device(2)),
+            &[],
+        );
+        assert_eq!(
+            got.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![endpoint_of(author)],
+            "an empty providers list falls back to the author"
+        );
+    }
+
+    #[test]
+    fn resolve_providers_skips_self() {
+        // Fetching from yourself is a no-op; self must be filtered out of the list.
+        let me = device(4);
+        let got = resolve_providers(&file_shared_with(None), me, endpoint_of(me), &[]);
+        assert!(got.is_empty(), "self is skipped, leaving no provider");
+    }
+
+    #[test]
+    fn resolve_providers_preserves_order_and_drops_self_from_the_list() {
+        let p1 = device(3);
+        let me = device(4);
+        let p2 = device(5);
+        let shared = file_shared_with(Some(vec![p1, me, p2]));
+        // author is unused because an explicit non-empty list is present.
+        let got = resolve_providers(&shared, device(9), endpoint_of(me), &[]);
+        assert_eq!(
+            got.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![endpoint_of(p1), endpoint_of(p2)],
+            "as-listed order is preserved and self is removed"
+        );
+    }
+
+    #[test]
+    fn resolve_providers_uses_a_matching_peer_hint_address() {
+        // A `--peer <id>@<ip:port>` hint makes the dial deterministic; the matching
+        // provider must resolve to that full address, not a bare EndpointId.
+        let p = device(6);
+        let pid = endpoint_of(p);
+        let sock: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let hint = EndpointAddr::new(pid).with_ip_addr(sock);
+        let got = resolve_providers(
+            &file_shared_with(Some(vec![p])),
+            device(9),
+            endpoint_of(device(7)),
+            std::slice::from_ref(&hint),
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, pid);
+        assert!(
+            got[0].ip_addrs().any(|a| *a == sock),
+            "the matching --peer direct address must be carried through"
+        );
+    }
+
+    #[test]
+    fn resolve_providers_falls_back_to_a_bare_endpoint_without_a_hint() {
+        let p = device(6);
+        let pid = endpoint_of(p);
+        let got = resolve_providers(
+            &file_shared_with(Some(vec![p])),
+            device(9),
+            endpoint_of(device(7)),
+            &[],
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, pid);
+        assert_eq!(
+            got[0].ip_addrs().count(),
+            0,
+            "with no hint the address is bare (discovery resolves it)"
+        );
+    }
+
+    // ── save_atomic (spec §5.2 step 8) ────────────────────────────────────────
+
+    #[test]
+    fn save_atomic_writes_bytes_and_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out.bin");
+        save_atomic(&target, b"hello world").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello world");
+        assert!(
+            !tmp.path().join(".out.bin.part").exists(),
+            "the temp part file must be renamed away, never left behind"
+        );
+    }
+
+    #[test]
+    fn save_atomic_replaces_an_existing_target_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out.bin");
+        std::fs::write(&target, b"stale").unwrap();
+        save_atomic(&target, b"fresh").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn save_atomic_missing_parent_dir_errors_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("no-such-dir").join("out.bin");
+        let err = save_atomic(&target, b"data").unwrap_err();
+        assert!(
+            err.to_string().contains("could not save to"),
+            "a write failure is reported against the target: {err}"
+        );
+        assert!(!target.exists(), "nothing is left at the target on failure");
+    }
+
+    // ── short_endpoint ────────────────────────────────────────────────────────
+
+    #[test]
+    fn short_endpoint_is_an_eight_char_prefix() {
+        let id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let short = short_endpoint(id);
+        assert_eq!(short.len(), 8, "diagnostic prefix is 8 chars");
+        assert!(
+            id.to_string().starts_with(&short),
+            "the short form is a prefix of the full id"
+        );
     }
 }

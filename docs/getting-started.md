@@ -73,6 +73,16 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 >   follow-up to issue #31 / IR-0206). **Expected output** blocks for Step 7 are *illustrative*
 >   (consistent with `PRD.v0.3.md` §16 but not yet captured from a real run). `agent invite`
 >   (Step 3) is implemented and runnable.
+
+> - **Step 5** (`iroh-rooms file share | list | fetch`) is implemented and runnable as of
+>   issue #29 / IR-0204, completing the Blob Plane #27 / IR-0202 started. Output blocks for
+>   all three commands are reconciled against the shipped binary and show the actual format.
+>   `file fetch` requires a provider to be online and serving — run `room tail` on the
+>   provider's terminal, which now also serves the blobs it holds over the ACL-gated
+>   `iroh-blobs` ALPN.
+> - **Step 7** — `agent` is scaffold — the binary does not recognise it yet. **Expected output**
+>   blocks for Step 7 are *illustrative* (consistent with `PRD.v0.3.md` §16 but not yet
+>   captured from a real run).
 > - **Issue #24 / IR-0109** adds the Phase 1A two-peer integration test suite
 >   (`crates/iroh-rooms-cli/tests/two_peer_e2e.rs`). The CI tier (offline-backbone and
 >   restart-persistence tests) runs automatically via `cargo test`. The full online tier —
@@ -572,17 +582,20 @@ hash: blake3:…(64 hex chars)…
 event: blake3:…(64 hex chars)…
 room: blake3:…(64 hex chars)…
 provider: you (local)
-next: run `iroh-rooms file list blake3:…` (peers can fetch it once serve/fetch lands)
+next: run `iroh-rooms room tail blake3:…` to serve it, then peers can `iroh-rooms file fetch blake3:… file_…`
 ```
 
 Copy the `file_…` value as `<FILE_ID>`. The `hash:` line is Alice's node's BLAKE3-256 content
-hash of `hello.txt`; Bob will receive the same hash via the synced `file.shared` event so he
-can verify integrity once `file fetch` lands.
+hash of `hello.txt`; Bob will receive the same hash via the synced `file.shared` event and
+verify it independently against the bytes he fetches.
 
-**Command** (Terminal A — Alice) — confirm the file is held locally:
+**Command** (Terminal A — Alice) — confirm the file is held locally *before* going online:
 
 ```bash
-# Substitute <ROOM_ID>.
+# Substitute <ROOM_ID>. Run this before `room tail` below: the durable blob store
+# takes an exclusive on-disk lock while a serving `room tail` session is up, so
+# `file list` / `file share` on this same home must run before you start it (or
+# after you stop it).
 iroh-rooms file list <ROOM_ID>
 ```
 
@@ -595,6 +608,18 @@ file_id: file_…(32 hex chars)…
   size: 17 bytes
   hash: blake3:…(64 hex chars)…
   provider: you (local)
+```
+
+**Command** (Terminal A — Alice) — stay online and serve the blob (leave this running):
+
+```bash
+# Substitute <ROOM_ID>. This is the same `room tail` session used in Step 4 — it now
+# also serves the blobs Alice holds over the ACL-gated `iroh-blobs` ALPN. It holds the
+# blob store's lock for the whole session: a concurrent `file list` on this home reads
+# provider status as `unknown (store in use)`, and a concurrent `file share` fails fast
+# (a few seconds, not a hang) with a `blob_store_locked` error — stop `room tail` first
+# to share another file from this home.
+iroh-rooms room tail <ROOM_ID>
 ```
 
 **Command** (Terminal B — Bob) — list shared files after syncing the event:
@@ -623,30 +648,38 @@ file_id: file_…(32 hex chars)…
 iroh-rooms file list <ROOM_ID> --json
 ```
 
-**`file fetch` is not yet implemented.** The block below is *illustrative* — it shows the
-intended user journey once the serve/fetch follow-up ships:
+**Command** (Terminal B — Bob) — fetch the file from Alice:
 
 ```bash
-# NOT YET RUNNABLE — tracked as a follow-up to IR-0202.
+# Substitute <ROOM_ID> and <FILE_ID> (the file_… value from Alice's `file share`).
 iroh-rooms file fetch <ROOM_ID> <FILE_ID>
 ```
 
+**Expected output** (reconciled to the binary; volatile bytes abbreviated as `…`):
+
 ```text
-Fetching file_…2c from an available provider (Alice)…
-Verified blake3:…9e — integrity OK. Saved to ./hello.txt
+saved: /home/bob/.local/share/iroh-rooms/downloads/hello.txt
+verified: blake3:…(64 hex chars)…
+size: 17 bytes
+provider: …(8 hex chars)…
 ```
+
+`saved:` names the exact path the verified bytes were written to — the downloads directory
+(`$IROH_ROOMS_DOWNLOADS`, else `<data-dir>/downloads/`) unless `--out <PATH>` names a file or
+directory. `verified:` is Bob's own independent BLAKE3-256 recompute over the fetched bytes; it
+must equal the `hash:` Alice printed at share time.
 
 **What this proves / verify:** `file share` content-addresses the file into a durable local
 blob store, records the BLAKE3-256 hash, and persists a signed `file.shared` event to the room
-log — the hash is the offline guarantee (spike §4). Peers that sync the event via the room log
-see it in `file list` with `provider: reference-only`; a peer that has locally imported the same
-file would see `provider: you (local)`. Integrity verification (`file fetch` BLAKE3 recompute)
-is part of the serve/fetch follow-up (spike §5 blob gate).
+log — the hash is the offline guarantee (spike §4). `file fetch` resolves that reference,
+discovers Alice as the provider, dials her over the ACL-gated `iroh-blobs` ALPN (only an active
+room member reaches this far — an unauthorized peer is denied at the connect gate, PRD §15.6),
+transfers the blob, and independently recomputes BLAKE3-256 over the received bytes before
+saving — a `file.shared` that lied about its hash would be caught here, not just trusted.
 
-> **Availability caveat (important):** once `file fetch` ships, file bytes will be fetchable
-> **only while a peer that holds the blob is online**. There is no always-on store; availability
-> follows the providers. Until then, `file share` records the reference locally and peers can
-> observe it via `file list`, but no byte transfer occurs — see the
+> **Availability caveat (important):** file bytes are fetchable **only while a peer that holds
+> the blob is online and running `room tail`** (the "provider stays online" surface). There is
+> no always-on store; availability follows the providers — see the
 > [unavailable file](#unavailable-file) troubleshooting case (PRD §9.2, §15.6 #6).
 
 ---
@@ -911,19 +944,24 @@ reason codes are stable identifiers also written to the local audit log.
 
 ### Unavailable file
 
-- **Status:** `file fetch` is not yet implemented (the serve/fetch half is tracked separately
-  from the landed import — IR-0202). The `file list` command is runnable and shows
-  `provider: reference-only` when a peer holds the `file.shared` event but not the blob bytes.
-- **Once `file fetch` ships — reproduce:** with Alice (the only provider) offline, have Bob
-  run `file fetch`.
-- **CLI will report** (illustrative; PRD §9.2, §15.6 #6):
+- **Reproduce:** with Alice (the only provider — she is not running `room tail`, or her process
+  is stopped), have Bob run `file fetch`.
+- **CLI reports** (PRD §9.2, §15.6 #6):
 
   ```text
-  File file_…2c is currently unavailable: no peer holding it is online.
+  file file_…2c is currently unavailable: no provider holding it is online
   ```
 
-- **Next action:** wait until a peer that holds the file is online, then retry. MVP has no
-  pinning or always-on node — availability follows the providers.
+  The fetch fails within the bounded per-provider timeout (`--timeout`, default 30s) — never a
+  hang. A hash mismatch is reported differently and distinctly (an integrity failure, not an
+  availability one):
+
+  ```text
+  integrity check FAILED: fetched bytes hash blake3:… but the reference declares blake3:…; refusing to save
+  ```
+
+- **Next action:** have a peer that holds the file run `iroh-rooms room tail <ROOM_ID>`, then
+  retry `file fetch`. MVP has no pinning or always-on node — availability follows the providers.
 
 ### Adjacent cases the CLI also distinguishes
 

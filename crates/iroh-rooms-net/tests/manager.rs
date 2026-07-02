@@ -192,6 +192,7 @@ async fn bind_transport(actor: &Actor) -> NetTransport {
             ..NetConfig::default()
         },
         None,
+        None,
     )
     .await
     .expect("bind loopback transport")
