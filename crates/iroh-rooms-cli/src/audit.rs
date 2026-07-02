@@ -110,5 +110,19 @@ mod tests {
         sink.event_rejected(device(1), 3);
         sink.deauthorized(device(1));
         sink.event_flagged(device(1), "clock_skew");
+        sink.blob_serve_accepted(device(1), [0x22; 32]);
+        sink.blob_serve_rejected(device(1), BlobDenyCause::NotActive, Some([0x22; 32]));
+        sink.blob_serve_rejected(device(1), BlobDenyCause::PushDenied, None);
+    }
+
+    #[test]
+    fn blob_serve_lines_key_on_the_same_short_device_and_hash_as_message_tail() {
+        let hash = [0x33; 32];
+        assert_eq!(short_hash(hash), "33333333");
+        assert_eq!(short_device(&device(1)), device(1).to_string()[..8]);
+
+        let sink = StderrAudit;
+        sink.blob_serve_accepted(device(1), hash);
+        sink.blob_serve_rejected(device(1), BlobDenyCause::NotReferenced, Some(hash));
     }
 }
