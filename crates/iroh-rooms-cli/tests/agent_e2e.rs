@@ -28,11 +28,21 @@
 //! wire level: `join::join` pre-checks the ticket's key binding before any
 //! dial (see `join.rs`), so a mismatched-identity join never touches the
 //! network and is already covered, network-free, by
-//! `join_cli.rs::join_wrong_identity_exits_nonzero_with_actionable_message`.
+//! `join_cli.rs::join_wrong_identity_exits_nonzero_with_actionable_message`, and,
+//! through the *agent* invite surface specifically, by IR-0207's
+//! `agent_invite_flow.rs` (corrupt / truncated / wrong-identity agent tickets).
 //! The network-layer admission gate is role-agnostic (it keys on
 //! identity/device, not on `role`) and already has dedicated online coverage in
 //! `iroh-rooms-net/tests/manager_e2e.rs::managed_room_unknown_inbound_rejected_by_snapshot_admission`;
 //! duplicating it for an `agent`-flavored device would add no new guarantee.
+//!
+//! The remaining online leg of AC3 — a *structurally valid* agent ticket rejected
+//! by a live admin's `gate_join` (wrong capability secret / expired invite) — is
+//! also not here: it is proven at the `Node` layer, `role = "agent"`, by
+//! `iroh-rooms-net/tests/join_e2e.rs::agent_bad_capability_secret_join_not_accepted`
+//! and `…::agent_expired_invite_join_not_accepted`, which mirror the member-role
+//! proofs in the same file (always-green — no live process/loopback socket
+//! needed, just two in-process `Node`s).
 //!
 //! ## Running the gated tier
 //!
