@@ -20,6 +20,9 @@
 //!   file list `--json` — empty room emits `[]`
 //!   file list     — after a share: `file_id` / name / hash / provider present
 //!   file list `--json` — emits a JSON array with the correct provider token
+//!   file list after validation — share's `file_id`/`hash` == list's `file_id`/`blob_hash`
+//!                   (IR-0203 AC3; the AC4 invalid-rejection proof lives in
+//!                   `iroh-rooms-core`'s `membership_store_e2e.rs`, offline of the CLI)
 //!   file list unknown room — exits nonzero
 //!   consecutive shares — second share does not deadlock on the blob store lock
 //!   secret hygiene — device and identity seeds absent from stdout/stderr
@@ -605,6 +608,83 @@ fn list_json_after_share_contains_correct_structure() {
     assert_eq!(
         hex_len, 64,
         "blob_hash hex part must be 64 chars; got {hash:?}"
+    );
+}
+
+// ── file list: shows the exact validated record after `file share` (IR-0203 /
+// issue #28 AC3 ⟺ AC4) ───────────────────────────────────────────────────────
+//
+// The `file_id`/`hash` reported at share time (the author path, which
+// self-validates) must be the *exact same* identifiers `file list` (text and
+// `--json`) later reports — proving the listed row is the validated record,
+// not merely "a" record. The CLI cannot easily inject an invalid `file.shared`
+// (the author path validates before printing), so the invalid-rejection proof
+// (AC4) lives in the core store test
+// `membership_store_e2e::invalid_file_shared_never_persisted_or_listed`; this
+// test proves the positive "valid ⇒ listed" half end-to-end.
+
+#[test]
+fn shared_file_appears_in_list_after_validation() {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+    let tmp = TempDir::new().unwrap();
+    let path = write_file(tmp.path(), "validated.txt", b"validated content");
+
+    let share_out = cmd(&home)
+        .args(["file", "share", &room_id, &path])
+        .output()
+        .unwrap();
+    assert!(
+        share_out.status.success(),
+        "file share must succeed; stderr: {}",
+        String::from_utf8_lossy(&share_out.stderr)
+    );
+    let share_stdout = String::from_utf8_lossy(&share_out.stdout);
+    let file_id = extract_field(&share_stdout, "file_id")
+        .expect("'file_id:' field from file share")
+        .to_owned();
+    let hash = extract_field(&share_stdout, "hash")
+        .expect("'hash:' field from file share")
+        .to_owned();
+
+    // Text `file list` shows the same file_id and name.
+    let list_out = cmd(&home)
+        .args(["file", "list", &room_id])
+        .output()
+        .unwrap();
+    assert!(list_out.status.success());
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(
+        list_stdout.contains(&file_id),
+        "file list must show the exact file_id from share; got:\n{list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("validated.txt"),
+        "file list must show the file name; got:\n{list_stdout}"
+    );
+
+    // `--json` shows the same file_id and blob_hash, i.e. the identical
+    // validated record, not a re-derived one.
+    let json_out = cmd(&home)
+        .args(["file", "list", &room_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(json_out.status.success());
+    let json_stdout = String::from_utf8_lossy(&json_out.stdout);
+    let arr: serde_json::Value =
+        serde_json::from_str(json_stdout.trim()).expect("file list --json must emit valid JSON");
+    let files = arr.as_array().expect("output must be a JSON array");
+    assert_eq!(files.len(), 1, "must list exactly one file");
+    assert_eq!(
+        files[0]["file_id"].as_str(),
+        Some(file_id.as_str()),
+        "JSON file_id must match the share output's file_id"
+    );
+    assert_eq!(
+        files[0]["blob_hash"].as_str(),
+        Some(hash.as_str()),
+        "JSON blob_hash must match the share output's hash"
     );
 }
 

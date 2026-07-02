@@ -593,6 +593,20 @@ Blob Plane and making `iroh-rooms file share` operational:
   Until it lands a shared blob is held locally and shown as `provider: you (local)` in
   `file list`; peers that have not yet imported it see `provider: reference-only`.
 
+**`file.shared` validation hardening** has landed in `crates/iroh-rooms-core::event`
+(issue #28 / IR-0203), closing the one gap #27 left open: `parse_file_shared` now enforces
+semantic bounds on peer-asserted file metadata at the stateless trust boundary, not just
+structural shape. `name` and `mime_type` must be non-empty, control-character-free, and
+within `MAX_FILE_NAME_BYTES`/`MAX_MIME_TYPE_BYTES` (255 bytes each); `mime_type` must also be a
+well-formed `type/subtype` pair; `size_bytes` is capped at the existing `MAX_SHARED_FILE_BYTES`
+(100 MiB) at the event layer, not just the CLI's local pre-import check; an explicit
+`providers` array, when present, must be non-empty and no longer than `MAX_FILE_PROVIDERS`
+(16). Every violation returns the existing `RejectReason::InvalidContent` — no new taxonomy
+variant, no wire-schema change, and every previously-valid `file.shared` (including the pinned
+golden vectors) stays byte-identical and valid. Because `EventStore::insert` is only ever
+reached for validated events, an invalid `file.shared` — however it arrives, from a local
+build or a remote peer — can never be persisted and therefore never appears in `file list`.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the

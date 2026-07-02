@@ -22,12 +22,14 @@
 #![allow(clippy::similar_names)]
 
 use iroh_rooms_core::event::binding::DeviceBinding;
+use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
 use iroh_rooms_core::event::content::{
     capability_hash, Content, EventType, FileShared, MemberInvited, MemberJoined, MemberRemoved,
     RoomCreated,
 };
 use iroh_rooms_core::event::ids::{HashRef, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
+use iroh_rooms_core::event::reject::RejectReason;
 use iroh_rooms_core::event::signed::{self, SignedEvent};
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
 use iroh_rooms_core::event::wire::WireEvent;
@@ -699,5 +701,68 @@ fn multi_room_isolation_in_shared_store() {
         blob_serve_allowed(&snap_b, &alice.device(), &blob_b, &shares_b),
         BlobDecision::Reject(DenyReason::UnknownDevice),
         "Alice's device must be UnknownDevice in room B (no cross-room device leak)"
+    );
+}
+
+/// AC4 ⟺ AC3 (issue #28 / IR-0203): a `file.shared` asserting an absurd
+/// `size_bytes` is rejected by the stateless validator before it ever produces
+/// a `ValidatedEvent` — so it can never reach `EventStore::insert` and never
+/// appears in `by_type`, the direct input to `file list`. A valid sibling
+/// `file.shared` in the same room is persisted and listed normally.
+#[test]
+fn invalid_file_shared_never_persisted_or_listed() {
+    let alice = Principal::new(0x07);
+    let bob = Principal::new(0x17);
+    let (events, room, _blob) = build_lifecycle(&alice, &bob);
+
+    // A sibling `file.shared`, same room/sender/parent as the valid share in
+    // `events[3]`, but with `size_bytes` far over `MAX_SHARED_FILE_BYTES` — a
+    // peer asserting an unbounded file size.
+    let invalid = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::FileShared,
+        created_at: T0 + 3,
+        prev_events: vec![events[2].event_id],
+        content: Content::FileShared(FileShared {
+            file_id: [0x02; 16],
+            name: "huge.bin".to_owned(),
+            mime_type: "application/octet-stream".to_owned(),
+            size_bytes: MAX_SHARED_FILE_BYTES + 1,
+            blob_hash: HashRef::from_bytes([0xcd; 32]),
+            blob_format: None,
+            providers: None,
+        }),
+    };
+    let invalid_bytes = seal(&invalid, &alice.dev);
+
+    // AC4: the stateless validator rejects it — there is no `ValidatedEvent` to
+    // insert, so the store integrity boundary is enforced by construction.
+    assert_eq!(
+        validate_wire_bytes(&invalid_bytes, &ctx(room)),
+        Err(RejectReason::InvalidContent),
+        "over-cap size_bytes must be rejected as invalid_content"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("room.db");
+    let mut store = EventStore::open(&db_path).expect("open store");
+    store.insert_all(&events).expect("insert_all");
+
+    // AC3: `by_type` (the direct input to `file list`) contains only the valid
+    // `file.shared`; the rejected sibling never appears.
+    let shared = store
+        .by_type(&room, EventType::FileShared)
+        .expect("by_type");
+    assert_eq!(shared.len(), 1, "only the valid file.shared is present");
+    assert_eq!(
+        shared[0].event_id, events[3].event_id,
+        "the persisted file.shared must be the valid one"
+    );
+    assert!(
+        shared.iter().all(|s| s.wire.to_bytes() != invalid_bytes),
+        "the rejected file.shared bytes must never appear in by_type"
     );
 }
