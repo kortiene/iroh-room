@@ -12,10 +12,11 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use iroh_rooms_core::event::ids::RoomId;
 
+use crate::error::{CodedResultExt, ErrorCode};
 use crate::{file, identity, invite, join, message, paths, pipe, room};
 
 /// Local-first rooms over iroh — local identity and device management.
@@ -420,7 +421,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                 // The live connection view is an online command: parse the timeout
                 // before any IO, then run it in a scoped runtime (mirrors `send`).
                 // (`--json` is rejected by clap in this combination for now.)
-                let timeout = message::parse_timeout(&timeout)?;
+                let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
                 runtime()?.block_on(message::members_status(
                     home, &room_id, &peers, timeout, loopback,
                 ))?;
@@ -456,7 +457,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
         } => {
             let room_id = parse_room_id(&room_id)?;
             // Parse the timeout before any IO so a bad value writes nothing.
-            let timeout = message::parse_timeout(&timeout)?;
+            let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
             // The online command runs in a scoped runtime; the rest stays
             // synchronous (spec IR-0105 D2).
             let summary = runtime()?.block_on(message::send(
@@ -504,7 +505,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
         } => {
             // Parse the timeout before any IO so a bad value writes nothing and
             // dials nothing (the ticket is decoded inside `join`, also pre-IO).
-            let timeout = message::parse_timeout(&timeout)?;
+            let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
             let summary = runtime()?.block_on(join::join(
                 home,
                 &ticket,
@@ -521,8 +522,9 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
 
 /// Parse a room-id argument or fail with the shared, actionable message.
 fn parse_room_id(s: &str) -> Result<RoomId> {
-    s.parse()
-        .map_err(|_| anyhow!("invalid room id (expected `blake3:<hex>`)"))
+    s.parse::<RoomId>()
+        .map_err(|_| "invalid room id (expected `blake3:<hex>`)")
+        .coded(ErrorCode::InvalidRoomId)
 }
 
 /// Dispatch the `pipe` subcommands (kept out of [`run`] so each dispatcher stays

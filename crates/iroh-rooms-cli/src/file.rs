@@ -43,6 +43,7 @@ use iroh_rooms_core::store::EventStore;
 use iroh_rooms_net::BlobStore;
 use serde_json::json;
 
+use crate::error::CodedResultExt;
 use crate::message::{fold_room, select_heads, DB_FILE};
 use crate::{clock, identity, paths};
 
@@ -114,7 +115,8 @@ pub async fn share(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (mut membership, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&sender_id) {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can share \
              files (this identity is {sender_id})"
         );
@@ -191,21 +193,27 @@ pub async fn share(
         created_at,
     );
     let ctx = ValidationContext::for_room(*room_id);
-    let validated = validate_wire_bytes(&wire.to_bytes(), &ctx).map_err(|reason| {
-        anyhow!(
-            "internal error: freshly built file.shared failed validation ({})",
-            reason.code()
-        )
-    })?;
+    let validated = validate_wire_bytes(&wire.to_bytes(), &ctx)
+        .map_err(|reason| {
+            anyhow!(
+                "internal error: freshly built file.shared failed validation ({})",
+                reason.code()
+            )
+        })
+        .coded(crate::error::ErrorCode::Internal)?;
     let event_id = validated.event_id;
     match membership.ingest(validated.clone()) {
         Ingest::Accepted { .. } => {}
-        Ingest::Rejected { reason, .. } => bail!(
+        Ingest::Rejected { reason, .. } => crate::bail_coded!(
+            crate::error::ErrorCode::Internal,
             "internal error: freshly built file.shared was rejected by the fold ({})",
             reason.code()
         ),
         Ingest::Buffered { .. } => {
-            bail!("internal error: freshly built file.shared is causally incomplete")
+            crate::bail_coded!(
+                crate::error::ErrorCode::Internal,
+                "internal error: freshly built file.shared is causally incomplete"
+            )
         }
     }
 
@@ -383,27 +391,36 @@ fn effective_max_share_bytes() -> u64 {
 /// target reports `no such file` and a symlink to a directory reports the directory
 /// error.
 fn classify_path(path: &Path, max_bytes: u64) -> Result<u64> {
+    use crate::error::ErrorCode;
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            bail!("no such file: {}", path.display())
+            crate::bail_coded!(ErrorCode::NoSuchFile, "no such file: {}", path.display())
         }
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            bail!("permission denied reading {}", path.display())
+            crate::bail_coded!(
+                ErrorCode::PermissionDenied,
+                "permission denied reading {}",
+                path.display()
+            )
         }
         Err(err) => {
             return Err(err).with_context(|| format!("could not read {}", path.display()));
         }
     };
     if meta.is_dir() {
-        bail!(
+        // Folded under `invalid_argument` to keep the code set minimal (OQ-4); a
+        // dedicated `not_a_file` code can split out later if a script needs it.
+        crate::bail_coded!(
+            ErrorCode::InvalidArgument,
             "{} is a directory, not a file; share a single file",
             path.display()
         );
     }
     let len = meta.len();
     if len > max_bytes {
-        bail!(
+        crate::bail_coded!(
+            ErrorCode::FileTooLarge,
             "{} is {len} bytes; exceeds the MVP share limit of {max_bytes} bytes",
             path.display()
         );
@@ -413,10 +430,14 @@ fn classify_path(path: &Path, max_bytes: u64) -> Result<u64> {
     match std::fs::File::open(path) {
         Ok(_) => {}
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            bail!("permission denied reading {}", path.display())
+            crate::bail_coded!(
+                ErrorCode::PermissionDenied,
+                "permission denied reading {}",
+                path.display()
+            )
         }
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            bail!("no such file: {}", path.display())
+            crate::bail_coded!(ErrorCode::NoSuchFile, "no such file: {}", path.display())
         }
         Err(err) => {
             return Err(err).with_context(|| format!("could not read {}", path.display()));

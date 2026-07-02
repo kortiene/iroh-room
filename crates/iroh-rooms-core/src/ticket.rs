@@ -88,6 +88,24 @@ impl fmt::Display for TicketError {
 
 impl std::error::Error for TicketError {}
 
+impl TicketError {
+    /// The stable string code (prefixed `ticket_`) for CLI failure-mode distinction
+    /// (spec IR-0110 AC3). `UnsupportedVersion` maps to the version-independent
+    /// `ticket_unsupported_version` — the specific version number stays in
+    /// [`Display`](fmt::Display), not the code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BadPrefix => "ticket_bad_prefix",
+            Self::BadBase32 => "ticket_bad_base32",
+            Self::Truncated => "ticket_truncated",
+            Self::UnsupportedVersion(_) => "ticket_unsupported_version",
+            Self::BadChecksum => "ticket_bad_checksum",
+            Self::MalformedBody => "ticket_malformed",
+        }
+    }
+}
+
 /// An out-of-band, key-bound room invite ticket (spec IR-0103 D4).
 ///
 /// The capability **secret** lives only here and in nothing written to the event
@@ -401,6 +419,26 @@ mod tests {
             RoomInviteTicket::from_str(&format!("{TICKET_PREFIX}1809")),
             Err(TicketError::BadBase32)
         );
+    }
+
+    #[test]
+    fn ticket_error_codes_are_stable() {
+        // Tooling parses these strings (spec IR-0110 AC3) — pin them exactly like
+        // `RejectReason::code` / `OfflineReason::label`.
+        assert_eq!(TicketError::BadPrefix.code(), "ticket_bad_prefix");
+        assert_eq!(TicketError::BadBase32.code(), "ticket_bad_base32");
+        assert_eq!(TicketError::Truncated.code(), "ticket_truncated");
+        assert_eq!(
+            TicketError::UnsupportedVersion(2).code(),
+            "ticket_unsupported_version"
+        );
+        assert_eq!(
+            TicketError::UnsupportedVersion(7).code(),
+            "ticket_unsupported_version",
+            "the version number must not leak into the code"
+        );
+        assert_eq!(TicketError::BadChecksum.code(), "ticket_bad_checksum");
+        assert_eq!(TicketError::MalformedBody.code(), "ticket_malformed");
     }
 
     #[test]

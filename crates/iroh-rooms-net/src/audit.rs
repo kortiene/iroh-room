@@ -47,6 +47,15 @@ pub trait AuditSink: Send + Sync + 'static {
     /// Terminal: we will not redial a since-removed peer. Default: no-op.
     fn deauthorized(&self, _device: EndpointId) {}
 
+    /// A validated, **accepted** inbound event from `device` carried an advisory
+    /// flag (spec IR-0110 §5.9) — `code` is the stable
+    /// [`Flag::code`](iroh_rooms_core::event::Flag::code) label (e.g.
+    /// `clock_skew`). Flags never change the verdict, the validated set, ordering,
+    /// or any authz/expiry decision — this is purely an observability signal for a
+    /// CLI/host that installs no `tracing` subscriber. Default: no-op, so existing
+    /// sinks need not change.
+    fn event_flagged(&self, _device: EndpointId, _code: &'static str) {}
+
     /// A connection was admitted **provisionally** for the join bootstrap
     /// (IR-0104, Approach A): a not-yet-Active invitee allowed to pull the
     /// membership sub-DAG and push a single `member.joined`. Default: no-op, so
@@ -127,6 +136,17 @@ impl AuditSink for TracingAudit {
         );
     }
 
+    fn event_flagged(&self, device: EndpointId, code: &'static str) {
+        // `event.flagged:<code>` is the stable, greppable advisory line (spec
+        // IR-0110 §5.9). INFO: a flag is never a rejection.
+        tracing::info!(
+            reason = "event.flagged",
+            code,
+            peer = %device,
+            "accepted inbound event carried an advisory flag"
+        );
+    }
+
     fn bootstrap_admitted(&self, device: EndpointId) {
         // `join.bootstrap.admitted` is the stable, greppable audit line (IR-0104
         // §8). INFO: a provisional admit is an expected part of the join handshake.
@@ -202,6 +222,25 @@ mod tests {
         // AC3 observability sink must be non-panicking for any reject count.
         TracingAudit.event_rejected(device(5), 1);
         TracingAudit.event_rejected(device(5), 0);
+    }
+
+    #[test]
+    fn tracing_audit_event_flagged_does_not_panic() {
+        // The clock-skew advisory sink (spec IR-0110 §5.9) must never panic.
+        TracingAudit.event_flagged(device(6), "clock_skew");
+    }
+
+    #[test]
+    fn default_event_flagged_is_a_no_op() {
+        // A minimal sink relying on the trait default must compile and not panic.
+        struct Minimal;
+        impl AuditSink for Minimal {
+            fn accepted(&self, _device: EndpointId, _identity: &IdentityKey) {}
+            fn rejected(&self, _device: EndpointId, _cause: RejectCause) {}
+            fn connected(&self, _device: EndpointId) {}
+            fn disconnected(&self, _device: EndpointId) {}
+        }
+        Minimal.event_flagged(device(7), "clock_skew");
     }
 
     #[test]

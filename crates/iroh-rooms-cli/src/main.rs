@@ -5,9 +5,11 @@
 
 use std::process::ExitCode;
 
+mod audit;
 mod cli;
 mod clock;
 mod display;
+mod error;
 mod file;
 mod identity;
 mod invite;
@@ -22,9 +24,17 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // `{:#}` includes the full anyhow context chain. No secret material
-            // ever reaches an error path (spec D8 / §9).
-            eprintln!("error: {err:#}");
-            ExitCode::FAILURE
+            // ever reaches an error path (spec D8 / §9). A coded failure (spec
+            // IR-0110) renders the pinned `error[<code>]:` line and the matching
+            // category exit code so scripts can branch on `$?`; an uncoded failure
+            // falls back to the generic `error:` line and exit 1.
+            if let Some(code) = error::code_of(&err) {
+                eprintln!("error[{}]: {err:#}", code.code());
+                ExitCode::from(code.exit_code())
+            } else {
+                eprintln!("error: {err:#}");
+                ExitCode::FAILURE
+            }
         }
     }
 }

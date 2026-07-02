@@ -243,6 +243,11 @@ pub struct SyncEngine {
 
     counters: SyncCounters,
     logs: Vec<String>,
+    /// Advisory-flag codes recorded on events accepted since the last
+    /// [`take_flags`](Self::take_flags) drain (spec IR-0110 §5.9) — the
+    /// receive-path source for `AuditSink::event_flagged`. Never affects the
+    /// verdict, order, or any authz/expiry decision; purely observability.
+    pending_flags: Vec<&'static str>,
 }
 
 impl SyncEngine {
@@ -291,6 +296,7 @@ impl SyncEngine {
             trust_decisions: Vec::new(),
             counters: SyncCounters::default(),
             logs: Vec::new(),
+            pending_flags: Vec::new(),
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -598,6 +604,13 @@ impl SyncEngine {
         &self.logs
     }
 
+    /// Drain the advisory-flag codes recorded on events accepted since the last
+    /// call (spec IR-0110 §5.9). Each call site (the `Node` receive-path pump)
+    /// gets exactly the flags raised since it last drained.
+    pub fn take_flags(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.pending_flags)
+    }
+
     /// The number of frames currently parked (test/observability helper).
     #[must_use]
     pub fn parked_len(&self) -> usize {
@@ -690,6 +703,12 @@ impl SyncEngine {
             InsertOutcome::Inserted => {
                 self.counters.accepted += 1;
                 self.note_admin_event(id);
+                // Advisory flags on a freshly-accepted event (spec IR-0110 §5.9,
+                // e.g. `clock_skew`) — never re-raised for a duplicate re-see.
+                for flag in &ev.flags {
+                    self.log(&format!("flag.{}", flag.code()));
+                    self.pending_flags.push(flag.code());
+                }
                 // Fan out to every connected peer except the sender.
                 let bytes = ev.wire.to_bytes();
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {

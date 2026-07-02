@@ -44,12 +44,12 @@ use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
     Admission, AdmissionView, AllowlistAdmission, ConnEvent, JoinBootstrapAdmission, NetConfig,
-    NetMode, Node, PeerConnState, PeerEntry, PeerManager, SnapshotAdmission, TracingAudit,
-    DEFAULT_TICK,
+    NetMode, Node, PeerConnState, PeerEntry, PeerManager, SnapshotAdmission, DEFAULT_TICK,
 };
 
 use crate::display::{self, display_names, iso8601_utc, short_id};
-use crate::{clock, identity};
+use crate::error::CodedResultExt;
+use crate::{audit, clock, identity};
 
 /// The single event-store database file under the data-directory home (spec D3).
 pub(crate) const DB_FILE: &str = "rooms.db";
@@ -105,7 +105,7 @@ pub async fn send(
 ) -> Result<SendSummary> {
     // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
     validate_body(body)?;
-    let format = validate_format(format)?;
+    let format = validate_format(format).coded(crate::error::ErrorCode::InvalidArgument)?;
     let in_reply_to = reply_to.map(parse_event_id).transpose()?;
     let peer_addrs = parse_peers(peers)?;
 
@@ -119,7 +119,8 @@ pub async fn send(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (mut membership, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&sender_id) {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can send \
              messages (this identity is {sender_id})"
         );
@@ -146,21 +147,27 @@ pub async fn send(
     );
     let wire_bytes = wire.to_bytes();
     let ctx = ValidationContext::for_room(*room_id);
-    let validated = validate_wire_bytes(&wire_bytes, &ctx).map_err(|reason| {
-        anyhow!(
-            "internal error: freshly built message.text failed validation ({})",
-            reason.code()
-        )
-    })?;
+    let validated = validate_wire_bytes(&wire_bytes, &ctx)
+        .map_err(|reason| {
+            anyhow!(
+                "internal error: freshly built message.text failed validation ({})",
+                reason.code()
+            )
+        })
+        .coded(crate::error::ErrorCode::Internal)?;
     let event_id = validated.event_id;
     match membership.ingest(validated.clone()) {
         Ingest::Accepted { .. } => {}
-        Ingest::Rejected { reason, .. } => bail!(
+        Ingest::Rejected { reason, .. } => crate::bail_coded!(
+            crate::error::ErrorCode::Internal,
             "internal error: freshly built message.text was rejected by the fold ({})",
             reason.code()
         ),
         Ingest::Buffered { .. } => {
-            bail!("internal error: freshly built message.text is causally incomplete")
+            crate::bail_coded!(
+                crate::error::ErrorCode::Internal,
+                "internal error: freshly built message.text is causally incomplete"
+            )
         }
     }
 
@@ -259,7 +266,8 @@ pub async fn tail(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can tail it \
              (this identity is {self_id})"
         );
@@ -299,7 +307,7 @@ pub async fn tail(
     let node = Node::spawn_room(
         secret_key,
         admission,
-        Arc::new(TracingAudit),
+        Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,
@@ -325,6 +333,11 @@ pub async fn tail(
     let mut seen: BTreeSet<EventId> = BTreeSet::new();
     let mut conn_rx = node.conn_events();
     let mut ticker = tokio::time::interval(TAIL_POLL_INTERVAL);
+    // How many of the engine's bounded `logs()` entries have already been rendered
+    // (spec IR-0110 AC1/§5.8): this is the receive-path surface where the specific
+    // `reject.<code>` distinguishing `bad_signature` from `not_a_member` becomes
+    // observable per event.
+    let mut logs_seen = 0usize;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
@@ -346,6 +359,9 @@ pub async fn tail(
                 match node.room_tail(limit).await {
                     Ok(events) => print_new_messages(&events, &mut seen, &display_names, &snapshot),
                     Err(err) => eprintln!("warning: could not read the timeline: {err}"),
+                }
+                if let Ok(logs) = node.logs().await {
+                    print_new_reject_warnings(&logs, &mut logs_seen);
                 }
             }
         }
@@ -385,7 +401,8 @@ pub async fn members_status(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can query \
              connection status (this identity is {self_id})"
         );
@@ -409,7 +426,7 @@ pub async fn members_status(
     let node = Node::spawn_room(
         secret_key,
         admission,
-        Arc::new(TracingAudit),
+        Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,
@@ -539,7 +556,7 @@ async fn run_push(
     let node = Node::spawn(
         secret_key,
         Arc::new(admission),
-        Arc::new(TracingAudit),
+        Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,
@@ -694,7 +711,8 @@ pub(crate) fn fold_room(
         .room_event_ids(room_id)
         .with_context(|| format!("could not read events for room {room_id}"))?;
     if ids.is_empty() {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::RoomNotFound,
             "no room {} in {}; run `iroh-rooms room create` or join an invite first",
             room_id,
             home.display()
@@ -771,6 +789,28 @@ fn print_new_messages(
             m.body
         );
     }
+}
+
+/// Render every not-yet-seen `reject.<code>` entry in the engine's bounded
+/// `logs()` (spec IR-0110 §5.8/AC1) as a pinned `warning[<code>]: …` line — the
+/// surface where a receive-path `bad_signature` reject is observable distinctly
+/// from a `not_a_member` reject. Other log kinds (`flag.*`, internal drop notes)
+/// are ignored here: flags render via the installed [`crate::audit::StderrAudit`]
+/// sink instead.
+///
+/// `logs` is a bounded ring (spec §4.4): under heavy reject volume the oldest
+/// entries may already have been evicted by the time this polls, in which case a
+/// handful of reject warnings can be missed — an accepted tradeoff for an
+/// observability surface, never for a verdict.
+fn print_new_reject_warnings(logs: &[String], seen: &mut usize) {
+    for line in logs.iter().skip((*seen).min(logs.len())) {
+        if let Some(code) = line.strip_prefix("reject.") {
+            eprintln!(
+                "warning[{code}]: dropped an invalid inbound event; not stored, not re-broadcast"
+            );
+        }
+    }
+    *seen = logs.len();
 }
 
 /// A short, human-friendly device id: the first 8 chars of the endpoint id.

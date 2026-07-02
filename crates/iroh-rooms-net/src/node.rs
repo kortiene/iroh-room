@@ -59,6 +59,10 @@ enum Cmd {
     Heads(oneshot::Sender<Result<Vec<EventId>, String>>),
     Snapshot(oneshot::Sender<MembershipSnapshot>),
     Completeness(oneshot::Sender<Completeness>),
+    /// The engine's bounded drop/cap log (spec IR-0110 §5.8) — lets a long-running
+    /// session (`room tail`) surface per-frame `reject.<code>` entries without a
+    /// `tracing` subscriber. See [`Node::logs`].
+    Logs(oneshot::Sender<Vec<String>>),
     /// Force an immediate peer-manager reconcile + admission refresh (a test hook;
     /// a no-op for a node with no room session). See [`Node::reconcile_now`].
     Reconcile(oneshot::Sender<()>),
@@ -457,6 +461,21 @@ impl Node {
         rx.await.map_err(|_| anyhow!("pump dropped the reply"))
     }
 
+    /// The engine's bounded drop/cap log (spec IR-0110 §5.8/§4.4): a running list of
+    /// `reject.<code>` / `flag.<code>` entries a long-running session (`room tail`)
+    /// can poll to surface the specific per-frame reject/flag code without a
+    /// `tracing` subscriber (project memory: *CLI has no tracing subscriber*).
+    ///
+    /// # Errors
+    /// Returns an error if the pump is gone.
+    pub async fn logs(&self) -> Result<Vec<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Logs(tx))
+            .map_err(|_| anyhow!("pump task is gone"))?;
+        rx.await.map_err(|_| anyhow!("pump dropped the reply"))
+    }
+
     /// The current admin-completeness verdict.
     ///
     /// # Errors
@@ -663,10 +682,13 @@ impl Node {
         if owner_addr.id.as_bytes() != opened.owner_endpoint.as_bytes() {
             bail!("{}", PipeError::OwnerEndpointMismatch);
         }
+        // `PipeError` (not collapsed to a string) is preserved on the error path so
+        // a caller can `downcast_ref::<PipeError>()` and distinguish, e.g.,
+        // `OwnerUnreachable` (offline owner, spec IR-0110 §5.5) from other setup
+        // faults.
         let endpoint = self.transport.endpoint();
-        let forwarder = connector::connect(&endpoint, owner_addr, pipe_id, PIPE_ALPN, local_port)
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
+        let forwarder =
+            connector::connect(&endpoint, owner_addr, pipe_id, PIPE_ALPN, local_port).await?;
         Ok(forwarder)
     }
 
@@ -808,6 +830,15 @@ async fn pump(
                                     shared.audit.event_rejected(d, rejected);
                                 }
                             }
+                            // Advisory flags on any events this message accepted
+                            // (spec IR-0110 §5.9, e.g. `clock_skew`) — surfaced
+                            // per-code, distinct from a rejection.
+                            let flags = engine.take_flags();
+                            if let Some(d) = device {
+                                for code in flags {
+                                    shared.audit.event_flagged(d, code);
+                                }
+                            }
                             if provisional {
                                 // Upgrade-on-learn: if that frame was the join the
                                 // fold accepted, the peer is now an Active member —
@@ -892,6 +923,10 @@ fn handle_cmd(
         }
         Cmd::Snapshot(reply) => {
             let _ = reply.send(engine.snapshot());
+            false
+        }
+        Cmd::Logs(reply) => {
+            let _ = reply.send(engine.logs().to_vec());
             false
         }
         Cmd::Completeness(reply) => {
