@@ -28,6 +28,7 @@ use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::ticket::RoomInviteTicket;
 use zeroize::Zeroizing;
 
+use crate::error::{CodedResultExt, ErrorCode};
 use crate::{clock, identity};
 
 /// The single event-store database file under the data-directory home (spec D3).
@@ -77,7 +78,7 @@ pub fn invite(
     expires: Option<&str>,
 ) -> Result<InviteSummary> {
     // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
-    let role = validate_role(role)?;
+    let role = validate_role(role).coded(ErrorCode::InvalidArgument)?;
     let invitee_key = parse_invitee(invitee_hex)?;
 
     // Load the signing secrets (also re-checks them against the public profile).
@@ -99,7 +100,8 @@ pub fn invite(
         .room_event_ids(room_id)
         .with_context(|| format!("could not read events for room {room_id}"))?;
     if ids.is_empty() {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::RoomNotFound,
             "no room {} in {}; run `iroh-rooms room create` first",
             room_id,
             home.display()
@@ -168,7 +170,8 @@ pub fn invite(
     let cap_hash = capability_hash(room_id, &invite_id, &secret_bytes);
     let expires_at = expires
         .map(|spec| parse_expires(spec, created_at))
-        .transpose()?;
+        .transpose()
+        .coded(ErrorCode::InvalidArgument)?;
 
     // ---- Build, self-validate, fold-check, then persist. ----
     let wire = build_member_invited(
@@ -189,20 +192,26 @@ pub fn invite(
     // built event MUST pass the stateless pipeline AND be accepted by the fold (the
     // exact admin-signer + membership-device-binding code peers run). A failure is
     // an internal bug — surfaced as an error, never a silent persist.
-    let validated_new = validate_wire_bytes(&wire.to_bytes(), &ctx).map_err(|reason| {
-        anyhow!(
-            "internal error: freshly built member.invited failed validation ({})",
-            reason.code()
-        )
-    })?;
+    let validated_new = validate_wire_bytes(&wire.to_bytes(), &ctx)
+        .map_err(|reason| {
+            anyhow!(
+                "internal error: freshly built member.invited failed validation ({})",
+                reason.code()
+            )
+        })
+        .coded(ErrorCode::Internal)?;
     match membership.ingest(validated_new.clone()) {
         Ingest::Accepted { .. } => {}
-        Ingest::Rejected { reason, .. } => bail!(
+        Ingest::Rejected { reason, .. } => crate::bail_coded!(
+            ErrorCode::Internal,
             "internal error: freshly built member.invited was rejected by the fold ({})",
             reason.code()
         ),
         Ingest::Buffered { .. } => {
-            bail!("internal error: freshly built member.invited is causally incomplete")
+            crate::bail_coded!(
+                ErrorCode::Internal,
+                "internal error: freshly built member.invited is causally incomplete"
+            )
         }
     }
 

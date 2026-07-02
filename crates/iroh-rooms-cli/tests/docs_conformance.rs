@@ -909,3 +909,190 @@ fn guide_shows_alias_setup_for_binary() {
          invocation convention throughout (spec §6.2)"
     );
 }
+
+// ── CLI error-taxonomy docs gate (issue #25 / IR-0110, spec §7 Step 7 / §8) ────
+//
+// AC4 ("codes stable enough for scripts/tests") is gated here: the README **Error
+// codes** table is the documented script contract, so it must (a) exist, (b) name
+// every stable code string the taxonomy emits — no undocumented codes — and (c)
+// document the render contract (`error[<code>]:` / `warning[<code>]:`) and the
+// category→exit scheme. This mirrors the core taxonomy-completeness gate but at the
+// docs boundary (spec §8 "Docs conformance").
+//
+// The canonical code list below MUST stay in lockstep with the pinned `.code()`
+// strings in `src/error.rs::codes_are_stable` and `src/ticket.rs::
+// ticket_error_codes_are_stable`; those unit tests pin the emitter, this test pins
+// the documentation of it. A new code that lands without a README row fails here.
+
+/// Every stable `ErrorCode::code()` string the taxonomy renders (spec §5.1/§5.3),
+/// grouped as in the README table. Kept identical to the strings pinned by the unit
+/// tests in `src/error.rs` and `src/ticket.rs`.
+const ALL_ERROR_CODES: &[&str] = &[
+    // Internal (exit 1)
+    "internal",
+    // Usage (exit 2)
+    "invalid_room_id",
+    "invalid_argument",
+    "no_such_file",
+    "permission_denied",
+    "file_too_large",
+    "identity_not_found",
+    "room_not_found",
+    "no_discovery_hint",
+    // Auth (exit 3): the five §8 authz rejects + two CLI-native twins
+    "not_a_member",
+    "unbound_device",
+    "insufficient_role",
+    "expired_invite",
+    "bad_capability",
+    "wrong_identity",
+    "peer_unauthorized",
+    // Integrity (exit 4): the crypto/structural §8 rejects
+    "bad_signature",
+    "id_mismatch",
+    "non_canonical_encoding",
+    "invalid_content",
+    "unknown_schema_version",
+    "unknown_event_type",
+    "too_many_parents",
+    "not_genesis_descended",
+    "room_id_mismatch",
+    // Ticket (exit 5)
+    "ticket_bad_prefix",
+    "ticket_bad_base32",
+    "ticket_truncated",
+    "ticket_unsupported_version",
+    "ticket_bad_checksum",
+    "ticket_malformed",
+    // Connectivity (exit 6)
+    "no_admin_reachable",
+    "peer_offline",
+    "blob_unavailable",
+];
+
+#[test]
+fn readme_has_error_codes_section() {
+    // Definition of Done: a README **Error codes** table must exist.
+    let content = readme();
+    assert!(
+        content.contains("### Error codes") || content.contains("## Error codes"),
+        "README must contain an `Error codes` section documenting the CLI taxonomy (IR-0110)"
+    );
+}
+
+#[test]
+fn readme_documents_the_render_contract() {
+    // Spec §5.2/OQ-6: the pinned `error[<code>]:` line, the `warning[<code>]:`
+    // advisory line, and the uncoded-fallback + zero-exit-for-success rules are the
+    // machine surface AC4 promises; they must be spelled out for script authors.
+    let content = readme();
+    assert!(
+        content.contains("error[<code>]:"),
+        "README must document the `error[<code>]: <message>` render contract"
+    );
+    assert!(
+        content.contains("warning[<code>]:"),
+        "README must document the `warning[<code>]: <message>` advisory contract"
+    );
+    assert!(
+        content.contains("`error: <message>`") && content.contains("exits `1`"),
+        "README must document the uncoded fallback (`error: <message>`, exit 1)"
+    );
+}
+
+#[test]
+fn readme_documents_every_error_code() {
+    // AC4 no-undocumented-codes half: every stable code the CLI can emit appears in
+    // the README table. A new code without a README row is a documentation drift bug.
+    let content = readme();
+    let mut missing: Vec<&str> = Vec::new();
+    for code in ALL_ERROR_CODES {
+        if !content.contains(code) {
+            missing.push(code);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "README Error codes table is missing these emitted codes: {missing:?} \
+         (add a row, or update `ALL_ERROR_CODES` if a code was intentionally removed)"
+    );
+}
+
+#[test]
+fn readme_documents_every_exit_category() {
+    // Spec §5.3: the coarse category→exit scheme (2..=6) is the `$?` contract; each
+    // named category must appear so a script author can map an exit code to a class.
+    let content = readme();
+    for category in &[
+        "Internal",
+        "Usage",
+        "Auth",
+        "Integrity",
+        "Ticket",
+        "Connectivity",
+    ] {
+        assert!(
+            content.contains(category),
+            "README Error codes table must name the `{category}` exit category (spec §5.3)"
+        );
+    }
+    // The distinctive non-trivial exit numbers (3=Auth .. 6=Connectivity) must be
+    // documented so `case $? in` branches are pinned, not guessed.
+    for exit in &["`3`", "`4`", "`5`", "`6`"] {
+        assert!(
+            content.contains(exit),
+            "README must document the exit code {exit} in the category scheme (spec §5.3)"
+        );
+    }
+}
+
+#[test]
+fn readme_marks_blob_unavailable_as_reserved() {
+    // Spec §5.10 / §3.3: `blob_unavailable` is defined now but only *emitted* by the
+    // future `file fetch`; the table must flag it reserved so a reader does not expect
+    // it from any landed command yet.
+    let content = readme();
+    assert!(
+        content.contains("blob_unavailable"),
+        "README must document the reserved `blob_unavailable` code"
+    );
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("reserved"),
+        "README Error codes section must mark `blob_unavailable` as reserved for the \
+         serve/fetch follow-up (spec §5.10)"
+    );
+}
+
+#[test]
+fn guide_documents_error_and_warning_line_contract() {
+    // Spec §7 Step 7: the getting-started troubleshooting guide extends the reason-code
+    // narrative with the stable `error[<code>]:` / `warning[<code>]:` line shapes and
+    // the clock-skew advisory, so the guide and the binary agree.
+    let content = guide();
+    assert!(
+        content.contains("error[<code>]:"),
+        "guide must document the `error[<code>]: <message>` line shape (IR-0110 §7)"
+    );
+    assert!(
+        content.contains("warning[<code>]:"),
+        "guide must document the `warning[<code>]: <message>` advisory line shape (IR-0110 §7)"
+    );
+    assert!(
+        content.contains("clock_skew"),
+        "guide must document the `warning[clock_skew]` advisory (spec §5.9)"
+    );
+}
+
+#[test]
+fn guide_states_zero_peer_send_is_success_not_failure() {
+    // Spec §5.5 / regression (test #16): the taxonomy must NOT turn a `room send` that
+    // reaches zero peers into an error; the guide must keep stating it exits `0`.
+    let content = guide();
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("room send") && lower.contains("zero") && lower.contains("exits `0`"),
+        "guide must state that `room send` reaching zero peers exits `0` (availability, \
+         not failure; spec §5.5)"
+    );
+}

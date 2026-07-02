@@ -23,14 +23,15 @@ use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::pipe::is_loopback_target;
 use iroh_rooms_net::{
-    NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeOutcome, TracingAudit, DEFAULT_TICK,
+    NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome, DEFAULT_TICK,
 };
 
+use crate::error::CodedResultExt;
 use crate::message::{
     build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
     render_endpoint_addr, DB_FILE,
 };
-use crate::{clock, identity};
+use crate::{audit, clock, identity};
 
 /// Grace period after publishing a `pipe.closed` so the per-peer writer queues flush
 /// before an ephemeral node tears down (mirrors `room send`).
@@ -85,7 +86,10 @@ pub async fn expose(
     let label = label.unwrap_or("pipe");
 
     let created_at = clock::now_ms();
-    let expires_at = expires.map(|e| parse_expires(e, created_at)).transpose()?;
+    let expires_at = expires
+        .map(|e| parse_expires(e, created_at))
+        .transpose()
+        .coded(crate::error::ErrorCode::InvalidArgument)?;
 
     // ---- Membership: confirm the caller is an Active member/owner. ----
     let secret = identity::SecretKeys::load(home)?;
@@ -95,7 +99,8 @@ pub async fn expose(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::PeerUnauthorized,
             "you are not an active member of room {room_id}; only an active member can expose a \
              pipe (this identity is {self_id})"
         );
@@ -143,7 +148,7 @@ pub async fn expose(
     let node = Node::spawn_with_pipe_audit(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(TracingAudit),
+        std::sync::Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,
@@ -232,7 +237,8 @@ pub async fn connect(
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::PeerUnauthorized,
             "you are not an active member of room {room_id}; only an active member can connect to \
              a pipe (this identity is {self_id})"
         );
@@ -252,7 +258,7 @@ pub async fn connect(
     let node = Node::spawn(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(TracingAudit),
+        std::sync::Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,
@@ -285,10 +291,23 @@ pub async fn connect(
     // bare endpoint id (discovery).
     let owner_addr = resolve_owner_addr(&opened.owner_endpoint, &peer_addrs)?;
 
-    let mut forwarder = node
-        .pipe_connect(owner_addr, pipe_id, local_port)
-        .await
-        .context("could not connect to the pipe")?;
+    // Scope item 3 (offline peer, command surface): an unreachable owner is
+    // distinct from other pipe setup faults. `Node::pipe_connect` preserves the
+    // original `PipeError` on the error path so it can be downcast here.
+    let mut forwarder = match node.pipe_connect(owner_addr, pipe_id, local_port).await {
+        Ok(f) => f,
+        Err(err) => match err.downcast_ref::<PipeError>() {
+            Some(PipeError::OwnerUnreachable(_)) => {
+                crate::bail_coded!(
+                    crate::error::ErrorCode::PeerOffline(
+                        iroh_rooms_net::OfflineReason::Unreachable
+                    ),
+                    "the pipe owner is unreachable: {err:#}"
+                );
+            }
+            _ => return Err(err.context("could not connect to the pipe")),
+        },
+    };
     println!("room: {room_id}");
     println!(
         "forwarding: {} -> pipe {pipe_id_hex}",
@@ -359,7 +378,10 @@ pub async fn close(
 
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
-        bail!("you are not an active member of room {room_id} (this identity is {self_id})");
+        crate::bail_coded!(
+            crate::error::ErrorCode::PeerUnauthorized,
+            "you are not an active member of room {room_id} (this identity is {self_id})"
+        );
     }
 
     // Only the pipe owner or the room admin may close a pipe (§7 signer rule). Best
@@ -367,7 +389,8 @@ pub async fn close(
     let is_admin = snapshot.admin() == Some(&self_id);
     let is_owner = open_pipe(&store, room_id, &pipe_id)?.is_some_and(|o| o.owner_id == self_id);
     if !is_admin && !is_owner {
-        bail!(
+        crate::bail_coded!(
+            crate::error::ErrorCode::PeerUnauthorized,
             "only the pipe owner or the room admin can close pipe {pipe_id_hex}; this identity is \
              neither"
         );
@@ -387,7 +410,7 @@ pub async fn close(
     let node = Node::spawn(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(TracingAudit),
+        std::sync::Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,

@@ -607,11 +607,42 @@ golden vectors) stays byte-identical and valid. Because `EventStore::insert` is 
 reached for validated events, an invalid `file.shared` — however it arrives, from a local
 build or a remote peer — can never be persisted and therefore never appears in `file list`.
 
+### Error codes
+
+The `iroh-rooms` binary (issue #25 / IR-0110) renders every terminal command failure as a
+machine-parseable stderr line, `error[<code>]: <message>`, and every accepted-but-flagged
+receive-path event as `warning[<code>]: <message>` (never a failure, never a non-zero exit).
+`<code>` is a stable string a script can branch on directly; the process exit code is the
+coarser category below, aligned with `clap`'s own exit `2` for a usage error. An uncoded
+failure (the long tail of prose errors not yet adopted into the taxonomy) still renders
+`error: <message>` and exits `1`. stdout is never used for an error or a warning.
+
+| Exit | Category | Meaning | Example codes |
+| ---: | --- | --- | --- |
+| `0` | — | success (including `room send` reaching zero peers — availability, not failure) | — |
+| `1` | Internal | unexpected / uncoded internal error | `internal`, any uncoded failure |
+| `2` | Usage | bad input or environment | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
+| `3` | Auth | authorization / capability denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `wrong_identity`, `peer_unauthorized` |
+| `4` | Integrity | crypto / structural rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch` |
+| `5` | Ticket | ticket decode failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
+| `6` | Connectivity | reachability / availability | `no_admin_reachable`, `peer_offline`, `blob_unavailable` (reserved for the serve/fetch follow-up) |
+
+The taxonomy **wraps** the already-pinned protocol/net vocabulary rather than re-listing it:
+`bad_signature`/`not_a_member`/… reuse `RejectReason::code()` verbatim (so `room join` and a
+`room tail` receive-path drop of the same event report the identical code — the crypto-vs-
+authorization split AC), and `ticket_*` reuses the new `TicketError::code()`. A ticket failure
+never echoes the raw token or the capability secret — only the redacted reason. An `offline`
+peer (authorized, unreachable right now) is never rendered as `unauthorized` (a peer this node
+will never talk to), and vice versa; `room members --status` / `room tail` show the connection
+panel distinguishing the two live, while `peer_offline` / `peer_unauthorized` are their
+command-failure twins (e.g. `pipe connect`). A clock-skewed but otherwise valid event is a
+`warning[clock_skew]` advisory only — it is still accepted, ordered, and displayed.
+
 With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
 engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
 room-read CLI, the iroh transport, the live pipe, the peer connection manager, the
-Phase 1A two-peer integration test, the hardened recent-history sync, and file import) are
-all landed.
+Phase 1A two-peer integration test, the hardened recent-history sync, file import, and the CLI
+error taxonomy) are all landed.
 The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
 remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
 Gate E memo (#15). The remaining feature work is the file serve/fetch half (`file fetch`,

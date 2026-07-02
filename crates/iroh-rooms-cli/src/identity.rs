@@ -68,7 +68,8 @@ impl Profile {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                bail!(
+                crate::bail_coded!(
+                    crate::error::ErrorCode::IdentityNotFound,
                     "no identity in {}; run `iroh-rooms identity create --name <name>`",
                     home.display()
                 );
@@ -136,7 +137,8 @@ impl SecretKeys {
         let mut bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                bail!(
+                crate::bail_coded!(
+                    crate::error::ErrorCode::IdentityNotFound,
                     "no identity in {}; run `iroh-rooms identity create --name <name>`",
                     home.display()
                 );

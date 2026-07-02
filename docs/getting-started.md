@@ -828,6 +828,11 @@ reason codes are stable identifiers also written to the local audit log.
   `room members <ROOM_ID> --status` shows `conn=offline reason=unreachable` for
   Alice's row if she cannot be reached within the timeout.
 
+  `pipe connect` is the one command in this list that actually fails when the
+  target is offline: it prints `error[peer_offline]: the pipe owner is unreachable:
+  …` and exits `6` (issue #25 / IR-0110 §5.7) — the command-failure twin of the
+  connection panel's `offline` state.
+
 - **Next action:** bring the peer back online and retry. Nothing is queued anywhere;
   delivery resumes only when both peers are online together. The `reason` field
   distinguishes a peer who went offline cleanly (`link_dropped`) from one that was
@@ -846,18 +851,38 @@ reason codes are stable identifiers also written to the local audit log.
   Pipe connect rejected (pipe.connect.rejected): caller not in allowed_members.
   ```
 
+  A caller who is not an **active member of the room at all** (not merely absent from a
+  pipe's `--allow` list) is turned away locally, before any dial: `pipe expose` / `pipe
+  connect` / `pipe close` report `error[peer_unauthorized]: you are not an active member of
+  room …` and exit `3` (issue #25 / IR-0110 §5.7).
+
 - **Next action:** have the pipe owner re-`expose` with the correct `--allow <ID>`, or have
   the admin invite the peer into the room first.
 
 ### Invalid ticket
 
-- **Reproduce:** have Bob run `room join` with a garbled or expired ticket.
-- **CLI reports:** `bad_capability` for a malformed ticket or secret mismatch, `expired_invite`
-  for an expired one (spike §8). Illustrative:
+- **Reproduce:** have Bob run `room join` with a garbled (corrupted copy-paste), expired, or
+  wrong-identity ticket.
+- **CLI reports:** a ticket that fails to **decode** (bad prefix, invalid base32, truncated,
+  unsupported version, a bad checksum, or a malformed body) reports one of six stable
+  `ticket_*` codes (issue #25 / IR-0110 AC3), exit `5` — never the raw token or secret, only
+  the redacted reason:
 
   ```text
-  Join failed (bad_capability): this ticket's secret or identity does not match the invite (bad_capability)
+  error[ticket_bad_checksum]: invite ticket failed its checksum (corrupted on copy-paste?)
   ```
+
+  A ticket that decodes fine but whose capability secret or identity does not match the
+  invite reports `bad_capability`; one past its `--expires` reports `expired_invite` — both
+  fold-check failures, exit `3`:
+
+  ```text
+  error[bad_capability]: this ticket's secret or identity does not match the invite (bad_capability)
+  ```
+
+  A ticket bound to a different identity than Bob's own reports `error[wrong_identity]`
+  (exit `3`) before any network dial; a ticket with no admin discovery hint and no `--peer`
+  given reports `error[no_discovery_hint]` (exit `2`).
 
 - **Next action:** ask the admin for a fresh `room invite` (re-issue, optionally with a longer
   `--expires`). There is no native revocation, so a re-issue is the fix.
@@ -866,11 +891,13 @@ reason codes are stable identifiers also written to the local audit log.
 
 - **Reproduce:** run `room join` while the admin has no `room tail --accept-joins` session running.
 - **CLI reports:** a bootstrap-timeout error — the joiner can reach the admin's endpoint but
-  the connection is closed before bytes (the default admission gate rejects unknown devices):
+  the connection is closed before bytes (the default admission gate rejects unknown devices).
+  This is the *offline peer* scope item on the join path: `error[no_admin_reachable]`, exit
+  `6` (issue #25 / IR-0110 §5.5) — distinct from any authorization rejection:
 
   ```text
-  could not bootstrap the room membership within 10s; is the room admin online and accepting joins?
-  Pass `--peer <admin-addr>` for a deterministic dial.
+  error[no_admin_reachable]: could not bootstrap the room membership within 10s; is the room
+  admin online and accepting joins? Pass `--peer <admin-addr>` for a deterministic dial.
   ```
 
 - **Next action:** have the admin start `iroh-rooms room tail <ROOM_ID> --accept-joins` and
@@ -898,13 +925,33 @@ reason codes are stable identifiers also written to the local audit log.
 These share the "rejected & logged" model (PRD §16.3); one line each:
 
 - **Invalid signature** — `bad_signature`: an event whose signature does not verify under its
-  device key is dropped and logged; nothing is persisted. Next action: none required by you;
-  the event never enters your log.
+  device key is dropped and logged; nothing is persisted. A running `room tail` prints
+  `warning[bad_signature]: dropped an invalid inbound event; not stored, not re-broadcast`
+  (issue #25 / IR-0110 §5.8); the session keeps running and still exits `0`. Next action: none
+  required by you; the event never enters your log.
 - **Non-member event** — `not_a_member`: an event from a key that is not an active member is
-  rejected. Next action: the author must be invited and join before their events count.
+  rejected; `room tail` prints the same line shape as `warning[not_a_member]`, kept distinct
+  from `bad_signature` (AC1) so a script can tell a forged signature from an unauthorized
+  sender. Next action: the author must be invited and join before their events count.
 
 For pipe activity specifically, the local audit log records **open / connect / reject / close**
 events (spike §5, PRD §13.2) — inspect it to see exactly why a connection was refused.
+
+### Stable error/warning lines and exit codes
+
+Every reason code above (and a few more — `wrong_identity`, `no_discovery_hint`,
+`no_admin_reachable`, `peer_offline`, `peer_unauthorized`, `blob_unavailable`) is rendered on
+**stderr** in one pinned shape a script can grep or branch on (issue #25 / IR-0110):
+
+- A terminal command failure prints `error[<code>]: <message>` and exits with a small,
+  documented category code (`2` = usage, `3` = auth, `4` = integrity, `5` = ticket,
+  `6` = connectivity — see the README **Error codes** table for the full scheme). A failure
+  the taxonomy has not adopted yet still prints `error: <message>` and exits `1`.
+- A long-running session (`room tail`) prints `warning[<code>]: <message>` for a per-event
+  advisory that never fails the command — most notably `warning[clock_skew]`, printed for an
+  inbound event whose timestamp is far from local time. The event is still accepted, ordered,
+  and displayed; the session still exits `0`.
+- `room send` reaching zero reachable peers is availability, not failure: it always exits `0`.
 
 ---
 

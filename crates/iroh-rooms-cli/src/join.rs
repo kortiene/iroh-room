@@ -48,14 +48,15 @@ use iroh_rooms_core::event::RejectReason;
 use iroh_rooms_core::membership::Ingest;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_core::ticket::RoomInviteTicket;
-use iroh_rooms_net::{AllowlistAdmission, NetConfig, Node, TracingAudit, DEFAULT_TICK};
+use iroh_rooms_core::ticket::{RoomInviteTicket, TicketError};
+use iroh_rooms_net::{AllowlistAdmission, NetConfig, Node, DEFAULT_TICK};
 use zeroize::Zeroizing;
 
+use crate::error::{CodedResultExt, ErrorCode};
 use crate::message::{
     endpoint_id_of, fold_room, net_mode, parse_peers, render_endpoint_addr, select_heads, DB_FILE,
 };
-use crate::{clock, identity};
+use crate::{audit, clock, identity};
 
 /// Default time budget for both the membership-pull and the post-publish
 /// confirmation waits (spec §5). `<int>{ms|s|m}`.
@@ -105,16 +106,20 @@ pub async fn join(
     loopback: bool,
 ) -> Result<JoinSummary> {
     // ---- Pre-IO: decode the ticket and pre-check the key binding (D3). ----
-    let ticket: RoomInviteTicket = ticket_str.trim().parse().context(
-        "could not decode invite ticket (expected a roomtkt1… token printed by `room invite`)",
-    )?;
+    // AC3: the reason is the ticket's own redacted `Display` (never the token/
+    // secret), tagged with the matching `ticket_*` code.
+    let ticket: RoomInviteTicket = ticket_str
+        .trim()
+        .parse::<RoomInviteTicket>()
+        .with_coded(|e: &TicketError| ErrorCode::Ticket(e.clone()))?;
 
     let secret = identity::SecretKeys::load(home)?;
     let self_id = secret.identity.identity_key();
     if self_id != ticket.invitee_key {
         // The wrong-identity acceptance criterion as a friendly, no-network failure;
         // the on-log `gate_join` (key binding) remains the convergent authority.
-        bail!(
+        crate::bail_coded!(
+            ErrorCode::WrongIdentity,
             "this invite ticket is bound to a different identity ({}); your identity is {}. \
              Ask the admin to invite {} instead.",
             ticket.invitee_key,
@@ -126,7 +131,8 @@ pub async fn join(
     let peer_addrs = parse_peers(peers)?;
     let dial_set = build_bootstrap_dial_set(&ticket, &peer_addrs)?;
     if dial_set.is_empty() {
-        bail!(
+        crate::bail_coded!(
+            ErrorCode::NoDiscoveryHint,
             "the invite ticket carries no admin discovery hint; cannot reach the room admin to \
              bootstrap the join (pass `--peer <admin-addr>`)"
         );
@@ -164,7 +170,7 @@ pub async fn join(
     let node = Node::spawn(
         secret_key,
         Arc::new(admission),
-        Arc::new(TracingAudit),
+        Arc::new(audit::StderrAudit),
         engine,
         cfg,
         DEFAULT_TICK,
@@ -246,12 +252,14 @@ async fn bootstrap_and_join(
 
     // ---- Stateless self-validate (internal-bug guard, D6 step 9). ----
     let ctx = ValidationContext::for_room(*room_id);
-    let validated = validate_wire_bytes(&wire_bytes, &ctx).map_err(|reason| {
-        anyhow!(
-            "internal error: freshly built member.joined failed validation ({})",
-            reason.code()
-        )
-    })?;
+    let validated = validate_wire_bytes(&wire_bytes, &ctx)
+        .map_err(|reason| {
+            anyhow!(
+                "internal error: freshly built member.joined failed validation ({})",
+                reason.code()
+            )
+        })
+        .coded(ErrorCode::Internal)?;
     let event_id = validated.event_id;
 
     // ---- Local fold-check (D6 step 10): a clean, deterministic error for a bad
@@ -260,7 +268,10 @@ async fn bootstrap_and_join(
     let (mut membership, _snapshot) = fold_room(&store, home, room_id)?;
     match membership.ingest(validated) {
         Ingest::Accepted { .. } => {}
-        Ingest::Rejected { reason, .. } => bail!("{}", join_reject_message(reason)),
+        Ingest::Rejected { reason, .. } => {
+            let message = join_reject_message(reason.clone());
+            return Err(crate::error::CliError::new(ErrorCode::Reject(reason), message).into());
+        }
         Ingest::Buffered { .. } => bail!(
             "could not place the join in the room history (its causal ancestors are incomplete); \
              retry once the admin has finished sharing the membership history"
@@ -366,11 +377,17 @@ async fn wait_for_invited(
         }
     })
     .await;
+    // Scope item 3 (offline peer / can't reach admin): the join never observed the
+    // admin within `timeout` — distinct from an authorization rejection.
     polled.map_err(|_| {
-        anyhow!(
-            "could not bootstrap the room membership within {timeout:?}; is the room admin online \
-             and accepting joins? Pass `--peer <admin-addr>` for a deterministic dial."
+        crate::error::CliError::new(
+            ErrorCode::NoAdminReachable,
+            format!(
+                "could not bootstrap the room membership within {timeout:?}; is the room admin \
+                 online and accepting joins? Pass `--peer <admin-addr>` for a deterministic dial."
+            ),
         )
+        .into()
     })
 }
 

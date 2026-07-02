@@ -25,6 +25,7 @@ use iroh_rooms_core::membership::{MembershipSnapshot, Role, RoomMembership};
 use iroh_rooms_core::store::EventStore;
 use serde_json::{json, Map, Value};
 
+use crate::error::CodedResultExt;
 use crate::{clock, display, identity, message, paths};
 
 /// Maximum room-name length, in UTF-8 bytes (spec D7 / OQ-5; far below the
@@ -118,7 +119,8 @@ pub fn create(home: &Path, name: &str) -> Result<CreateSummary> {
                 "internal error: freshly built genesis failed validation ({})",
                 reason.code()
             )
-        })?;
+        })
+        .coded(crate::error::ErrorCode::Internal)?;
 
     let db_path = home.join(DB_FILE);
     let mut store = EventStore::open(&db_path)
@@ -153,7 +155,12 @@ pub fn members(home: &Path, room_id: &RoomId) -> Result<MembersView> {
         .room_event_ids(room_id)
         .with_context(|| format!("could not read events for room {room_id}"))?;
     if ids.is_empty() {
-        bail!("no room {} in {}", room_id, home.display());
+        crate::bail_coded!(
+            crate::error::ErrorCode::RoomNotFound,
+            "no room {} in {}",
+            room_id,
+            home.display()
+        );
     }
 
     // Re-validate each stored event through the full §6 pipeline before folding,
