@@ -3,6 +3,6 @@
 //! deterministic rebuild.
 
 pub use iroh_rooms_core::store::{
-    EventStore, InsertOutcome, InsertStats, ParkedRow, StoreError, StoredEvent, SyncStateRow,
-    TrustRow,
+    EventStore, InsertOutcome, InsertStats, ParkedRow, StoreError, StoreOptions, StoredEvent,
+    SyncStateRow, TrustRow,
 };
