@@ -1,7 +1,12 @@
 //! Focused unit tests for the `SQLite` event store, mapped to the issue Acceptance
 //! Criteria (the broader integration suite lives in `tests/` per the test phase).
 
-use rusqlite::params;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use rusqlite::{params, Connection, ErrorCode, TransactionBehavior};
 
 use super::{EventStore, InsertOutcome};
 use crate::event::binding::DeviceBinding;
@@ -1061,5 +1066,346 @@ fn room_event_ids_returns_full_validated_set() {
     assert!(
         store.room_event_ids(&other_room).unwrap().is_empty(),
         "an unknown room must return an empty set"
+    );
+}
+
+// ── issue #85: busy_timeout + IMMEDIATE writes for concurrent writers ─────────
+//
+// Bantaba opens two `EventStore` connections onto one file (RPC writes + a sync
+// pump). Under WAL exactly one writer is allowed at a time; the fix makes a
+// colliding writer *wait* (default 5000ms busy_timeout) or, for read-then-write
+// bodies, take the write lock up front (`BEGIN IMMEDIATE`) so no un-retryable
+// `SQLITE_BUSY` reaches the caller. These map 1:1 to the spec's T1–T5.
+
+/// Read `PRAGMA busy_timeout` (milliseconds) off a store's connection.
+fn busy_timeout_ms(store: &EventStore) -> i64 {
+    store
+        .conn
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .unwrap()
+}
+
+// T1 (AC1) — two connections on one file-backed DB, interleaved concurrent
+// `insert`s, must all return Ok (no `SQLITE_BUSY` escapes) and converge on the
+// union of events. `insert` runs `propagate_from` (a heavy critical section), so
+// N is kept small per spec §7 to avoid escalating busy-handler backoff.
+#[test]
+fn two_connections_interleaved_inserts_never_surface_busy() {
+    const N: usize = 4;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.sqlite3");
+    let (admin, admin_dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&admin, &admin_dev);
+
+    // Seed the shared parent once so both writers cite an existing genesis.
+    {
+        let mut store = EventStore::open(&path).unwrap();
+        store.insert(&g).unwrap();
+    }
+
+    let build = |tag: char, first_t: u64| -> Vec<ValidatedEvent> {
+        (0..N)
+            .map(|i| {
+                let t = first_t + u64::try_from(i).unwrap();
+                message(
+                    &admin,
+                    &admin_dev,
+                    room,
+                    vec![g.event_id],
+                    &format!("{tag}{i}"),
+                    t,
+                )
+            })
+            .collect()
+    };
+    let events_a = build('a', T0 + 1);
+    let events_b = build('b', T0 + 1_000);
+
+    let expected: BTreeSet<EventId> = std::iter::once(g.event_id)
+        .chain(events_a.iter().map(|e| e.event_id))
+        .chain(events_b.iter().map(|e| e.event_id))
+        .collect();
+
+    let mut store_a = EventStore::open(&path).unwrap();
+    let mut store_b = EventStore::open(&path).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let ba = Arc::clone(&barrier);
+    let ta = thread::spawn(move || {
+        ba.wait();
+        for ev in &events_a {
+            store_a
+                .insert(ev)
+                .expect("connection A: no SQLITE_BUSY may reach the caller");
+        }
+    });
+    let bb = Arc::clone(&barrier);
+    let tb = thread::spawn(move || {
+        bb.wait();
+        for ev in &events_b {
+            store_b
+                .insert(ev)
+                .expect("connection B: no SQLITE_BUSY may reach the caller");
+        }
+    });
+    ta.join().unwrap();
+    tb.join().unwrap();
+
+    // A third connection reads back exactly the union of both writers' events.
+    let verify = EventStore::open(&path).unwrap();
+    assert_eq!(verify.room_event_ids(&room).unwrap(), expected);
+    assert_eq!(
+        verify.count(&room).unwrap(),
+        1 + 2 * u64::try_from(N).unwrap()
+    );
+}
+
+// T2 (AC1) — the read-then-write path (`append_trust_decision`: SELECT MAX(seq)+1
+// → INSERT) under contention. This is the case a bare `busy_timeout` cannot
+// rescue (a DEFERRED transaction loses the write-lock *upgrade* race with
+// `SQLITE_BUSY_SNAPSHOT`, and the busy handler is not invoked) — only `BEGIN
+// IMMEDIATE` fixes it. Both connections hammer the same room; afterwards the
+// per-room `seq` values must be a gap-free 0..2N set, proving append-only
+// monotonicity survived the race with no lost/duplicated seq.
+#[test]
+fn concurrent_read_then_write_appends_are_gap_free() {
+    use super::TrustRow;
+
+    // Cheap critical section, so a larger N is safe (spec §7).
+    const N: usize = 100;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.sqlite3");
+    let room = RoomId::from_bytes([0x24; 32]);
+
+    // Create the schema before the racers open their connections.
+    EventStore::open(&path).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    let (pa, ba) = (path.clone(), Arc::clone(&barrier));
+    let a = thread::spawn(move || {
+        let mut store = EventStore::open(&pa).unwrap();
+        let row = TrustRow {
+            seq: 0, // ignored: append assigns the next per-room seq
+            code: "equivocation".to_owned(),
+            severity: "critical".to_owned(),
+            admin_seq: None,
+            event_ids: vec![],
+            created_at: 0,
+        };
+        ba.wait();
+        for _ in 0..N {
+            store
+                .append_trust_decision(&room, &row)
+                .expect("connection A read-then-write append must not surface SQLITE_BUSY");
+        }
+    });
+    let (pb, bb) = (path.clone(), Arc::clone(&barrier));
+    let b = thread::spawn(move || {
+        let mut store = EventStore::open(&pb).unwrap();
+        let row = TrustRow {
+            seq: 0,
+            code: "admin_view_suspect".to_owned(),
+            severity: "warning".to_owned(),
+            admin_seq: None,
+            event_ids: vec![],
+            created_at: 0,
+        };
+        bb.wait();
+        for _ in 0..N {
+            store
+                .append_trust_decision(&room, &row)
+                .expect("connection B read-then-write append must not surface SQLITE_BUSY");
+        }
+    });
+    a.join().unwrap();
+    b.join().unwrap();
+
+    let store = EventStore::open(&path).unwrap();
+    let seqs: Vec<u64> = store
+        .load_trust_decisions(&room)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.seq)
+        .collect();
+    let expected: Vec<u64> = (0..2 * u64::try_from(N).unwrap()).collect();
+    assert_eq!(
+        seqs, expected,
+        "per-room seq must be gap-free and unique under concurrent writers"
+    );
+}
+
+// T2 companion (AC1, deterministic) — a *direct*, race-free proof that
+// `begin_write` opens a `BEGIN IMMEDIATE` transaction: the write lock is grabbed
+// at BEGIN, before any statement runs. This is the load-bearing D1 fix (spec §1
+// risk #1: "sets only the pragma and skips IMMEDIATE"). T2 exercises it under a
+// thread race, which only *probabilistically* hits the upgrade deadlock; here we
+// hold one connection's write transaction open (running no statement) and show a
+// second, fail-fast connection cannot even BEGIN its own write. A `BEGIN
+// DEFERRED` transaction would take no lock at BEGIN, so the second `begin_write`
+// would succeed and the `unwrap_err` below would panic — i.e. this test fails
+// loudly if `begin_write` is ever "simplified" back to `conn.transaction()`.
+#[test]
+fn begin_write_takes_the_write_lock_up_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.sqlite3");
+    EventStore::open(&path).unwrap(); // create the schema + enable WAL
+
+    let mut store_a = EventStore::open(&path).unwrap();
+    // Fail-fast so a collision is observed immediately, not after the 5s default.
+    let mut store_b =
+        EventStore::open_with(&path, &super::StoreOptions { busy_timeout: None }).unwrap();
+
+    // A opens a write transaction but runs NO statement. Under BEGIN IMMEDIATE the
+    // single WAL write lock is already held at this point.
+    let tx_a = store_a.begin_write().unwrap();
+
+    // B therefore cannot even BEGIN its own write transaction — it collides on the
+    // write lock at BEGIN (not at some later statement). With DEFERRED this call
+    // would instead succeed, holding only a read snapshot.
+    let err = store_b.begin_write().unwrap_err();
+    match &err {
+        super::StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => assert!(
+            matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked),
+            "expected a BUSY/LOCKED code at BEGIN, got {:?}",
+            e.code
+        ),
+        other => panic!("expected a Sqlite busy failure at BEGIN, got {other:?}"),
+    }
+
+    // Once A releases the write lock, B can begin unobstructed — proving the
+    // collision was the held lock, not a broken connection.
+    drop(tx_a);
+    let tx_b = store_b
+        .begin_write()
+        .expect("the write lock must be free once A's transaction ends");
+    drop(tx_b);
+}
+
+// T3 (AC3) — `busy_timeout: None` truly clears rusqlite's pre-installed 5000ms
+// handler: with the single WAL write lock held by another connection, a colliding
+// write fails *promptly* with a BUSY-class error instead of stalling ~5s.
+#[test]
+fn busy_timeout_none_fails_fast_on_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.sqlite3");
+    let (admin, admin_dev) = (sk(1), sk(2));
+    let (g, _room) = genesis(&admin, &admin_dev);
+
+    // Schema first, then the fail-fast writer.
+    EventStore::open(&path).unwrap();
+    let mut store_b =
+        EventStore::open_with(&path, &super::StoreOptions { busy_timeout: None }).unwrap();
+
+    // Hold the one WAL write lock on a separate connection (BEGIN IMMEDIATE + a
+    // write) for the duration of the collision.
+    let mut holder = Connection::open(&path).unwrap();
+    let lock = holder
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    lock.execute("DELETE FROM events WHERE 1 = 0", []).unwrap();
+
+    let start = Instant::now();
+    let err = store_b.insert(&g).unwrap_err();
+    let elapsed = start.elapsed();
+
+    match &err {
+        super::StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => assert!(
+            matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked),
+            "expected a BUSY/LOCKED code, got {:?}",
+            e.code
+        ),
+        other => panic!("expected a Sqlite busy failure, got {other:?}"),
+    }
+    // The opt-out must not wait out the 5000ms default it replaced.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "fail-fast opt-out stalled ({elapsed:?}); did None clear the handler?"
+    );
+    drop(lock);
+}
+
+// T4 (AC2) — the default path *waits* for a briefly-held write lock and then
+// commits, rather than failing. A holder thread takes the write lock, rendezvous
+// with the writer, then releases after ~50ms; the default-timeout writer blocks
+// and succeeds.
+#[test]
+fn default_busy_timeout_waits_then_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.sqlite3");
+    let (admin, admin_dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&admin, &admin_dev);
+    {
+        let mut store = EventStore::open(&path).unwrap();
+        store.insert(&g).unwrap(); // schema + the parent `msg` cites
+    }
+    let msg = message(&admin, &admin_dev, room, vec![g.event_id], "waited", T0 + 1);
+
+    let mut store_b = EventStore::open(&path).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let (ph, bh) = (path.clone(), Arc::clone(&barrier));
+    let holder = thread::spawn(move || {
+        let mut conn = Connection::open(&ph).unwrap();
+        let lock = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        lock.execute("DELETE FROM events WHERE 1 = 0", []).unwrap();
+        bh.wait(); // rendezvous: the write lock is now held
+        thread::sleep(Duration::from_millis(50));
+        lock.rollback().unwrap(); // release
+    });
+
+    barrier.wait(); // proceed only once the holder owns the lock
+    let start = Instant::now();
+    store_b
+        .insert(&msg)
+        .expect("default busy_timeout must wait for the lock, not fail");
+    let waited = start.elapsed();
+    holder.join().unwrap();
+
+    assert!(
+        store_b.contains(&msg.event_id).unwrap(),
+        "the waited-for write must be committed"
+    );
+    // It waited (the lock was provably held first) but nowhere near the 5s cap.
+    assert!(
+        waited < Duration::from_secs(5),
+        "write should have proceeded well before the timeout; waited {waited:?}"
+    );
+}
+
+// T5 (AC2/AC3) — pin the observed rusqlite default and the opt-out/override
+// behavior. rusqlite 0.37 pre-installs 5000ms on open, so the default must read
+// back 5000, `None` must actively clear it to 0, and an explicit duration must
+// be applied verbatim. Fails loudly if a future rusqlite bump changes the default
+// or if `from_connection_with` is "simplified" back to a conditional set.
+#[test]
+fn busy_timeout_pragma_reflects_store_options() {
+    let default = EventStore::open_in_memory().unwrap();
+    assert_eq!(
+        busy_timeout_ms(&default),
+        5000,
+        "default StoreOptions must yield a 5000ms busy_timeout"
+    );
+
+    let opt_out =
+        EventStore::open_in_memory_with(&super::StoreOptions { busy_timeout: None }).unwrap();
+    assert_eq!(
+        busy_timeout_ms(&opt_out),
+        0,
+        "busy_timeout: None must clear the handler to 0 (genuine fail-fast)"
+    );
+
+    let custom = EventStore::open_in_memory_with(&super::StoreOptions {
+        busy_timeout: Some(Duration::from_millis(1234)),
+    })
+    .unwrap();
+    assert_eq!(
+        busy_timeout_ms(&custom),
+        1234,
+        "an explicit busy_timeout must be applied verbatim"
     );
 }

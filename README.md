@@ -1011,6 +1011,23 @@ flip it.
   while a member connected before either flip shows no disconnect/reconnect
   on the admin's `ConnEvent` stream.
 
+**`EventStore` now supports concurrent writers on a shared `SQLite` file**
+(issue #85), closing a gap a real SDK consumer (a resident daemon opening two
+`EventStore` connections onto one database — RPC-driven writes plus a room
+session's sync pump) hit under entirely ordinary concurrency: a colliding
+write from the second connection could surface to the caller as `SQLITE_BUSY`.
+
+- Every write transaction now uses `BEGIN IMMEDIATE` instead of the rusqlite
+  default `BEGIN DEFERRED`, so a colliding writer waits for the lock (bounded
+  by the connection's `busy_timeout`) instead of racing a read-then-write
+  upgrade that `SQLite` fails immediately, bypassing any busy handler.
+- `StoreOptions { busy_timeout: Option<Duration> }` (default `Some(5000ms)`),
+  set via the new `EventStore::open_with` / `open_in_memory_with`
+  constructors, is re-exported through `iroh_rooms::experimental::store` so
+  embedders can tune or explicitly opt out of the timeout (`None` clears
+  rusqlite's own pre-installed 5000ms default rather than leaving it in place).
+  `open`/`open_in_memory` are unchanged for existing callers.
+
 ## Repository Layout
 
 ```text
