@@ -1148,6 +1148,51 @@ example agent — the SDK-driven, adapt-me-as-a-template evolution of this guide
 and Step 7 (agent status) — with its own `README.md` covering the run flow and adaptation
 points.
 
+### Subscribe to room events
+
+A long-running consumer (a resident daemon, a UI backend) can subscribe to a live push
+stream of newly-ingested room events instead of polling `room_tail` (issue #83 / IR-0307):
+
+```rust,ignore
+use iroh_rooms::experimental::session::Node;
+use tokio::sync::broadcast::error::RecvError;
+
+let mut rx = node.room_events();
+let mut seen = std::collections::HashSet::new();
+loop {
+    match rx.recv().await {
+        Ok(ev) => {
+            if seen.insert(ev.event_id) {
+                handle(ev);
+            }
+        }
+        Err(RecvError::Lagged(_)) => {
+            // A slow subscriber missed some events — resync from the authoritative
+            // tail, deduping against what's already been handled.
+            for ev in node.room_tail(u32::MAX).await? {
+                if seen.insert(ev.event_id) {
+                    handle(ev);
+                }
+            }
+        }
+        Err(RecvError::Closed) => break,
+    }
+}
+```
+
+- **Exactly once per stored event.** Own publish, peer sync, and delayed park-promotion all
+  route through the same insert choke point, so a duplicate re-see is never re-emitted.
+- **Lossy on lag, not silent.** This is a bounded `tokio::sync::broadcast` (capacity
+  `NetConfig::room_event_capacity`, default 256, identical in contract to `conn_events`). A
+  subscriber that falls behind gets `RecvError::Lagged` and resyncs via `room_tail(u32::MAX)`
+  deduped against a seen-set, as in the recipe above.
+- **Not ordered by Lamport.** Emission order follows insertion order at the engine, which is
+  not necessarily causal order across a park-promotion cascade (a child delivered before its
+  parent). Sort by `StoredEvent.lamport` if a total order is needed.
+- Out of scope: the CLI's offline authoring commands (`room`/`message`/`invite`/`file.rs`)
+  insert directly through the store and never build a `Node`, so they never emit on this
+  channel; a `room tail --follow` renderer built on this primitive is deferred.
+
 ## Next steps & references
 
 - [`live-pipe-preview.md`](./live-pipe-preview.md) — a task-focused guide to the Live Pipe

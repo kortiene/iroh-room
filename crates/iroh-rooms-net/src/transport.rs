@@ -53,6 +53,9 @@ pub struct NetConfig {
     pub mode: NetMode,
     /// Broadcast backlog for the [`ConnEvent`] stream before a slow observer lags.
     pub conn_event_capacity: usize,
+    /// Ring capacity of the `Node::room_events` broadcast (issue #83). Lossy on
+    /// lag exactly like `conn_event_capacity`; a slow subscriber gets `Lagged`.
+    pub room_event_capacity: usize,
 }
 
 impl Default for NetConfig {
@@ -60,6 +63,7 @@ impl Default for NetConfig {
         Self {
             mode: NetMode::Loopback,
             conn_event_capacity: 256,
+            room_event_capacity: 256,
         }
     }
 }
@@ -500,6 +504,11 @@ mod tests {
     #[test]
     fn net_config_default_conn_event_capacity_is_256() {
         assert_eq!(NetConfig::default().conn_event_capacity, 256);
+    }
+
+    #[test]
+    fn net_config_default_room_event_capacity_is_256() {
+        assert_eq!(NetConfig::default().room_event_capacity, 256);
     }
 
     #[test]

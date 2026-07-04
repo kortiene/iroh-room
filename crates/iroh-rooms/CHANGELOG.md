@@ -7,6 +7,14 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Added `Node::room_events() -> broadcast::Receiver<StoredEvent>` (issue #83 /
+  IR-0307, `experimental::session`): a live push stream of every event accepted
+  into the room's store — own publish, peer sync, and delayed park-promotion
+  all emit here exactly once, so a long-running consumer (e.g. a resident
+  daemon driving a UI) no longer has to poll `room_tail`. Lossy on lag like
+  `conn_events` (`RecvError::Lagged`, resync via `room_tail` + a seen-set —
+  see the method's doc comment for the recipe). Purely additive; existing
+  `Node` methods are unchanged.
 - Added `examples/example_agent/` (issue #39 / IR-0304): a minimal, runnable
   example agent driven by real command-line arguments — the adapt-me-as-a-
   template evolution of `07_agent_status.rs` — plus a co-located `README.md`

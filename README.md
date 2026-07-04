@@ -1028,6 +1028,43 @@ write from the second connection could surface to the caller as `SQLITE_BUSY`.
   rusqlite's own pre-installed 5000ms default rather than leaving it in place).
   `open`/`open_in_memory` are unchanged for existing callers.
 
+**Push-based room-event subscription** (issue #83 / IR-0307): `Node::room_events()`
+streams each newly-ingested `StoredEvent` exactly once; consumers stop polling
+`room_tail`. Filed from a real SDK consumer (Bantaba, a resident daemon + web UI)
+whose only prior option was polling `room_tail` every ~300ms per open room and
+deduping against a seen-set — a latency floor plus an ever-growing
+`room_tail(u32::MAX)` rescan to avoid silently dropping a late-arriving
+low-lamport event from a bounded poll window.
+
+- The sans-IO `SyncEngine` accumulates each freshly-`Inserted` event (own
+  publish, peer sync, or delayed park-promotion — all three routes funnel
+  through one insert choke point) into `pending_ingested`; `take_ingested()`
+  drains it, mirroring the established `pending_flags`/`take_flags` pattern.
+  The `Duplicate` insert arm never reaches the emit point, so a re-seen event
+  is never re-emitted — exactly-once for free.
+- The net-crate pump owns a `broadcast::Sender<StoredEvent>` (capacity
+  `NetConfig::room_event_capacity`, default 256, mirroring
+  `conn_event_capacity`) and drains after every engine drive that can insert
+  (`publish`, `on_message`, `on_tick`); `Node::room_events()` returns a fresh
+  subscriber. A lagging subscriber gets `RecvError::Lagged`, never silent
+  loss, and resyncs via the documented `room_tail(u32::MAX)` + seen-set
+  recipe on the method's doc comment.
+- Emission order follows insertion order, not causal/Lamport order: a
+  park-promotion cascade records the directly-accepted trigger first, then
+  its promoted descendants in engine-iteration order. Only set-membership +
+  exactly-once are guaranteed within a cascade; consumers needing a total
+  order sort by `StoredEvent.lamport`.
+- Reachable through the façade unchanged (`iroh_rooms::experimental::session::Node`)
+  since `Node` was already re-exported. Proven over real loopback QUIC by a
+  two-node test with induced out-of-order delivery (a child event parked and
+  later promoted by its backfilled parent) at both the `iroh-rooms-net` and
+  façade layers.
+- The CLI's offline authoring paths (`room`/`message`/`invite`/`file.rs`) insert
+  directly through `EventStore::insert`, bypassing `SyncEngine` entirely, and
+  never build a `Node`, so they do not emit on this channel — deliberately out
+  of scope, since they have no live subscriber to serve. A `room tail --follow`
+  renderer is deferred to a future issue; this lands only the SDK primitive.
+
 ## Repository Layout
 
 ```text
