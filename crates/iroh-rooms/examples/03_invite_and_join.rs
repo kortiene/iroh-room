@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "experimental")]
-use iroh::{EndpointAddr, EndpointId, SecretKey};
-#[cfg(feature = "experimental")]
 use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
 #[cfg(feature = "experimental")]
-use iroh_rooms::experimental::session::{AllowlistAdmission, NetConfig, Node, DEFAULT_TICK};
+use iroh_rooms::experimental::session::{
+    AllowlistAdmission, EndpointAddr, EndpointId, NetConfig, Node, SecretKey, DEFAULT_TICK,
+};
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::store::EventStore;
 #[cfg(feature = "experimental")]

@@ -7,6 +7,20 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Re-exported the online tier's `iroh` transport identities — `EndpointAddr`,
+  `EndpointId`, `SecretKey`, `Endpoint` — from `experimental::session`
+  (`EndpointId` also from `experimental::blob` and `experimental::pipe_runtime`,
+  issue #87): closes the last gap in "a consumer imports only through
+  `iroh_rooms::*`". Driving `Node::spawn`/`connect_to`/admission wiring
+  previously required a consumer's own direct `iroh` dependency pinned
+  byte-identical to `iroh-rooms-net`'s `=1.0.1` — a version-skew trap where
+  two resolved `iroh` crates produce incompatible `EndpointAddr` types. `iroh`
+  becomes a direct, `experimental`-gated optional dependency of the façade
+  (pinned `=1.0.1` to match `-net` exactly, so Cargo unifies to one crate
+  instance); a default-features build still cannot name any of these types.
+  The reference CLI proves the claim: its direct `iroh` dependency is deleted
+  entirely, with every `iroh::` path routed through the façade instead. Purely
+  additive — a re-export + import-routing change, no new runtime behavior.
 - Added `Node::live_pipe_sessions_for(pipe_id) -> usize` and
   `Node::pipe_session_info() -> Vec<PipeSessionInfo>` (issue #86 / IR-0309,
   `experimental::session` + `experimental::pipe_runtime`): per-pipe

@@ -27,7 +27,7 @@ default = []
 # The online runtime tier (spec D3/D4): transport, sync engine, local store,
 # blob serve/fetch, live-pipe forwarding. Off by default so a default-features
 # consumer cannot even name an experimental type.
-experimental = ["dep:iroh-rooms-net", "iroh-rooms-core/sync"]
+experimental = ["dep:iroh-rooms-net", "iroh-rooms-core/sync", "dep:iroh"]
 # Convenience alias for the full surface.
 full = ["experimental"]
 
@@ -36,13 +36,19 @@ full = ["experimental"]
 iroh-rooms-core = { path = "../iroh-rooms-core" }
 # Experimental tier only.
 iroh-rooms-net = { path = "../iroh-rooms-net", optional = true }
+# Re-exported verbatim from `experimental::{session, blob, pipe_runtime}`
+# (issue #87): `EndpointAddr`/`EndpointId`/`SecretKey`/`Endpoint` are the
+# transport identities the online `Node` API names. Same-type re-export — this
+# pin MUST stay byte-identical to `crates/iroh-rooms-net/Cargo.toml`'s (D6/OQ2:
+# the `[workspace.dependencies]` hoist was considered and deferred, so the two
+# pins are kept in sync by hand and cross-referenced instead) so Cargo unifies
+# to one `iroh` crate and the re-exported types are identical to net's.
+# Optional + experimental-gated: a default-features build cannot name it.
+iroh = { version = "=1.0.1", optional = true }
 
 [dev-dependencies]
 # Async runtime for the online examples' `main()`.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# `EndpointId`/`EndpointAddr`/`SecretKey` for the online examples' peer wiring.
-# Same pin `iroh-rooms-net` resolves.
-iroh = "=1.0.1"
 # CSPRNG room-nonce generation in the offline examples (spec IR-0102 D5). Same
 # 0.4 line `iroh-rooms-core` already resolves.
 getrandom = "0.4"

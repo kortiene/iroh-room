@@ -1121,6 +1121,44 @@ second pipe.
   (`iroh_rooms::experimental::session::Node`); `PipeSessionInfo` is newly
   re-exported through `experimental::pipe_runtime`.
 
+**The façade now re-exports the online tier's `iroh` transport identities**
+(issue #87), closing the last gap in "a consumer imports only through
+`iroh_rooms::*`": driving `Node::spawn`/`connect_to`/admission wiring names
+`EndpointAddr`, `EndpointId`, and `SecretKey` in a consumer's own code, and
+the façade never re-exported them — every consumer (the CLI included) needed
+its own direct `iroh` dependency pinned byte-identical to `iroh-rooms-net`'s
+`=1.0.1`, a version-skew trap: two resolved `iroh` crates produce two
+distinct `EndpointAddr` types that don't compile against each other. Filed
+from Bantaba, a real SDK consumer hitting exactly this friction against the
+developer-preview façade.
+
+- `iroh_rooms::experimental::session` re-exports `EndpointAddr`, `EndpointId`,
+  `SecretKey`, and `Endpoint` verbatim from the pinned `iroh` release (a
+  same-type re-export, like every other façade path — not a wrapper).
+  `EndpointId` is duplicated into `experimental::blob` and
+  `experimental::pipe_runtime`, next to the `BlobAclView` / `PipeSessionInfo` /
+  `PipeAuditSink` APIs that name it, following the same duplicate-where-used
+  precedent as `RoomId` and `HashRef`.
+- `crates/iroh-rooms/Cargo.toml` promotes `iroh` from a dev-dependency to an
+  optional, `experimental`-gated direct dependency, pinned byte-identical to
+  `iroh-rooms-net`'s `=1.0.1` (kept in sync by hand — a
+  `[workspace.dependencies]` hoist was considered and deferred).
+- The reference CLI proves the claim end-to-end:
+  `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct `iroh`
+  dependency at all, and `file.rs` / `join.rs` / `message.rs` / `pipe.rs` /
+  `audit.rs` import the trio through `iroh_rooms::experimental::session`
+  instead.
+- Guarded by three checks: `experimental_surface.rs`'s compile-time
+  type-identity test (coerces real `Node` / `BlobAclView` method items to the
+  façade re-export types, so a pin drift fails the build rather than silently
+  producing two incompatible types); `iroh-rooms-cli/tests/no_direct_iroh_dep.rs`
+  (scans the CLI's own manifest and source for any bare `iroh` dependency or
+  `iroh::` path); and `iroh-rooms/tests/iroh_pin_consistency.rs` (parses both
+  manifests and asserts the pins match exactly).
+- `docs/sdk-coverage.md` gained the "iroh transport types" table; the
+  "imports only through the façade" claim is now fully true for the online
+  tier.
+
 ## Repository Layout
 
 ```text

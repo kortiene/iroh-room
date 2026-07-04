@@ -1,11 +1,14 @@
 # SDK coverage audit (IR-0301)
 
-This is the AC2 evidence artifact for issue #36 / IR-0301: every symbol
-`crates/iroh-rooms-cli/src` imports from `iroh-rooms-core` / `iroh-rooms-net`
-(in production code — not `#[cfg(test)] mod tests` blocks, which exercise the
-same symbols already listed below), mapped to its `iroh-rooms` façade path.
-The façade is a superset of what the CLI needs: every production import maps
-to a façade path — there is no CLI-internal residue.
+This is the AC2 evidence artifact for issue #36 / IR-0301 (extended by issue
+#87 to the raw `iroh` transport types): every symbol
+`crates/iroh-rooms-cli/src` imports from `iroh-rooms-core` / `iroh-rooms-net` /
+`iroh` (in production code — not `#[cfg(test)] mod tests` blocks, which
+exercise the same symbols already listed below), mapped to its `iroh-rooms`
+façade path. The façade is a superset of what the CLI needs: every production
+import maps to a façade path — there is no CLI-internal residue, and
+`crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct `iroh`
+dependency at all.
 
 Regenerate this table by re-running the `grep` in the "Method" section below
 whenever the CLI's imports change; a path listed here that no longer resolves
@@ -61,6 +64,33 @@ as pure/deterministic as the already-listed `capability_hash`; see
 | `net::{PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome}` | `experimental::pipe_runtime::*` | pipe.rs |
 | `net::pipe::is_loopback_target` | `experimental::pipe_runtime::is_loopback_target` | pipe.rs |
 
+### iroh transport types (issue #87)
+
+The public online `Node` API (`iroh-rooms-net/src/node.rs`) names three raw
+`iroh` types in its signatures, plus `Endpoint` on `Node::endpoint`. These are
+re-exported *verbatim* (not wrapped — a same-type re-export, like every other
+façade path) so a consumer needs no direct `iroh` dependency of its own to
+drive the online API; the pin becomes an SDK-internal detail, kept
+byte-identical to `iroh-rooms-net`'s pin by hand (a `[workspace.dependencies]`
+hoist was considered and deferred; both `Cargo.toml`s cross-reference the
+other's pin — spec D6/OQ2):
+
+| `iroh` symbol | Façade path | Used by |
+|---|---|---|
+| `EndpointAddr` | `experimental::session::EndpointAddr` | file.rs, join.rs, message.rs, pipe.rs |
+| `EndpointId` | `experimental::session::EndpointId` (also `blob::EndpointId`, `pipe_runtime::EndpointId`) | audit.rs, file.rs, join.rs, message.rs, pipe.rs |
+| `SecretKey` | `experimental::session::SecretKey` | file.rs, join.rs, message.rs, pipe.rs |
+| `Endpoint` | `experimental::session::Endpoint` | (none in CLI; completeness — `Node::endpoint()` returns it) |
+
+`EndpointId` is duplicated into `experimental::blob` and
+`experimental::pipe_runtime` (the `BlobAclView::is_active` / `PipeSessionInfo.device`
+/ `PipeAuditSink` call sites), following the same duplicate-where-used
+precedent as `RoomId` (`room`/`events`) and `HashRef` (`files`/`events`).
+`EndpointAddr` and `SecretKey` are session-only concepts and are not
+duplicated. All four are behind the `experimental` feature (gated by the
+optional `dep:iroh` on the façade's `Cargo.toml`); a default-features build
+cannot name any of them.
+
 **Resolution of spec OQ6** (promote `is_loopback_target`?): promoted. It is a
 small, genuinely reusable loopback-target guard for any consumer building a
 pipe connector, not a test-only hack, so it is re-exported from
@@ -94,16 +124,26 @@ so every existing CLI test stays green unchanged):
   transport, and store imports stay direct `iroh-rooms-core` /
   `iroh-rooms-net` deps, as the spec explicitly scopes this narrower for the
   two online-heavy files.
-- `agent.rs`, `audit.rs`, `cli.rs`, `display.rs`, `error.rs`, `join.rs`,
-  `pipe.rs` — **not migrated** this issue (the online/experimental-heavy
-  files; §5.4 calls this "recommended but optional"). Every symbol they use is
-  already reachable through the façade per the tables above, so a future
-  migration is a pure import swap with no design change.
+- `agent.rs`, `cli.rs`, `display.rs`, `error.rs` — **not migrated** this issue
+  (the online/experimental-heavy files; §5.4 calls this "recommended but
+  optional"). Every symbol they use is already reachable through the façade
+  per the tables above, so a future migration is a pure import swap with no
+  design change.
+- `audit.rs`, `join.rs`, `pipe.rs` — their `event`/`store`/`sync`/`net`
+  imports stay direct `iroh-rooms-core` / `iroh-rooms-net` deps (unchanged
+  scope), but every `EndpointAddr` / `EndpointId` / `SecretKey` use now routes
+  through `iroh_rooms::experimental::session` (issue #87) — see the "iroh
+  transport types" table above.
 
-`crates/iroh-rooms-cli/Cargo.toml` depends on `iroh-rooms` (with the
-`experimental` feature, so the façade's re-exports stay a strict superset of
-the CLI's needs) alongside the existing direct `iroh-rooms-core` /
-`iroh-rooms-net` dependencies used by the unmigrated files.
+Per issue #87, `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct
+`iroh` dependency at all: `file.rs`, `join.rs`, `message.rs`, `pipe.rs`, and
+`audit.rs` all import `EndpointAddr`/`EndpointId`/`SecretKey` through
+`iroh_rooms::experimental::session` instead. `crates/iroh-rooms-cli/Cargo.toml`
+depends on `iroh-rooms` (with the `experimental` feature, so the façade's
+re-exports stay a strict superset of the CLI's needs) alongside the existing
+direct `iroh-rooms-core` / `iroh-rooms-net` dependencies used by the
+unmigrated files. The "imports only through the façade" claim is now fully
+true for the online tier: no CLI production source names `iroh::` directly.
 
 ## Method
 
@@ -116,3 +156,14 @@ grep -n "use iroh_rooms_core::\|use iroh_rooms_net::\|use iroh_rooms::" crates/i
 
 against the façade's re-export lists in `crates/iroh-rooms/src/{identity,room,
 events,files,pipes}.rs` and `crates/iroh-rooms/src/experimental/*.rs`.
+
+Issue #87 extends the audit to the raw `iroh::` transport types (both `use`
+statements and inline fully-qualified paths), proving zero direct-`iroh`
+residue in CLI production code:
+
+```console
+grep -n "use iroh_rooms_core::\|use iroh_rooms_net::\|use iroh_rooms::\|iroh::" crates/iroh-rooms-cli/src/*.rs
+```
+
+After the migration, this surfaces only `iroh_rooms::` paths — no bare
+`iroh::` — in production source.

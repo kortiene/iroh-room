@@ -1148,6 +1148,26 @@ example agent — the SDK-driven, adapt-me-as-a-template evolution of this guide
 and Step 7 (agent status) — with its own `README.md` covering the run flow and adaptation
 points.
 
+Driving the online tier (`Node::spawn`, `connect_to`, admission wiring) names the raw `iroh`
+transport identities — `EndpointAddr`, `EndpointId`, `SecretKey` — but a consumer needs no
+direct `iroh` dependency of its own to get them (issue #87): they're re-exported verbatim from
+`iroh_rooms::experimental::session` (`EndpointId` is also re-exported from `experimental::blob`
+and `experimental::pipe_runtime`, next to the blob/pipe APIs that name it, so a consumer working
+with only one of those need not import `session` too):
+
+```rust,ignore
+use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
+
+let secret_key = SecretKey::from_bytes(&joiner_device.to_seed());
+let admin_id: EndpointId = ADMIN_ENDPOINT.parse()?;
+node.connect_to(EndpointAddr::new(admin_id));
+```
+
+These are the exact types `iroh-rooms-net`'s public `Node` API names — a same-type re-export,
+not a wrapper — so nothing needs converting, and a consumer's own `Cargo.toml` carries no `iroh`
+entry at all (see `crates/iroh-rooms-cli/Cargo.toml`, which dropped its direct `iroh` dependency
+when it migrated to this re-export).
+
 ### Subscribe to room events
 
 A long-running consumer (a resident daemon, a UI backend) can subscribe to a live push

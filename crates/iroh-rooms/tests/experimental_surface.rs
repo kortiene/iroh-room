@@ -17,6 +17,7 @@
 #![cfg(feature = "experimental")]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use iroh_rooms::experimental::{blob, pipe_runtime, session, store, sync};
 
@@ -66,6 +67,14 @@ fn experimental_session_paths_resolve() {
     assert!(!name_of::<session::RejectCause>().is_empty());
     assert!(!name_of::<session::OfflineReason>().is_empty());
     assert!(!name_of::<session::TracingAudit>().is_empty());
+
+    // iroh transport identities re-exported verbatim (issue #87) — the paths must
+    // resolve here; `iroh_transport_reexports_are_the_net_api_types` below proves
+    // they are the *same* types `iroh-rooms-net` names, not just any resolvable one.
+    assert!(!name_of::<session::EndpointAddr>().is_empty());
+    assert!(!name_of::<session::EndpointId>().is_empty());
+    assert!(!name_of::<session::SecretKey>().is_empty());
+    assert!(!name_of::<session::Endpoint>().is_empty());
 
     // Trait re-exports, proven through their re-exported concrete impls.
     assert!(!admission_name::<session::AllowlistAdmission>().is_empty());
@@ -131,6 +140,114 @@ fn pipe_session_methods_signatures_are_locked() {
         session::Node::pipe_session_info;
 }
 
+/// Type-identity regression guard for the iroh transport re-exports (issue #87),
+/// done **offline** — the compile-time counterpart to `facade_e2e.rs`'s live guard.
+///
+/// The load-bearing correctness constraint of #87 (spec §3.2, R1) is that the
+/// façade's re-exported `EndpointAddr` / `EndpointId` / `SecretKey` / `Endpoint`
+/// are the *same* crate-instance types `iroh-rooms-net`'s public `Node` API names.
+/// If the façade's `iroh` pin ever drifted from `-net`'s, Cargo would resolve two
+/// `iroh` crates and these would silently become *different* types — the exact bug
+/// the issue exists to kill.
+///
+/// Each `fn(..) -> _` binding coerces a real `Node`/`BlobAclView` method item into
+/// a pointer typed with the *façade's* re-export. It compiles only if the façade
+/// type unifies with the type the net method actually names, so any pin desync is a
+/// compile error here (fast, no node spawned) rather than a downstream surprise.
+#[test]
+fn iroh_transport_reexports_are_the_net_api_types() {
+    // Inner items first (clippy::items_after_statements). `SecretKey` is only named
+    // by net's async `Node::spawn*`; an async fn's return future is unnameable, so —
+    // like `blob_import_signatures_are_locked` above — we pin its `secret` parameter
+    // through a never-called inner `async fn`: it compiles only if `session::SecretKey`
+    // is the exact type `Node::spawn` (hence `-net`) names. Building the future
+    // (without awaiting it) does no IO.
+    async fn spawn_secret_lock(secret: session::SecretKey, engine: sync::SyncEngine) {
+        let admission: Arc<dyn session::Admission> = Arc::new(session::AllowlistAdmission::new());
+        let audit: Arc<dyn session::AuditSink> = Arc::new(session::TracingAudit);
+        // Dropped, never awaited (and this fn is never called): construction alone
+        // type-checks the `secret` position, which is the lock.
+        drop(session::Node::spawn(
+            secret,
+            admission,
+            audit,
+            engine,
+            session::NetConfig::default(),
+            session::DEFAULT_TICK,
+        ));
+    }
+
+    // The three `EndpointId` re-exports (session/blob/pipe_runtime) must be one and
+    // the same type — a consumer mixing modules must not get incompatible ids. These
+    // identity coercions compile only if all three paths name the same type, and the
+    // `pipe_runtime` one ties the re-export to the real `PipeSessionInfo.device` field.
+    fn session_id_is_blob_id(id: session::EndpointId) -> blob::EndpointId {
+        id
+    }
+    fn session_id_is_pipe_id(id: session::EndpointId) -> pipe_runtime::EndpointId {
+        id
+    }
+    fn pipe_session_device_is_pipe_endpoint_id(
+        info: pipe_runtime::PipeSessionInfo,
+    ) -> pipe_runtime::EndpointId {
+        info.device
+    }
+
+    // `EndpointId` — named by `Node::id` (return) and `Node::disconnect_peer` (arg).
+    let _: fn(&session::Node) -> session::EndpointId = session::Node::id;
+    let _: fn(&session::Node, session::EndpointId) = session::Node::disconnect_peer;
+    // `EndpointAddr` — named by `Node::connect_to` (arg).
+    let _: fn(&session::Node, session::EndpointAddr) = session::Node::connect_to;
+    // `Endpoint` — named by `Node::endpoint` (return).
+    let _: fn(&session::Node) -> session::Endpoint = session::Node::endpoint;
+    // The `blob` duplicate — named by `BlobAclView::is_active` (arg).
+    let _: fn(&blob::BlobAclView, blob::EndpointId) -> bool = blob::BlobAclView::is_active;
+    // Name each inner item so it is type-checked without a dead-code warning under
+    // `-D warnings`; none is executed.
+    let _ = spawn_secret_lock;
+    let _ = session_id_is_blob_id;
+    let _ = session_id_is_pipe_id;
+    let _ = pipe_session_device_is_pipe_endpoint_id;
+}
+
+/// Exercise the exact inherent methods the reference CLI drives through these
+/// re-exports (issue #87 §4.2) — `SecretKey::from_bytes`/`.public()`,
+/// `EndpointId::from_bytes`/`from_str`/`Display`, `EndpointAddr::new`/
+/// `.with_ip_addr`/`.id` — proving re-exporting the *types* is sufficient (no extra
+/// iroh symbol is needed) and that they behave, all offline and deterministic.
+#[test]
+fn iroh_transport_reexports_construct_offline() {
+    use std::str::FromStr;
+
+    // `SecretKey::from_bytes(&seed).public()` is how the CLI turns a device seed into
+    // a transport identity (join.rs / file.rs / message.rs), now through the facade.
+    let id: session::EndpointId = session::SecretKey::from_bytes(&[7u8; 32]).public();
+    let same: session::EndpointId = session::SecretKey::from_bytes(&[7u8; 32]).public();
+    let other: session::EndpointId = session::SecretKey::from_bytes(&[8u8; 32]).public();
+    assert_eq!(id, same, "same seed must derive the same EndpointId");
+    assert_ne!(
+        id, other,
+        "different seeds must derive different EndpointIds"
+    );
+
+    // `EndpointId` Display + FromStr round-trip (message.rs parses `EndpointId::from_str`).
+    let printed = id.to_string();
+    let parsed = session::EndpointId::from_str(&printed)
+        .expect("EndpointId round-trips via its string form");
+    assert_eq!(parsed, id);
+
+    // `EndpointId::from_bytes` on its own 32 bytes (file.rs `resolve_providers` path).
+    let from_bytes = session::EndpointId::from_bytes(id.as_bytes())
+        .expect("a valid public key's own bytes parse back");
+    assert_eq!(from_bytes, id);
+
+    // `EndpointAddr::new(id).with_ip_addr(sock)` + `.id` field — the dial hint the
+    // CLI builds (join.rs / message.rs / pipe.rs), routed through the facade.
+    let sock: SocketAddr = "127.0.0.1:45001".parse().expect("valid loopback socket");
+    let addr = session::EndpointAddr::new(id).with_ip_addr(sock);
+    assert_eq!(addr.id, id, "EndpointAddr carries the id it was built from");
+}
+
 #[test]
 fn experimental_sync_paths_resolve() {
     assert!(!name_of::<sync::SyncEngine>().is_empty());
@@ -176,6 +293,10 @@ fn experimental_blob_paths_resolve() {
     assert!(!name_of::<blob::BlobError>().is_empty());
     assert!(!name_of::<blob::BlobImport>().is_empty());
     assert!(!name_of::<blob::FetchOutcome>().is_empty());
+
+    // `EndpointId` is duplicated into `blob` (issue #87) so a blob-only consumer
+    // need not reach into `session` — it is the type `BlobAclView::is_active` names.
+    assert!(!name_of::<blob::EndpointId>().is_empty());
 }
 
 #[test]
@@ -193,6 +314,11 @@ fn experimental_pipe_runtime_paths_resolve() {
 
     // Const re-export.
     assert!(!pipe_runtime::PIPE_ALPN.is_empty());
+
+    // `EndpointId` is duplicated into `pipe_runtime` (issue #87) so a pipe-only
+    // consumer need not reach into `session` — it is the type `PipeSessionInfo.device`
+    // and the `PipeAuditSink` callbacks name.
+    assert!(!name_of::<pipe_runtime::EndpointId>().is_empty());
 }
 
 #[test]

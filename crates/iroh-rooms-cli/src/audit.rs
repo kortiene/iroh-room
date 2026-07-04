@@ -11,7 +11,7 @@
 //! stays a thin, always-available fallback for every command, not only `room
 //! tail`. stdout is never touched here (script-friendly output stays clean).
 
-use iroh::EndpointId;
+use iroh_rooms::experimental::session::EndpointId;
 use iroh_rooms_core::event::keys::IdentityKey;
 use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
 
@@ -88,13 +88,13 @@ impl AuditSink for StderrAudit {
 #[cfg(test)]
 mod tests {
     use super::StderrAudit;
-    use iroh::SecretKey;
+    use iroh_rooms::experimental::session::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
     use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
 
     use crate::message::{short_device, short_hash};
 
-    fn device(seed: u8) -> iroh::EndpointId {
+    fn device(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
     }
 
