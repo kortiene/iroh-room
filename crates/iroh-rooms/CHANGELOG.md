@@ -7,6 +7,16 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Added `Node::live_pipe_sessions_for(pipe_id) -> usize` and
+  `Node::pipe_session_info() -> Vec<PipeSessionInfo>` (issue #86 / IR-0309,
+  `experimental::session` + `experimental::pipe_runtime`): per-pipe
+  live-session observability on the owner side, so an owner exposing more
+  than one pipe can tell which pipe carries a live forwarding session
+  instead of only a node-wide total (`Node::live_pipe_sessions()`). Both are
+  pure `&self` reads over the existing session table — no new tracking, no
+  engine/pump involvement — and are decrement-correct on every teardown path
+  with no separate counter to desync. `live_pipe_sessions()` is unchanged;
+  purely additive.
 - Added `Node::blob_import(&Path)` / `Node::blob_import_bytes(Bytes)` (issue #84 /
   IR-0308, `experimental::session` + `experimental::blob`): import a file, or
   re-provide in-memory bytes, into the live session's already-open blob store —

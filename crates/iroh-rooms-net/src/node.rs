@@ -47,7 +47,8 @@ use crate::pipe::registry::is_loopback_target;
 use crate::pipe::runtime::PipeQueryMsg;
 use crate::pipe::{
     connector, new_pipe_id, watcher, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder,
-    PipeHandlerState, PipeProtocolHandler, PipeQuery, PipeRegistry, PipeSessions, TracingPipeAudit,
+    PipeHandlerState, PipeProtocolHandler, PipeQuery, PipeRegistry, PipeSessionInfo, PipeSessions,
+    TracingPipeAudit,
 };
 use crate::state::{ConnEvent, PeerConnState, PeerEntry};
 use crate::transport::{Inbound, NetConfig, NetTransport, Shared};
@@ -854,10 +855,31 @@ impl Node {
     }
 
     /// The number of live pipe sessions currently being forwarded (observability /
-    /// tests for the teardown path).
+    /// tests for the teardown path). For a per-pipe count, see
+    /// [`Node::live_pipe_sessions_for`].
     #[must_use]
     pub fn live_pipe_sessions(&self) -> usize {
         self.pipe_sessions.len()
+    }
+
+    /// Count of live forwarding sessions for one exposed `pipe_id` (issue #86).
+    ///
+    /// Unlike [`Node::live_pipe_sessions`] (node-wide across every exposed pipe),
+    /// this attributes sessions to a single pipe, so an owner exposing more than one
+    /// pipe can render an accurate per-pipe "connected" indicator. `0` for an
+    /// unknown / never-connected pipe.
+    #[must_use]
+    pub fn live_pipe_sessions_for(&self, pipe_id: [u8; 16]) -> usize {
+        self.pipe_sessions.count_for(&pipe_id)
+    }
+
+    /// Per-session detail for every live forwarding session this node owns (issue
+    /// #86): `(pipe_id, connecting device, since)`. A point-in-time snapshot in
+    /// unspecified order — sort by `pipe_id`/`since_ms` for display. Resolve
+    /// `device` to a member identity via [`Node::snapshot`] if needed.
+    #[must_use]
+    pub fn pipe_session_info(&self) -> Vec<PipeSessionInfo> {
+        self.pipe_sessions.info()
     }
 
     /// **Fetch** `hash` from `provider_addr` over the blobs ALPN on this node's

@@ -73,7 +73,7 @@ pub use manager::PeerManager;
 pub use node::{BlobServeConfig, Node, DEFAULT_TICK};
 pub use pipe::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,
-    TracingPipeAudit, PIPE_ALPN,
+    PipeSessionInfo, TracingPipeAudit, PIPE_ALPN,
 };
 pub use state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
 pub use transport::{Inbound, NetConfig, NetMode, NetTransport, Shared};
