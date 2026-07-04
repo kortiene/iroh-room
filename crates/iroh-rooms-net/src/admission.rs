@@ -10,6 +10,7 @@
 //! not a reshape (the reusable-shape seam proven by `spike-blobs::acl::AuthContext`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointId;
@@ -284,29 +285,106 @@ impl Admission for SnapshotAdmission {
 /// IR-0107 production re-point) without duplicating the overlay logic; the default
 /// keeps the historical `JoinBootstrapAdmission` (over `AllowlistAdmission`) working
 /// unchanged.
+///
+/// `accept_joins` is a window, not a fixed setting: it should be **on** only while
+/// the admin's join-hosting session has at least one invite open, and **off**
+/// otherwise. [`new`](Self::new) fixes that window for the lifetime of the gate —
+/// exactly right when the caller's own lifetime *is* the window (e.g. the CLI's
+/// `room tail --accept-joins`). [`new_dynamic`](Self::new_dynamic) instead reads the
+/// window from a shared `Arc<AtomicBool>` on every `authorize()` call, so a
+/// long-running host (issue #88) can flip the window on invite mint/redemption
+/// without rebuilding the gate or respawning the session — the identical live-cell
+/// pattern [`SnapshotAdmission`] already uses for the roster itself.
 #[derive(Debug, Clone)]
 pub struct JoinBootstrapAdmission<A: Admission = AllowlistAdmission> {
     inner: A,
-    accept_joins: bool,
+    accept_joins: AcceptJoins,
+}
+
+/// The source of [`JoinBootstrapAdmission`]'s join-window flag: fixed at
+/// construction ([`new`](JoinBootstrapAdmission::new)) or a live cell the host
+/// flips as invites open and close
+/// ([`new_dynamic`](JoinBootstrapAdmission::new_dynamic)).
+#[derive(Debug, Clone)]
+enum AcceptJoins {
+    Fixed(bool),
+    Dynamic(Arc<AtomicBool>),
+}
+
+impl AcceptJoins {
+    #[inline]
+    fn get(&self) -> bool {
+        match self {
+            Self::Fixed(b) => *b,
+            // Relaxed is sufficient: the flag is a standalone advisory boolean, not
+            // a lock guarding other data. `authorize` depends on no other memory
+            // being published alongside the flip, and a briefly-stale read is
+            // bounded and benign in both directions (see `new_dynamic`'s doc).
+            Self::Dynamic(cell) => cell.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl<A: Admission> JoinBootstrapAdmission<A> {
-    /// Wrap `inner` with the provisional join-bootstrap overlay. `accept_joins`
-    /// should be set by the admin's join-hosting session **only** while at least one
-    /// invite is open; the caller computes that policy (caller-is-admin +
-    /// pending-invite) and passes the result here.
+    /// Wrap `inner` with the provisional join-bootstrap overlay and a **fixed**
+    /// join window. `accept_joins` should be set by the admin's join-hosting
+    /// session **only** while at least one invite is open; the caller computes
+    /// that policy (caller-is-admin + pending-invite) and passes the result here.
     #[must_use]
     pub fn new(inner: A, accept_joins: bool) -> Self {
         Self {
             inner,
-            accept_joins,
+            accept_joins: AcceptJoins::Fixed(accept_joins),
         }
     }
 
-    /// Whether this gate currently admits first-time invitees provisionally.
+    /// Wrap `inner` with the provisional join-bootstrap overlay and a **live**
+    /// join window, read from `accept_joins` on every `authorize()` call instead of
+    /// being fixed at construction (issue #88).
+    ///
+    /// For a resident host whose room session outlives many invite mint/redeem
+    /// cycles, a construction-time `bool` forces either serving the bootstrap
+    /// overlay for the whole session (widening the pre-authorization metadata
+    /// surface) or respawning the session to flip it (which drops the endpoint and
+    /// disconnects every connected peer). `new_dynamic` avoids both: the caller
+    /// keeps a clone of `accept_joins`, storing `true` while at least one invite is
+    /// open and `false` otherwise —
+    ///
+    /// ```ignore
+    /// let window = Arc::new(AtomicBool::new(false));
+    /// let gate = JoinBootstrapAdmission::new_dynamic(inner, window.clone());
+    /// // … on invite mint:
+    /// window.store(true, Ordering::Relaxed);
+    /// // … on the last invite being redeemed or expiring:
+    /// window.store(false, Ordering::Relaxed);
+    /// ```
+    ///
+    /// The flag is read with `Ordering::Relaxed`: it is a standalone advisory
+    /// boolean, not a lock guarding other shared state, so no happens-before
+    /// relationship is required. A briefly-stale read is bounded and benign either
+    /// way — a stale `true` costs at most one extra `AdmitProvisional` for an
+    /// unknown device, which `gate_join` still refuses membership to; a stale
+    /// `false` costs the invitee one refused bootstrap attempt before it retries.
+    ///
+    /// Because admission is consulted only on the accept path for **new** inbound
+    /// connections, flipping the flag never re-evaluates an already-established
+    /// connection: an Active member's live connection is unaffected, and connected
+    /// peers observe no `ConnEvent` churn across the flip. `new_dynamic` is
+    /// observationally identical to `new` for any fixed value of the flag; see the
+    /// sibling live-cell pattern on [`SnapshotAdmission`].
+    #[must_use]
+    pub fn new_dynamic(inner: A, accept_joins: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            accept_joins: AcceptJoins::Dynamic(accept_joins),
+        }
+    }
+
+    /// Whether this gate **currently** admits first-time invitees provisionally
+    /// (reads the live cell for a gate built with [`new_dynamic`](Self::new_dynamic)).
     #[must_use]
     pub fn accepts_joins(&self) -> bool {
-        self.accept_joins
+        self.accept_joins.get()
     }
 }
 
@@ -314,7 +392,7 @@ impl<A: Admission> Admission for JoinBootstrapAdmission<A> {
     fn authorize(&self, device: EndpointId) -> AdmissionDecision {
         match self.inner.authorize(device) {
             // An unknown device + an open join window ⇒ provisional bootstrap admit.
-            AdmissionDecision::Reject(RejectCause::UnknownDevice) if self.accept_joins => {
+            AdmissionDecision::Reject(RejectCause::UnknownDevice) if self.accept_joins.get() => {
                 AdmissionDecision::AdmitProvisional
             }
             // Active member, bound-but-inactive, fail-closed, or unknown-with-no-open
@@ -332,6 +410,7 @@ mod tests {
     };
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn device(seed: u8) -> EndpointId {
@@ -774,5 +853,352 @@ mod tests {
             AdmissionDecision::Reject(RejectCause::NotActive),
             "bound-but-inactive device must be rejected even with accept_joins=true"
         );
+    }
+
+    // ── JoinBootstrapAdmission::new_dynamic (issue #88) — the live join window ───
+    //
+    // A resident host reads the accept-joins window per request from a shared
+    // `Arc<AtomicBool>` so it can gate on pending invites without a session
+    // respawn. These prove: new_dynamic reproduces new(.., bool)'s decision matrix
+    // for a fixed flag value (#1/#2), the window re-opens and closes live on the
+    // SAME gate (#3), a flip never disturbs an Active member or a departed one
+    // (#4/#5), accepts_joins() tracks the live flag (#6), derive(Clone) keeps the
+    // shared cell (#7), and the overlay composes with the live SnapshotAdmission (#8).
+
+    /// Build the four-outcome inner gate shared by the dynamic-matrix tests: an
+    /// Active member (`device(1)`), a bound-but-inactive one (`device(2)`), and a
+    /// fail-closed one (`device(3)`); every other device is unknown.
+    fn matrix_inner() -> (AllowlistAdmission, IdentityKey) {
+        let id_active = identity(0xA1);
+        let id_inactive = identity(0xB2);
+        let id_fc = identity(0xC3);
+        let inner = AllowlistAdmission::new()
+            .bind_device(device(1), id_active)
+            .set_active(id_active)
+            .bind_device(device(2), id_inactive)
+            .bind_device(device(3), id_fc)
+            .set_active(id_fc)
+            .set_fail_closed(id_fc);
+        (inner, id_active)
+    }
+
+    #[test]
+    fn dynamic_matrix_flag_true_matches_fixed_true() {
+        // #1: new_dynamic with the flag `true` is byte-for-byte the new(.., true)
+        // matrix — unknown → provisional, Active → Admit, inactive → NotActive,
+        // fail-closed → FailClosed — so only the flag's *source* differs from `new`.
+        let (inner, id_active) = matrix_inner();
+        let gate = JoinBootstrapAdmission::new_dynamic(inner, Arc::new(AtomicBool::new(true)));
+
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::AdmitProvisional
+        );
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Admit {
+                identity: id_active
+            }
+        );
+        assert_eq!(
+            gate.authorize(device(2)),
+            AdmissionDecision::Reject(RejectCause::NotActive)
+        );
+        assert_eq!(
+            gate.authorize(device(3)),
+            AdmissionDecision::Reject(RejectCause::FailClosed)
+        );
+        assert!(gate.accepts_joins());
+    }
+
+    #[test]
+    fn dynamic_matrix_flag_false_matches_fixed_false() {
+        // #2: the same construction with `false` flips only the unknown-device
+        // outcome to UnknownDevice; Active/NotActive/FailClosed are unchanged —
+        // matching new(.., false).
+        let (inner, id_active) = matrix_inner();
+        let gate = JoinBootstrapAdmission::new_dynamic(inner, Arc::new(AtomicBool::new(false)));
+
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        );
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Admit {
+                identity: id_active
+            }
+        );
+        assert_eq!(
+            gate.authorize(device(2)),
+            AdmissionDecision::Reject(RejectCause::NotActive)
+        );
+        assert_eq!(
+            gate.authorize(device(3)),
+            AdmissionDecision::Reject(RejectCause::FailClosed)
+        );
+        assert!(!gate.accepts_joins());
+    }
+
+    #[test]
+    fn dynamic_live_flip_reopens_and_closes_join_window() {
+        // #3 (the core AC at unit level): the SAME unknown device is refused while
+        // the window is closed, AdmitProvisional after store(true) (invite minted),
+        // and refused again after store(false) (redeemed/expired) — all on one gate,
+        // with no rebuild or respawn. Sibling of
+        // snapshot_admission_live_flip_on_mid_session_removal.
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(AllowlistAdmission::new(), flag.clone());
+
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice),
+            "closed window ⇒ a stranger is refused"
+        );
+
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::AdmitProvisional,
+            "minting an invite opens the window without rebuilding the gate"
+        );
+
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice),
+            "redemption/expiry closes the window again"
+        );
+    }
+
+    #[test]
+    fn dynamic_active_member_admitted_regardless_of_flag() {
+        // #4: a window flip must never change an Active member's verdict — the unit
+        // analog of "connected members observe no ConnEvent churn across the flip".
+        let id = identity(0xD4);
+        let inner = AllowlistAdmission::new()
+            .bind_device(device(1), id)
+            .set_active(id);
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(inner, flag.clone());
+
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Admit { identity: id },
+            "Active member admitted with the window closed"
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(1)),
+            AdmissionDecision::Admit { identity: id },
+            "opening the window does not perturb the Active member's Admit verdict"
+        );
+    }
+
+    #[test]
+    fn dynamic_bound_but_inactive_stays_rejected_across_flips() {
+        // #5: re-opening the window must not resurrect a removed/left member — a
+        // bound-but-inactive device is NotActive whether the flag is false or true.
+        let id = identity(0xB2);
+        let inner = AllowlistAdmission::new().bind_device(device(2), id);
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(inner, flag.clone());
+
+        assert_eq!(
+            gate.authorize(device(2)),
+            AdmissionDecision::Reject(RejectCause::NotActive)
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(2)),
+            AdmissionDecision::Reject(RejectCause::NotActive),
+            "sticky departure survives a window re-open — provisional is for unknown devices only"
+        );
+    }
+
+    #[test]
+    fn dynamic_accepts_joins_tracks_the_live_flag() {
+        // #6: accepts_joins() reflects the live cell, not a construction-time freeze.
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(AllowlistAdmission::new(), flag.clone());
+        assert!(!gate.accepts_joins());
+        flag.store(true, Ordering::Relaxed);
+        assert!(gate.accepts_joins());
+        flag.store(false, Ordering::Relaxed);
+        assert!(!gate.accepts_joins());
+    }
+
+    #[test]
+    fn dynamic_clone_shares_the_flag_cell() {
+        // #7: Node installs the gate as Arc<dyn Admission>, so derive(Clone) must
+        // NOT detach the shared cell. A flip via the original handle is observed by
+        // a clone's authorize() and accepts_joins().
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(AllowlistAdmission::new(), flag.clone());
+        let clone = gate.clone();
+
+        assert_eq!(
+            clone.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            clone.accepts_joins(),
+            "the clone must observe the flip through the shared Arc<AtomicBool>"
+        );
+        assert_eq!(
+            clone.authorize(device(9)),
+            AdmissionDecision::AdmitProvisional
+        );
+    }
+
+    #[test]
+    fn dynamic_wraps_snapshot_admission_and_tracks_flag() {
+        // #8: the overlay composes with the live inner gate. An Active member in the
+        // view is admitted independent of the flag; an unknown device tracks the flag
+        // (provisional when open, UnknownDevice when closed).
+        let id = identity(0xE5);
+        let cell = Arc::new(Mutex::new(view(&[(device(6), id)], &[id], &[])));
+        let flag = Arc::new(AtomicBool::new(true));
+        let gate = JoinBootstrapAdmission::new_dynamic(SnapshotAdmission::new(cell), flag.clone());
+
+        assert_eq!(
+            gate.authorize(device(6)),
+            AdmissionDecision::Admit { identity: id }
+        );
+        assert_eq!(
+            gate.authorize(device(99)),
+            AdmissionDecision::AdmitProvisional
+        );
+
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(6)),
+            AdmissionDecision::Admit { identity: id },
+            "closing the window leaves the inner gate's Active Admit intact"
+        );
+        assert_eq!(
+            gate.authorize(device(99)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice),
+            "closing the window returns unknown devices to UnknownDevice"
+        );
+    }
+
+    #[test]
+    fn dynamic_is_observationally_identical_to_fixed_across_the_matrix() {
+        // AC "no behavioural regression": new_dynamic must equal new for ANY fixed
+        // flag value. #1/#2 pin new_dynamic to hardcoded expectations; this instead
+        // pins the two constructors to *each other* over the whole device matrix, so
+        // if `new`'s (or the overlay's) decision logic ever drifted, the parity would
+        // break here — the dynamic path can never silently diverge from the fixed one.
+        let (inner, _) = matrix_inner();
+        // One device from each class: unknown, Active, bound-but-inactive, fail-closed.
+        let devices = [device(9), device(1), device(2), device(3)];
+        for flag in [false, true] {
+            let fixed = JoinBootstrapAdmission::new(inner.clone(), flag);
+            let dynamic =
+                JoinBootstrapAdmission::new_dynamic(inner.clone(), Arc::new(AtomicBool::new(flag)));
+            for (i, &d) in devices.iter().enumerate() {
+                assert_eq!(
+                    dynamic.authorize(d),
+                    fixed.authorize(d),
+                    "new_dynamic(flag={flag}) must match new(.., {flag}) for device class {i}"
+                );
+            }
+            assert_eq!(
+                dynamic.accepts_joins(),
+                fixed.accepts_joins(),
+                "accepts_joins() must match new(.., {flag})"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_fail_closed_stays_rejected_across_flips() {
+        // Sibling of #5 for the OTHER sticky-reject cause: a fail-closed identity must
+        // stay FailClosed whether the window is closed or open — re-opening the join
+        // window must never bypass the §0/§5 fail-closed overlay (which takes priority
+        // over Active). Provisional is for genuinely-unknown devices only.
+        let id = identity(0xC3);
+        let inner = AllowlistAdmission::new()
+            .bind_device(device(3), id)
+            .set_active(id)
+            .set_fail_closed(id);
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(inner, flag.clone());
+
+        assert_eq!(
+            gate.authorize(device(3)),
+            AdmissionDecision::Reject(RejectCause::FailClosed),
+            "fail-closed rejected with the window closed"
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(3)),
+            AdmissionDecision::Reject(RejectCause::FailClosed),
+            "opening the window must not override the fail-closed overlay"
+        );
+    }
+
+    #[test]
+    fn dynamic_repeated_flip_cycles_and_redundant_stores_stay_consistent() {
+        // Strengthens #3: the verdict is a pure function of the flag's *level*, read
+        // fresh on every authorize — so it must survive many open/close cycles, and a
+        // redundant store of the value already held must not toggle it (guards against
+        // any accidental edge-triggered / one-shot latch in the dynamic path).
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = JoinBootstrapAdmission::new_dynamic(AllowlistAdmission::new(), flag.clone());
+
+        for _ in 0..3 {
+            // Redundant close while already closed: still refused.
+            flag.store(false, Ordering::Relaxed);
+            assert_eq!(
+                gate.authorize(device(9)),
+                AdmissionDecision::Reject(RejectCause::UnknownDevice)
+            );
+            // Open, then a redundant re-open: provisional both times.
+            flag.store(true, Ordering::Relaxed);
+            assert_eq!(
+                gate.authorize(device(9)),
+                AdmissionDecision::AdmitProvisional
+            );
+            flag.store(true, Ordering::Relaxed);
+            assert_eq!(
+                gate.authorize(device(9)),
+                AdmissionDecision::AdmitProvisional,
+                "a redundant store(true) keeps the window open"
+            );
+        }
+        // Land closed after the cycles.
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            gate.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        );
+    }
+
+    #[test]
+    fn dynamic_independent_gates_have_independent_windows() {
+        // Two gates built from two DISTINCT Arc<AtomicBool> cells must not share a
+        // window: opening one leaves the other closed. Guards against any accidental
+        // shared/static flag state in the dynamic path (the complement of #7, which
+        // proves a *cloned* gate DOES share its cell).
+        let flag_a = Arc::new(AtomicBool::new(false));
+        let flag_b = Arc::new(AtomicBool::new(false));
+        let gate_a = JoinBootstrapAdmission::new_dynamic(AllowlistAdmission::new(), flag_a.clone());
+        let gate_b = JoinBootstrapAdmission::new_dynamic(AllowlistAdmission::new(), flag_b);
+
+        flag_a.store(true, Ordering::Relaxed);
+        assert_eq!(
+            gate_a.authorize(device(9)),
+            AdmissionDecision::AdmitProvisional
+        );
+        assert_eq!(
+            gate_b.authorize(device(9)),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice),
+            "gate_b's window must stay closed when only gate_a's flag is flipped"
+        );
+        assert!(gate_a.accepts_joins());
+        assert!(!gate_b.accepts_joins());
     }
 }

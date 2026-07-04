@@ -983,6 +983,34 @@ honor-system checkbox:
   `verify.sh`/online-tier boundaries to prove the READY/NOT-READY exit-code
   wiring).
 
+**`JoinBootstrapAdmission`'s join window is now dynamic** (issue #88), closing
+a gap a real SDK consumer hit against the developer-preview façade: a
+resident daemon holding a room session open indefinitely needs its
+pending-invite state to gate join-bootstrap admission many times within one
+session's lifetime, but the gate's `accept_joins` was a `bool` fixed at
+construction — forcing either serving the bootstrap overlay for the whole
+session or respawning the `Node` (dropping every connected peer) just to
+flip it.
+
+- `JoinBootstrapAdmission::new_dynamic(inner, Arc<AtomicBool>)` reads the
+  `accept_joins` window from a shared, caller-owned flag on every
+  `authorize()` call, instead of `new`'s fixed-at-construction `bool`. A
+  long-running host stores `true` on invite mint and `false` on
+  redemption/expiry — the same "provisional bootstrap only while an invite
+  is open" policy the type's docs already stated — with no session respawn
+  and no admission-chain rebuild.
+- `new` and its fixed-`bool` semantics (and the CLI's `room tail
+  --accept-joins`, whose command lifetime *is* the policy window) are
+  unchanged; `new_dynamic` is observationally identical to `new` for any
+  fixed flag value.
+- Because admission is consulted only on the accept path for new inbound
+  connections, flipping the flag never re-evaluates an already-established
+  connection. A new `join_e2e.rs` test proves this end-to-end: on one
+  long-lived admin `Node`, the window opens (joiner completes bootstrap +
+  `member.joined`) then closes again (a second unknown device is refused),
+  while a member connected before either flip shows no disconnect/reconnect
+  on the admin's `ConnEvent` stream.
+
 ## Repository Layout
 
 ```text
