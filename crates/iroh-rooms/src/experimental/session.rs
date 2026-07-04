@@ -5,7 +5,8 @@
 //! [`NetTransport`] with a sync engine and pumping them (`spawn` /
 //! `spawn_room` / `publish` / `room_tail` / `snapshot` / `fetch_file` /
 //! `blob_import` / `blob_import_bytes` / `pipe_expose` / `pipe_connect` /
-//! `conn_events` / `room_events` / `shutdown`, …). See its own docs in
+//! `conn_events` / `room_events` / `live_pipe_sessions_for` /
+//! `pipe_session_info` / `shutdown`, …). See its own docs in
 //! `iroh-rooms-net` for the full method set.
 //!
 //! `room_events()` (issue #83 / IR-0307) returns a

@@ -15,6 +15,7 @@
 //! | P4b | Owner node shutdown while Bob forwards drops the live session | AC4 |
 //! | P5 | Admin removes Bob; the owner tears the active session down within ≤1 tick | AC5 |
 //! | P6 | An expired pipe is denied `expired` (the one wall-clock consultation) | §5 |
+//! | P11 | Two pipes exposed; per-pipe session count/info distinguish the connected pipe from the idle one, and closing one pipe decrements only its count | issue #86 |
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -301,6 +302,22 @@ async fn wait_sessions(node: &Node, want: usize) {
 
 fn loopback_addr(node: &Node) -> EndpointAddr {
     node.endpoint_addr().expect("owner endpoint addr")
+}
+
+/// Poll until `pipe_id`'s per-pipe live-session count reads `want` (issue #86).
+async fn wait_sessions_for(node: &Node, pipe_id: [u8; 16], want: usize) {
+    tokio::time::timeout(WAIT, async {
+        while node.live_pipe_sessions_for(pipe_id) != want {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected {want} live sessions for the pipe, got {}",
+            node.live_pipe_sessions_for(pipe_id)
+        )
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,4 +1227,161 @@ async fn p10_audit_sink_records_connect_rejected_for_unauthorized_member() {
     forwarder.shutdown();
     alice_node.shutdown().await.expect("shutdown alice");
     carol_node.shutdown().await.expect("shutdown carol");
+}
+
+// ---------------------------------------------------------------------------
+// P11 (issue #86 AC1–AC3) — per-pipe live-session attribution: with two pipes
+// exposed, the connected pipe and the idle pipe are distinguishable, and
+// closing one pipe decrements only its own count (spec
+// `per-pipe-live-session-state.md` §7.2, the acceptance oracle for #86).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)] // one linear two-pipe attribute-then-teardown narrative; splitting fragments it
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p11_per_pipe_session_attribution() {
+    let (room, log, alice, bob, _carol) = build_room();
+    let (echo_a, _echo_a_count) = spawn_echo_server().await;
+    let (echo_b, _echo_b_count) = spawn_echo_server().await;
+
+    let alice_node = spawn_node(alice.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+
+    // Alice exposes two independent pipes, both allowing Bob.
+    let pipe_a = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            echo_a,
+            "echo-a",
+            "localhost:echo-a",
+            &[bob.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("expose pipe A");
+    let pipe_b = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            echo_b,
+            "echo-b",
+            "localhost:echo-b",
+            &[bob.identity()],
+            None,
+            T0 + 101,
+        )
+        .await
+        .expect("expose pipe B");
+    assert_ne!(pipe_a, pipe_b, "two exposes must draw distinct pipe ids");
+
+    wait_pipe_opened(&bob_node, pipe_a).await;
+    wait_pipe_opened(&bob_node, pipe_b).await;
+
+    // Before any connector attaches, every accessor reads zero for both pipes.
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_a), 0);
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_b), 0);
+    assert!(alice_node.pipe_session_info().is_empty());
+
+    // Bob connects through pipe A only and round-trips a byte to force
+    // the accept handler to register the session. The local client is kept
+    // open (not dropped) — the owner deregisters a session when its spliced
+    // local socket closes (`handler.rs`), so an already-dropped client would
+    // race the very assertions below.
+    let mut fwd_a = bob_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_a, 0)
+        .await
+        .expect("bob connects pipe A");
+    let mut client_a = TcpStream::connect(fwd_a.local_addr())
+        .await
+        .expect("connect local A");
+    client_a.write_all(b"a").await.expect("write A");
+    let mut buf_a = [0u8; 1];
+    tokio::time::timeout(WAIT, client_a.read_exact(&mut buf_a))
+        .await
+        .expect("read A")
+        .expect("echo A");
+    assert_eq!(fwd_a.next_outcome().await, Some(PipeOutcome::Forwarded));
+    wait_sessions_for(&alice_node, pipe_a, 1).await;
+
+    // AC1: the connected pipe and the idle pipe are distinguishable; the
+    // node-wide total (unchanged, AC4) still just sums them.
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_a), 1);
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_b), 0);
+    assert_eq!(alice_node.live_pipe_sessions(), 1);
+
+    // AC2: `pipe_session_info` carries exactly the one live session, attributed
+    // to pipe A and Bob's device, with a since_ms timestamp populated.
+    let info = alice_node.pipe_session_info();
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0].pipe_id, pipe_a);
+    assert_eq!(info[0].device, bob.endpoint_id());
+    assert!(
+        info[0].since_ms > 0,
+        "since_ms must be a real wall-clock stamp under the real clock"
+    );
+
+    // A second connector on pipe B: both per-pipe counts now read 1
+    // independently, the node-wide total is 2, and `pipe_session_info`
+    // attributes two distinct entries to the two pipes (AC2's two-pipe case).
+    let mut fwd_b = bob_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_b, 0)
+        .await
+        .expect("bob connects pipe B");
+    let mut client_b = TcpStream::connect(fwd_b.local_addr())
+        .await
+        .expect("connect local B");
+    client_b.write_all(b"b").await.expect("write B");
+    let mut buf_b = [0u8; 1];
+    tokio::time::timeout(WAIT, client_b.read_exact(&mut buf_b))
+        .await
+        .expect("read B")
+        .expect("echo B");
+    assert_eq!(fwd_b.next_outcome().await, Some(PipeOutcome::Forwarded));
+    wait_sessions_for(&alice_node, pipe_b, 1).await;
+
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_a), 1);
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_b), 1);
+    assert_eq!(alice_node.live_pipe_sessions(), 2);
+    let mut info = alice_node.pipe_session_info();
+    info.sort_by_key(|i| i.pipe_id);
+    let mut expected_ids = [pipe_a, pipe_b];
+    expected_ids.sort_unstable();
+    assert_eq!(info.len(), 2);
+    assert_eq!([info[0].pipe_id, info[1].pipe_id], expected_ids);
+    assert!(info.iter().all(|i| i.device == bob.endpoint_id()));
+
+    // AC3: closing pipe A tears down only its own session; pipe B's count
+    // (and its info entry) is untouched.
+    alice_node
+        .pipe_close(
+            &alice.id,
+            &alice.dev,
+            &room,
+            pipe_a,
+            Some("closed"),
+            T0 + 200,
+        )
+        .await
+        .expect("close pipe A");
+    wait_sessions_for(&alice_node, pipe_a, 0).await;
+
+    assert_eq!(alice_node.live_pipe_sessions_for(pipe_a), 0);
+    assert_eq!(
+        alice_node.live_pipe_sessions_for(pipe_b),
+        1,
+        "AC3: closing pipe A must not decrement pipe B's count"
+    );
+    assert_eq!(alice_node.live_pipe_sessions(), 1);
+    let info = alice_node.pipe_session_info();
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0].pipe_id, pipe_b);
+
+    fwd_a.shutdown();
+    fwd_b.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
 }

@@ -112,6 +112,25 @@ fn blob_import_signatures_are_locked() {
     let _ = lock;
 }
 
+/// Compile-only signature tripwire for the per-pipe live-session façade (issue #86
+/// / IR-0309): pins the exact shapes of `Node::live_pipe_sessions_for` (a per-pipe
+/// count keyed by `[u8; 16]`) and `Node::pipe_session_info` (the `PipeSessionInfo`
+/// snapshot the Pipes panel renders), reached through `experimental::session::Node`.
+///
+/// Both are sync `&self` reads returning owned values, so — like `room_events`
+/// above — they can be named as plain `fn(..) -> _` pointers; the lock is that this
+/// binds. Using `pipe_runtime::PipeSessionInfo` in the `Vec` return type also ties
+/// the façade re-export to the method's real return type, so a drift between them
+/// (or a change to the count's key/return type) is a compile error here, not a
+/// downstream surprise. Reaching the methods on `session::Node` is the AC5
+/// façade-reach check, done offline (no node is spawned).
+#[test]
+fn pipe_session_methods_signatures_are_locked() {
+    let _: fn(&session::Node, [u8; 16]) -> usize = session::Node::live_pipe_sessions_for;
+    let _: fn(&session::Node) -> Vec<pipe_runtime::PipeSessionInfo> =
+        session::Node::pipe_session_info;
+}
+
 #[test]
 fn experimental_sync_paths_resolve() {
     assert!(!name_of::<sync::SyncEngine>().is_empty());
@@ -166,6 +185,7 @@ fn experimental_pipe_runtime_paths_resolve() {
     assert!(!name_of::<pipe_runtime::PipeOutcome>().is_empty());
     assert!(!name_of::<pipe_runtime::PipeError>().is_empty());
     assert!(!name_of::<pipe_runtime::PipeDenyCause>().is_empty());
+    assert!(!name_of::<pipe_runtime::PipeSessionInfo>().is_empty());
     assert!(!name_of::<pipe_runtime::TracingPipeAudit>().is_empty());
 
     // Trait re-export, proven through `TracingPipeAudit`'s impl.

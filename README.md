@@ -1091,6 +1091,36 @@ restarting.
   (`iroh_rooms::experimental::session::Node`, `experimental::blob::{BlobImport,
   BlobError}`) since both were already re-exported.
 
+**Per-pipe live-session state on the owner side** (issue #86 / IR-0309):
+`Node::live_pipe_sessions_for` / `Node::pipe_session_info` answer "is *this*
+pipe connected, and by whom?" instead of only a node-wide total. Filed from
+the same real SDK consumer (Bantaba): its Pipes panel lists every exposed
+pipe with a live "connected" indicator, but `Node::live_pipe_sessions()`
+returns one node-wide count — with two pipes exposed and one live session,
+there was no way to tell which pipe carried it. Bantaba's honesty rule (never
+fabricate state) forced it to show `connected` only when unambiguous (exactly
+one open pipe), under-reporting real connections the moment a host exposed a
+second pipe.
+
+- `Node::live_pipe_sessions_for(&self, pipe_id: [u8; 16]) -> usize` — count of
+  live forwarding sessions for one pipe; `0` for an unknown or
+  never-connected pipe.
+- `Node::pipe_session_info(&self) -> Vec<PipeSessionInfo>` — per-session
+  detail (`pipe_id`, connecting `device`, `since_ms`) across every pipe this
+  node owns, the direct data source for a Pipes-panel row. A point-in-time,
+  unordered snapshot; sort by `pipe_id`/`since_ms` for stable display.
+- Both are pure `&self` reads that filter/project the existing `PipeSessions`
+  table (already `Arc`-held on `Node`, off the sync engine, no `Cmd`/pump
+  hop), so per-pipe counts are decrement-correct for free: every teardown
+  path (splice finish, watcher revocation, owner `pipe_close`) mutates that
+  one table, so a filtered read reflects it on the next call — no separate
+  counter to desync.
+- `live_pipe_sessions()` (node-wide) is unchanged; the new methods are purely
+  additive.
+- Reachable through the façade unchanged
+  (`iroh_rooms::experimental::session::Node`); `PipeSessionInfo` is newly
+  re-exported through `experimental::pipe_runtime`.
+
 ## Repository Layout
 
 ```text
