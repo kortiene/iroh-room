@@ -11,6 +11,14 @@ where feasible); the **experimental** tier may change on any release.
   example agent driven by real command-line arguments — the adapt-me-as-a-
   template evolution of `07_agent_status.rs` — plus a co-located `README.md`
   and a gated integration test. Docs-and-examples only; no SDK surface change.
+- Added `JoinBootstrapAdmission::new_dynamic` (issue #88, `experimental::session`):
+  the join-bootstrap window (`accept_joins`) can now be read from a shared
+  `Arc<AtomicBool>` on every `authorize()` call instead of being fixed at
+  construction, so a long-running host (e.g. a resident daemon) can gate
+  provisional admission on pending invites without respawning its `Node`.
+  Purely additive — `new` and its fixed-`bool` semantics are unchanged, and
+  `new_dynamic` is observationally identical to `new` for any fixed flag
+  value.
 
 ## 0.1.0 — initial surface (IR-0301)
 

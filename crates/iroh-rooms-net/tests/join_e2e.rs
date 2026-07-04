@@ -38,7 +38,20 @@
 //!
 //! Every await is bounded (via `wait_until_contains` / a manual `timeout`) so a
 //! wiring bug fails fast rather than hanging CI (mirrors `message_e2e` / `pipe_e2e`).
+//!
+//! ## Issue #88 — `JoinBootstrapAdmission::new_dynamic` (no-respawn window flip)
+//!
+//! `dynamic_accept_joins_flips_join_window_without_respawn_or_conn_churn` covers the
+//! issue's acceptance sketch end-to-end: an admin built with `new_dynamic` and a
+//! shared `Arc<AtomicBool>` window refuses a fresh joiner while the window is
+//! closed, opens it on `window.store(true)` (invite mint) **without respawning the
+//! admin's `Node`**, completes the joiner's bootstrap + `member.joined` (both peers
+//! fold `Active`, reusing the AC1/AC5 convergence check above), closes it again on
+//! `window.store(false)` (redemption) so a second unknown device is refused, and
+//! asserts a pre-connected resident member's admin-side `ConnEvent` stream carries
+//! only its initial admit — no churn attributable to either flip.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,14 +68,20 @@ use iroh_rooms_core::event::wire::WireEvent;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
-    AllowlistAdmission, JoinBootstrapAdmission, NetConfig, NetMode, Node, TracingAudit,
-    DEFAULT_TICK,
+    AllowlistAdmission, JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState,
+    TracingAudit, DEFAULT_TICK,
 };
 
 // ── fixed test fixtures ───────────────────────────────────────────────────────
 
 /// Loopback-wait budget — generous so transient scheduling hiccups don't flake.
 const WAIT: Duration = Duration::from_secs(15);
+
+/// Bounded wait for an outcome that must NOT happen (a closed-window refusal is a
+/// structural reject decided before any event byte is read, so it never becomes
+/// true no matter how long we wait — this only bounds how long the test spends
+/// confirming that).
+const REFUSAL_WAIT: Duration = Duration::from_secs(3);
 
 /// Room nonce (deterministic across all tests in this file).
 const NONCE: [u8; 16] = [0xab; 16];
@@ -219,6 +238,43 @@ async fn spawn_admin_node(admin: &Principal, room: RoomId, log: &[Vec<u8>]) -> N
     )
     .await
     .expect("spawn admin node")
+}
+
+/// Spawn an admin node pre-seeded with `log`, using
+/// [`JoinBootstrapAdmission::new_dynamic`] (issue #88) instead of a fixed
+/// `accept_joins` bool. The inner `AllowlistAdmission` already knows `resident`
+/// as an Active member, so `resident`'s admit verdict never depends on
+/// `window`; only a genuinely unknown device's outcome tracks the live flag.
+async fn spawn_admin_node_dynamic(
+    admin: &Principal,
+    resident: &Principal,
+    room: RoomId,
+    log: &[Vec<u8>],
+    window: Arc<AtomicBool>,
+) -> Node {
+    let store = EventStore::open_in_memory().expect("in-memory admin store");
+    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("admin engine");
+    for ev in log {
+        engine.publish(ev).expect("seed admin event");
+    }
+    let inner = AllowlistAdmission::new()
+        .bind_device(resident.endpoint_id(), resident.identity())
+        .set_active(resident.identity());
+    let admission = JoinBootstrapAdmission::new_dynamic(inner, window);
+    let cfg = NetConfig {
+        mode: NetMode::Loopback,
+        ..NetConfig::default()
+    };
+    Node::spawn(
+        admin.iroh_secret(),
+        Arc::new(admission),
+        Arc::new(TracingAudit),
+        engine,
+        cfg,
+        DEFAULT_TICK,
+    )
+    .await
+    .expect("spawn admin node (dynamic admission)")
 }
 
 /// Spawn a joiner node with an empty store.
@@ -727,4 +783,137 @@ async fn provisional_peer_does_not_receive_chat_events() {
 
     admin_node.shutdown().await.expect("shutdown admin");
     joiner_node.shutdown().await.expect("shutdown joiner");
+}
+
+// ── Issue #88 — JoinBootstrapAdmission::new_dynamic (no-respawn window flip) ─
+
+/// Issue #88's acceptance sketch, end-to-end: a resident host built with
+/// [`JoinBootstrapAdmission::new_dynamic`] refuses join-bootstrap while its
+/// shared `Arc<AtomicBool>` window is closed; minting an invite
+/// (`window.store(true)`) opens the window **without restarting the admin's
+/// `Node`** and a joiner completes the bootstrap + `member.joined`, converging
+/// both peers to `Active`; redeeming it (`window.store(false)`) closes the
+/// window again and a second unknown device is refused. Throughout, a resident
+/// member that connected *before* either flip is asserted to produce no
+/// disconnect/reconnect `ConnEvent` on the admin's live stream — the direct
+/// consequence of admission being consulted only on the accept path for new
+/// inbound connections (`admission.rs`'s `new_dynamic` doc / handler.rs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_accept_joins_flips_join_window_without_respawn_or_conn_churn() {
+    let admin = Principal::new(0x01);
+    let resident = Principal::new(0x20);
+    let joiner = Principal::new(0x10);
+    let second_joiner = Principal::new(0x11);
+
+    let setup = build_admin_room(&admin, joiner.identity(), "member", None);
+    let window = Arc::new(AtomicBool::new(false));
+
+    let admin_node =
+        spawn_admin_node_dynamic(&admin, &resident, setup.room_id, &setup.log, window.clone())
+            .await;
+
+    // A resident member connects once, before any flip, and stays connected for
+    // the whole test — the peer whose admin-side `ConnEvent` stream must stay quiet.
+    let resident_node = spawn_joiner_node(&resident, &admin, setup.room_id).await;
+    let mut conn_events = admin_node.conn_events();
+    resident_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    admin_node
+        .wait_for_state(resident.endpoint_id(), PeerConnState::Connected, WAIT)
+        .await
+        .expect("resident member connects and is admitted (Active, independent of the window)");
+
+    // ── Window closed: a fresh joiner's bootstrap dial is refused ───────────
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    assert!(
+        joiner_node
+            .wait_until_contains(setup.genesis_event_id, REFUSAL_WAIT)
+            .await
+            .is_err(),
+        "closed window: joiner must not pull the membership sub-DAG"
+    );
+    assert!(
+        !wait_active(&joiner_node, &joiner.identity(), REFUSAL_WAIT).await,
+        "closed window: joiner must not converge to Active"
+    );
+
+    // ── Mint: open the window WITHOUT respawning the admin's session ───────
+    window.store(true, Ordering::Relaxed);
+    // The prior dial loop already stopped after the remote reject (`peer::dial_loop`
+    // returns on `Established::RemoteRejected`), so redial now that the window is open.
+    joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+
+    joiner_node
+        .wait_until_contains(setup.genesis_event_id, WAIT)
+        .await
+        .expect("open window: joiner pulls genesis from the admin");
+    joiner_node
+        .wait_until_contains(setup.invite_dag_id, WAIT)
+        .await
+        .expect("open window: joiner pulls the invite from the admin");
+
+    let heads = joiner_node.heads().await.expect("joiner DAG heads");
+    let binding = DeviceBinding::create(&setup.room_id, &joiner.id, joiner.device_key());
+    let join_wire = build_member_joined(
+        &joiner.id,
+        &joiner.dev,
+        &setup.room_id,
+        &INV_ID,
+        &INV_SECRET,
+        "member",
+        binding,
+        Some("Joiner"),
+        &heads,
+        T0 + 1_000,
+    );
+    publish_and_wait_admin(&joiner_node, &admin_node, join_wire).await;
+
+    assert!(
+        wait_active(&admin_node, &joiner.identity(), WAIT).await,
+        "open window: admin's fold must show the joiner Active once the join lands"
+    );
+    assert!(
+        wait_active(&joiner_node, &joiner.identity(), WAIT).await,
+        "open window: joiner's own fold must show itself Active"
+    );
+
+    // ── Redeem: close the window again WITHOUT respawning ───────────────────
+    window.store(false, Ordering::Relaxed);
+
+    let second_joiner_node = spawn_joiner_node(&second_joiner, &admin, setup.room_id).await;
+    second_joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    assert!(
+        second_joiner_node
+            .wait_until_contains(setup.genesis_event_id, REFUSAL_WAIT)
+            .await
+            .is_err(),
+        "re-closed window: a second unknown device must be refused again"
+    );
+
+    // ── No ConnEvent churn on the resident's connection across either flip ──
+    let mut resident_events = Vec::new();
+    while let Ok(ev) = conn_events.try_recv() {
+        if ev.device == resident.endpoint_id() {
+            resident_events.push(ev);
+        }
+    }
+    assert_eq!(
+        resident_events.len(),
+        1,
+        "the resident's admin-side ConnEvent stream must carry exactly the initial \
+         admit and nothing else across the mint/redeem flips; saw {resident_events:?}"
+    );
+    assert_eq!(
+        (resident_events[0].from, resident_events[0].to),
+        (PeerConnState::Connected, PeerConnState::Connected),
+        "the resident's only ConnEvent must be the first-sight admit, not a disconnect/reconnect"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    resident_node.shutdown().await.expect("shutdown resident");
+    joiner_node.shutdown().await.expect("shutdown joiner");
+    second_joiner_node
+        .shutdown()
+        .await
+        .expect("shutdown second_joiner");
 }
