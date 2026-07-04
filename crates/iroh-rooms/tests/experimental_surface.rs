@@ -77,6 +77,15 @@ fn experimental_session_paths_resolve() {
     assert!(session::DEFAULT_TICK > core::time::Duration::ZERO);
 }
 
+/// Compile-only signature tripwire for `Node::room_events` (issue #83 / IR-0307):
+/// locks the method's exact type so a future signature drift (wrong event type,
+/// wrong channel kind) is a compile error here, not a downstream surprise.
+#[test]
+fn room_events_signature_is_locked() {
+    let _: fn(&session::Node) -> tokio::sync::broadcast::Receiver<store::StoredEvent> =
+        session::Node::room_events;
+}
+
 #[test]
 fn experimental_sync_paths_resolve() {
     assert!(!name_of::<sync::SyncEngine>().is_empty());

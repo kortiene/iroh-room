@@ -338,3 +338,73 @@ async fn message_propagates_through_the_facade_after_convergence() {
     admin_node.shutdown().await.expect("shutdown admin");
     joiner_node.shutdown().await.expect("shutdown joiner");
 }
+
+/// After convergence, a `message.text` published on the admin's façade `Node`
+/// must arrive on the joiner's `room_events()` push stream — proving the
+/// issue #83 / IR-0307 primitive works through the public façade over real
+/// loopback QUIC, not only in the offline `drain_room_events` unit tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn room_events_delivers_published_message_through_the_facade() {
+    let admin = Principal::new(0x03);
+    let joiner = Principal::new(0x30);
+    let setup = build_admin_room(&admin, joiner.identity());
+
+    let (admin_node, joiner_node) = converge(&admin, &joiner, &setup).await;
+    assert!(
+        wait_active(&admin_node, &joiner.identity(), WAIT).await,
+        "the room must converge before the push round trip"
+    );
+
+    let mut room_events = joiner_node.room_events();
+
+    let admin_heads = admin_node.heads().await.expect("admin heads");
+    let body = "hello from the room_events facade test";
+    let message = build_message_text(
+        &admin.id,
+        &admin.dev,
+        &setup.room_id,
+        body,
+        Some("plain"),
+        None,
+        &[],
+        &admin_heads,
+        T0 + 2_000,
+    );
+    let message_id: EventId = message.id.parse().expect("valid message event_id");
+    admin_node
+        .publish(message.to_bytes())
+        .await
+        .expect("publish message.text through the facade Node");
+
+    let stored = tokio::time::timeout(WAIT, async {
+        loop {
+            match room_events.recv().await {
+                Ok(ev) if ev.event_id == message_id => return ev,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("room_events closed before the message arrived")
+                }
+            }
+        }
+    })
+    .await
+    .expect("joiner's room_events must deliver the peer-synced message.text");
+
+    assert_eq!(stored.event_type, EventType::MessageText);
+    let ctx = ValidationContext::for_room(setup.room_id);
+    let validated = validate_wire_bytes(&stored.wire.to_bytes(), &ctx)
+        .expect("the pushed wire bytes must still validate through the facade");
+    let Content::MessageText(m) = validated.event.content else {
+        panic!(
+            "expected MessageText content, got {:?}",
+            validated.event.content
+        );
+    };
+    assert_eq!(
+        m.body, body,
+        "the message body must survive the room_events push unchanged"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    joiner_node.shutdown().await.expect("shutdown joiner");
+}
