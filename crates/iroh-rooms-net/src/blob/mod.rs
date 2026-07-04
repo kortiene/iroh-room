@@ -29,6 +29,12 @@
 //!   *complete* blob (it maps `BlobStatus::Complete`), which survives restart.
 //! - **Hash:** the store's content hash is BLAKE3-256 (`iroh_blobs::Hash`), the same
 //!   digest the spike relied on; `Hash::as_bytes()` yields the raw `[u8; 32]`.
+//! - **Import in-memory bytes (issue #84 / IR-0308, confirmed for `import_bytes`
+//!   below):** `store.blobs().add_bytes(bytes)` returns the same `AddProgress` type
+//!   as `add_path`; both share one `IntoFuture` impl whose default `.await` calls
+//!   `with_tag()`, which creates a **persistent** tag (`Tags::create`) — durability
+//!   parity with `add_path` confirmed directly on the 0.103.0 source, no temp-tag
+//!   fallback needed.
 //! - **Serve (IR-0204 §5.3/§6.1):** [`BlobsProtocol::new`]`(&store, Some(events))`
 //!   builds the ALPN handler over a `&Store` — `FsStore: Deref<Target = Store>`, so
 //!   passing `&self.store` here coerces automatically. [`BlobStore::serve_handler`]
@@ -39,6 +45,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::Duration;
 
+use bytes::Bytes;
 use iroh_blobs::provider::events::EventSender;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
@@ -161,6 +168,44 @@ impl BlobStore {
         })
     }
 
+    /// Import in-memory bytes into the durable store, returning the content hash and
+    /// byte length. The in-session analog of [`BlobStore::import_path`] for
+    /// re-providing fetched bytes (issue #84 / IR-0308).
+    ///
+    /// Like `import_path`, the store computes the content hash during import and this
+    /// method **independently** recomputes BLAKE3-256 over the same bytes and asserts
+    /// they agree (an internal-bug guard, not a trust boundary). The blob is durably
+    /// persisted via the same persistent-tag path `add_path` takes (module doc §
+    /// "Confirmed `iroh-blobs 0.103.0`" above), so this node becomes a
+    /// restart-surviving provider.
+    ///
+    /// # Errors
+    /// [`BlobError::Import`] if the store import fails, or [`BlobError::HashMismatch`]
+    /// if the store hash and the independent recompute disagree.
+    pub async fn import_bytes(&self, bytes: Bytes) -> Result<BlobImport, BlobError> {
+        let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        // In-memory: hashing a resident buffer (bounded by the share size cap) needs
+        // no `spawn_blocking` — there is no file IO to offload off the reactor.
+        let computed = *blake3::hash(&bytes).as_bytes();
+        let tag = self
+            .store
+            .blobs()
+            .add_bytes(bytes)
+            .await
+            .map_err(|e| BlobError::Import(e.to_string()))?;
+        let store_hash = *tag.hash.as_bytes();
+        if computed != store_hash {
+            return Err(BlobError::HashMismatch {
+                store: hex::encode(store_hash),
+                computed: hex::encode(computed),
+            });
+        }
+        Ok(BlobImport {
+            hash: store_hash,
+            size_bytes,
+        })
+    }
+
     /// Whether this store currently holds the *complete* blob `hash` (⇒ this node
     /// is a local provider of it). Durable across restart.
     ///
@@ -250,6 +295,11 @@ pub enum BlobError {
     },
     /// Querying blob presence failed.
     Status(String),
+    /// This session does not own a durable blob store, so it cannot import — the
+    /// node was spawned without a `BlobServeConfig` (issue #84). Distinct from
+    /// [`BlobError::Locked`]: nothing is holding a store, there simply is none in
+    /// this session.
+    NotServing,
 }
 
 impl core::fmt::Display for BlobError {
@@ -269,6 +319,11 @@ impl core::fmt::Display for BlobError {
                 "blob_hash_mismatch: store import hash {store} != independent blake3 {computed}"
             ),
             Self::Status(e) => write!(f, "blob_status_error: {e}"),
+            Self::NotServing => write!(
+                f,
+                "blob_not_serving: this session does not serve blobs; spawn the room with a \
+                 BlobServeConfig to import in-session"
+            ),
         }
     }
 }
@@ -331,6 +386,7 @@ impl BlobAclView {
 #[cfg(test)]
 mod tests {
     use super::{blake3_file, BlobAclView, BlobError, BlobStore};
+    use bytes::Bytes;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::time::Duration;
@@ -476,6 +532,9 @@ mod tests {
             computed: "bb".into(),
         };
         assert!(mismatch.to_string().starts_with("blob_hash_mismatch:"));
+        assert!(BlobError::NotServing
+            .to_string()
+            .starts_with("blob_not_serving:"));
     }
 
     #[test]
@@ -504,6 +563,119 @@ mod tests {
         assert!(
             matches!(err, BlobError::Import(_)),
             "expected BlobError::Import for a missing source path, got: {err}"
+        );
+    }
+
+    // ── import_bytes (issue #84 / IR-0308) ───────────────────────────────────
+    // The in-memory analog of import_path (re-provide fetched bytes in-session).
+    // Mirrors the import_path tests above; spec §7.1.
+
+    #[tokio::test]
+    async fn import_bytes_hash_equals_independent_blake3_and_size_is_correct() {
+        let tmp = TempDir::new().unwrap();
+        let store = BlobStore::open(&tmp.path().join("blobs")).await.unwrap();
+
+        let content = b"the quick brown fox jumps over the lazy dog";
+        let import = store
+            .import_bytes(Bytes::from_static(content))
+            .await
+            .unwrap();
+        assert_eq!(
+            import.hash,
+            *blake3::hash(content).as_bytes(),
+            "import_bytes hash must equal an independent BLAKE3-256 over the bytes"
+        );
+        assert_eq!(
+            import.size_bytes,
+            u64::try_from(content.len()).unwrap(),
+            "size_bytes must equal the byte length"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_is_true_after_import_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let store = BlobStore::open(&tmp.path().join("blobs")).await.unwrap();
+
+        let import = store
+            .import_bytes(Bytes::from_static(b"re-provide me"))
+            .await
+            .unwrap();
+        assert!(
+            store.has(import.hash).await.unwrap(),
+            "the store must hold the bytes it just imported (⇒ it is now a provider)"
+        );
+        assert!(
+            !store.has([0x00; 32]).await.unwrap(),
+            "the store must not claim to hold an unrelated hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_bytes_import_is_held() {
+        // A 0-length payload is a valid content-addressed blob (parity with the
+        // empty-file import above).
+        let tmp = TempDir::new().unwrap();
+        let store = BlobStore::open(&tmp.path().join("blobs")).await.unwrap();
+
+        let import = store.import_bytes(Bytes::new()).await.unwrap();
+        assert_eq!(import.size_bytes, 0);
+        assert_eq!(
+            import.hash,
+            *blake3::hash(b"").as_bytes(),
+            "empty bytes must hash to the well-known BLAKE3 empty digest"
+        );
+        assert!(store.has(import.hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn import_bytes_provider_status_survives_reopen() {
+        // Durability / persistent-tag (AC5 + Risk R2): a *temporary* tag would leave
+        // the blob GC-eligible and this reopen would fail to find it. This is the
+        // regression tripwire that fails loudly if `add_bytes` ever stops taking the
+        // same persistent-tag path `add_path` does (spec Step 0).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("blobs");
+
+        let store = BlobStore::open(&dir).await.unwrap();
+        let import = store
+            .import_bytes(Bytes::from_static(b"persist across restart"))
+            .await
+            .unwrap();
+        assert!(store.has(import.hash).await.unwrap());
+        // Cleanly close so the exclusive lock is released, then reopen the same dir.
+        store.close().await.unwrap();
+
+        let reopened = BlobStore::open(&dir).await.unwrap();
+        assert!(
+            reopened.has(import.hash).await.unwrap(),
+            "a reopened store must still hold the byte-imported blob (persistent tag)"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_path_and_import_bytes_agree_on_hash() {
+        // Content-addressing is source-independent: the same bytes imported by path
+        // and from memory must produce the identical hash and size.
+        let tmp = TempDir::new().unwrap();
+        let store = BlobStore::open(&tmp.path().join("blobs")).await.unwrap();
+
+        let content = b"identical content, two import routes";
+        let path = write_file(tmp.path(), "same.bin", content);
+
+        let by_path = store.import_path(&path).await.unwrap();
+        let by_bytes = store
+            .import_bytes(Bytes::from_static(content))
+            .await
+            .unwrap();
+        assert_eq!(
+            by_path.hash, by_bytes.hash,
+            "import_path and import_bytes must agree on the content hash"
+        );
+        assert_eq!(
+            by_path.size_bytes, by_bytes.size_bytes,
+            "both import routes must report the same size"
         );
     }
 

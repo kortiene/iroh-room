@@ -1193,6 +1193,52 @@ loop {
   insert directly through the store and never build a `Node`, so they never emit on this
   channel; a `room tail --follow` renderer built on this primitive is deferred.
 
+### Share a file from a live session
+
+The CLI's `file share` (Step 5) cycles the session (shutdown → open store → import →
+close → respawn) because it never keeps a `Node` alive across commands. A resident
+daemon that already holds a `Node` open (`spawn_room` with a `BlobServeConfig`) can
+import straight through the live session instead — no session cycle, no peer
+disconnects (issue #84 / IR-0308):
+
+```rust,ignore
+use iroh_rooms::experimental::blob::BlobImport;
+use iroh_rooms::files::{build_file_shared, HashRef};
+
+let BlobImport { hash, size_bytes } = node.blob_import(&path).await?;
+let wire = build_file_shared(
+    &identity_secret, &device_secret, &room_id, file_id, name, mime_type,
+    size_bytes, HashRef::from_bytes(hash), None, &providers, &heads, now,
+);
+node.publish(wire.to_bytes()).await?;
+```
+
+Import **before** publish: publishing the `file.shared` first would briefly reference
+a hash the store doesn't hold yet, so a racing fetcher could see a transient
+`blob_unavailable`. The node must have opened its store with a `BlobServeConfig`
+(`Node::spawn` alone has none) or `blob_import` returns `BlobError::NotServing`.
+
+### Re-provide a fetched file
+
+Symmetrically, a long-running consumer that just verified fetched bytes can become a
+provider of them without restarting:
+
+```rust,ignore
+use iroh_rooms::experimental::blob::FetchOutcome;
+
+let (outcome, bytes) = node.fetch_file(provider_addr, hash, hash, timeout).await;
+if let (FetchOutcome::Fetched, Some(bytes)) = (outcome, bytes) {
+    node.blob_import_bytes(bytes).await?;
+    // The hash is already referenced by the file.shared this node fetched by, so it
+    // serves the blob to other members immediately — no new file.shared needed.
+}
+```
+
+Only re-provide on `FetchOutcome::Fetched`: a `HashMismatch` also returns `Some(bytes)` (the
+transfer completed but the receiver's independent BLAKE3 recheck disagreed with the declared
+hash), and importing those bytes would make this node serve content under a hash it does not
+actually match.
+
 ## Next steps & references
 
 - [`live-pipe-preview.md`](./live-pipe-preview.md) — a task-focused guide to the Live Pipe

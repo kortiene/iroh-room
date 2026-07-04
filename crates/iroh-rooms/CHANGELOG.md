@@ -7,6 +7,14 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Added `Node::blob_import(&Path)` / `Node::blob_import_bytes(Bytes)` (issue #84 /
+  IR-0308, `experimental::session` + `experimental::blob`): import a file, or
+  re-provide in-memory bytes, into the live session's already-open blob store —
+  no second `FsStore` open (so no `BlobError::Locked`), no session cycle, zero
+  `ConnEvent` disconnects. Pair with `build_file_shared` + `Node::publish` to
+  announce the reference. A node spawned without a `BlobServeConfig` returns
+  the new `BlobError::NotServing`. Purely additive; existing `Node` methods and
+  the exclusive-lock model are unchanged.
 - Added `Node::room_events() -> broadcast::Receiver<StoredEvent>` (issue #83 /
   IR-0307, `experimental::session`): a live push stream of every event accepted
   into the room's store — own publish, peer sync, and delayed park-promotion
