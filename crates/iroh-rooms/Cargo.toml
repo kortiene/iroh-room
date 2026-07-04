@@ -60,3 +60,7 @@ tempfile = "3"
 # file bytes rather than only against the example's own claimed hash. Same 1.x
 # line `iroh-rooms-core`/`-net` already resolve.
 blake3 = "1"
+# Name `bytes::Bytes` in the experimental-surface signature lock for
+# `Node::blob_import_bytes` (issue #84 / IR-0308) — the exact type a façade
+# consumer supplies. Same 1.x line `iroh-rooms-net` already resolves.
+bytes = "1"

@@ -1065,6 +1065,32 @@ low-lamport event from a bounded poll window.
   of scope, since they have no live subscriber to serve. A `room tail --follow`
   renderer is deferred to a future issue; this lands only the SDK primitive.
 
+**In-session blob import** (issue #84 / IR-0308): `Node::blob_import` /
+`blob_import_bytes` import into the live session's already-open store —
+resident daemons share files and re-provide fetched bytes with **no** session
+cycle (zero peer disconnects). Filed from the same real SDK consumer
+(Bantaba): unlike the CLI's short-lived process model, a daemon keeps a room
+session (and its blob store) open indefinitely, and the store's `iroh-blobs`
+`FsStore` takes an exclusive on-disk lock for the opener's lifetime — so
+`file share` used to require a full `shutdown → open → import → close →
+respawn` cycle, and a peer's fetched bytes could never be re-provided without
+restarting.
+
+- `BlobStore::import_bytes` is a sibling to the existing `import_path`: same
+  independent-BLAKE3-256-recompute guard, same persistent (restart-surviving)
+  tag.
+- `Node::blob_import(&self, &Path)` / `Node::blob_import_bytes(&self, Bytes)`
+  delegate straight to the node's already-open `blob_store` handle — no second
+  `FsStore` open, no `BlobError::Locked`, no transport touched. `file.shared`
+  authoring stays the caller's job via the existing `build_file_shared` +
+  `Node::publish`; import before publish so a racing fetcher never sees a
+  reference to bytes the store doesn't hold yet.
+- A node spawned without a `BlobServeConfig` has no store to import into and
+  gets the new coded `BlobError::NotServing`, distinct from `Locked`.
+- Reachable through the façade unchanged
+  (`iroh_rooms::experimental::session::Node`, `experimental::blob::{BlobImport,
+  BlobError}`) since both were already re-exported.
+
 ## Repository Layout
 
 ```text

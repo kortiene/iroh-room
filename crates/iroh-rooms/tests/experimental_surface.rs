@@ -86,6 +86,32 @@ fn room_events_signature_is_locked() {
         session::Node::room_events;
 }
 
+/// Compile-only signature tripwire for the in-session blob-import façade (issue #84
+/// / IR-0308): pins the argument and awaited-output types of
+/// `session::Node::blob_import` / `blob_import_bytes`, so a future drift (e.g.
+/// returning `(HashRef, u64)` instead of `BlobImport`, or taking `PathBuf` instead
+/// of `&Path`) is a compile error here rather than a downstream surprise.
+///
+/// Both are `async fn`s whose return future is opaque *and* generic over the input
+/// lifetimes, so — unlike the sync `room_events` lock above — they cannot be named
+/// as a single `fn(..) -> Fut` pointer. The pin is instead a never-called inner
+/// `async fn` that binds each awaited result to its exact type; the lock is that
+/// inner fn *compiling*, which is why the `#[test]` body itself is an intentional
+/// no-op.
+#[test]
+fn blob_import_signatures_are_locked() {
+    async fn lock(node: &session::Node, path: &std::path::Path, fetched: bytes::Bytes) {
+        let by_path: Result<blob::BlobImport, blob::BlobError> = node.blob_import(path).await;
+        let by_bytes: Result<blob::BlobImport, blob::BlobError> =
+            node.blob_import_bytes(fetched).await;
+        // Reference both pins so neither is an unused binding (this never runs).
+        let _ = (by_path.is_ok(), by_bytes.is_ok());
+    }
+    // Name the fn so it is type-checked (the actual lock) without a dead-code
+    // warning under `-D warnings`; it is never executed.
+    let _ = lock;
+}
+
 #[test]
 fn experimental_sync_paths_resolve() {
     assert!(!name_of::<sync::SyncEngine>().is_empty());

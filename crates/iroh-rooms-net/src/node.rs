@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::admission::{Admission, AdmissionView};
 use crate::audit::AuditSink;
-use crate::blob::{self, BlobAclView, BlobStore, FetchOutcome};
+use crate::blob::{self, BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
 use crate::manager::PeerManager;
 use crate::peer::peer_id;
 use crate::pipe::alpn::{PIPE_ALPN, PIPE_ALPN_STR};
@@ -880,6 +880,47 @@ impl Node {
             timeout,
         )
         .await
+    }
+
+    /// Import a file into the durable store this session already owns (issue #84 /
+    /// IR-0308), returning the verified content ref. Unlike the CLI's
+    /// open→import→close, this reuses the live session's store handle: no second
+    /// `FsStore` open (so no [`BlobError::Locked`]) and **no session cycle** — the
+    /// endpoint, engine pump, and every peer link stay up (zero `ConnEvent` churn).
+    ///
+    /// Pair with `build_file_shared` + [`Node::publish`] to announce the reference;
+    /// the serve ACL's Gate 2 begins allowing the new hash on the next fold drive.
+    /// Import **before** publish — publishing first would briefly reference a hash
+    /// the store doesn't hold yet.
+    ///
+    /// # Errors
+    /// [`BlobError::NotServing`] if this session opened no blob store (spawned
+    /// without a `BlobServeConfig`); otherwise the `import_path` errors (`Import`,
+    /// `Read`, `HashMismatch`).
+    pub async fn blob_import(&self, path: &Path) -> Result<BlobImport, BlobError> {
+        self.blob_store
+            .as_ref()
+            .ok_or(BlobError::NotServing)?
+            .import_path(path)
+            .await
+    }
+
+    /// [`Node::blob_import`] from in-memory bytes — re-provide fetched bytes
+    /// in-session so a long-running consumer becomes a provider without restarting.
+    /// After a `fetch_file` that returned `(FetchOutcome::Fetched, Some(bytes))`, the
+    /// bytes' hash is already the one the `file.shared` references, so once imported
+    /// this node serves it immediately (Gate 2 already allows the referenced hash;
+    /// no new `file.shared`, no reconcile needed).
+    ///
+    /// # Errors
+    /// [`BlobError::NotServing`] if this session opened no blob store; otherwise the
+    /// `import_bytes` errors (`Import`, `HashMismatch`).
+    pub async fn blob_import_bytes(&self, bytes: Bytes) -> Result<BlobImport, BlobError> {
+        self.blob_store
+            .as_ref()
+            .ok_or(BlobError::NotServing)?
+            .import_bytes(bytes)
+            .await
     }
 
     /// Gracefully stop: drain the pump, stop the pipe watcher, stop serving blobs
