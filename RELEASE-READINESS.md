@@ -140,9 +140,15 @@ Drawn from `PRD.v0.3.md` §13.4/§14, the README status log, and the crate
 `NOTES.md` files. A preview ships honest only if these are stated up front,
 not discovered by a user:
 
-- **★ No verified real-NAT connectivity yet (Gate A pending).** Direct
-  hole-punching on restrictive/symmetric networks is unproven; relay fallback
-  exists but the cross-network measurement and verdict are owed. See
+- **★ Real-NAT connectivity measured on one environment pair (Gate A,
+  2026-07-03/04, scenario 1 of 2).** A direct hole-punched path establishes both
+  directions, and establishment + relay fallback pass the rubric, on a home-NAT ↔
+  public-server pair; the real carrier crossed the NAT (event + pipe ALPN).
+  nat-probe labels these runs `mixed` (relay stays Active as warm standby, even at
+  `--settle 30`) — a classifier artifact, not a punch failure; corroborated as a
+  real direct path by the issue-#43 SDK-daemon run on the same pair. Still owed:
+  the likely-symmetric (CGNAT/hotspot) environment, where hole-punch is expected
+  to fail and relay fallback must carry the session. See
   [`crates/iroh-rooms-net/NOTES.md`](crates/iroh-rooms-net/NOTES.md) §"Gate A
   (real-network)" and [`crates/spike-nat/results/results.md`](crates/spike-nat/results/results.md).
 - **★ No cloud inbox; no guaranteed offline delivery.** Files and pipes
@@ -249,7 +255,7 @@ Status: DEVELOPER PREVIEW. Not for production. No security audit has been perfor
 - <notable changes>
 
 ## Known limitations (read before relying on this)
-- No verified real-NAT connectivity yet (Gate A pending): <current status>.
+- Real-NAT connectivity (Gate A): <current status — e.g. measured 2026-07-03, scenario 1 of 2; likely-symmetric environment owed>.
 - No cloud inbox / no guaranteed offline delivery; peers must be online.
 - Local storage is unencrypted; no invite revocation; no group E2EE / PFS.
 - <copy the full list from RELEASE-READINESS.md "Known MVP limitations">

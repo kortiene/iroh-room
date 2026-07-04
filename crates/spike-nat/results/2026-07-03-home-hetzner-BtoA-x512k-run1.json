@@ -1,0 +1,32 @@
+{
+  "scenario": "home-broadband<->hetzner-server",
+  "direction": "BtoA",
+  "nat_a": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "wifi",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 1005,
+  "ttfb_direct_ms": 1005,
+  "rtt_ms": 126.37198699999999,
+  "rtt_p90_ms": 186.82978,
+  "throughput_mbit_s": 3.54055370898195,
+  "setup_time_ms": 1267,
+  "relay_url": "https://use1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "0e199d3",
+  "run_at_utc": "2026-07-03T11:51Z",
+  "notes": "supplement: 512KiB xfer (8MiB busts the fixed 30s op budget over the throttled relay path); connect/RTT evidence; no VPN bridge; both ends native IPv6; A uplink ~10Mbit/s scp-verified; path upgraded relay -> mixed within the settle window"
+}

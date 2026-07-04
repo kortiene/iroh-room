@@ -112,14 +112,21 @@ Confirmed against the pinned source; no blocking divergences:
   `identity_of_device` + the Active set). The production re-point is a swap of those
   two lookups, not a reshape.
 
-## Gate A (real-network) — STATUS: NOT YET RUN (measurement harness landed, IR-0012)
+## Gate A (real-network) — STATUS: MEASURED 2026-07-03/04, scenario 1 of 2 (CONDITIONAL GO)
 
-**A green loopback run is NOT Gate A.** The Gate-A NAT test (two physical machines
-on different real NATs) has not been executed — it remains **owed before MVP go**.
-What changed in IR-0012 (#43): the previously-missing rig now exists. A dedicated
-substrate probe **`nat-probe`** (`crates/spike-nat`) and a full runbook +
-GO/NO-GO rubric + results schema are landed and CI-proven; only the manual
-two-host *execution* is outstanding.
+**A green loopback run is NOT Gate A.** The first real two-host run was executed
+on 2026-07-03 (18 JSONs), with an issue-#43 reconciliation pass 2026-07-04
+(5 `--settle 30` JSONs): home-broadband (Spectrum home-router NAT, wifi) ↔
+Hetzner public server behind a stateful ufw INPUT-DROP firewall; different real
+networks, no VPN bridge, both ends native IPv6; both directions ×
+{natural, relay-only}. Measured verdict: **a direct hole-punched path establishes
+both directions, and establishment + relay usability PASS the rubric.** nat-probe
+*labels* the runs `mixed` (never sole-`direct`) only because iroh 1.0.1 keeps the
+relay addr Active as warm standby and has no ConnectionType watcher — a classifier
+artifact, unchanged at `--settle 30`, and corroborated as a real direct path by the
+#43 SDK-daemon run on the same pair (traffic on direct, no relay carrying bytes).
+**The likely-symmetric (CGNAT/hotspot) environment is still owed** before the full
+matrix is closed. Findings block: `crates/spike-nat/NOTES.md` §6.
 
 Two complementary runs close Gate A (see `crates/spike-nat/NOTES.md` for the full
 runbook):
@@ -142,12 +149,36 @@ runbook):
 Run ≥2 NAT scenarios incl. ≥1 likely-symmetric (CGNAT/mobile), both directions.
 GO iff a path is established both directions within ≤10 s in every scenario via at
 least relay fallback, with a direct hole-punched path in ≥1 non-symmetric scenario
-and usable relay throughput (≥1 Mbit/s, RTT ≤ ~300 ms). Paste the rolled-up
-`crates/spike-nat/results/results.md` table in place of the placeholder below.
+and usable relay throughput (≥1 Mbit/s, RTT ≤ ~300 ms).
 
-| scenario | direction | established | path type | TTF event | RTT | throughput |
-|----------|-----------|-------------|-----------|-----------|-----|------------|
-| _(pending manual two-host run — harness: `crates/spike-nat`, `nat-probe`)_ | | | | | | |
+Measured results, 2026-07-03/04 (scenario 1 of 2 — full per-run table:
+`crates/spike-nat/results/results.md`; the remaining rows close with the
+likely-symmetric scenario):
+
+| scenario | direction | mode | established | settled path† | ttfb (ms) | rtt median (ms) | throughput (Mbit/s) |
+|----------|-----------|------|-------------|--------------|-----------|-----------------|---------------------|
+| home-broadband↔hetzner-server | BtoA | natural (×3 @512KiB) | yes | mixed | 638–1005 | 113.5–126.6 | 0.7–3.8 |
+| home-broadband↔hetzner-server | BtoA | relay-only | yes | relay | 1074 | 132.0 | 3.3 |
+| home-broadband↔hetzner-server | AtoB | natural (×3 @2MiB) | yes | mixed | 976–1539 | 109.1–129.8 | 1.1–1.8 |
+| home-broadband↔hetzner-server | AtoB | relay-only | yes | relay | 1141 | 144.1 | 1.2 |
+| home-broadband↔hetzner-server | AtoB | settle30 (×3 @0) | yes | mixed | 1129–1439 | 121.8–128.0 | — |
+| home-broadband↔hetzner-server | BtoA | settle30 (×2 @0) | yes | mixed | 753–1731 | 131.6–149.1 | — |
+| home-broadband↔hetzner-server | both | natural (×10 @8MiB) | no* | none* | — | — | — |
+
+† `mixed` = a direct addr Active **and** the relay addr Active (warm standby); a
+direct hole-punched path is up on every established run, both directions. The
+`settle30` rows (`--settle 30`, issue #43 reconciliation) confirm the relay never
+drops to Inactive on this pair even at a 30 s window, so nat-probe's addr-set
+classifier structurally can't emit sole-`direct` here — it is a label, not a punch
+failure (corroborated by the #43 SDK-daemon traffic-path evidence).
+\* failed only at the bulk-transfer stage: the probe's fixed 30 s per-op budget
+vs 0.6–3.8 Mbit/s sustained on the auto-selected path; connect/TTFB/RTT
+succeeded in every paired supplement run. Confirmation pass over this carrier:
+event ALPN ✓ both directions (signed genesis across the NAT in 1.06/1.08 s;
+non-member rejected before any event bytes, `unknown_device`); pipe ALPN ✓
+(HTTP round-trip through an authenticated `pipe expose`/`pipe connect` across
+the real NAT — full CLI flow: identity → room → key-bound invite → cross-NAT
+join → pipe).
 
 ### Loopback baseline (reference only — NOT Gate A)
 

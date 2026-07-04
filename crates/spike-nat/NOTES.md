@@ -18,10 +18,11 @@ GO/NO-GO rubric, and a **findings block ready to lift into the Gate E memo
 Gate A is the **one load-bearing Phase-0 assumption with no measured evidence**:
 that two iroh endpoints behind real, separate NATs can establish a **direct**
 QUIC connection, or cleanly **fall back to relay**. The landed carrier
-(`iroh-rooms-net`, IR-0005) is proven only on loopback (`RelayMode::Disabled`,
-same host); its `NOTES.md` records *"Gate A (real-network) — STATUS: NOT YET
-RUN"*. A LAN or loopback demo cannot exercise NAT traversal and "will lie to you
-about it" (`PHASE-0-SPIKE.md` Day 1).
+(`iroh-rooms-net`, IR-0005) was proven only on loopback (`RelayMode::Disabled`,
+same host); its `NOTES.md` recorded *"Gate A (real-network) — STATUS: NOT YET
+RUN"* until the first two-host run was executed on 2026-07-03 (§6). A LAN or
+loopback demo cannot exercise NAT traversal and "will lie to you about it"
+(`PHASE-0-SPIKE.md` Day 1).
 
 `nat-probe` is the purpose-built **measurement** tool: a bare `iroh::Endpoint`
 echo probe (isolated from our ALPN/framing, so it tests the *substrate*), which
@@ -72,6 +73,15 @@ sample repeatedly and record the settled value (and the initial one, so the
 upgrade latency is captured for the memo). The `RUST_LOG=iroh=debug` log path
 (spec §6.2 fallback) remains available for cross-checking but is not needed —
 `remote_info` is a clean, typed signal.
+
+> **Measured caveat on `mixed` (2026-07-04, §6).** On the S1 home-NAT↔cloud pair,
+> a direct addr is Active on every run **but the relay addr also stays Active** as a
+> warm standby, so this classifier settles on `mixed` and never emits sole `direct`
+> — even with `--settle 30`. `mixed` therefore reads "direct up, relay warm", **not**
+> "traffic on relay": a direct path is established (corroborated by the #43 SDK-daemon
+> traffic-path evidence on the same pair). The addr-set method cannot, on its own,
+> distinguish which Active path carries bytes; that ambiguity is exactly what a restored
+> `ConnectionType` watcher would remove.
 
 > If a future iroh bump restores a `ConnectionType`/`conn_type` watcher, prefer it
 > and keep this addr-set method as the cross-check (per spec §6.2 ordering).
@@ -188,27 +198,59 @@ whole matrix**, evaluated by the operator from the committed JSON.
 
 ## 6. Gate A findings block — lift verbatim into the Gate E memo (#15)
 
-> **PENDING the manual two-host run.** Fill from `results/results.md` after the
-> matrix (§4) is executed. Template:
+> **Filled 2026-07-03; reconciled 2026-07-04** from the first executed run of
+> the §4 runbook (18 per-run JSONs) plus 5 `--settle 30` reconciliation runs,
+> all committed under `results/` (table in `results/results.md`). One
+> environment pair of the ≥2-environment matrix is measured; the likely-symmetric
+> (CGNAT/hotspot) environment is still owed.
 
 ```md
 ### Gate A — real-NAT hole-punching (IR-0012 / #43)
 
-Verdict: <GO | NO-GO>    Date: <UTC>    iroh: 1.0.1    Probe SHA: <sha>
+Verdict: CONDITIONAL GO (scenario 1 of 2 measured)    Date: 2026-07-03/04    iroh: 1.0.1    Probe SHA: 0e199d3
 
-Environments (≥2, ≥1 likely-symmetric):
-  S1 <A: net/isp/nat-class> ↔ <B: net/isp/nat-class>   (VPN off, different networks)
-  S2 <A …> ↔ <B …>
+Environments (1 of the ≥2 executed; likely-symmetric still owed):
+  S1 A: wifi/Spectrum/home-router NAT ↔ B: ethernet/Hetzner/public-IP behind stateful ufw INPUT-DROP
+     (different real networks; no VPN bridge — B has no tailnet; both ends native IPv6)
+  S2 (owed): home-broadband ↔ mobile-hotspot (CGNAT / likely-symmetric)
 
-Results (both directions; natural + relay-only):
-  <paste results/results.md table>
+Results (both directions; natural + relay-only + settle30): results/results.md (23 committed runs).
 
-Hole-punch reliability: <direct settles>/<attempts> = <rate> over S2 (K=<K>).
-Relay fallback: confirmed <controlled --relay-only> AND <natural on symmetric pair>.
-Relay usability: throughput <X> Mbit/s, RTT <Y> ms (thresholds ≥1 Mbit/s, ≤300 ms).
-Confirmation pass (real carrier): event ALPN <✓/✗>, pipe ALPN <✓/✗> across the NAT.
+Direct path: ESTABLISHED on every successful run, both directions — an active direct
+  addr (native IPv6, and/or the IPv4 socket punched through the home NAT) was present in
+  the peer addr set every time. Independently corroborated on the SAME pair by the #43
+  SDK-daemon data point (a resident consumer on the real transport reported traffic on
+  the direct path, no relay carrying traffic).
+On nat-probe's "mixed" label (NOT a substrate limit): nat-probe reports settled MIXED
+  (never sole "direct") on this pair because iroh 1.0.1 keeps the RELAY addr ACTIVE as a
+  warm standby alongside the live direct addr, and 1.0.1 exposes no ConnectionType
+  watcher — so the addr-set classifier (§2, a backup method promoted to primary) cannot
+  distinguish "direct carrying traffic + relay standby" from "both live". Widening the
+  window to `--settle 30` (2026-07-04, both directions) did NOT change this: the relay
+  addr stays Active for the full 30 s while a direct addr is also Active. "mixed" here
+  means "direct up, relay warm", not "traffic on relay". hole_punched=false in the JSON
+  is therefore a labelling artifact of this classifier, not a failure to punch.
+Relay fallback: confirmed via controlled --relay-only both directions.
+Relay usability: throughput 3.3 Mbit/s @ RTT 132.0 ms (BtoA) and 1.2 Mbit/s @ 144.1 ms
+  (AtoB) — thresholds ≥1 Mbit/s, ≤300 ms: PASS both directions.
+Establishment: every successful run, both directions, well under 10 s (TTFB 0.6–1.7 s,
+  setup 0.9–4.8 s). The ten 8 MiB-xfer runs record established=false: the bulk transfer
+  exceeded the probe's fixed 30 s per-op budget (sustained 0.6–3.8 Mbit/s on the
+  auto-selected path); connect/TTFB/RTT succeeded in every paired supplement run.
+  Harness residual: a late-stage failure discards the run's earlier partial
+  measurements — spike-nat improvement candidate.
+Confirmation pass (real carrier): event ALPN ✓ both directions (signed genesis across
+  the NAT in 1.06 s / 1.08 s; non-member rejected before any event bytes,
+  cause=unknown_device); pipe ALPN ✓ (HTTP round-trip through an authenticated
+  pipe expose/pipe connect across the real NAT, driven by the full CLI flow:
+  identity → room → key-bound invite → cross-NAT join → pipe).
 
-Implication for Residual #12: <discharged with measured evidence | escalation: …>.
+Implication for Residual #12: substantially discharged with measured evidence on this
+  pair — a direct hole-punched path AND relay fallback both work across real separate
+  NATs, corroborated by two independent measurement methods (nat-probe addr set + the
+  #43 SDK daemon). Still owed for the full gate: the likely-symmetric (CGNAT/hotspot)
+  environment, where hole-punch is expected to FAIL and relay fallback must carry the
+  session. Escalation not triggered.
 Confidentiality: every hop (direct or relay) is QUIC/TLS between authenticated
   endpoints; relays forward only ciphertext (relay ≠ plaintext).
 ```

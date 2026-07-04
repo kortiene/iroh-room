@@ -1,0 +1,31 @@
+{
+  "scenario": "home-broadband<->hetzner-server",
+  "direction": "BtoA",
+  "nat_a": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "wifi",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 1731,
+  "ttfb_direct_ms": 1731,
+  "rtt_ms": 149.073533,
+  "rtt_p90_ms": 217.17694400000002,
+  "setup_time_ms": 1998,
+  "relay_url": "https://use1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "0e199d3",
+  "run_at_utc": "2026-07-04T15:53Z",
+  "notes": "reconciliation run: --settle 30 + --xfer 0; relay-stays-active check per issue #43 SDK-daemon data point; path upgraded relay -> mixed within the settle window"
+}

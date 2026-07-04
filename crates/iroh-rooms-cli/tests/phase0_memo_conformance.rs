@@ -71,8 +71,11 @@ fn memo_documents_every_gate_a_through_e() {
             "AC1: memo must document {gate} (spec §6.2)"
         );
     }
-    // The three status verdicts used across the table must all appear.
-    for status in &["PENDING", "GO", "CONDITIONAL"] {
+    // The status verdicts used across the table must all appear. (PENDING left
+    // the required set when Gate A was measured on 2026-07-03 — the memo may no
+    // longer say PENDING once measured results exist; see
+    // `memo_gate_a_verdict_matches_spike_nat_source`, which owns that pivot.)
+    for status in &["GO", "CONDITIONAL"] {
         assert!(
             content.contains(status),
             "memo gate table must use the {status} verdict (spec §6.2)"
@@ -92,15 +95,12 @@ fn memo_documents_both_soft_gates() {
 }
 
 #[test]
-fn memo_marks_gate_a_pending_with_honest_framing() {
-    // AC1 + spec §10 highest risk: Gate A is the only un-measured gate. The memo
-    // must mark it PENDING and state plainly that a green loopback run is NOT Gate
-    // A (CI cannot prove NAT traversal) — this is the load-bearing honesty guard.
+fn memo_frames_gate_a_honestly() {
+    // AC1 + spec §10 highest risk: whatever Gate A's state (pending or measured
+    // — that pivot is owned by `memo_gate_a_verdict_matches_spike_nat_source`),
+    // the memo must state plainly that a green loopback run is NOT Gate A (CI
+    // cannot prove NAT traversal) — this is the load-bearing honesty guard.
     let content = memo();
-    assert!(
-        content.contains("PENDING"),
-        "AC1: memo must mark Gate A PENDING (spec §6.2)"
-    );
     assert!(
         content.contains("loopback run is NOT Gate A") || content.contains("prove NAT traversal"),
         "memo must state that a green loopback run is NOT Gate A / CI cannot prove NAT traversal \
@@ -149,8 +149,10 @@ fn memo_confirms_adr2_and_discloses_no_docs_benchmark() {
 
 #[test]
 fn memo_states_explicit_go_no_go_recommendation() {
-    // AC4: an explicit MVP go/no-go recommendation. With Gate A pending the
-    // prescribed call is CONDITIONAL GO (spec §6.7); the sentence must be present.
+    // AC4: an explicit MVP go/no-go recommendation. The prescribed call is
+    // CONDITIONAL GO (spec §6.7) — originally because Gate A was unmeasured,
+    // now because its residuals (likely-symmetric environment, settled
+    // sole-direct) remain open; the sentence must be present.
     let content = memo();
     assert!(
         content.contains("CONDITIONAL GO"),

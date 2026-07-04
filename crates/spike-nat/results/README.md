@@ -24,6 +24,12 @@ first.
 
 ## Status
 
-Pending the manual two-host run (see [`../NOTES.md`](../NOTES.md) runbook). CI
-proves the harness builds and its loopback self-check passes; it **cannot** prove
-NAT traversal.
+First two-host run executed 2026-07-03 (scenario 1 of 2: home-broadband ↔
+hetzner-server; 18 per-run JSONs), plus 5 `--settle 30` reconciliation runs on
+2026-07-04 (issue #43): 23 JSONs committed, table in `results.md`, findings in
+[`../NOTES.md`](../NOTES.md) §6. A direct path is established both directions on
+this pair; nat-probe labels it `mixed` (relay stays Active as warm standby, even
+at `--settle 30`), corroborated as a real direct path by the #43 SDK-daemon
+data point. The likely-symmetric (CGNAT/hotspot) environment of the §4 matrix is
+still owed. CI proves the harness builds and its loopback self-check passes; it
+**cannot** prove NAT traversal.
