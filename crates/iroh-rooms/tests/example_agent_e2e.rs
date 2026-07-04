@@ -554,13 +554,12 @@ mod online {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use iroh::EndpointAddr;
     use iroh_rooms::events::{
         capability_hash, validate_wire_bytes, Content, EventType, ValidationContext,
     };
     use iroh_rooms::experimental::session::{
-        AllowlistAdmission, JoinBootstrapAdmission, NetConfig, NetMode, Node, TracingAudit,
-        DEFAULT_TICK,
+        AllowlistAdmission, EndpointAddr, JoinBootstrapAdmission, NetConfig, NetMode, Node,
+        SecretKey, TracingAudit, DEFAULT_TICK,
     };
     use iroh_rooms::experimental::store::EventStore;
     use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
@@ -721,15 +720,15 @@ mod online {
     }
 
     /// Small extension trait so [`OnlineFixture`]'s `admin_device` can produce
-    /// the [`iroh::SecretKey`] transport identity the same way the example's
-    /// own `join` subcommand derives it (`SecretKey::from_bytes(&device.to_seed())`).
+    /// the [`SecretKey`] transport identity the same way the example's own
+    /// `join` subcommand derives it (`SecretKey::from_bytes(&device.to_seed())`).
     trait IrohSecret {
-        fn iroh_secret(&self) -> iroh::SecretKey;
+        fn iroh_secret(&self) -> SecretKey;
     }
 
     impl IrohSecret for SigningKey {
-        fn iroh_secret(&self) -> iroh::SecretKey {
-            iroh::SecretKey::from_bytes(&self.to_seed())
+        fn iroh_secret(&self) -> SecretKey {
+            SecretKey::from_bytes(&self.to_seed())
         }
     }
 

@@ -13,12 +13,15 @@
 //! `iroh_rooms_core`/`iroh_rooms_net` dependency anywhere below — and drives the
 //! same create → invite → join → converge scenario as
 //! `iroh-rooms-net/tests/join_e2e.rs`, plus a `message.text` round trip, entirely
-//! through the façade. `iroh::{SecretKey, EndpointId}` are still imported
-//! directly: the façade does not (yet) wrap the raw transport identity/dial
-//! primitives (spec OQ5 — ergonomic wrappers are an explicit follow-up), and
-//! `examples/03_invite_and_join.rs` does the same; every protocol-shaped type
-//! (event authoring, validation, the membership fold, the sync engine, the
-//! store, the node) comes from `iroh_rooms` alone.
+//! through the façade. `SecretKey`/`EndpointId` come from
+//! `iroh_rooms::experimental::session` (issue #87) — re-exported *verbatim*
+//! from the pinned `iroh` release, so this test doubles as the type-identity
+//! regression guard: it only compiles if the façade's `iroh` is the same
+//! crate instance `iroh-rooms-net` uses. The façade does not (yet) *wrap* the
+//! raw transport identity/dial primitives in an ergonomic newtype (spec
+//! OQ5 — an explicit follow-up); every protocol-shaped type (event authoring,
+//! validation, the membership fold, the sync engine, the store, the node)
+//! comes from `iroh_rooms` alone.
 //!
 //! Runs unmarked in CI: two in-process nodes on `NetMode::Loopback` with
 //! OS-assigned ports, no external process and no port contention, mirroring
@@ -30,15 +33,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::{EndpointId, SecretKey};
 use iroh_rooms::events::{
     build_message_text, capability_hash, validate_wire_bytes, Content, EventId, EventType,
     ValidationContext,
 };
 use iroh_rooms::experimental::blob::{BlobImport, BlobStore, FetchOutcome};
 use iroh_rooms::experimental::session::{
-    AdmissionView, AllowlistAdmission, BlobServeConfig, JoinBootstrapAdmission, NetConfig, NetMode,
-    Node, SnapshotAdmission, TracingAudit, DEFAULT_TICK,
+    AdmissionView, AllowlistAdmission, BlobServeConfig, EndpointId, JoinBootstrapAdmission,
+    NetConfig, NetMode, Node, SecretKey, SnapshotAdmission, TracingAudit, DEFAULT_TICK,
 };
 use iroh_rooms::experimental::store::EventStore;
 use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
@@ -270,6 +272,17 @@ async fn two_nodes_converge_to_active_through_the_facade_alone() {
     assert!(
         wait_active(&joiner_node, &joiner.identity(), WAIT).await,
         "joiner's own facade-driven snapshot must show itself Active"
+    );
+
+    // `Endpoint` (issue #87, D3) is the one re-exported transport type
+    // `experimental_surface.rs`'s identity guard only proves by compile-time
+    // coercion, never by calling it against a live Node. Do that here: a real
+    // spawned facade `Node`'s `.endpoint()` must be a working handle onto the
+    // *same* transport session `.id()` reports, not merely a type-compatible one.
+    assert_eq!(
+        admin_node.endpoint().id(),
+        admin_node.id(),
+        "the facade-reexported Endpoint must be a live handle onto this Node's own transport session"
     );
 
     admin_node.shutdown().await.expect("shutdown admin");

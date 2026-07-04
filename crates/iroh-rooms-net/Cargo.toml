@@ -34,6 +34,10 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # Same pin proven by `spike-blobs` (crates.io index 2026-06-29). Only the iroh 1.0
 # stable core (`Endpoint`/`Router`/`ProtocolHandler`/`Connection`/`EndpointId`) is
 # used — zero 0.x crates on the event critical path (ADR-1 churn argument / D5).
+# Cross-referenced pin (issue #87 D6/OQ2, deferred the `[workspace.dependencies]`
+# hoist): `crates/iroh-rooms/Cargo.toml`'s optional `iroh` dep MUST stay byte-
+# identical to this pin, or its re-exported `EndpointAddr`/`EndpointId`/
+# `SecretKey` become a different type from this crate's.
 iroh = "=1.0.1"
 # The Blob Plane's durable local store (IR-0202). The exact pin `spike-blobs`
 # confirmed against the crates.io index (NOTES.md §1); it resolves `iroh ^1.0`

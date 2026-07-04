@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::content::{Content, EventType};
 use iroh_rooms_core::event::ids::RoomId;
 use iroh_rooms_core::event::keys::IdentityKey;
@@ -523,7 +523,7 @@ fn resolve_owner_addr(
     owner_endpoint: &iroh_rooms_core::event::keys::DeviceKey,
     peer_addrs: &[EndpointAddr],
 ) -> Result<EndpointAddr> {
-    let id = iroh::EndpointId::from_bytes(owner_endpoint.as_bytes())
+    let id = EndpointId::from_bytes(owner_endpoint.as_bytes())
         .map_err(|err| anyhow!("pipe owner_endpoint is not a valid endpoint id: {err}"))?;
     Ok(peer_addrs
         .iter()
@@ -767,7 +767,7 @@ mod tests {
         short_pipe, StderrPipeAudit,
     };
 
-    use iroh::EndpointAddr;
+    use iroh_rooms::experimental::session::EndpointAddr;
     use iroh_rooms_core::event::ids::{EventId, RoomId};
     use iroh_rooms_core::event::keys::SigningKey;
     use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
@@ -955,7 +955,7 @@ mod tests {
     // a non-empty code() so the log line is stable and greppable).
     #[test]
     fn stderr_pipe_audit_reject_does_not_panic_for_all_causes() {
-        use iroh::SecretKey;
+        use iroh_rooms::experimental::session::SecretKey;
         let sink = StderrPipeAudit::new(false);
         let dummy_device = SecretKey::from_bytes(&[0u8; 32]).public();
         let dummy_pipe: [u8; 16] = [0x42; 16];
@@ -978,7 +978,7 @@ mod tests {
     // connect_accepted is a no-op unless verbose; calling it must not panic.
     #[test]
     fn stderr_pipe_audit_accept_does_not_panic() {
-        use iroh::SecretKey;
+        use iroh_rooms::experimental::session::SecretKey;
         let quiet = StderrPipeAudit::new(false);
         let loud = StderrPipeAudit::new(true);
         let dummy_device = SecretKey::from_bytes(&[0u8; 32]).public();
@@ -1079,7 +1079,7 @@ mod tests {
     // endpoint id (does not return an error or use the wrong peer).
     #[test]
     fn resolve_owner_addr_with_non_matching_peers_falls_back_to_bare_endpoint() {
-        use iroh::SecretKey;
+        use iroh_rooms::experimental::session::SecretKey;
         let dev_key = SigningKey::from_seed(&[0xDDu8; 32]).device_key();
         let expected_id = resolve_owner_addr(&dev_key, &[])
             .expect("empty-peers baseline must succeed")

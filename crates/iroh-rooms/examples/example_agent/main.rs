@@ -44,8 +44,6 @@ use std::time::Duration;
 #[cfg(feature = "experimental")]
 use anyhow::Context;
 #[cfg(feature = "experimental")]
-use iroh::{EndpointAddr, EndpointId, SecretKey};
-#[cfg(feature = "experimental")]
 use iroh_rooms::events::{
     build_agent_status, constants::SHORT_ID_LEN, validate_wire_bytes, HashRef, ValidationContext,
 };
@@ -53,7 +51,8 @@ use iroh_rooms::events::{
 use iroh_rooms::experimental::blob::BlobStore;
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::session::{
-    AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, TracingAudit, DEFAULT_TICK,
+    AllowlistAdmission, EndpointAddr, EndpointId, NetConfig, NetMode, Node, PeerConnState,
+    SecretKey, TracingAudit, DEFAULT_TICK,
 };
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::store::EventStore;

@@ -1072,27 +1072,30 @@ async fn p9_clean_close_emits_pipe_closed_on_log() {
         .expect("expose pipe");
     wait_pipe_opened(&bob_node, pipe_id).await;
 
-    // Establish a live HTTP session so there is something to tear down.
+    // Establish a live HTTP session so there is something to tear down. The local
+    // client is kept open (not dropped) until after the session count is confirmed
+    // — the owner deregisters a session when its spliced local socket closes
+    // (`handler.rs`), so an already-dropped client would race `wait_sessions` below
+    // (see the same hazard documented in `p11_per_pipe_session_attribution`).
     let mut forwarder = bob_node
         .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
         .await
         .expect("bob connects");
-    {
-        let local = forwarder.local_addr();
-        let mut client = TcpStream::connect(local).await.expect("connect local");
-        client
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("send request");
-        let mut buf = Vec::new();
-        let _ = tokio::time::timeout(WAIT, client.read_to_end(&mut buf)).await;
-    }
+    let local = forwarder.local_addr();
+    let mut client = TcpStream::connect(local).await.expect("connect local");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send request");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(WAIT, client.read_to_end(&mut buf)).await;
     assert_eq!(
         forwarder.next_outcome().await,
         Some(PipeOutcome::Forwarded),
         "P9 setup: live HTTP session must report Forwarded"
     );
     wait_sessions(&alice_node, 1).await;
+    drop(client);
 
     // Owner closes: publishes pipe.closed{closed} and tears the session down.
     alice_node

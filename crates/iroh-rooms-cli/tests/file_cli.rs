@@ -51,6 +51,7 @@
 //!                    within the bounded `--timeout`, no hang (AC1/AC4)
 
 use assert_cmd::Command;
+use iroh_rooms::experimental::session::EndpointId;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -1501,7 +1502,7 @@ fn fetch_unreachable_named_provider_is_unavailable_within_timeout() {
     // A distinct, never-online device — a real key, not the caller's own, so
     // `resolve_providers` does not filter it out as self.
     let ghost_provider_device = SigningKey::from_seed(&[0xEEu8; 32]).device_key();
-    let ghost_endpoint_id = iroh::EndpointId::from_bytes(ghost_provider_device.as_bytes())
+    let ghost_endpoint_id = EndpointId::from_bytes(ghost_provider_device.as_bytes())
         .expect("a device key is a valid iroh endpoint id");
 
     // Seed a `file.shared` naming only the ghost device as provider, parented on
