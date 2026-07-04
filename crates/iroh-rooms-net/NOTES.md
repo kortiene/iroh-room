@@ -112,21 +112,25 @@ Confirmed against the pinned source; no blocking divergences:
   `identity_of_device` + the Active set). The production re-point is a swap of those
   two lookups, not a reshape.
 
-## Gate A (real-network) — STATUS: MEASURED 2026-07-03/04, scenario 1 of 2 (CONDITIONAL GO)
+## Gate A (real-network) — STATUS: MEASURED 2026-07-03/04, both environments (CONDITIONAL GO)
 
-**A green loopback run is NOT Gate A.** The first real two-host run was executed
-on 2026-07-03 (18 JSONs), with an issue-#43 reconciliation pass 2026-07-04
-(5 `--settle 30` JSONs): home-broadband (Spectrum home-router NAT, wifi) ↔
-Hetzner public server behind a stateful ufw INPUT-DROP firewall; different real
-networks, no VPN bridge, both ends native IPv6; both directions ×
-{natural, relay-only}. Measured verdict: **a direct hole-punched path establishes
-both directions, and establishment + relay usability PASS the rubric.** nat-probe
-*labels* the runs `mixed` (never sole-`direct`) only because iroh 1.0.1 keeps the
-relay addr Active as warm standby and has no ConnectionType watcher — a classifier
-artifact, unchanged at `--settle 30`, and corroborated as a real direct path by the
-#43 SDK-daemon run on the same pair (traffic on direct, no relay carrying bytes).
-**The likely-symmetric (CGNAT/hotspot) environment is still owed** before the full
-matrix is closed. Findings block: `crates/spike-nat/NOTES.md` §6.
+**A green loopback run is NOT Gate A.** Two real NAT environments were measured
+(37 JSONs): **S1** home-broadband (Spectrum home-router NAT, wifi) ↔ Hetzner
+public server behind a stateful ufw INPUT-DROP firewall (2026-07-03 + a
+`--settle 30` #43 reconciliation pass); **S2** an iPhone cellular Personal Hotspot
+(carrier CGNAT — the likely-symmetric environment) ↔ {Hetzner cloud;
+home-broadband NAT} (2026-07-04). Different real networks, no VPN bridge, both
+directions × {natural, relay-only}. Measured verdict: **a direct hole-punched
+path establishes on every run in both environments** (native IPv6 throughout, plus
+a punched IPv4 path even between the cellular CGNAT and the home NAT), and
+**establishment + relay reachability PASS both directions** (incl. inbound to the
+CGNAT client). nat-probe *labels* the runs `mixed` only because iroh 1.0.1 keeps
+the relay addr Active as warm standby with no ConnectionType watcher — a classifier
+artifact, unchanged at `--settle 30`, corroborated on S1 by the #43 SDK-daemon run.
+**Residuals are non-connectivity:** forced-relay throughput over the cellular
+uplink read 0.1–0.2 Mbit/s on 256 KiB samples (below the ≥1 Mbit/s target — a
+larger-sample re-measure is owed), and the home-NAT→CGNAT reverse leg was not run.
+Findings block: `crates/spike-nat/NOTES.md` §6.
 
 Two complementary runs close Gate A (see `crates/spike-nat/NOTES.md` for the full
 runbook):
@@ -151,26 +155,36 @@ GO iff a path is established both directions within ≤10 s in every scenario vi
 least relay fallback, with a direct hole-punched path in ≥1 non-symmetric scenario
 and usable relay throughput (≥1 Mbit/s, RTT ≤ ~300 ms).
 
-Measured results, 2026-07-03/04 (scenario 1 of 2 — full per-run table:
-`crates/spike-nat/results/results.md`; the remaining rows close with the
-likely-symmetric scenario):
+Measured results, 2026-07-03/04, both environments (full per-run table:
+`crates/spike-nat/results/results.md`, 37 runs). S1 = home-NAT ↔ cloud
+(non-symmetric); S2 = cellular CGNAT hotspot ↔ {cloud, home-NAT}
+(likely-symmetric):
 
-| scenario | direction | mode | established | settled path† | ttfb (ms) | rtt median (ms) | throughput (Mbit/s) |
-|----------|-----------|------|-------------|--------------|-----------|-----------------|---------------------|
-| home-broadband↔hetzner-server | BtoA | natural (×3 @512KiB) | yes | mixed | 638–1005 | 113.5–126.6 | 0.7–3.8 |
-| home-broadband↔hetzner-server | BtoA | relay-only | yes | relay | 1074 | 132.0 | 3.3 |
-| home-broadband↔hetzner-server | AtoB | natural (×3 @2MiB) | yes | mixed | 976–1539 | 109.1–129.8 | 1.1–1.8 |
-| home-broadband↔hetzner-server | AtoB | relay-only | yes | relay | 1141 | 144.1 | 1.2 |
-| home-broadband↔hetzner-server | AtoB | settle30 (×3 @0) | yes | mixed | 1129–1439 | 121.8–128.0 | — |
-| home-broadband↔hetzner-server | BtoA | settle30 (×2 @0) | yes | mixed | 753–1731 | 131.6–149.1 | — |
-| home-broadband↔hetzner-server | both | natural (×10 @8MiB) | no* | none* | — | — | — |
+| env | scenario | direction | mode | established | settled path† | ttfb (ms) | rtt (ms) | tput (Mbit/s) |
+|----|----------|-----------|------|-------------|--------------|-----------|----------|---------------|
+| S1 | home-broadband↔hetzner | BtoA | natural (×3) | yes | mixed | 638–1005 | 113.5–126.6 | 0.7–3.8 |
+| S1 | home-broadband↔hetzner | BtoA | relay-only | yes | relay | 1074 | 132.0 | 3.3 |
+| S1 | home-broadband↔hetzner | AtoB | natural (×3) | yes | mixed | 976–1539 | 109.1–129.8 | 1.1–1.8 |
+| S1 | home-broadband↔hetzner | AtoB | relay-only | yes | relay | 1141 | 144.1 | 1.2 |
+| S1 | home-broadband↔hetzner | both | settle30 (×5) | yes | mixed | 753–1439 | 121.8–149.1 | — |
+| S1 | home-broadband↔hetzner | both | natural (×10 @8MiB) | no* | none* | — | — | — |
+| S2 | cgnat↔hetzner | AtoB | natural+settle30 (×4) | yes | mixed | 1121–1482 | 155–166 | — |
+| S2 | cgnat↔hetzner | AtoB | relay-only | yes | relay | 1159 | 171.6 | 1.2 |
+| S2 | cgnat↔hetzner | BtoA (inbound-to-CGNAT) | natural (×3) | yes | mixed | 1211–1683 | 179.9–180.9 | — |
+| S2 | cgnat↔hetzner | BtoA | relay-only | yes | relay | 1207 | 297.8 | 0.2‡ |
+| S2 | cgnat↔home-broadband | AtoB | natural+settle30 (×4) | yes | mixed | 403–650 | 96.9–131.3 | — |
+| S2 | cgnat↔home-broadband | AtoB | relay-only | yes | relay | 648 | 113.2 | 0.1‡ |
 
 † `mixed` = a direct addr Active **and** the relay addr Active (warm standby); a
-direct hole-punched path is up on every established run, both directions. The
-`settle30` rows (`--settle 30`, issue #43 reconciliation) confirm the relay never
-drops to Inactive on this pair even at a 30 s window, so nat-probe's addr-set
-classifier structurally can't emit sole-`direct` here — it is a label, not a punch
-failure (corroborated by the #43 SDK-daemon traffic-path evidence).
+direct hole-punched path is up on every established run (native IPv6 in all pairs,
+plus a punched IPv4 path in S2 cgnat↔home). The `settle30` rows (`--settle 30`,
+issue #43) confirm the relay never drops to Inactive even at a 30 s window, so
+nat-probe's addr-set classifier structurally can't emit sole-`direct` — a label,
+not a punch failure (corroborated on S1 by the #43 SDK-daemon traffic-path
+evidence).
+‡ forced-relay throughput bottlenecked by the cellular **uplink**, on 256 KiB
+slow-start-dominated samples — below the ≥1 Mbit/s target; a larger-sample
+re-measure is owed (natural S2 sessions used the healthy direct path).
 \* failed only at the bulk-transfer stage: the probe's fixed 30 s per-op budget
 vs 0.6–3.8 Mbit/s sustained on the auto-selected path; connect/TTFB/RTT
 succeeded in every paired supplement run. Confirmation pass over this carrier:

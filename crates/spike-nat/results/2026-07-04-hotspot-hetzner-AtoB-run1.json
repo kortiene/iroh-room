@@ -1,0 +1,31 @@
+{
+  "scenario": "hotspot-cgnat<->hetzner-server",
+  "direction": "AtoB",
+  "nat_a": {
+    "kind": "cgnat",
+    "isp": "cellular-hotspot",
+    "network_type": "lte",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 1127,
+  "ttfb_direct_ms": 1127,
+  "rtt_ms": 162.68127399999997,
+  "rtt_p90_ms": 204.745139,
+  "setup_time_ms": 1731,
+  "relay_url": "https://euc1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "5e58e49",
+  "run_at_utc": "2026-07-04T17:25Z",
+  "notes": "scenario 2: Mac on iPhone cellular hotspot (carrier CGNAT egress; iPhone-hotspot local subnet) -> Hetzner; tailscale off; distinct NAT env from scenario 1"
+}

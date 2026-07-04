@@ -1,0 +1,32 @@
+{
+  "scenario": "hotspot-cgnat<->home-broadband",
+  "direction": "AtoB",
+  "nat_a": {
+    "kind": "cgnat",
+    "isp": "cellular-hotspot",
+    "network_type": "lte",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "relay",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": true,
+  "ttfb_ms": 648,
+  "ttfb_relay_ms": 648,
+  "rtt_ms": 113.183535,
+  "rtt_p90_ms": 171.143175,
+  "throughput_mbit_s": 0.10206381041017572,
+  "setup_time_ms": 2521,
+  "relay_url": "https://use1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "5e58e49",
+  "run_at_utc": "2026-07-04T17:30Z",
+  "notes": "scenario 2 NAT<->NAT controlled relay-only"
+}

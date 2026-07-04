@@ -14,20 +14,23 @@
 
 **CONDITIONAL GO.** Gates B, C, and D are green with measured or CI-reproducible
 evidence; the Day 8 (Blob ACL) and Day 9 (Live Pipe) soft gates are green at
-loopback. **Gate A (real-network NAT hole-punching) is now MEASURED on one of
-the two required environments** (2026-07-03/04, home-NAT ↔ Hetzner public server,
-23 committed runs): a **direct hole-punched path is established both directions**,
-establishment is ≤2 s, relay usability (1.2–3.3 Mbit/s @ 132–144 ms) passes the
-rubric, and the real shipping carrier crossed the NAT (event ALPN both
-directions; an authenticated Live Pipe carried HTTP end-to-end). The direct-path
-result is corroborated by two independent methods — nat-probe's addr set (an
-active direct addr every run) and the issue-#43 SDK-daemon run on the same pair
-(traffic on the direct path, no relay carrying bytes). nat-probe *labels* these
+loopback. **Gate A (real-network NAT hole-punching) is now MEASURED across BOTH
+required environments** (2026-07-03/04, 37 committed runs): **S1** home-NAT ↔
+Hetzner public server (non-symmetric) and **S2** an iPhone cellular Personal
+Hotspot (carrier CGNAT — the likely-symmetric environment) ↔ {cloud, home-NAT}.
+Establishment passes both directions in every scenario (incl. inbound to the
+CGNAT client), a direct hole-punched path is Active on every established run in
+both environments (native IPv6 throughout, plus a punched IPv4 path even between
+the cellular CGNAT and the home NAT), and the real shipping carrier crossed both
+NATs (S1 event + pipe ALPN; S2 event ALPN from cellular). The direct-path result
+is corroborated on S1 by the issue-#43 SDK-daemon run; nat-probe *labels* these
 runs `mixed` only because iroh 1.0.1 keeps the relay addr Active as warm standby
-and exposes no ConnectionType watcher (confirmed unchanged at `--settle 30`); it
-is not a failure to punch. The one substantive residual keeping Gate E
-CONDITIONAL, not GO, is the **likely-symmetric (CGNAT/hotspot) environment**,
-where hole-punch is expected to fail and relay fallback must carry the session.
+with no ConnectionType watcher (unchanged at `--settle 30`), not a punch failure.
+What keeps Gate E CONDITIONAL rather than GO is now narrow and non-connectivity:
+forced-relay **throughput** over the constrained cellular uplink measured
+0.1–0.2 Mbit/s on small 256 KiB samples (below the ≥1 Mbit/s target; natural S2
+sessions used the healthy direct path), so a larger-sample cellular relay
+re-measure — plus the one un-run home-NAT→CGNAT reverse leg — remain owed.
 
 **ADR-1 (full-mesh direct QUIC) — confirmed by measurement.** **ADR-2
 (hand-rolled SQLite signed log + bounded recent-sync) — confirmed**, with
@@ -44,7 +47,7 @@ See §7 for the full disposition and the NO-GO escalation branch.
 
 | Gate | Scope | Status | Evidence |
 |---|---|---|---|
-| **A** | Real-network NAT hole-punching (Day 1) | **MEASURED 2026-07-03/04 (scenario 1 of 2) — CONDITIONAL GO** | 23 committed runs (`crates/spike-nat/results/`): direct path established both directions + establishment + relay usability PASS; carrier confirmation ✓ (event + pipe ALPN across the NAT); direct corroborated by the #43 SDK-daemon run (nat-probe's `mixed` = relay warm-standby, a classifier label not a punch failure — unchanged at `--settle 30`); residual: likely-symmetric environment owed |
+| **A** | Real-network NAT hole-punching (Day 1) | **MEASURED 2026-07-03/04, both environments — CONDITIONAL GO** | 37 committed runs (`crates/spike-nat/results/`): S1 home-NAT↔cloud + S2 cellular-CGNAT↔{cloud, home-NAT}. Establishment + direct hole-punch + relay reachability PASS both environments/directions (incl. inbound-to-CGNAT); carrier confirmation ✓ (S1 event+pipe, S2 event ALPN); direct corroborated by #43 SDK-daemon (`mixed` = relay warm-standby label, unchanged at `--settle 30`); residual: cellular forced-relay throughput 0.1–0.2 Mbit/s on small samples (< 1 Mbit/s target) + home-NAT→CGNAT reverse leg |
 | **B** | Event Plane byte-level correctness (Days 2–3) | **GO (measured, CI-reproducible)** | `iroh-rooms-core` golden vectors + full `PHASE-0-SPIKE.md` §8 reject/flag taxonomy + strict-CBOR property tests |
 | **C** | The two decisions D1+D2, and recent-sync converges on ≥1 path (Day 5) | **GO** | D1 measured (`spike-transport`); D2 hand-roll built and converges (`iroh-rooms-core/src/sync`); see caveat below |
 | **D** | Sync convergence hardening — arrival-order-independent, bounded (Day 6) | **GO (measured in-sim/loopback)** | `iroh-rooms-core` `tests/sync_convergence.rs` + `tests/sync_restart.rs` |
@@ -52,47 +55,55 @@ See §7 for the full disposition and the NO-GO escalation branch.
 | Day 8 (soft) | Blob Plane ACL | **GO** | `spike-blobs` 49 tests (38 unit + 11 integration), iroh-blobs 0.103.0 |
 | Day 9 (soft) | Live Pipe Plane | **GO (loopback + real-NAT pipe confirmation, 2026-07-03)** | `iroh-rooms-net/src/pipe/`, `tests/pipe_e2e.rs` (P1–P6); an authenticated pipe carried HTTP across a real NAT in the Gate A confirmation pass |
 
-### Gate A — MEASURED 2026-07-03/04 (scenario 1 of 2) — CONDITIONAL GO
+### Gate A — MEASURED 2026-07-03/04, both environments — CONDITIONAL GO
 
-The first real two-host run was executed on 2026-07-03 (18 JSONs), with an
-issue-#43 reconciliation pass on 2026-07-04 (5 `--settle 30` JSONs): home-broadband
-(Spectrum home-router NAT, wifi) ↔ Hetzner public server behind a stateful
-ufw INPUT-DROP firewall — different real networks, no VPN bridge, both ends
-native IPv6, both directions × {natural, relay-only}.
+Two real NAT environments were measured (37 committed JSONs): **S1** home-broadband
+(Spectrum home-router NAT, wifi) ↔ Hetzner public server behind a stateful ufw
+INPUT-DROP firewall (2026-07-03, 18 runs + 5 `--settle 30` #43 reconciliation
+runs); **S2** an iPhone cellular Personal Hotspot (carrier CGNAT — the
+likely-symmetric environment) ↔ {Hetzner public server; home-broadband NAT}
+(2026-07-04, 14 runs). Different real networks, no VPN bridge (Tailscale off),
+both directions × {natural, relay-only}.
 **A green loopback run is NOT Gate A** — CI still only proves the tool works;
-these numbers came from the real network. Against the rubric (establish both
-directions ≤10 s in every
-scenario; a direct hole-punched path in ≥1 non-symmetric scenario; relay usable
-≥1 Mbit/s and RTT ≤ ~300 ms):
+these numbers came from real networks. Against the rubric (establish both
+directions ≤10 s in every scenario; a direct hole-punched path in ≥1
+non-symmetric scenario; relay usable ≥1 Mbit/s and RTT ≤ ~300 ms):
 
-- **Establishment: PASS** — every successful run both directions in ≤2.7 s
-  (TTFB 0.6–1.7 s). The ten 8 MiB-transfer runs record `established=false`
-  as a harness artifact: the bulk transfer exceeded the probe's fixed 30 s
-  per-op budget (0.6–3.8 Mbit/s sustained on the auto-selected path);
-  connect/TTFB/RTT succeeded in every paired supplement run.
-- **Relay usability: PASS both directions** — controlled `--relay-only`:
-  3.3 Mbit/s @ 132.0 ms (BtoA), 1.2 Mbit/s @ 144.1 ms (AtoB).
-- **Direct hole-punch: PASS on this pair** — a direct addr (native IPv6, and/or
-  the IPv4 socket punched through the home NAT) was ACTIVE on every run, both
-  directions. nat-probe *labels* the run `mixed`, never sole-`direct`, only
-  because iroh 1.0.1 keeps the relay addr Active as a warm standby and exposes
-  no ConnectionType watcher; widening to `--settle 30` (2026-07-04, both
-  directions) did not change this — the relay simply stays warm alongside the
-  live direct path. `mixed` here = "direct up, relay standby", not "on relay".
-  Corroborated independently on the same pair by the #43 SDK-daemon run (traffic
-  on the direct path, no relay carrying bytes).
-- **Carrier confirmation: PASS** — event ALPN both directions (signed genesis
-  across the NAT in 1.06/1.08 s; non-member rejected before any event bytes,
-  `unknown_device`); pipe ALPN (authenticated `pipe expose`/`pipe connect`
-  carried HTTP across the NAT, full CLI flow).
+- **Establishment: PASS in both environments** — every natural run established
+  both directions in ≤2.7 s (S1 TTFB 0.6–1.7 s; S2/cellular TTFB 0.4–1.7 s),
+  **including inbound to the CGNAT client** (the cloud peer dialed the Mac behind
+  carrier CGNAT and established every run). The ten S1 8 MiB-transfer runs record
+  `established=false` as a harness artifact: the bulk transfer exceeded the
+  probe's fixed 30 s per-op budget; connect/TTFB/RTT succeeded in every paired
+  supplement.
+- **Direct hole-punch: PASS** — a direct addr was ACTIVE on every established run
+  in **both** environments: native IPv6 throughout, plus a punched **IPv4** path
+  even between the cellular CGNAT and the home NAT. nat-probe *labels* the runs
+  `mixed`, never sole-`direct`, only because iroh 1.0.1 keeps the relay addr
+  Active as warm standby and exposes no ConnectionType watcher (unchanged at
+  `--settle 30`); `mixed` = "direct up, relay standby", not "on relay".
+  Corroborated on S1 by the #43 SDK-daemon run (traffic on the direct path).
+- **Relay usability: S1 PASS, S2 caveat** — S1 controlled `--relay-only`:
+  3.3 Mbit/s @ 132 ms (BtoA), 1.2 Mbit/s @ 144 ms (AtoB). S2 forward
+  cellular→cloud: 1.2 Mbit/s @ 172 ms (PASS); but forced-relay legs bottlenecked
+  by the cellular **uplink** measured 0.1–0.2 Mbit/s @ 113–298 ms — below the
+  ≥1 Mbit/s target. These are 256 KiB slow-start-dominated samples on a forced
+  worst-case path (natural S2 sessions used the healthy direct path); a
+  larger-sample cellular relay re-measure is owed.
+- **Carrier confirmation: PASS** — S1 event ALPN both directions (signed genesis
+  in ~1.07 s; non-member rejected before any event bytes, `unknown_device`) and
+  pipe ALPN (authenticated `pipe expose`/`pipe connect` carried HTTP across the
+  NAT, full CLI flow). S2 event ALPN: the real transport carried a signed genesis
+  from the cellular CGNAT to the cloud peer in 1.35 s.
 
 Evidence: [`crates/spike-nat/NOTES.md`](crates/spike-nat/NOTES.md) §6 (findings
 block), [`crates/spike-nat/results/results.md`](crates/spike-nat/results/results.md)
-(23 committed runs), and
+(37 committed runs), and
 [`crates/iroh-rooms-net/NOTES.md`](crates/iroh-rooms-net/NOTES.md) §"Gate A
-(real-network)". Residual: the likely-symmetric (CGNAT/hotspot) environment of
-the ≥2-environment matrix is still owed (there hole-punch is expected to fail and
-relay fallback must carry the session) — carried in §7.
+(real-network)". Both required environments are now measured; the remaining
+residuals are non-connectivity — a larger-sample cellular forced-relay throughput
+re-measure (small samples read below the ≥1 Mbit/s target) and the one un-run
+home-NAT→CGNAT reverse leg — carried in §7.
 
 ### Gate B — GO
 
@@ -296,54 +307,65 @@ Open decisions deferred to MVP time (recorded as open, not blocking):
 
 ## 7. Failed / not-green gate → mitigation, and the MVP go/no-go
 
-The one gate that was unmeasured, **Gate A, was measured on 2026-07-03/04**
-(scenario 1 of 2): `crates/spike-nat/results/` now holds 23 per-run JSONs and
-`crates/spike-nat/results/results.md` / `crates/iroh-rooms-net/NOTES.md`
-§"Gate A" record the measured state. A direct hole-punched path establishes both
-directions, establishment and relay usability pass the rubric, and the real
-carrier crossed the NAT (event + pipe ALPN). Applying this memo's source spec's
-branch logic (`specs/phase-0-go-no-go-memo.md` §6.7) with one residual still open:
+The one gate that was unmeasured, **Gate A, is now measured across BOTH required
+environments (2026-07-03/04)**: `crates/spike-nat/results/` holds 37 per-run JSONs
+and `crates/spike-nat/results/results.md` / `crates/iroh-rooms-net/NOTES.md`
+§"Gate A" record the measured state. Across S1 (home-NAT ↔ cloud) and S2 (cellular
+CGNAT ↔ {cloud, home-NAT}), a direct hole-punched path establishes on every run,
+establishment passes both directions (incl. inbound-to-CGNAT), relay fallback is
+reachable everywhere, and the real carrier crossed both NATs. Applying this memo's
+source spec's branch logic (`specs/phase-0-go-no-go-memo.md` §6.7) with only
+non-connectivity residuals open:
 
-**→ Gate A measured (1 of 2 environments): direct hole-punch + establishment +
-relay fallback all GO; the likely-symmetric environment remains open →
-recommend CONDITIONAL GO.**
+**→ Gate A measured (both environments): direct hole-punch + establishment +
+relay reachability all GO; the only open items are a cellular relay-throughput
+re-measure and one reverse leg → recommend CONDITIONAL GO (a hair from
+unconditional).**
 
 - **Rationale:** Gates B, C, D and the blob + pipe soft gates are green with
   measured or CI-reproducible evidence; ADR-1 is measured-ratified and ADR-2
-  is confirmed with a working, measured hand-roll; the full lifecycle
-  converges at loopback, and the substrate + carrier are now measured on a
-  real home-NAT ↔ public-server pair — including a direct hole-punched path
-  both directions (corroborated by the #43 SDK-daemon run; nat-probe's `mixed`
-  label is the relay warm-standby classifier artifact, not a punch failure —
-  unchanged at `--settle 30`). The remaining un-discharged piece of the
-  substrate assumption is the likely-symmetric NAT pairing, where hole-punch
-  is expected to fail and relay fallback must carry the session.
-- **Blocking exit condition (P0):** complete the `spike-nat` §4 matrix
-  (`crates/spike-nat/NOTES.md`) with the likely-symmetric/CGNAT scenario
-  (e.g. home-broadband ↔ mobile-hotspot), both directions ×
-  {natural, relay-only}, commit the per-run JSON and regenerate
-  `crates/spike-nat/results/results.md`, and re-evaluate the Gate A rubric —
-  before declaring the substrate assumption fully proven and before this
-  CONDITIONAL GO can be upgraded to an unconditional GO.
-- **Mitigation if the remaining scenario returns NO-GO:** this does **not**
-  auto-fail the MVP — relay fallback is the PRD §18.1 mitigation, the rubric
-  already accepts "at least relay fallback" for the non-direct case, and the
-  measured relay path passes usability both directions. A NO-GO on *all*
-  paths (no direct and no usable relay) triggers the Residual #12 escalation:
-  evaluate a self-hosted relay, reconsider discovery config, or flag the
-  substrate assumption as broken.
+  is confirmed with a working, measured hand-roll; the full lifecycle converges
+  at loopback, and the substrate + carrier are now measured on two real NAT
+  environments including a carrier CGNAT — with a direct hole-punched path on
+  every run (corroborated on S1 by the #43 SDK-daemon; nat-probe's `mixed` label
+  is the relay warm-standby classifier artifact, not a punch failure — unchanged
+  at `--settle 30`). The connectivity assumption Gate A exists to test is
+  discharged. What remains is a measurement-quality item, not a connectivity
+  risk: forced-relay THROUGHPUT over the constrained cellular uplink read
+  0.1–0.2 Mbit/s on 256 KiB slow-start-dominated samples (below the ≥1 Mbit/s
+  target; natural S2 sessions used the healthy direct path).
+- **Blocking exit condition (P0) — SATISFIED:** the P0 exit condition was to
+  execute the `spike-nat` §4 runbook (`crates/spike-nat/NOTES.md`) on two machines
+  across ≥2 real NAT environments (VPN off, ≥1 likely-symmetric/CGNAT case), both
+  directions × {natural, relay-only}, and commit the per-run JSON. That is **done**
+  (2026-07-03/04; 37 JSONs; `results.md` regenerated) — so the substrate assumption
+  is no longer un-measured and external preview is unblocked. What remains before
+  *unconditional* GO is non-blocking: re-measure S2 forced-relay throughput with a
+  larger transfer (needs a `--budget` knob — the per-op budget is hardcoded 30 s,
+  so a big transfer over a slow relay records `established=false`; a `nat-probe`
+  follow-up), and run the one un-run home-NAT→CGNAT reverse leg.
+- **Mitigation if a re-measure disappoints:** this does **not** auto-fail the
+  MVP — relay fallback is the PRD §18.1 mitigation, the rubric accepts "at least
+  relay fallback" for the non-direct case, relay reachability held on every S2
+  run, and even a slow relay carries chat/control. A NO-GO on *all* paths (no
+  direct and no usable relay) — not observed in either environment — would
+  trigger the Residual #12 escalation: evaluate a self-hosted relay, reconsider
+  discovery config, or flag the substrate assumption as broken.
 
 **Recommendation (restated):** MVP build work may proceed on Gates B–D,
-ADR-1/ADR-2, and the measured Gate A scenario; the likely-symmetric run is
-the remaining exit condition before this CONDITIONAL GO can be upgraded to an
-unconditional GO. External previews may proceed with the measured state
-disclosed (direct hole-punch + establishment + relay proven on a non-symmetric
-pair; the symmetric/CGNAT environment owed).
+ADR-1/ADR-2, and the measured Gate A. Both required NAT environments are now
+measured and the connectivity assumption is discharged; the only items before
+this CONDITIONAL GO becomes unconditional are a larger-sample cellular
+relay-throughput re-measure and the one home-NAT→CGNAT reverse leg. External
+previews may proceed with the measured state disclosed (direct hole-punch +
+establishment + relay reachability proven across a non-symmetric and a cellular
+CGNAT environment; forced-relay throughput over the mobile uplink read below the
+usability target on small samples).
 
 The preview-cadence tracking of the above is mechanized by
 [`RELEASE-READINESS.md`](RELEASE-READINESS.md) (IR-0306): its Sign-off records
-Gate A's status per candidate build (P1 — measured 2026-07-03/04, scenario 1 of 2;
-non-blocking for a *developer* preview — pointing at the same
+Gate A's status per candidate build (P1 — measured 2026-07-03/04, both
+environments; non-blocking for a *developer* preview — pointing at the same
 `crates/spike-nat/results/results.md`), while `scripts/release-readiness.sh`
 mechanizes the P0 test gate this memo's Gates B–E are drawn from.
 

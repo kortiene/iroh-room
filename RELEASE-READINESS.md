@@ -140,15 +140,17 @@ Drawn from `PRD.v0.3.md` §13.4/§14, the README status log, and the crate
 `NOTES.md` files. A preview ships honest only if these are stated up front,
 not discovered by a user:
 
-- **★ Real-NAT connectivity measured on one environment pair (Gate A,
-  2026-07-03/04, scenario 1 of 2).** A direct hole-punched path establishes both
-  directions, and establishment + relay fallback pass the rubric, on a home-NAT ↔
-  public-server pair; the real carrier crossed the NAT (event + pipe ALPN).
-  nat-probe labels these runs `mixed` (relay stays Active as warm standby, even at
-  `--settle 30`) — a classifier artifact, not a punch failure; corroborated as a
-  real direct path by the issue-#43 SDK-daemon run on the same pair. Still owed:
-  the likely-symmetric (CGNAT/hotspot) environment, where hole-punch is expected
-  to fail and relay fallback must carry the session. See
+- **★ Real-NAT connectivity measured across both environments (Gate A,
+  2026-07-03/04).** S1 home-NAT ↔ cloud and S2 cellular CGNAT hotspot ↔ {cloud,
+  home-NAT}: a direct hole-punched path establishes on every run in both
+  environments, establishment + relay reachability pass both directions (incl.
+  inbound to the CGNAT client), and the real carrier crossed both NATs. nat-probe
+  labels runs `mixed` (relay stays Active as warm standby, even at `--settle 30`)
+  — a classifier artifact, not a punch failure; corroborated on S1 by the
+  issue-#43 SDK-daemon run. **Open (non-connectivity):** forced-relay throughput
+  over the cellular uplink read 0.1–0.2 Mbit/s on small samples (below the
+  ≥1 Mbit/s target — a larger-sample re-measure is owed), and the home-NAT→CGNAT
+  reverse leg was not run. See
   [`crates/iroh-rooms-net/NOTES.md`](crates/iroh-rooms-net/NOTES.md) §"Gate A
   (real-network)" and [`crates/spike-nat/results/results.md`](crates/spike-nat/results/results.md).
 - **★ No cloud inbox; no guaranteed offline delivery.** Files and pipes
@@ -255,7 +257,7 @@ Status: DEVELOPER PREVIEW. Not for production. No security audit has been perfor
 - <notable changes>
 
 ## Known limitations (read before relying on this)
-- Real-NAT connectivity (Gate A): <current status — e.g. measured 2026-07-03, scenario 1 of 2; likely-symmetric environment owed>.
+- Real-NAT connectivity (Gate A): <current status — e.g. measured 2026-07-03/04 across both environments (home-NAT + cellular CGNAT); direct hole-punch + relay reachability confirmed; a larger-sample cellular relay-throughput re-measure owed>.
 - No cloud inbox / no guaranteed offline delivery; peers must be online.
 - Local storage is unencrypted; no invite revocation; no group E2EE / PFS.
 - <copy the full list from RELEASE-READINESS.md "Known MVP limitations">

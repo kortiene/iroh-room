@@ -24,12 +24,20 @@ first.
 
 ## Status
 
-First two-host run executed 2026-07-03 (scenario 1 of 2: home-broadband ↔
-hetzner-server; 18 per-run JSONs), plus 5 `--settle 30` reconciliation runs on
-2026-07-04 (issue #43): 23 JSONs committed, table in `results.md`, findings in
-[`../NOTES.md`](../NOTES.md) §6. A direct path is established both directions on
-this pair; nat-probe labels it `mixed` (relay stays Active as warm standby, even
-at `--settle 30`), corroborated as a real direct path by the #43 SDK-daemon
-data point. The likely-symmetric (CGNAT/hotspot) environment of the §4 matrix is
-still owed. CI proves the harness builds and its loopback self-check passes; it
-**cannot** prove NAT traversal.
+**Both required environments measured** (2026-07-03/04; 37 per-run JSONs, table in
+`results.md`, findings in [`../NOTES.md`](../NOTES.md) §6):
+
+- **S1** home-broadband NAT ↔ Hetzner cloud (non-symmetric) — 18 runs + 5
+  `--settle 30` reconciliation runs (issue #43).
+- **S2** iPhone cellular Personal Hotspot (carrier CGNAT — the likely-symmetric
+  environment) ↔ {Hetzner cloud, home-broadband NAT} — 14 runs.
+
+Establishment and relay reachability pass across both environments, both
+directions (incl. inbound-to-CGNAT); a direct path is Active on every established
+run (nat-probe labels it `mixed` because iroh 1.0.1 keeps the relay as a warm
+standby even at `--settle 30` — a classifier label, corroborated as a real direct
+path by the #43 SDK-daemon data point). Soft residuals: a larger-sample cellular
+forced-relay **throughput** re-measure (the 256 KiB samples read below the
+≥1 Mbit/s target over the mobile uplink) and the home-NAT→CGNAT reverse leg. CI
+proves the harness builds and its loopback self-check passes; it **cannot** prove
+NAT traversal.
