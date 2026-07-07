@@ -1,0 +1,32 @@
+{
+  "scenario": "operator-local<->demo1-cloud",
+  "direction": "AtoB",
+  "nat_a": {
+    "kind": "unknown",
+    "isp": "operator-local",
+    "network_type": "unknown",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-cloud",
+    "isp": "demo1",
+    "network_type": "ethernet",
+    "observed_via": "operator-ssh"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 889,
+  "ttfb_direct_ms": 889,
+  "rtt_ms": 123.66610899999999,
+  "rtt_p90_ms": 146.058567,
+  "throughput_mbit_s": 8.63630779195081,
+  "setup_time_ms": 1464,
+  "relay_url": "https://euc1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "db637ed25ca5",
+  "run_at_utc": "2026-07-07T18:36:47Z",
+  "notes": "2026-07-07 real run; local dials demo1 listener; shared-LAN/VPN status not independently verified by tool; path upgraded relay -> mixed within the settle window"
+}

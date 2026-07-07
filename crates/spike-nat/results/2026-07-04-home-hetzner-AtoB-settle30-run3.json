@@ -1,0 +1,31 @@
+{
+  "scenario": "home-broadband<->hetzner-server",
+  "direction": "AtoB",
+  "nat_a": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "wifi",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 1129,
+  "ttfb_direct_ms": 1129,
+  "rtt_ms": 126.335576,
+  "rtt_p90_ms": 158.990479,
+  "setup_time_ms": 1531,
+  "relay_url": "https://euc1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "0e199d3",
+  "run_at_utc": "2026-07-04T15:50Z",
+  "notes": "reconciliation run: --settle 30 (widened from default 4s) + --xfer 0; tests whether the relay addr goes Inactive -> settled sole-direct, per issue #43 SDK-daemon data point; path upgraded relay -> mixed within the settle window"
+}

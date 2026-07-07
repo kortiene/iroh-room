@@ -1,0 +1,31 @@
+{
+  "scenario": "hotspot-cgnat<->home-broadband",
+  "direction": "AtoB",
+  "nat_a": {
+    "kind": "cgnat",
+    "isp": "cellular-hotspot",
+    "network_type": "lte",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 434,
+  "ttfb_direct_ms": 434,
+  "rtt_ms": 106.462362,
+  "rtt_p90_ms": 142.03506,
+  "setup_time_ms": 1255,
+  "relay_url": "https://use1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "5e58e49",
+  "run_at_utc": "2026-07-04T17:30Z",
+  "notes": "scenario 2 NAT<->NAT: Mac cellular CGNAT -> kilo home broadband NAT (both behind NAT, different networks); tailscale off; reverse owed (no SSH to kilo from hotspot); path upgraded relay -> mixed within the settle window"
+}

@@ -1,0 +1,32 @@
+{
+  "scenario": "home-broadband<->hetzner-server",
+  "direction": "BtoA",
+  "nat_a": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "wifi",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "relay",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": true,
+  "ttfb_ms": 1074,
+  "ttfb_relay_ms": 1074,
+  "rtt_ms": 132.029855,
+  "rtt_p90_ms": 153.635982,
+  "throughput_mbit_s": 3.3294985460461337,
+  "setup_time_ms": 2035,
+  "relay_url": "https://use1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "0e199d3",
+  "run_at_utc": "2026-07-03T11:54Z",
+  "notes": "controlled relay-only pass (clear_ip_transports both ends); 512KiB xfer; no VPN bridge"
+}

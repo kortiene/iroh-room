@@ -238,8 +238,9 @@ shipping carrier behind the landed, sans-IO `SyncEngine` — proving the
 - 85 tests: 67 unit tests, a 9-test frame-codec integration suite (`tests/frame.rs`,
   real QUIC loopback), and a 9-test loopback integration suite (`tests/loopback.rs`,
   T1–T9) covering all four acceptance criteria (deterministic, no relay/network).
-- **Gate A (real-NAT run) is still owed** before MVP go — the loopback suite is not
-  Gate A; see `crates/iroh-rooms-net/NOTES.md`.
+- **Gate A is measured, not only loopback**: S1/S2 real-network runs are recorded
+  under `crates/spike-nat/results/`, with a 2026-07-07 local↔`demo1` refresh.
+  Remaining caveats are documented in `crates/iroh-rooms-net/NOTES.md`.
 
 **Key-bound room invite** has landed in `crates/iroh-rooms-cli` (issue #18 / IR-0103),
 adding the second authoring command and the first out-of-band capability artifact:
@@ -264,6 +265,9 @@ adding the second authoring command and the first out-of-band capability artifac
 - `--role admin` is rejected at the CLI (single immutable admin; the fold has no second-admin
   semantics). `agent` and `member` are accepted.
 - Tickets are key-bound to the named `--invitee`; open/bearer tickets are out of scope for MVP.
+  There is no native ticket-specific revocation in Phase 2.5 Production Beta;
+  the bounded leaked-ticket model is accepted in
+  [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md).
 - Output is script-friendly labeled lines, ending with the ticket token and a password-grade warning.
 - 20+ tests (core unit: deterministic builder, golden event id, secret-absent-from-log AC3,
   capability-hash AC4, ticket round-trip + corruption rejection; CLI integration: admin path,
@@ -400,14 +404,17 @@ The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
 - **Loopback-only binds** (PRD §13.2.3): non-loopback `--tcp` targets are refused; the
   connector's local listener binds `127.0.0.1` only.
 - Stable, greppable audit vocabulary: `pipe.opened` / `pipe.closed` /
-  `pipe.connect.accepted` / `pipe.connect.rejected:<cause>` / `pipe.torndown:<cause>`.
+  `pipe.connect.accepted` / `pipe.connect.rejected:<cause>` / `pipe.torndown:<cause>`,
+  written to stderr for operator visibility and to `<IROH_ROOMS_HOME>/audit.ndjson`
+  for local incident reconstruction.
 - `iroh-rooms pipe expose | connect | close | list` CLI subcommands with the PRD §13.2
   security warning, loopback enforcement, non-empty `--allow`, active-member pre-check,
   and §16.3 failure-mode distinction.
 - `crates/iroh-rooms-net/tests/pipe_e2e.rs` proves P1–P6 (AC1–AC5 + expiry) on
   in-process loopback nodes with an in-test echo server; every await is timeout-bounded.
-- **Gate A (real-NAT run for the pipe ALPN) is still owed** before MVP go, inheriting the
-  open Gate-A risk from the transport prototype (#9); see `crates/iroh-rooms-net/NOTES.md`.
+- **Gate A is measured** for the transport substrate and a prior pipe ALPN
+  confirmation exists; current caveats remain the cellular relay-throughput
+  re-measure and one home-NAT→CGNAT reverse leg.
 
 Issue **#23 / IR-0108** reconciles that prototype to the PRD's canonical, user-facing contract
 (no change to the authorization model, event schema, gate, or splice logic):
@@ -415,10 +422,10 @@ Issue **#23 / IR-0108** reconciles that prototype to the PRD's canonical, user-f
 - `iroh-rooms pipe close <PIPE_ID>` now takes a **bare pipe id** — the room is inferred from the
   local log (backed by the additive read-only `EventStore::room_ids()`), with an optional
   `--room <ROOM_ID>` disambiguator that fails closed on an unknown or ambiguous pipe.
-- The owner's `pipe expose` installs a **stderr audit sink** (`Node::spawn_with_pipe_audit`), so
-  an unauthorized connect is rejected **and locally visible** as
-  `pipe.connect.rejected:<cause>`; `-v` also logs each accepted connection. stdout stays clean
-  for scripting.
+- The owner's `pipe expose` installs a **CLI-local audit sink** (`Node::spawn_with_pipe_audit`),
+  so an unauthorized connect is rejected **and locally visible** as
+  `pipe.connect.rejected:<cause>` on stderr and in `<IROH_ROOMS_HOME>/audit.ndjson`;
+  `-v` also logs each accepted connection. stdout stays clean for scripting.
 - The §13.2.4 security warning names the exposed **target and each allowed member**, and graceful
   owner exit now covers **SIGINT and SIGTERM** (`pipe.closed{owner_exit}`); a hard kill
   (SIGKILL / power loss) still stops forwarding but leaves the pipe open on the log until an
@@ -461,8 +468,8 @@ on the same pattern as `spike-blobs`:
   "Gate A (real-network)".
 - CI proves the harness builds, its loopback self-check passes (a bidi echo on
   loopback, well-formed `ProbeResult` emitted, path classification correct), and all
-  unit tests pass; **the manual two-host execution is still owed** before Gate A
-  closes (see `crates/iroh-rooms-net/NOTES.md` for the pending table and Gate E feed).
+  unit tests pass. Real-network results are committed for S1/S2, plus a
+  2026-07-07 local↔`demo1` refresh; CI still cannot prove NAT traversal.
 
 The **peer connection manager** has landed in `crates/iroh-rooms-net` and
 `crates/iroh-rooms-cli` (issue #22 / IR-0107), wiring the landed transport primitives
@@ -516,8 +523,8 @@ into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follo
   removed exclusion, three-actor rooms); live-flip test for `SnapshotAdmission` (proves
   mid-session removal takes effect); full decision-matrix test and `JoinBootstrapAdmission`
   over the live gate; `PeerTable` reason-refinement and label-stability tests.
-  **Gate A (real-NAT) remains separately owed** (inherits the IR-0005 residual;
-  see `crates/iroh-rooms-net/NOTES.md`).
+  Gate A remains a release-signoff item with measured evidence and residual
+  caveats; see `crates/iroh-rooms-net/NOTES.md`.
 
 The **two-peer Phase 1A integration test suite** has landed in
 `crates/iroh-rooms-cli/tests/two_peer_e2e.rs` (issue #24 / IR-0109), the PRD §19 Phase 1A
@@ -964,8 +971,9 @@ honor-system checkbox:
 
 - A fill-in-per-build checklist: a P0 test taxonomy across protocol,
   integration, pipe security, blob verification, and agent flow; every known
-  MVP limitation stated up front (Gate A pending, no cloud inbox, unencrypted
-  local storage, no invite revocation, the live-tail display gap, the 100 MiB
+  MVP limitation stated up front (Gate A caveats, no cloud inbox, unencrypted
+  local storage, no native invite revocation / ADR-0002 bounded ticket model,
+  the live-tail display gap, the 100 MiB
   code cap vs. the PRD's 25 MB metric target, …); the security warnings a
   shipping build must actually print/enforce; a dependency/churn review; a
   `docs/getting-started.md` demo-verification pass with the PRD §17.2 DX
@@ -1197,6 +1205,60 @@ codes — a preview cannot be marked ready while a P0 test is failing. See
 [`RELEASE-READINESS.md`](RELEASE-READINESS.md) for the full checklist (known
 limitations, security warnings, dependency/churn review, demo verification,
 and the release-notes template).
+
+## Production Readiness
+
+Production-grade post-MVP work is tracked separately from the Developer Preview
+gate in [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md). That plan defines
+the Phase 2.5 release-candidate bar: security threat model, access revocation,
+local data handling, persistent audit/diagnostics, compatibility/migration,
+release operations, and beta validation.
+
+The Phase 2.5 local-storage decision is
+[`ADR-0001`](docs/decisions/ADR-0001-local-storage-posture.md): Production Beta
+is scoped to trusted local machines, with plaintext `rooms.db`, blobs, and
+`audit.ndjson` disclosed as a release limitation.
+
+The Phase 2.5 invite-revocation decision is
+[`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md):
+Production Beta accepts key-bound, expiring, departure-consumed tickets as a
+bounded leaked-ticket model. Native ticket-specific revocation remains a GA
+decision unless the GA scope explicitly re-accepts the narrow beta posture.
+
+The Phase 2.5 audit decision is
+[`ADR-0003`](docs/decisions/ADR-0003-persistent-audit-posture.md): Production
+Beta accepts local `audit.ndjson` as a best-effort incident reconstruction trail,
+not as remote, tamper-evident, centrally retained, or compliance-grade audit.
+
+The Phase 2.5 compatibility gate is documented in
+[`docs/compatibility.md`](docs/compatibility.md). The current core fixture lives
+under `crates/iroh-rooms-core/tests/fixtures/v1/` and is verified by:
+
+```bash
+cargo test -p iroh-rooms-core --features store --test compatibility
+```
+
+Production Beta release operations are documented in
+[`docs/operations/release-operations.md`](docs/operations/release-operations.md),
+with install/uninstall/rollback steps in
+[`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md).
+Versioned binary archives and SHA-256 files are produced with:
+
+```bash
+scripts/build-release-artifacts.sh --version <VERSION>
+```
+
+The automated preflight is:
+
+```bash
+scripts/production-readiness.sh
+```
+
+Use `scripts/production-readiness.sh --offline-only` for a fast P0 evidence
+check during local iteration. It is expected to fail until the production P0
+artifacts exist. The script does not replace manual production sign-off; it only
+verifies automatable evidence and delegates final acceptance to
+`PRODUCTION-READINESS.md`.
 
 ## Backlog
 

@@ -1,17 +1,73 @@
 # Gate A — rolled-up results
 
-Rendered by [`report::results_md`](../src/report.rs) from the committed per-run
-JSON in this directory. One row per (scenario, direction, path-mode). This table
-drops verbatim into `crates/iroh-rooms-net/NOTES.md` under *Gate A
-(real-network)* and feeds the Gate E memo (#15).
+Rendered from the committed per-run JSON in this directory (schema = [`report::results_md`](../src/report.rs), throughput/ttfb-direct/relay columns elided for width).
+Findings + method caveats: [`../NOTES.md`](../NOTES.md) §6. **Both required environments measured** (2026-07-03/04):
+S1 home-broadband NAT ↔ Hetzner cloud (non-symmetric); S2 cellular CGNAT ↔ {Hetzner cloud, home-broadband NAT} (the likely-symmetric environment).
+The `settle30` rows are the issue-#43 `--settle 30` reconciliation runs (path-type only, `--xfer 0`).
+S3 is a 2026-07-07 refresh run using `root@demo1` as the cloud peer; it is not a
+replacement for S1/S2, but it refreshes both directions plus controlled
+relay-only throughput.
 
-| scenario | direction | mode | established | path type | ttfb (ms) | ttfb direct (ms) | ttfb relay (ms) | rtt median (ms) | throughput (Mbit/s) | setup (ms) |
-|----------|-----------|------|-------------|-----------|-----------|------------------|-----------------|-----------------|---------------------|------------|
-| _(pending manual two-host run — see [../NOTES.md](../NOTES.md) runbook)_ | | | | | | | | | | |
+## S1 — home-broadband ↔ hetzner-server (2026-07-03/04, 23 runs)
 
-> **This table is empty by design in the code deliverable.** Gate A is an
-> inherently manual measurement across two physical machines on two different real
-> NATs (spec §1 / §12 risk 1). The harness, runbook, GO/NO-GO rubric, and results
-> schema are landed and CI-proven; the *numbers* are produced by the operator
-> running the matrix (spec §7) and committing the per-run JSON here. Regenerate
-> this table from the JSON after the run.
+| scenario | direction | mode | established | path type | ttfb (ms) | rtt median (ms) | throughput (Mbit/s) | setup (ms) |
+|---|---|---|---|---|---|---|---|---|
+| home-broadband<->hetzner-server | BtoA | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | BtoA | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | BtoA | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | BtoA | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | BtoA | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | BtoA | natural | yes | mixed | 1005 | 126.4 | 3.5 | 1267 |
+| home-broadband<->hetzner-server | BtoA | natural | yes | mixed | 638 | 126.6 | 0.7 | 928 |
+| home-broadband<->hetzner-server | BtoA | natural | yes | mixed | 712 | 113.5 | 3.8 | 1036 |
+| home-broadband<->hetzner-server | BtoA | relay-only | yes | relay | 1074 | 132.0 | 3.3 | 2035 |
+| home-broadband<->hetzner-server | AtoB | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | AtoB | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | AtoB | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | AtoB | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | AtoB | natural | no | none | — | — | — | — |
+| home-broadband<->hetzner-server | AtoB | natural | yes | mixed | 1539 | 109.1 | 1.1 | 1961 |
+| home-broadband<->hetzner-server | AtoB | natural | yes | mixed | 976 | 129.8 | 1.2 | 1685 |
+| home-broadband<->hetzner-server | AtoB | natural | yes | mixed | 1373 | 124.2 | 1.8 | 2214 |
+| home-broadband<->hetzner-server | AtoB | relay-only | yes | relay | 1141 | 144.1 | 1.2 | 2736 |
+| home-broadband<->hetzner-server | AtoB | natural | yes | mixed | 1439 | 121.8 | — | 4758 |
+| home-broadband<->hetzner-server | AtoB | natural | yes | mixed | 1316 | 128.0 | — | 1706 |
+| home-broadband<->hetzner-server | AtoB | natural | yes | mixed | 1129 | 126.3 | — | 1531 |
+| home-broadband<->hetzner-server | BtoA | natural | yes | mixed | 1731 | 149.1 | — | 1998 |
+| home-broadband<->hetzner-server | BtoA | natural | yes | mixed | 753 | 131.6 | — | 1012 |
+
+## S2 — cellular CGNAT hotspot ↔ {hetzner-server, home-broadband} (2026-07-04, 14 runs)
+
+Mac on iPhone cellular Personal Hotspot (carrier CGNAT). `AtoB` = Mac dials peer; `BtoA` = peer dials Mac (inbound-to-CGNAT). Natural rows use `--xfer 0`; relay rows use a 256 KiB transfer.
+
+| scenario | direction | mode | established | path type | ttfb (ms) | rtt median (ms) | throughput (Mbit/s) | setup (ms) |
+|---|---|---|---|---|---|---|---|---|
+| hotspot-cgnat<->hetzner-server | AtoB | natural | yes | mixed | 1127 | 162.7 | — | 1731 |
+| hotspot-cgnat<->hetzner-server | AtoB | natural | yes | mixed | 1121 | 155.0 | — | 1858 |
+| hotspot-cgnat<->hetzner-server | AtoB | natural | yes | mixed | 1482 | 166.4 | — | 2118 |
+| hotspot-cgnat<->hetzner-server | AtoB | natural | yes | mixed | 1333 | 166.3 | — | 2036 |
+| hotspot-cgnat<->hetzner-server | AtoB | relay-only | yes | relay | 1159 | 171.6 | 1.2 | 2828 |
+| hotspot-cgnat<->hetzner-server | BtoA | natural | yes | mixed | 1683 | 180.9 | — | 1940 |
+| hotspot-cgnat<->hetzner-server | BtoA | natural | yes | mixed | 1211 | 180.3 | — | 1482 |
+| hotspot-cgnat<->hetzner-server | BtoA | natural | yes | mixed | 1360 | 179.9 | — | 1637 |
+| hotspot-cgnat<->hetzner-server | BtoA | relay-only | yes | relay | 1207 | 297.8 | 0.2 | 2154 |
+| hotspot-cgnat<->home-broadband | AtoB | natural | yes | mixed | 472 | 117.9 | — | 1333 |
+| hotspot-cgnat<->home-broadband | AtoB | natural | yes | mixed | 434 | 106.5 | — | 1255 |
+| hotspot-cgnat<->home-broadband | AtoB | natural | yes | mixed | 403 | 96.9 | — | 1127 |
+| hotspot-cgnat<->home-broadband | AtoB | natural | yes | mixed | 650 | 131.3 | — | 1501 |
+| hotspot-cgnat<->home-broadband | AtoB | relay-only | yes | relay | 648 | 113.2 | 0.1 | 2521 |
+
+## S3 — operator-local ↔ demo1-cloud refresh (2026-07-07, 4 runs)
+
+`AtoB` = local workstation dials `demo1`; `BtoA` = `demo1` dials the local
+workstation. Both natural runs upgraded `relay -> mixed` within the settle
+window, meaning a direct addr was Active while relay remained warm. The tool did
+not independently verify VPN/shared-LAN status; treat this as a current refresh,
+not a replacement for the S1/S2 Gate-A coverage above.
+
+| scenario | direction | mode | established | path type | ttfb (ms) | rtt median (ms) | throughput (Mbit/s) | setup (ms) |
+|---|---|---|---|---|---|---|---|---|
+| operator-local<->demo1-cloud | BtoA | natural | yes | mixed | 1116 | 108.7 | 5.3 | 1361 |
+| operator-local<->demo1-cloud | BtoA | relay-only | yes | relay | 789 | 129.1 | 4.1 | 1744 |
+| operator-local<->demo1-cloud | AtoB | natural | yes | mixed | 889 | 123.7 | 8.6 | 1464 |
+| operator-local<->demo1-cloud | AtoB | relay-only | yes | relay | 1124 | 143.6 | 1.3 | 2581 |

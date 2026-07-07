@@ -192,7 +192,7 @@ pub async fn send(
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
         let admission = build_admission(&snapshot);
         let delivered = match run_push(
-            store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
+            home, store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
         )
         .await
         {
@@ -341,7 +341,7 @@ pub async fn send_agent_status(
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
         let admission = build_admission(&snapshot);
         let delivered = match run_push(
-            store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
+            home, store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
         )
         .await
         {
@@ -483,10 +483,11 @@ pub async fn tail(
     // taxonomy lines — otherwise those lines would be silently dropped (the CLI
     // installs no `tracing` subscriber).
     let blobs_dir = home.join(crate::file::BLOBS_DIR);
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn_room(
         secret_key,
         admission,
-        Arc::new(audit::StderrAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,
@@ -608,10 +609,11 @@ pub async fn members_status(
         ..NetConfig::default()
     };
     // A short-lived connection-status query need not serve blobs (spec §6.6).
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn_room(
         secret_key,
         admission,
-        Arc::new(audit::StderrAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,
@@ -791,6 +793,7 @@ fn role_label(role: Role) -> &'static str {
 /// Consumes `store` (moved into the engine) and the wire `frame`.
 #[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
 async fn run_push(
+    home: &Path,
     store: EventStore,
     room_id: &RoomId,
     secret_key: SecretKey,
@@ -806,10 +809,11 @@ async fn run_push(
         mode,
         ..NetConfig::default()
     };
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn(
         secret_key,
         Arc::new(admission),
-        Arc::new(audit::StderrAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,

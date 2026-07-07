@@ -1,5 +1,6 @@
-//! A stderr-rendering [`AuditSink`] for the `room`/`join` network commands (spec
-//! IR-0110 §5.4/§5.9; project memory *CLI has no tracing subscriber*).
+//! CLI-local [`AuditSink`] implementations for the `room`/`join`/`file` network
+//! commands (spec IR-0110 §5.4/§5.9; project memory *CLI has no tracing
+//! subscriber*).
 //!
 //! The CLI installs no `tracing` subscriber, so the default [`TracingAudit`]
 //! output is silently dropped. [`StderrAudit`] renders the security-relevant
@@ -10,16 +11,277 @@
 //! [`Node::logs`](iroh_rooms_net::Node::logs) — see that module — so this sink
 //! stays a thin, always-available fallback for every command, not only `room
 //! tail`. stdout is never touched here (script-friendly output stays clean).
+//!
+//! [`PersistentAudit`] appends the same class of security/lifecycle signals to
+//! `<IROH_ROOMS_HOME>/audit.ndjson`, giving operators a local post-run trail even
+//! when the terminal output is gone. It records public identifiers and minimized
+//! hashes only; it must never write capability secrets, tickets, identity secrets,
+//! blob bytes, or local filesystem paths.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
 use iroh_rooms::experimental::session::EndpointId;
 use iroh_rooms_core::event::keys::IdentityKey;
 use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+use serde_json::{json, Value};
 
+use crate::clock;
 use crate::message::{short_device, short_hash};
+use crate::paths;
+
+/// Append-only audit log under the CLI data directory.
+pub(crate) const AUDIT_LOG_FILE: &str = "audit.ndjson";
+
+/// Build the default CLI audit sink: stderr for immediate operator feedback plus
+/// a persistent local NDJSON audit trail.
+pub(crate) fn sink(home: &Path) -> Result<Arc<dyn AuditSink>> {
+    let persistent = PersistentAudit::open(home)?;
+    Ok(sink_with(persistent))
+}
+
+/// Build a network audit sink sharing an already-open persistent writer.
+pub(crate) fn sink_with(persistent: PersistentAudit) -> Arc<dyn AuditSink> {
+    Arc::new(LocalAudit::new(persistent))
+}
+
+/// Best-effort, append-only JSON-lines audit writer.
+///
+/// The sink is intentionally small and local: commands already operate inside a
+/// user-owned data directory, and audit volume is low. Each line is flushed after
+/// write so a normally exiting CLI command leaves a readable trail without adding
+/// heavyweight logging infrastructure.
+#[derive(Debug, Clone)]
+pub(crate) struct PersistentAudit {
+    path: Arc<PathBuf>,
+    file: Arc<Mutex<File>>,
+    warned_write_failure: Arc<AtomicBool>,
+}
+
+impl PersistentAudit {
+    pub(crate) fn open(home: &Path) -> Result<Self> {
+        paths::ensure_dir(home)?;
+        let path = home.join(AUDIT_LOG_FILE);
+        let file = open_audit_file(&path)?;
+        Ok(Self {
+            path: Arc::new(path),
+            file: Arc::new(Mutex::new(file)),
+            warned_write_failure: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub(crate) fn record(&self, event: &'static str, fields: Value) {
+        if let Err(err) = self.try_record(event, fields) {
+            if !self.warned_write_failure.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "warning[audit_write_failed]: could not append to {}: {err:#}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    fn try_record(&self, event: &'static str, fields: Value) -> Result<()> {
+        let mut record = serde_json::Map::new();
+        record.insert("ts_ms".to_owned(), json!(clock::now_ms()));
+        record.insert("event".to_owned(), json!(event));
+        match fields {
+            Value::Object(fields) => record.extend(fields),
+            other => {
+                record.insert("fields".to_owned(), other);
+            }
+        }
+
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audit writer lock poisoned"))?;
+        serde_json::to_writer(&mut *file, &Value::Object(record))
+            .context("could not encode audit record")?;
+        file.write_all(b"\n")
+            .context("could not write audit record newline")?;
+        file.flush().context("could not flush audit record")?;
+        Ok(())
+    }
+}
+
+fn open_audit_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("could not open audit log at {}", path.display()))?;
+    tighten_audit_file_permissions(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn tighten_audit_file_permissions(file: &File, path: &Path) -> Result<()> {
+    let perms = std::fs::Permissions::from_mode(0o600);
+    file.set_permissions(perms)
+        .with_context(|| format!("could not set 0600 permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn tighten_audit_file_permissions(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LocalAudit {
+    stderr: StderrAudit,
+    persistent: PersistentAudit,
+}
+
+impl LocalAudit {
+    fn new(persistent: PersistentAudit) -> Self {
+        Self {
+            stderr: StderrAudit,
+            persistent,
+        }
+    }
+
+    fn record_peer(&self, event: &'static str, device: EndpointId) {
+        self.persistent
+            .record(event, json!({ "peer": device.to_string() }));
+    }
+}
 
 /// Renders [`AuditSink`] callbacks as stable, greppable stderr lines.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StderrAudit;
+
+impl AuditSink for LocalAudit {
+    fn accepted(&self, device: EndpointId, identity: &IdentityKey) {
+        self.persistent.record(
+            "peer.accepted",
+            json!({
+                "peer": device.to_string(),
+                "identity": identity.to_string(),
+            }),
+        );
+        self.stderr.accepted(device, identity);
+    }
+
+    fn rejected(&self, device: EndpointId, cause: RejectCause) {
+        self.persistent.record(
+            "peer.rejected",
+            json!({
+                "peer": device.to_string(),
+                "cause": cause.code(),
+            }),
+        );
+        self.stderr.rejected(device, cause);
+    }
+
+    fn connected(&self, device: EndpointId) {
+        self.record_peer("peer.connected", device);
+        self.stderr.connected(device);
+    }
+
+    fn disconnected(&self, device: EndpointId) {
+        self.record_peer("peer.disconnected", device);
+        self.stderr.disconnected(device);
+    }
+
+    fn offline(&self, device: EndpointId, reason: &'static str) {
+        self.persistent.record(
+            "peer.offline",
+            json!({
+                "peer": device.to_string(),
+                "reason": reason,
+            }),
+        );
+        self.stderr.offline(device, reason);
+    }
+
+    fn event_rejected(&self, device: EndpointId, count: u64) {
+        self.persistent.record(
+            "event.rejected",
+            json!({
+                "peer": device.to_string(),
+                "count": count,
+            }),
+        );
+        self.stderr.event_rejected(device, count);
+    }
+
+    fn deauthorized(&self, device: EndpointId) {
+        self.record_peer("peer.deauthorized", device);
+        self.stderr.deauthorized(device);
+    }
+
+    fn event_flagged(&self, device: EndpointId, code: &'static str) {
+        self.persistent.record(
+            "event.flagged",
+            json!({
+                "peer": device.to_string(),
+                "code": code,
+            }),
+        );
+        self.stderr.event_flagged(device, code);
+    }
+
+    fn bootstrap_admitted(&self, device: EndpointId) {
+        self.record_peer("join.bootstrap.admitted", device);
+        self.stderr.bootstrap_admitted(device);
+    }
+
+    fn bootstrap_upgraded(&self, device: EndpointId, identity: &IdentityKey) {
+        self.persistent.record(
+            "join.bootstrap.upgraded",
+            json!({
+                "peer": device.to_string(),
+                "identity": identity.to_string(),
+            }),
+        );
+        self.stderr.bootstrap_upgraded(device, identity);
+    }
+
+    fn bootstrap_blocked(&self, device: EndpointId, kind: &'static str) {
+        self.persistent.record(
+            "join.bootstrap.blocked",
+            json!({
+                "peer": device.to_string(),
+                "kind": kind,
+            }),
+        );
+        self.stderr.bootstrap_blocked(device, kind);
+    }
+
+    fn blob_serve_accepted(&self, peer: EndpointId, hash: [u8; 32]) {
+        self.persistent.record(
+            "blob.serve.accepted",
+            json!({
+                "peer": peer.to_string(),
+                "hash_prefix": short_hash(hash),
+            }),
+        );
+        self.stderr.blob_serve_accepted(peer, hash);
+    }
+
+    fn blob_serve_rejected(&self, peer: EndpointId, cause: BlobDenyCause, hash: Option<[u8; 32]>) {
+        self.persistent.record(
+            "blob.serve.rejected",
+            json!({
+                "peer": peer.to_string(),
+                "cause": cause.code(),
+                "hash_prefix": hash.map(short_hash),
+            }),
+        );
+        self.stderr.blob_serve_rejected(peer, cause, hash);
+    }
+}
 
 impl AuditSink for StderrAudit {
     fn accepted(&self, _device: EndpointId, _identity: &IdentityKey) {
@@ -87,10 +349,12 @@ impl AuditSink for StderrAudit {
 
 #[cfg(test)]
 mod tests {
-    use super::StderrAudit;
+    use super::{LocalAudit, PersistentAudit, StderrAudit, AUDIT_LOG_FILE};
     use iroh_rooms::experimental::session::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
     use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+    use serde_json::{json, Value};
+    use tempfile::tempdir;
 
     use crate::message::{short_device, short_hash};
 
@@ -124,5 +388,56 @@ mod tests {
         let sink = StderrAudit;
         sink.blob_serve_accepted(device(1), hash);
         sink.blob_serve_rejected(device(1), BlobDenyCause::NotReferenced, Some(hash));
+    }
+
+    #[test]
+    fn persistent_audit_appends_valid_ndjson() {
+        let home = tempdir().unwrap();
+        let persistent = PersistentAudit::open(home.path()).unwrap();
+
+        persistent.record(
+            "peer.rejected",
+            json!({
+                "peer": "peer-1",
+                "cause": "unknown_device",
+            }),
+        );
+
+        let content = std::fs::read_to_string(home.path().join(AUDIT_LOG_FILE)).unwrap();
+        let line: Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(line["event"], "peer.rejected");
+        assert_eq!(line["peer"], "peer-1");
+        assert_eq!(line["cause"], "unknown_device");
+        assert!(line["ts_ms"].as_u64().is_some());
+        assert!(line.get("ticket").is_none());
+        assert!(line.get("capability_secret").is_none());
+    }
+
+    #[test]
+    fn local_audit_persists_security_relevant_hooks() {
+        let home = tempdir().unwrap();
+        let persistent = PersistentAudit::open(home.path()).unwrap();
+        let sink = LocalAudit::new(persistent);
+        let id = IdentityKey::from_bytes([0x11; 32]);
+
+        sink.accepted(device(1), &id);
+        sink.rejected(device(1), RejectCause::UnknownDevice);
+        sink.blob_serve_rejected(device(1), BlobDenyCause::NotReferenced, Some([0x44; 32]));
+
+        let content = std::fs::read_to_string(home.path().join(AUDIT_LOG_FILE)).unwrap();
+        let events = content
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec![
+                Value::String("peer.accepted".to_owned()),
+                Value::String("peer.rejected".to_owned()),
+                Value::String("blob.serve.rejected".to_owned()),
+            ]
+        );
+        assert!(content.contains("\"hash_prefix\":\"44444444\""));
+        assert!(!content.contains("identity.secret"));
     }
 }

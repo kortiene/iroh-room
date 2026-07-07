@@ -18,10 +18,11 @@ GO/NO-GO rubric, and a **findings block ready to lift into the Gate E memo
 Gate A is the **one load-bearing Phase-0 assumption with no measured evidence**:
 that two iroh endpoints behind real, separate NATs can establish a **direct**
 QUIC connection, or cleanly **fall back to relay**. The landed carrier
-(`iroh-rooms-net`, IR-0005) is proven only on loopback (`RelayMode::Disabled`,
-same host); its `NOTES.md` records *"Gate A (real-network) — STATUS: NOT YET
-RUN"*. A LAN or loopback demo cannot exercise NAT traversal and "will lie to you
-about it" (`PHASE-0-SPIKE.md` Day 1).
+(`iroh-rooms-net`, IR-0005) was proven only on loopback (`RelayMode::Disabled`,
+same host); its `NOTES.md` recorded *"Gate A (real-network) — STATUS: NOT YET
+RUN"* until the first two-host run was executed on 2026-07-03 (§6). A LAN or
+loopback demo cannot exercise NAT traversal and "will lie to you about it"
+(`PHASE-0-SPIKE.md` Day 1).
 
 `nat-probe` is the purpose-built **measurement** tool: a bare `iroh::Endpoint`
 echo probe (isolated from our ALPN/framing, so it tests the *substrate*), which
@@ -72,6 +73,15 @@ sample repeatedly and record the settled value (and the initial one, so the
 upgrade latency is captured for the memo). The `RUST_LOG=iroh=debug` log path
 (spec §6.2 fallback) remains available for cross-checking but is not needed —
 `remote_info` is a clean, typed signal.
+
+> **Measured caveat on `mixed` (2026-07-04, §6).** On the S1 home-NAT↔cloud pair,
+> a direct addr is Active on every run **but the relay addr also stays Active** as a
+> warm standby, so this classifier settles on `mixed` and never emits sole `direct`
+> — even with `--settle 30`. `mixed` therefore reads "direct up, relay warm", **not**
+> "traffic on relay": a direct path is established (corroborated by the #43 SDK-daemon
+> traffic-path evidence on the same pair). The addr-set method cannot, on its own,
+> distinguish which Active path carries bytes; that ambiguity is exactly what a restored
+> `ConnectionType` watcher would remove.
 
 > If a future iroh bump restores a `ConnectionType`/`conn_type` watcher, prefer it
 > and keep this addr-set method as the cross-check (per spec §6.2 ordering).
@@ -188,27 +198,60 @@ whole matrix**, evaluated by the operator from the committed JSON.
 
 ## 6. Gate A findings block — lift verbatim into the Gate E memo (#15)
 
-> **PENDING the manual two-host run.** Fill from `results/results.md` after the
-> matrix (§4) is executed. Template:
+> **Filled 2026-07-03; reconciled + S2 added 2026-07-04** from the §4 runbook:
+> S1 = 18 runs + 5 `--settle 30` reconciliation runs; S2 = 14 runs from a cellular
+> CGNAT hotspot; all 37 per-run JSONs committed under `results/` (table in
+> `results/results.md`). **Both required environments are now measured.**
 
 ```md
 ### Gate A — real-NAT hole-punching (IR-0012 / #43)
 
-Verdict: <GO | NO-GO>    Date: <UTC>    iroh: 1.0.1    Probe SHA: <sha>
+Verdict: CONDITIONAL GO (both environments measured; residual = cellular relay throughput)    Date: 2026-07-03/04    iroh: 1.0.1    Probe SHA: 0e199d3 / 5e58e49
 
-Environments (≥2, ≥1 likely-symmetric):
-  S1 <A: net/isp/nat-class> ↔ <B: net/isp/nat-class>   (VPN off, different networks)
-  S2 <A …> ↔ <B …>
+Environments (≥2 executed — both real, different networks, no VPN bridge):
+  S1 wifi/Spectrum/home-router NAT ↔ ethernet/Hetzner/public-IP behind stateful ufw INPUT-DROP (non-symmetric; both native IPv6)
+  S2 iPhone cellular Personal Hotspot (carrier CGNAT — the likely-symmetric env) ↔ {Hetzner public server; home-broadband NAT}
 
-Results (both directions; natural + relay-only):
-  <paste results/results.md table>
+Results (both directions; natural + relay-only + settle30): results/results.md (37 committed runs).
 
-Hole-punch reliability: <direct settles>/<attempts> = <rate> over S2 (K=<K>).
-Relay fallback: confirmed <controlled --relay-only> AND <natural on symmetric pair>.
-Relay usability: throughput <X> Mbit/s, RTT <Y> ms (thresholds ≥1 Mbit/s, ≤300 ms).
-Confirmation pass (real carrier): event ALPN <✓/✗>, pipe ALPN <✓/✗> across the NAT.
+Establishment: PASS across BOTH environments — every natural run established both
+  directions well under 10 s (S1 TTFB 0.6–1.7 s; S2/cellular TTFB 0.4–1.7 s, RTT
+  ~100 ms to the home peer, ~160–180 ms to cloud). Includes inbound-to-CGNAT
+  (cloud dialed the Mac behind carrier CGNAT: established every run). The ten S1
+  8 MiB-xfer runs record established=false — a harness artifact (bulk transfer
+  exceeds the probe's fixed 30 s per-op budget; connect/TTFB/RTT succeeded in every
+  paired supplement). Reverse home-NAT→CGNAT (kilo→Mac) is the one leg not run
+  (no route to drive kilo once the Mac left the LAN); inbound-to-CGNAT is covered
+  by the cloud→Mac reverse runs.
+Direct path: a direct addr was ACTIVE on every established run in BOTH environments —
+  native IPv6 in all pairs, AND a punched IPv4 socket even between the cellular CGNAT
+  and the home NAT (S2 hotspot↔home settle30). nat-probe labels these `mixed`, never
+  sole "direct", because iroh 1.0.1 keeps the RELAY addr Active as a warm standby and
+  exposes no ConnectionType watcher (§2) — unchanged at `--settle 30`. "mixed" = "direct
+  up, relay warm", not "on relay"; hole_punched=false is a classifier label, not a punch
+  failure. Corroborated on S1 by the #43 SDK-daemon (traffic on direct, no relay bytes).
+Relay fallback: reachability confirmed via controlled --relay-only in BOTH environments,
+  both directions where run — a relay path always established.
+Relay usability: S1 PASS both directions (3.3 Mbit/s @ 132 ms BtoA, 1.2 Mbit/s @ 144 ms
+  AtoB). S2 MIXED: forward cellular→cloud 1.2 Mbit/s @ 172 ms (PASS); but forced-relay
+  throughput on the legs bottlenecked by the cellular UPLINK measured 0.1–0.2 Mbit/s @
+  113–298 ms — BELOW the ≥1 Mbit/s target. Caveat: 256 KiB samples dominated by
+  slow-start over a constrained mobile uplink, and forced worst-case (natural S2 sessions
+  used the healthy direct/mixed path). A larger-sample cellular relay re-measure is the
+  open item; --xfer can't grow without also raising the hardcoded 30 s budget (see below).
+Confirmation pass (real carrier): S1 event ALPN ✓ both directions (signed genesis in
+  ~1.07 s; non-member rejected before any event bytes, unknown_device) and pipe ALPN ✓
+  (HTTP through an authenticated pipe across the NAT, full CLI flow). S2 event ALPN ✓ —
+  the real transport carried a signed genesis from the cellular CGNAT to the cloud peer
+  in 1.35 s (admission gate accepted).
 
-Implication for Residual #12: <discharged with measured evidence | escalation: …>.
+Implication for Residual #12: DISCHARGED on connectivity — a direct hole-punched path,
+  establishment, and relay fallback all work across TWO real NAT environments incl. a
+  carrier CGNAT, both directions (inbound-to-CGNAT included), corroborated by two
+  independent methods. Remaining soft residuals (not connectivity failures): (1) a
+  clean, larger-sample cellular forced-relay THROUGHPUT measurement — the small samples
+  read below the ≥1 Mbit/s target; (2) the home-NAT→CGNAT reverse leg. Escalation not
+  triggered; relay reachability holds everywhere.
 Confidentiality: every hop (direct or relay) is QUIC/TLS between authenticated
   endpoints; relays forward only ciphertext (relay ≠ plaintext).
 ```
@@ -237,6 +280,12 @@ ISP/network labels, and timings — **no secrets, and no home-IP socket addrs**
 2. **Path mis-classification is the load-bearing risk (spec risk 2).** Mitigated
    by reading iroh's active-addr set (never latency), the settle window for the
    relay→direct upgrade, and recording the initial *and* settled values.
+   **Measured limit (§6):** on iroh 1.0.1 the relay addr stays Active as a warm
+   standby even when a direct path carries traffic, and there is no
+   `ConnectionType` watcher — so the addr-set classifier reports `mixed`, never
+   sole-`direct`, and `hole_punched` under-reports. Read `mixed` as "direct up,
+   relay warm". A restored path watcher (or the SDK daemon's traffic-path view)
+   is the disambiguator.
 3. **`--relay-only` completeness (spec risk 5).** `clear_ip_transports()` removes
    IP transports at bind, so a relay-only endpoint has no direct path to upgrade
    to. If a future iroh line opportunistically re-adds direct paths, cross-check
@@ -247,7 +296,16 @@ ISP/network labels, and timings — **no secrets, and no home-IP socket addrs**
    shared LAN or VPN silently passes; the operator must confirm it is off.
 5. **Reliability from too few samples (spec risk 6).** One hole-punch is not a
    rate; the runbook prescribes K repeats and the memo states the sample size.
-6. **Confirmation pass boundary (spec OQ-2).** IR-0012 covers connectivity +
+6. **No `--budget` flag; throughput bounded by the 30 s per-op budget.** The
+   per-op wait budget is hardcoded 30 s (`DialParams::default`), so a large
+   `--xfer` over a slow (e.g. forced-relay-over-cellular) path busts the budget
+   and records `established=false`, and a late-stage transfer failure discards
+   the run's earlier connect/TTFB/RTT measurements. The S2 cellular forced-relay
+   throughput therefore rests on small 256 KiB samples (§6). Follow-up: add a
+   `--budget <SECS>` flag (mirrors the new `--settle`) and stage partial results
+   so a transfer timeout doesn't void the established measurement — then re-run
+   the cellular relay-throughput leg with a larger transfer.
+7. **Confirmation pass boundary (spec OQ-2).** IR-0012 covers connectivity +
    event/pipe ALPN reachability; the full create→invite→join→message→file→pipe
    lifecycle across real NATs belongs to the Gate E integration run (#15) reusing
    this rig. Confirm with the #15 owner.

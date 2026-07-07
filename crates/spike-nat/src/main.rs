@@ -6,7 +6,7 @@
 //! ```text
 //! nat-probe listen [--relay-only] [--loopback] [--seed <N>]
 //! nat-probe dial <ENDPOINT_ID> [--addr <IP:PORT>] [--relay-only] [--loopback]
-//!                              [--ping <N>] [--xfer <BYTES>] [--seed <N>]
+//!                              [--ping <N>] [--xfer <BYTES>] [--settle <SECS>] [--seed <N>]
 //!                              [--scenario <label>] [--direction AtoB|BtoA]
 //!                              [--nat-a <spec>] [--nat-b <spec>]
 //!                              [--run-at <UTC>] [--git-sha <sha>] [--notes <text>]
@@ -25,7 +25,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
@@ -60,7 +60,7 @@ const USAGE: &str = "\
 usage:
   nat-probe listen [--relay-only] [--loopback] [--seed <N>]
   nat-probe dial <ENDPOINT_ID> [--addr <IP:PORT>] [--relay-only] [--loopback]
-                 [--ping <N>] [--xfer <BYTES>] [--seed <N>]
+                 [--ping <N>] [--xfer <BYTES>] [--settle <SECS>] [--seed <N>]
                  [--scenario <label>] [--direction AtoB|BtoA]
                  [--nat-a <k=v;...>] [--nat-b <k=v;...>]
                  [--run-at <UTC>] [--git-sha <sha>] [--notes <text>] [--json <path>]";
@@ -306,6 +306,12 @@ fn dial_params(args: &[String]) -> Result<DialParams> {
     if let Some(x) = flag_value(args, "--xfer") {
         params.xfer_bytes = x.parse().context("--xfer must be a byte count")?;
     }
+    if let Some(s) = flag_value(args, "--settle") {
+        let secs = s
+            .parse()
+            .context("--settle must be a whole number of seconds")?;
+        params.settle = Duration::from_secs(secs);
+    }
     Ok(params)
 }
 
@@ -377,8 +383,10 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{assemble_result, dial_params, endpoint_opts, flag_value, has_flag, push_note};
-    use spike_nat::probe::{Measurement, RelayStack};
+    use spike_nat::probe::{DialParams, Measurement, RelayStack};
     use spike_nat::report::{Direction, PathType};
 
     fn strs(v: &[&str]) -> Vec<String> {
@@ -625,6 +633,25 @@ mod tests {
         let p = dial_params(&args).expect("parse params");
         assert_eq!(p.pings, 5);
         assert_eq!(p.xfer_bytes, 131_072);
+    }
+
+    #[test]
+    fn dial_params_overrides_settle_seconds() {
+        let args = strs(&["dial", "fakeid", "--settle", "30"]);
+        let p = dial_params(&args).expect("parse params");
+        assert_eq!(p.settle, Duration::from_secs(30));
+        // Absent → the default settle window (spec §6.2).
+        let d = dial_params(&strs(&["dial", "fakeid"])).expect("parse params");
+        assert_eq!(d.settle, DialParams::default().settle);
+    }
+
+    #[test]
+    fn dial_params_invalid_settle_returns_error() {
+        let args = strs(&["dial", "fakeid", "--settle", "4s"]);
+        assert!(
+            dial_params(&args).is_err(),
+            "--settle with non-integer must error"
+        );
     }
 
     #[test]

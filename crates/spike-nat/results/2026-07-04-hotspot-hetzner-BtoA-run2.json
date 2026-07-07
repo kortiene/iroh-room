@@ -1,0 +1,31 @@
+{
+  "scenario": "hotspot-cgnat<->hetzner-server",
+  "direction": "BtoA",
+  "nat_a": {
+    "kind": "cgnat",
+    "isp": "cellular-hotspot",
+    "network_type": "lte",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": true,
+  "path_type": "mixed",
+  "initial_path_type": "relay",
+  "hole_punched": false,
+  "relay_only": false,
+  "ttfb_ms": 1211,
+  "ttfb_direct_ms": 1211,
+  "rtt_ms": 180.267147,
+  "rtt_p90_ms": 289.78216000000003,
+  "setup_time_ms": 1482,
+  "relay_url": "https://usw1-1.relay.n0.iroh.link./",
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "5e58e49",
+  "run_at_utc": "2026-07-04T17:28Z",
+  "notes": "scenario 2 reverse: Hetzner public server dials Mac behind cellular CGNAT (inbound-to-CGNAT hard case); tailscale off; path upgraded relay -> mixed within the settle window"
+}

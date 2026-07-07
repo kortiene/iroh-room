@@ -1,6 +1,6 @@
 [package]
 name = "iroh-rooms-core"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -64,4 +64,3 @@ tempfile = "3"
 # Property-based robustness/round-trip tests for the strict CBOR reader (risk
 # R1, IR-0002 follow-up). Dev-only so validate-only consumers stay lean.
 proptest = "1"
-

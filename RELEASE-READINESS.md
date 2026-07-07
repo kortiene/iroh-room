@@ -140,21 +140,38 @@ Drawn from `PRD.v0.3.md` §13.4/§14, the README status log, and the crate
 `NOTES.md` files. A preview ships honest only if these are stated up front,
 not discovered by a user:
 
-- **★ No verified real-NAT connectivity yet (Gate A pending).** Direct
-  hole-punching on restrictive/symmetric networks is unproven; relay fallback
-  exists but the cross-network measurement and verdict are owed. See
+- **★ Real-NAT connectivity measured across both environments (Gate A,
+  2026-07-03/04).** S1 home-NAT ↔ cloud and S2 cellular CGNAT hotspot ↔ {cloud,
+  home-NAT}: a direct hole-punched path establishes on every run in both
+  environments, establishment + relay reachability pass both directions (incl.
+  inbound to the CGNAT client), and the real carrier crossed both NATs. nat-probe
+  labels runs `mixed` (relay stays Active as warm standby, even at `--settle 30`)
+  — a classifier artifact, not a punch failure; corroborated on S1 by the
+  issue-#43 SDK-daemon run. **Open (non-connectivity):** forced-relay throughput
+  over the cellular uplink read 0.1–0.2 Mbit/s on small samples (below the
+  ≥1 Mbit/s target — a larger-sample re-measure is owed), and the home-NAT→CGNAT
+  reverse leg was not run. See
   [`crates/iroh-rooms-net/NOTES.md`](crates/iroh-rooms-net/NOTES.md) §"Gate A
   (real-network)" and [`crates/spike-nat/results/results.md`](crates/spike-nat/results/results.md).
+  A 2026-07-07 local↔`demo1` refresh also passed both directions, natural and
+  relay-only; relay-only measured 4.1 Mbit/s BtoA and 1.3 Mbit/s AtoB.
 - **★ No cloud inbox; no guaranteed offline delivery.** Files and pipes
   require a provider to be online; messages deliver only when peers are
   online or reconnect (PRD §14).
 - **No group E2EE, no PFS, no advanced key rotation, no secure multi-device
   recovery.** (PRD §13.4 items 1–4)
-- **No invite revocation; weak protection after a ticket leak.** A ticket is
-  a scoped capability until it expires or is consumed (PRD §13.4 item 10,
-  §13.5 item 1).
+- **No native invite revocation; bounded leaked-ticket model.** A ticket is a
+  scoped, key-bound capability until it expires or is consumed by departure
+  rules (PRD §13.4 item 10, §13.5 item 1). Phase 2.5 Production Beta accepts
+  this only under
+  `docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md`; Production
+  GA still needs native revocation or an explicit re-acceptance of the narrow
+  scope.
 - **Unencrypted local storage.** `rooms.db` / `blobs/` are plaintext on disk
-  (storage encryption is roadmap PRD §13.5 item 9).
+  (storage encryption is roadmap PRD §13.5 item 9). Phase 2.5 Production Beta
+  accepts this only under the trusted-local-machine scope in
+  `docs/decisions/ADR-0001-local-storage-posture.md`; Production GA still needs
+  encryption or a narrower deployment claim.
 - **Join-bootstrap privacy trade-off (Approach A).** With `--accept-joins`, a
   dialer who knows `room_id` + admin `EndpointId` is served the
   **secret-free** membership sub-DAG during the open-invite window; no
@@ -166,9 +183,11 @@ not discovered by a user:
 - **`SIGKILL` leaves a pipe open on the log** until an owner/admin
   `pipe close` (clean `SIGINT`/`SIGTERM` emit `pipe.closed{owner_exit}`)
   (IR-0108).
-- **CLI installs no tracing subscriber.** Audit is only via the explicit
-  stderr sinks (`pipe.*`, `reject.*`); `Tracing*Audit` output is dropped (see
-  project memory "CLI has no tracing subscriber").
+- **CLI installs no tracing subscriber.** Audit is via explicit CLI sinks:
+  operator-facing stderr lines plus `<IROH_ROOMS_HOME>/audit.ndjson` for local
+  persistence. Phase 2.5 Production Beta accepts this local audit posture in
+  `docs/decisions/ADR-0003-persistent-audit-posture.md`; `Tracing*Audit` output
+  is still dropped wherever no explicit CLI sink is installed.
 - **Small-room, single-immutable-admin, TCP-only-pipe, loopback-only-bind**
   scope (PRD §7, §18.4).
 - **File-size cap divergence to confirm.** Code enforces
@@ -249,9 +268,10 @@ Status: DEVELOPER PREVIEW. Not for production. No security audit has been perfor
 - <notable changes>
 
 ## Known limitations (read before relying on this)
-- No verified real-NAT connectivity yet (Gate A pending): <current status>.
+- Real-NAT connectivity (Gate A): <current status — e.g. measured 2026-07-03/04 across both environments (home-NAT + cellular CGNAT); direct hole-punch + relay reachability confirmed; a larger-sample cellular relay-throughput re-measure owed>.
 - No cloud inbox / no guaranteed offline delivery; peers must be online.
-- Local storage is unencrypted; no invite revocation; no group E2EE / PFS.
+- Local storage is unencrypted; no native invite revocation (ADR-0002 bounded
+  model); no group E2EE / PFS.
 - <copy the full list from RELEASE-READINESS.md "Known MVP limitations">
 
 ## Security notes

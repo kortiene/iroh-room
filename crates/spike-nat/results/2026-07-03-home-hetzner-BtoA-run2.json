@@ -1,0 +1,25 @@
+{
+  "scenario": "home-broadband<->hetzner-server",
+  "direction": "BtoA",
+  "nat_a": {
+    "kind": "home-router",
+    "isp": "spectrum",
+    "network_type": "wifi",
+    "observed_via": "operator-knowledge"
+  },
+  "nat_b": {
+    "kind": "public-ip-stateful-fw",
+    "isp": "hetzner",
+    "network_type": "ethernet",
+    "observed_via": "operator-knowledge"
+  },
+  "established": false,
+  "path_type": "none",
+  "initial_path_type": "none",
+  "hole_punched": false,
+  "relay_only": false,
+  "iroh_version": "1.0.1",
+  "probe_git_sha": "0e199d3",
+  "run_at_utc": "2026-07-03T11:39Z",
+  "notes": "different networks; no VPN bridge (B has no tailscale; A tailnet iface unreachable from B); both ends native IPv6; B behind ufw INPUT DROP (stateful); run did not establish: throughput transfer"
+}
