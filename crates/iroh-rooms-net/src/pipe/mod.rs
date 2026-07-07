@@ -44,12 +44,12 @@ pub use hello::PipeHello;
 pub use owner::new_pipe_id;
 pub use registry::{is_loopback_target, OpenPipe, PipeRegistry};
 pub use runtime::{PipeQuery, PipeQueryMsg};
-pub use sessions::{LiveSession, PipeSessions};
+pub use sessions::{LiveSession, PipeSessionInfo, PipeSessions};
 
 pub(crate) use handler::{PipeHandlerState, PipeProtocolHandler};
 
-/// Advisory wall-clock ms — the one place the Pipe plane reads a clock, and only to
-/// deny on expiry (fail-closed, §5). Mirrors the `Node` pump's `now_ms`.
+/// Advisory wall-clock ms — reads a clock (to deny on expiry, and to stamp a live
+/// session's start). Mirrors the `Node` pump's `now_ms`.
 #[must_use]
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -72,7 +72,26 @@ pub(crate) fn hex16(id: &[u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::hex16;
+    use super::{hex16, now_ms};
+
+    #[test]
+    fn now_ms_is_real_wall_clock_and_non_decreasing() {
+        // `now_ms` stamps a live pipe session's `since_ms` at register time (issue
+        // #86); its `map_or(0, ..)` fallback means a broken clock surfaces as the
+        // documented `0` sentinel. Pin that the happy path returns real epoch-ms
+        // (past a fixed floor — never a time bomb, since wall-clock only moves
+        // forward) and never runs backward across two reads.
+        let a = now_ms();
+        let b = now_ms();
+        assert!(
+            a > 1_600_000_000_000,
+            "now_ms must be real epoch-ms (after 2020-09), not the 0 fallback"
+        );
+        assert!(
+            b >= a,
+            "wall-clock ms must not go backward across two reads"
+        );
+    }
 
     #[test]
     fn hex16_all_zeros_is_thirty_two_zero_chars() {

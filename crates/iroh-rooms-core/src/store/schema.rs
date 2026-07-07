@@ -31,6 +31,13 @@ pub(crate) const USER_VERSION: i64 = 2;
 /// `WAL` gives multi-reader + single-writer; `foreign_keys = ON` enforces the
 /// `event_parents.child_id` FK; `synchronous = NORMAL` is the WAL-recommended
 /// durability/throughput balance.
+///
+/// `busy_timeout` is deliberately **not** in this batch: it is set separately via
+/// `Connection::busy_timeout` (see [`super::StoreOptions`] / `EventStore::open_with`)
+/// so it can be parameterized per-open and cleared for the fail-fast opt-out
+/// (issue #85). Every `EventStore` write transaction also uses `BEGIN IMMEDIATE`
+/// (`EventStore::begin_write`) rather than `BEGIN DEFERRED`, so the busy handler
+/// covers the write-lock wait for read-then-write bodies too.
 const PRAGMAS: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;

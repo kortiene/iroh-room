@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::build_member_joined;
 use iroh_rooms_core::event::constants::SHORT_ID_LEN;
@@ -438,7 +438,7 @@ fn room_name_from_store(store: &EventStore, room_id: &RoomId) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::{build_bootstrap_dial_set, join_reject_message, DEFAULT_JOIN_TIMEOUT};
-    use iroh::{EndpointAddr, SecretKey};
+    use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
     use iroh_rooms_core::event::ids::RoomId;
     use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey};
     use iroh_rooms_core::event::RejectReason;

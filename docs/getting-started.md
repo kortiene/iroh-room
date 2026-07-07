@@ -1152,6 +1152,117 @@ example agent — the SDK-driven, adapt-me-as-a-template evolution of this guide
 and Step 7 (agent status) — with its own `README.md` covering the run flow and adaptation
 points.
 
+Driving the online tier (`Node::spawn`, `connect_to`, admission wiring) names the raw `iroh`
+transport identities — `EndpointAddr`, `EndpointId`, `SecretKey` — but a consumer needs no
+direct `iroh` dependency of its own to get them (issue #87): they're re-exported verbatim from
+`iroh_rooms::experimental::session` (`EndpointId` is also re-exported from `experimental::blob`
+and `experimental::pipe_runtime`, next to the blob/pipe APIs that name it, so a consumer working
+with only one of those need not import `session` too):
+
+```rust,ignore
+use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
+
+let secret_key = SecretKey::from_bytes(&joiner_device.to_seed());
+let admin_id: EndpointId = ADMIN_ENDPOINT.parse()?;
+node.connect_to(EndpointAddr::new(admin_id));
+```
+
+These are the exact types `iroh-rooms-net`'s public `Node` API names — a same-type re-export,
+not a wrapper — so nothing needs converting, and a consumer's own `Cargo.toml` carries no `iroh`
+entry at all (see `crates/iroh-rooms-cli/Cargo.toml`, which dropped its direct `iroh` dependency
+when it migrated to this re-export).
+
+### Subscribe to room events
+
+A long-running consumer (a resident daemon, a UI backend) can subscribe to a live push
+stream of newly-ingested room events instead of polling `room_tail` (issue #83 / IR-0307):
+
+```rust,ignore
+use iroh_rooms::experimental::session::Node;
+use tokio::sync::broadcast::error::RecvError;
+
+let mut rx = node.room_events();
+let mut seen = std::collections::HashSet::new();
+loop {
+    match rx.recv().await {
+        Ok(ev) => {
+            if seen.insert(ev.event_id) {
+                handle(ev);
+            }
+        }
+        Err(RecvError::Lagged(_)) => {
+            // A slow subscriber missed some events — resync from the authoritative
+            // tail, deduping against what's already been handled.
+            for ev in node.room_tail(u32::MAX).await? {
+                if seen.insert(ev.event_id) {
+                    handle(ev);
+                }
+            }
+        }
+        Err(RecvError::Closed) => break,
+    }
+}
+```
+
+- **Exactly once per stored event.** Own publish, peer sync, and delayed park-promotion all
+  route through the same insert choke point, so a duplicate re-see is never re-emitted.
+- **Lossy on lag, not silent.** This is a bounded `tokio::sync::broadcast` (capacity
+  `NetConfig::room_event_capacity`, default 256, identical in contract to `conn_events`). A
+  subscriber that falls behind gets `RecvError::Lagged` and resyncs via `room_tail(u32::MAX)`
+  deduped against a seen-set, as in the recipe above.
+- **Not ordered by Lamport.** Emission order follows insertion order at the engine, which is
+  not necessarily causal order across a park-promotion cascade (a child delivered before its
+  parent). Sort by `StoredEvent.lamport` if a total order is needed.
+- Out of scope: the CLI's offline authoring commands (`room`/`message`/`invite`/`file.rs`)
+  insert directly through the store and never build a `Node`, so they never emit on this
+  channel; a `room tail --follow` renderer built on this primitive is deferred.
+
+### Share a file from a live session
+
+The CLI's `file share` (Step 5) cycles the session (shutdown → open store → import →
+close → respawn) because it never keeps a `Node` alive across commands. A resident
+daemon that already holds a `Node` open (`spawn_room` with a `BlobServeConfig`) can
+import straight through the live session instead — no session cycle, no peer
+disconnects (issue #84 / IR-0308):
+
+```rust,ignore
+use iroh_rooms::experimental::blob::BlobImport;
+use iroh_rooms::files::{build_file_shared, HashRef};
+
+let BlobImport { hash, size_bytes } = node.blob_import(&path).await?;
+let wire = build_file_shared(
+    &identity_secret, &device_secret, &room_id, file_id, name, mime_type,
+    size_bytes, HashRef::from_bytes(hash), None, &providers, &heads, now,
+);
+node.publish(wire.to_bytes()).await?;
+```
+
+Import **before** publish: publishing the `file.shared` first would briefly reference
+a hash the store doesn't hold yet, so a racing fetcher could see a transient
+`blob_unavailable`. The node must have opened its store with a `BlobServeConfig`
+(`Node::spawn` alone has none) or `blob_import` returns `BlobError::NotServing`.
+
+### Re-provide a fetched file
+
+Symmetrically, a long-running consumer that just verified fetched bytes can become a
+provider of them without restarting:
+
+```rust,ignore
+use iroh_rooms::experimental::blob::FetchOutcome;
+
+let (outcome, bytes) = node.fetch_file(provider_addr, hash, hash, timeout).await;
+if let (FetchOutcome::Fetched, Some(bytes)) = (outcome, bytes) {
+    node.blob_import_bytes(bytes).await?;
+    // The hash is already referenced by the file.shared this node fetched by, so it
+    // serves the blob to other members immediately — no new file.shared needed.
+}
+```
+
+Only re-provide on `FetchOutcome::Fetched`: a `HashMismatch` also returns `Some(bytes)` (the
+transfer completed but the receiver's independent BLAKE3 recheck disagreed with the declared
+hash), and importing those bytes would make this node serve content under a hash it does not
+actually match.
+
 ## Next steps & references
 
 - [`live-pipe-preview.md`](./live-pipe-preview.md) — a task-focused guide to the Live Pipe

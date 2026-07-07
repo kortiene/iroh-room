@@ -248,6 +248,12 @@ pub struct SyncEngine {
     /// receive-path source for `AuditSink::event_flagged`. Never affects the
     /// verdict, order, or any authz/expiry decision; purely observability.
     pending_flags: Vec<&'static str>,
+    /// Events accepted (`InsertOutcome::Inserted`) since the last
+    /// [`take_ingested`](Self::take_ingested) drain — the push-subscription feed
+    /// (issue #83 / IR-0307). Mirrors `pending_flags`: the sans-IO engine cannot
+    /// own a tokio broadcast sender, so it buffers and the net pump drains + fans
+    /// out.
+    pending_ingested: Vec<StoredEvent>,
 }
 
 impl SyncEngine {
@@ -297,6 +303,7 @@ impl SyncEngine {
             counters: SyncCounters::default(),
             logs: Vec::new(),
             pending_flags: Vec::new(),
+            pending_ingested: Vec::new(),
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -630,6 +637,19 @@ impl SyncEngine {
         std::mem::take(&mut self.pending_flags)
     }
 
+    /// Drain the events accepted since the last call — the push-subscription
+    /// feed for `Node::room_events` (issue #83 / IR-0307). Each freshly-Inserted
+    /// event appears exactly once across own-publish, peer-sync, and delayed
+    /// park-promotion; a duplicate re-see never lands here. Callers get exactly
+    /// the events accepted since they last drained (destructive `mem::take`).
+    ///
+    /// NOTE: within a single drive, park-promotion appends in engine-iteration
+    /// order, NOT causal/Lamport order (see spec §6.2). Set-membership + exactly-once
+    /// hold; strict ordering does not.
+    pub fn take_ingested(&mut self) -> Vec<StoredEvent> {
+        std::mem::take(&mut self.pending_ingested)
+    }
+
     /// The number of frames currently parked (test/observability helper).
     #[must_use]
     pub fn parked_len(&self) -> usize {
@@ -722,6 +742,13 @@ impl SyncEngine {
             InsertOutcome::Inserted => {
                 self.counters.accepted += 1;
                 self.note_admin_event(id);
+                // Push-subscription feed (issue #83): emit exactly once, only on a real
+                // insert (the Duplicate arm never reaches here → exactly-once for free).
+                match self.store.get(&id) {
+                    Ok(Some(stored)) => self.pending_ingested.push(stored),
+                    Ok(None) => self.log("room_events: inserted event vanished from store"),
+                    Err(e) => self.log(&format!("room_events: store.get failed: {e}")),
+                }
                 // Advisory flags on a freshly-accepted event (spec IR-0110 §5.9,
                 // e.g. `clock_skew`) — never re-raised for a duplicate re-see.
                 for flag in &ev.flags {

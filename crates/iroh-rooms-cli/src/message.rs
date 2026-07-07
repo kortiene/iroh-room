@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::constants::{MAX_MESSAGE_BODY_BYTES, MAX_PREV_EVENTS, SHORT_ID_LEN};
 use iroh_rooms_core::event::content::{Content, EventType};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
@@ -1236,7 +1236,7 @@ mod tests {
         parse_event_id, parse_peer, parse_timeout, render_endpoint_addr, validate_body,
         validate_format,
     };
-    use iroh::{EndpointAddr, SecretKey};
+    use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
     use iroh_rooms_core::event::constants::MAX_MESSAGE_BODY_BYTES;
     use std::time::Duration;
 
@@ -1311,7 +1311,7 @@ mod tests {
 
     // ── parse_peer / render round-trip ────────────────────────────────────────
 
-    fn an_endpoint_id() -> iroh::EndpointId {
+    fn an_endpoint_id() -> iroh_rooms::experimental::session::EndpointId {
         SecretKey::from_bytes(&[7u8; 32]).public()
     }
 

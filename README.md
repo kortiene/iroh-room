@@ -991,6 +991,182 @@ honor-system checkbox:
   `verify.sh`/online-tier boundaries to prove the READY/NOT-READY exit-code
   wiring).
 
+**`JoinBootstrapAdmission`'s join window is now dynamic** (issue #88), closing
+a gap a real SDK consumer hit against the developer-preview façade: a
+resident daemon holding a room session open indefinitely needs its
+pending-invite state to gate join-bootstrap admission many times within one
+session's lifetime, but the gate's `accept_joins` was a `bool` fixed at
+construction — forcing either serving the bootstrap overlay for the whole
+session or respawning the `Node` (dropping every connected peer) just to
+flip it.
+
+- `JoinBootstrapAdmission::new_dynamic(inner, Arc<AtomicBool>)` reads the
+  `accept_joins` window from a shared, caller-owned flag on every
+  `authorize()` call, instead of `new`'s fixed-at-construction `bool`. A
+  long-running host stores `true` on invite mint and `false` on
+  redemption/expiry — the same "provisional bootstrap only while an invite
+  is open" policy the type's docs already stated — with no session respawn
+  and no admission-chain rebuild.
+- `new` and its fixed-`bool` semantics (and the CLI's `room tail
+  --accept-joins`, whose command lifetime *is* the policy window) are
+  unchanged; `new_dynamic` is observationally identical to `new` for any
+  fixed flag value.
+- Because admission is consulted only on the accept path for new inbound
+  connections, flipping the flag never re-evaluates an already-established
+  connection. A new `join_e2e.rs` test proves this end-to-end: on one
+  long-lived admin `Node`, the window opens (joiner completes bootstrap +
+  `member.joined`) then closes again (a second unknown device is refused),
+  while a member connected before either flip shows no disconnect/reconnect
+  on the admin's `ConnEvent` stream.
+
+**`EventStore` now supports concurrent writers on a shared `SQLite` file**
+(issue #85), closing a gap a real SDK consumer (a resident daemon opening two
+`EventStore` connections onto one database — RPC-driven writes plus a room
+session's sync pump) hit under entirely ordinary concurrency: a colliding
+write from the second connection could surface to the caller as `SQLITE_BUSY`.
+
+- Every write transaction now uses `BEGIN IMMEDIATE` instead of the rusqlite
+  default `BEGIN DEFERRED`, so a colliding writer waits for the lock (bounded
+  by the connection's `busy_timeout`) instead of racing a read-then-write
+  upgrade that `SQLite` fails immediately, bypassing any busy handler.
+- `StoreOptions { busy_timeout: Option<Duration> }` (default `Some(5000ms)`),
+  set via the new `EventStore::open_with` / `open_in_memory_with`
+  constructors, is re-exported through `iroh_rooms::experimental::store` so
+  embedders can tune or explicitly opt out of the timeout (`None` clears
+  rusqlite's own pre-installed 5000ms default rather than leaving it in place).
+  `open`/`open_in_memory` are unchanged for existing callers.
+
+**Push-based room-event subscription** (issue #83 / IR-0307): `Node::room_events()`
+streams each newly-ingested `StoredEvent` exactly once; consumers stop polling
+`room_tail`. Filed from a real SDK consumer (Bantaba, a resident daemon + web UI)
+whose only prior option was polling `room_tail` every ~300ms per open room and
+deduping against a seen-set — a latency floor plus an ever-growing
+`room_tail(u32::MAX)` rescan to avoid silently dropping a late-arriving
+low-lamport event from a bounded poll window.
+
+- The sans-IO `SyncEngine` accumulates each freshly-`Inserted` event (own
+  publish, peer sync, or delayed park-promotion — all three routes funnel
+  through one insert choke point) into `pending_ingested`; `take_ingested()`
+  drains it, mirroring the established `pending_flags`/`take_flags` pattern.
+  The `Duplicate` insert arm never reaches the emit point, so a re-seen event
+  is never re-emitted — exactly-once for free.
+- The net-crate pump owns a `broadcast::Sender<StoredEvent>` (capacity
+  `NetConfig::room_event_capacity`, default 256, mirroring
+  `conn_event_capacity`) and drains after every engine drive that can insert
+  (`publish`, `on_message`, `on_tick`); `Node::room_events()` returns a fresh
+  subscriber. A lagging subscriber gets `RecvError::Lagged`, never silent
+  loss, and resyncs via the documented `room_tail(u32::MAX)` + seen-set
+  recipe on the method's doc comment.
+- Emission order follows insertion order, not causal/Lamport order: a
+  park-promotion cascade records the directly-accepted trigger first, then
+  its promoted descendants in engine-iteration order. Only set-membership +
+  exactly-once are guaranteed within a cascade; consumers needing a total
+  order sort by `StoredEvent.lamport`.
+- Reachable through the façade unchanged (`iroh_rooms::experimental::session::Node`)
+  since `Node` was already re-exported. Proven over real loopback QUIC by a
+  two-node test with induced out-of-order delivery (a child event parked and
+  later promoted by its backfilled parent) at both the `iroh-rooms-net` and
+  façade layers.
+- The CLI's offline authoring paths (`room`/`message`/`invite`/`file.rs`) insert
+  directly through `EventStore::insert`, bypassing `SyncEngine` entirely, and
+  never build a `Node`, so they do not emit on this channel — deliberately out
+  of scope, since they have no live subscriber to serve. A `room tail --follow`
+  renderer is deferred to a future issue; this lands only the SDK primitive.
+
+**In-session blob import** (issue #84 / IR-0308): `Node::blob_import` /
+`blob_import_bytes` import into the live session's already-open store —
+resident daemons share files and re-provide fetched bytes with **no** session
+cycle (zero peer disconnects). Filed from the same real SDK consumer
+(Bantaba): unlike the CLI's short-lived process model, a daemon keeps a room
+session (and its blob store) open indefinitely, and the store's `iroh-blobs`
+`FsStore` takes an exclusive on-disk lock for the opener's lifetime — so
+`file share` used to require a full `shutdown → open → import → close →
+respawn` cycle, and a peer's fetched bytes could never be re-provided without
+restarting.
+
+- `BlobStore::import_bytes` is a sibling to the existing `import_path`: same
+  independent-BLAKE3-256-recompute guard, same persistent (restart-surviving)
+  tag.
+- `Node::blob_import(&self, &Path)` / `Node::blob_import_bytes(&self, Bytes)`
+  delegate straight to the node's already-open `blob_store` handle — no second
+  `FsStore` open, no `BlobError::Locked`, no transport touched. `file.shared`
+  authoring stays the caller's job via the existing `build_file_shared` +
+  `Node::publish`; import before publish so a racing fetcher never sees a
+  reference to bytes the store doesn't hold yet.
+- A node spawned without a `BlobServeConfig` has no store to import into and
+  gets the new coded `BlobError::NotServing`, distinct from `Locked`.
+- Reachable through the façade unchanged
+  (`iroh_rooms::experimental::session::Node`, `experimental::blob::{BlobImport,
+  BlobError}`) since both were already re-exported.
+
+**Per-pipe live-session state on the owner side** (issue #86 / IR-0309):
+`Node::live_pipe_sessions_for` / `Node::pipe_session_info` answer "is *this*
+pipe connected, and by whom?" instead of only a node-wide total. Filed from
+the same real SDK consumer (Bantaba): its Pipes panel lists every exposed
+pipe with a live "connected" indicator, but `Node::live_pipe_sessions()`
+returns one node-wide count — with two pipes exposed and one live session,
+there was no way to tell which pipe carried it. Bantaba's honesty rule (never
+fabricate state) forced it to show `connected` only when unambiguous (exactly
+one open pipe), under-reporting real connections the moment a host exposed a
+second pipe.
+
+- `Node::live_pipe_sessions_for(&self, pipe_id: [u8; 16]) -> usize` — count of
+  live forwarding sessions for one pipe; `0` for an unknown or
+  never-connected pipe.
+- `Node::pipe_session_info(&self) -> Vec<PipeSessionInfo>` — per-session
+  detail (`pipe_id`, connecting `device`, `since_ms`) across every pipe this
+  node owns, the direct data source for a Pipes-panel row. A point-in-time,
+  unordered snapshot; sort by `pipe_id`/`since_ms` for stable display.
+- Both are pure `&self` reads that filter/project the existing `PipeSessions`
+  table (already `Arc`-held on `Node`, off the sync engine, no `Cmd`/pump
+  hop), so per-pipe counts are decrement-correct for free: every teardown
+  path (splice finish, watcher revocation, owner `pipe_close`) mutates that
+  one table, so a filtered read reflects it on the next call — no separate
+  counter to desync.
+- `live_pipe_sessions()` (node-wide) is unchanged; the new methods are purely
+  additive.
+- Reachable through the façade unchanged
+  (`iroh_rooms::experimental::session::Node`); `PipeSessionInfo` is newly
+  re-exported through `experimental::pipe_runtime`.
+
+**The façade now re-exports the online tier's `iroh` transport identities**
+(issue #87), closing the last gap in "a consumer imports only through
+`iroh_rooms::*`": driving `Node::spawn`/`connect_to`/admission wiring names
+`EndpointAddr`, `EndpointId`, and `SecretKey` in a consumer's own code, and
+the façade never re-exported them — every consumer (the CLI included) needed
+its own direct `iroh` dependency pinned byte-identical to `iroh-rooms-net`'s
+`=1.0.1`, a version-skew trap: two resolved `iroh` crates produce two
+distinct `EndpointAddr` types that don't compile against each other. Filed
+from Bantaba, a real SDK consumer hitting exactly this friction against the
+developer-preview façade.
+
+- `iroh_rooms::experimental::session` re-exports `EndpointAddr`, `EndpointId`,
+  `SecretKey`, and `Endpoint` verbatim from the pinned `iroh` release (a
+  same-type re-export, like every other façade path — not a wrapper).
+  `EndpointId` is duplicated into `experimental::blob` and
+  `experimental::pipe_runtime`, next to the `BlobAclView` / `PipeSessionInfo` /
+  `PipeAuditSink` APIs that name it, following the same duplicate-where-used
+  precedent as `RoomId` and `HashRef`.
+- `crates/iroh-rooms/Cargo.toml` promotes `iroh` from a dev-dependency to an
+  optional, `experimental`-gated direct dependency, pinned byte-identical to
+  `iroh-rooms-net`'s `=1.0.1` (kept in sync by hand — a
+  `[workspace.dependencies]` hoist was considered and deferred).
+- The reference CLI proves the claim end-to-end:
+  `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct `iroh`
+  dependency at all, and `file.rs` / `join.rs` / `message.rs` / `pipe.rs` /
+  `audit.rs` import the trio through `iroh_rooms::experimental::session`
+  instead.
+- Guarded by three checks: `experimental_surface.rs`'s compile-time
+  type-identity test (coerces real `Node` / `BlobAclView` method items to the
+  façade re-export types, so a pin drift fails the build rather than silently
+  producing two incompatible types); `iroh-rooms-cli/tests/no_direct_iroh_dep.rs`
+  (scans the CLI's own manifest and source for any bare `iroh` dependency or
+  `iroh::` path); and `iroh-rooms/tests/iroh_pin_consistency.rs` (parses both
+  manifests and asserts the pins match exactly).
+- `docs/sdk-coverage.md` gained the "iroh transport types" table; the
+  "imports only through the façade" claim is now fully true for the online
+  tier.
+
 ## Repository Layout
 
 ```text

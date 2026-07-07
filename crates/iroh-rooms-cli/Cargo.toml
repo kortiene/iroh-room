@@ -40,9 +40,10 @@ iroh-rooms = { path = "../iroh-rooms", features = ["experimental"] }
 # `signal` powers `room tail`'s Ctrl-C shutdown.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 # `SecretKey` / `EndpointId` / `EndpointAddr` types crossed at the CLI boundary
-# when wiring the device key into the carrier and parsing `--peer` addresses. Pin
-# identical to `iroh-rooms-net` (spec IR-0105 D2).
-iroh = "=1.0.1"
+# when wiring the device key into the carrier and parsing `--peer` addresses
+# come from `iroh_rooms::experimental::{session, blob, pipe_runtime}` (issue
+# #87) — no direct `iroh` dependency needed; the façade's re-exports are the
+# same type as `iroh-rooms-net`'s (same `=1.0.1` pin, kept in sync by hand).
 # Argument parsing for the subcommand tree (PRD §16 CLI surface). `derive` gives
 # the declarative `Cli`/subcommand structs. Caret 4.x; the exact patch is pinned
 # in Cargo.lock. (CI builds on the latest stable toolchain — the landed crypto

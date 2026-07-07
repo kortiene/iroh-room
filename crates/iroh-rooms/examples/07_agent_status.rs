@@ -13,12 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "experimental")]
-use iroh::{EndpointAddr, EndpointId, SecretKey};
-#[cfg(feature = "experimental")]
 use iroh_rooms::events::build_agent_status;
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::session::{
-    AllowlistAdmission, NetConfig, Node, TracingAudit, DEFAULT_TICK,
+    AllowlistAdmission, EndpointAddr, EndpointId, NetConfig, Node, SecretKey, TracingAudit,
+    DEFAULT_TICK,
 };
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::store::EventStore;

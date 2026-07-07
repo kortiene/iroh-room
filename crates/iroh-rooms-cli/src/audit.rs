@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh_rooms::experimental::session::EndpointId;
 use iroh_rooms_core::event::keys::IdentityKey;
 use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
 use serde_json::{json, Value};
@@ -350,7 +350,7 @@ impl AuditSink for StderrAudit {
 #[cfg(test)]
 mod tests {
     use super::{LocalAudit, PersistentAudit, StderrAudit, AUDIT_LOG_FILE};
-    use iroh::SecretKey;
+    use iroh_rooms::experimental::session::{EndpointId, SecretKey};
     use iroh_rooms_core::event::keys::IdentityKey;
     use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
     use serde_json::{json, Value};
@@ -358,7 +358,7 @@ mod tests {
 
     use crate::message::{short_device, short_hash};
 
-    fn device(seed: u8) -> iroh::EndpointId {
+    fn device(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
     }
 

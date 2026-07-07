@@ -7,10 +7,58 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Re-exported the online tier's `iroh` transport identities — `EndpointAddr`,
+  `EndpointId`, `SecretKey`, `Endpoint` — from `experimental::session`
+  (`EndpointId` also from `experimental::blob` and `experimental::pipe_runtime`,
+  issue #87): closes the last gap in "a consumer imports only through
+  `iroh_rooms::*`". Driving `Node::spawn`/`connect_to`/admission wiring
+  previously required a consumer's own direct `iroh` dependency pinned
+  byte-identical to `iroh-rooms-net`'s `=1.0.1` — a version-skew trap where
+  two resolved `iroh` crates produce incompatible `EndpointAddr` types. `iroh`
+  becomes a direct, `experimental`-gated optional dependency of the façade
+  (pinned `=1.0.1` to match `-net` exactly, so Cargo unifies to one crate
+  instance); a default-features build still cannot name any of these types.
+  The reference CLI proves the claim: its direct `iroh` dependency is deleted
+  entirely, with every `iroh::` path routed through the façade instead. Purely
+  additive — a re-export + import-routing change, no new runtime behavior.
+- Added `Node::live_pipe_sessions_for(pipe_id) -> usize` and
+  `Node::pipe_session_info() -> Vec<PipeSessionInfo>` (issue #86 / IR-0309,
+  `experimental::session` + `experimental::pipe_runtime`): per-pipe
+  live-session observability on the owner side, so an owner exposing more
+  than one pipe can tell which pipe carries a live forwarding session
+  instead of only a node-wide total (`Node::live_pipe_sessions()`). Both are
+  pure `&self` reads over the existing session table — no new tracking, no
+  engine/pump involvement — and are decrement-correct on every teardown path
+  with no separate counter to desync. `live_pipe_sessions()` is unchanged;
+  purely additive.
+- Added `Node::blob_import(&Path)` / `Node::blob_import_bytes(Bytes)` (issue #84 /
+  IR-0308, `experimental::session` + `experimental::blob`): import a file, or
+  re-provide in-memory bytes, into the live session's already-open blob store —
+  no second `FsStore` open (so no `BlobError::Locked`), no session cycle, zero
+  `ConnEvent` disconnects. Pair with `build_file_shared` + `Node::publish` to
+  announce the reference. A node spawned without a `BlobServeConfig` returns
+  the new `BlobError::NotServing`. Purely additive; existing `Node` methods and
+  the exclusive-lock model are unchanged.
+- Added `Node::room_events() -> broadcast::Receiver<StoredEvent>` (issue #83 /
+  IR-0307, `experimental::session`): a live push stream of every event accepted
+  into the room's store — own publish, peer sync, and delayed park-promotion
+  all emit here exactly once, so a long-running consumer (e.g. a resident
+  daemon driving a UI) no longer has to poll `room_tail`. Lossy on lag like
+  `conn_events` (`RecvError::Lagged`, resync via `room_tail` + a seen-set —
+  see the method's doc comment for the recipe). Purely additive; existing
+  `Node` methods are unchanged.
 - Added `examples/example_agent/` (issue #39 / IR-0304): a minimal, runnable
   example agent driven by real command-line arguments — the adapt-me-as-a-
   template evolution of `07_agent_status.rs` — plus a co-located `README.md`
   and a gated integration test. Docs-and-examples only; no SDK surface change.
+- Added `JoinBootstrapAdmission::new_dynamic` (issue #88, `experimental::session`):
+  the join-bootstrap window (`accept_joins`) can now be read from a shared
+  `Arc<AtomicBool>` on every `authorize()` call instead of being fixed at
+  construction, so a long-running host (e.g. a resident daemon) can gate
+  provisional admission on pending invites without respawning its `Node`.
+  Purely additive — `new` and its fixed-`bool` semantics are unchanged, and
+  `new_dynamic` is observationally identical to `new` for any fixed flag
+  value.
 
 ## 0.1.0 — initial surface (IR-0301)
 

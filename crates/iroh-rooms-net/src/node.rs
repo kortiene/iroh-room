@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::admission::{Admission, AdmissionView};
 use crate::audit::AuditSink;
-use crate::blob::{self, BlobAclView, BlobStore, FetchOutcome};
+use crate::blob::{self, BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
 use crate::manager::PeerManager;
 use crate::peer::peer_id;
 use crate::pipe::alpn::{PIPE_ALPN, PIPE_ALPN_STR};
@@ -47,7 +47,8 @@ use crate::pipe::registry::is_loopback_target;
 use crate::pipe::runtime::PipeQueryMsg;
 use crate::pipe::{
     connector, new_pipe_id, watcher, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder,
-    PipeHandlerState, PipeProtocolHandler, PipeQuery, PipeRegistry, PipeSessions, TracingPipeAudit,
+    PipeHandlerState, PipeProtocolHandler, PipeQuery, PipeRegistry, PipeSessionInfo, PipeSessions,
+    TracingPipeAudit,
 };
 use crate::state::{ConnEvent, PeerConnState, PeerEntry};
 use crate::transport::{Inbound, NetConfig, NetTransport, Shared};
@@ -188,6 +189,10 @@ pub struct Node {
     blob_store: Option<BlobStore>,
     /// The blob-plane serve gate's decision loop, aborted on [`Node::shutdown`].
     blob_gate: Option<JoinHandle<()>>,
+    /// Broadcasts every event the engine accepts (issue #83 / IR-0307). Lives
+    /// here (not `Shared`/`PeerTable`) because room events are engine-scoped,
+    /// drained where the engine is driven — not a transport/peer concern.
+    room_event_tx: broadcast::Sender<StoredEvent>,
 }
 
 impl Node {
@@ -299,7 +304,7 @@ impl Node {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one wiring seam; each arg is a distinct input
     async fn spawn_inner(
         secret: SecretKey,
         admission: Arc<dyn Admission>,
@@ -354,6 +359,9 @@ impl Node {
             None => (None, None, None, None),
         };
 
+        // Created before `cfg` is consumed by `bind` below (issue #83 / IR-0307).
+        let (room_event_tx, _) = broadcast::channel::<StoredEvent>(cfg.room_event_capacity);
+
         let mut transport = NetTransport::bind(
             secret,
             admission,
@@ -406,6 +414,7 @@ impl Node {
             pipe_query_rx,
             tick,
             room_reconciler,
+            room_event_tx.clone(),
         ));
 
         // The teardown-on-learn watcher (spec §4.5/D5): re-evaluates every live pipe
@@ -430,6 +439,7 @@ impl Node {
             pipe_watcher,
             blob_store,
             blob_gate,
+            room_event_tx,
         })
     }
 
@@ -481,6 +491,44 @@ impl Node {
     #[must_use]
     pub fn conn_events(&self) -> broadcast::Receiver<ConnEvent> {
         self.transport.conn_events()
+    }
+
+    /// Subscribe to the live stream of events accepted into this room's store —
+    /// every event validated + inserted via local publish OR remote sync, emitted
+    /// exactly once after insert (issue #83 / IR-0307).
+    ///
+    /// # Semantics
+    /// - **Exactly once per stored event.** A duplicate re-see (same `event_id`)
+    ///   is idempotent and never re-emitted.
+    /// - **Lossy on lag.** This is a bounded `broadcast` (capacity
+    ///   `NetConfig::room_event_capacity`, default 256). A subscriber that falls
+    ///   behind receives `RecvError::Lagged(n)` and MUST resync — the events it
+    ///   missed are gone from this channel.
+    /// - **Not ordered by Lamport.** Emission order follows insertion order at the
+    ///   engine choke point. A park-promotion cascade emits the directly-accepted
+    ///   trigger first, then its promoted descendants in engine-iteration order —
+    ///   NOT causal order. Use `StoredEvent.lamport` if you need a total order.
+    ///
+    /// # Reconcile recipe (on `Lagged`)
+    /// ```ignore
+    /// let mut rx = node.room_events();
+    /// let mut seen = HashSet::new();
+    /// loop {
+    ///     match rx.recv().await {
+    ///         Ok(ev) => { if seen.insert(ev.event_id) { handle(ev); } }
+    ///         Err(RecvError::Lagged(_)) => {
+    ///             // Rebuild from the authoritative tail, dedupe against `seen`.
+    ///             for ev in node.room_tail(u32::MAX).await? {
+    ///                 if seen.insert(ev.event_id) { handle(ev); }
+    ///             }
+    ///         }
+    ///         Err(RecvError::Closed) => break,
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn room_events(&self) -> broadcast::Receiver<StoredEvent> {
+        self.room_event_tx.subscribe()
     }
 
     /// Per-peer live path classification (direct/relay/mixed/none) + relay url (spec
@@ -807,10 +855,31 @@ impl Node {
     }
 
     /// The number of live pipe sessions currently being forwarded (observability /
-    /// tests for the teardown path).
+    /// tests for the teardown path). For a per-pipe count, see
+    /// [`Node::live_pipe_sessions_for`].
     #[must_use]
     pub fn live_pipe_sessions(&self) -> usize {
         self.pipe_sessions.len()
+    }
+
+    /// Count of live forwarding sessions for one exposed `pipe_id` (issue #86).
+    ///
+    /// Unlike [`Node::live_pipe_sessions`] (node-wide across every exposed pipe),
+    /// this attributes sessions to a single pipe, so an owner exposing more than one
+    /// pipe can render an accurate per-pipe "connected" indicator. `0` for an
+    /// unknown / never-connected pipe.
+    #[must_use]
+    pub fn live_pipe_sessions_for(&self, pipe_id: [u8; 16]) -> usize {
+        self.pipe_sessions.count_for(&pipe_id)
+    }
+
+    /// Per-session detail for every live forwarding session this node owns (issue
+    /// #86): `(pipe_id, connecting device, since)`. A point-in-time snapshot in
+    /// unspecified order — sort by `pipe_id`/`since_ms` for display. Resolve
+    /// `device` to a member identity via [`Node::snapshot`] if needed.
+    #[must_use]
+    pub fn pipe_session_info(&self) -> Vec<PipeSessionInfo> {
+        self.pipe_sessions.info()
     }
 
     /// **Fetch** `hash` from `provider_addr` over the blobs ALPN on this node's
@@ -833,6 +902,47 @@ impl Node {
             timeout,
         )
         .await
+    }
+
+    /// Import a file into the durable store this session already owns (issue #84 /
+    /// IR-0308), returning the verified content ref. Unlike the CLI's
+    /// open→import→close, this reuses the live session's store handle: no second
+    /// `FsStore` open (so no [`BlobError::Locked`]) and **no session cycle** — the
+    /// endpoint, engine pump, and every peer link stay up (zero `ConnEvent` churn).
+    ///
+    /// Pair with `build_file_shared` + [`Node::publish`] to announce the reference;
+    /// the serve ACL's Gate 2 begins allowing the new hash on the next fold drive.
+    /// Import **before** publish — publishing first would briefly reference a hash
+    /// the store doesn't hold yet.
+    ///
+    /// # Errors
+    /// [`BlobError::NotServing`] if this session opened no blob store (spawned
+    /// without a `BlobServeConfig`); otherwise the `import_path` errors (`Import`,
+    /// `Read`, `HashMismatch`).
+    pub async fn blob_import(&self, path: &Path) -> Result<BlobImport, BlobError> {
+        self.blob_store
+            .as_ref()
+            .ok_or(BlobError::NotServing)?
+            .import_path(path)
+            .await
+    }
+
+    /// [`Node::blob_import`] from in-memory bytes — re-provide fetched bytes
+    /// in-session so a long-running consumer becomes a provider without restarting.
+    /// After a `fetch_file` that returned `(FetchOutcome::Fetched, Some(bytes))`, the
+    /// bytes' hash is already the one the `file.shared` references, so once imported
+    /// this node serves it immediately (Gate 2 already allows the referenced hash;
+    /// no new `file.shared`, no reconcile needed).
+    ///
+    /// # Errors
+    /// [`BlobError::NotServing`] if this session opened no blob store; otherwise the
+    /// `import_bytes` errors (`Import`, `HashMismatch`).
+    pub async fn blob_import_bytes(&self, bytes: Bytes) -> Result<BlobImport, BlobError> {
+        self.blob_store
+            .as_ref()
+            .ok_or(BlobError::NotServing)?
+            .import_bytes(bytes)
+            .await
     }
 
     /// Gracefully stop: drain the pump, stop the pipe watcher, stop serving blobs
@@ -912,6 +1022,7 @@ async fn pump(
     mut pipe_query_rx: mpsc::UnboundedReceiver<PipeQueryMsg>,
     tick: Duration,
     mut room: Option<RoomReconciler>,
+    room_event_tx: broadcast::Sender<StoredEvent>,
 ) {
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -927,7 +1038,7 @@ async fn pump(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
-                if handle_cmd(&mut engine, &shared, &mut room, cmd) {
+                if handle_cmd(&mut engine, &shared, &mut room, cmd, &room_event_tx) {
                     break;
                 }
             }
@@ -984,6 +1095,9 @@ async fn pump(
                                     shared.audit.event_flagged(d, code);
                                 }
                             }
+                            // Push-subscription feed (issue #83): peer-sync + any
+                            // park-promotion this message triggered.
+                            drain_room_events(&mut engine, &room_event_tx);
                             if provisional {
                                 // Upgrade-on-learn: if that frame was the join the
                                 // fold accepted, the peer is now an Active member —
@@ -1014,6 +1128,9 @@ async fn pump(
             _ = ticker.tick() => {
                 let outs = engine.on_tick(now_ms());
                 route_all(&shared, outs);
+                // Push-subscription feed (issue #83): `on_tick` also drives
+                // `wake_park`, so park-promotions surface here.
+                drain_room_events(&mut engine, &room_event_tx);
                 // The anti-entropy cadence doubles as the roster-reactive reconcile
                 // trigger (spec §4.3): bounded ≤1-tick latency to react to a change.
                 if let Some(room) = room.as_mut() {
@@ -1030,6 +1147,7 @@ fn handle_cmd(
     shared: &Arc<Shared>,
     room: &mut Option<RoomReconciler>,
     cmd: Cmd,
+    room_event_tx: &broadcast::Sender<StoredEvent>,
 ) -> bool {
     match cmd {
         Cmd::Publish(bytes, reply) => {
@@ -1040,6 +1158,9 @@ fn handle_cmd(
                 }
                 Err(err) => Err(err.to_string()),
             };
+            // Push-subscription feed (issue #83): own publish + any park-promotion
+            // it triggered.
+            drain_room_events(engine, room_event_tx);
             // A publish can advance membership (e.g. an admin `member.removed`):
             // reconcile the dial set + admission against the new snapshot.
             if let Some(room) = room.as_mut() {
@@ -1092,6 +1213,16 @@ fn handle_cmd(
             let _ = reply.send(());
             true
         }
+    }
+}
+
+/// Fan out every event the engine accepted since the last drain onto the
+/// `room_events` broadcast (issue #83 / IR-0307). A `send` error means no
+/// live subscriber — expected and ignored; a lagging subscriber is dropped
+/// frames on the receiver, not an error here.
+fn drain_room_events(engine: &mut SyncEngine, tx: &broadcast::Sender<StoredEvent>) {
+    for ev in engine.take_ingested() {
+        let _ = tx.send(ev);
     }
 }
 
@@ -1196,4 +1327,154 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Tests for the private [`drain_room_events`] helper (issue #83 / IR-0307) — a
+/// real [`SyncEngine`] over `open_in_memory`, but a bare `broadcast::channel`, no
+/// endpoint/QUIC/tokio runtime: `try_recv` is sync, so these run as plain `#[test]`.
+#[cfg(test)]
+mod room_events_pump_tests {
+    use iroh_rooms_core::event::ids::{EventId, RoomId};
+    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms_core::sync::SyncConfig;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::{drain_room_events, StoredEvent, SyncEngine};
+    use crate::demo;
+
+    /// A fresh engine seeded with only genesis, plus the host/room/genesis-id
+    /// needed to author further admin messages. Lets a test publish in distinct
+    /// phases (drain, subscribe, publish more, drain) so the live-tap contract of
+    /// `Node::room_events` can be exercised without any network.
+    fn engine_and_author() -> (SyncEngine, demo::Participant, RoomId, EventId) {
+        let host = demo::Participant::new(0x01);
+        let (room, genesis_id, genesis_wire) = demo::genesis(&host);
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        engine.publish(&genesis_wire).expect("publish genesis");
+        (engine, host, room, genesis_id)
+    }
+
+    /// A fresh engine seeded with a genesis + `n` admin-authored chat messages
+    /// (each a distinct sibling of genesis, so every one is directly `Accepted` —
+    /// no park/promotion needed to exercise the drain).
+    fn engine_with_chain(n: u8) -> SyncEngine {
+        let (mut engine, host, room, genesis_id) = engine_and_author();
+        for i in 0..n {
+            let (_, wire) = demo::admin_message(&host, room, genesis_id, i);
+            engine.publish(&wire).expect("publish admin message");
+        }
+        engine
+    }
+
+    #[test]
+    fn drain_forwards_in_order_and_is_destructive() {
+        let mut engine = engine_with_chain(3);
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<StoredEvent>(16);
+
+        drain_room_events(&mut engine, &tx);
+
+        // genesis + 3 admin messages, in acceptance order.
+        let mut received = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            received.push(ev);
+        }
+        assert_eq!(received.len(), 4, "genesis + 3 chat messages, each once");
+
+        // A second drain with nothing newly accepted must forward nothing.
+        drain_room_events(&mut engine, &tx);
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "a second drain must be empty (destructive take)"
+        );
+    }
+
+    #[test]
+    fn drain_no_subscriber_does_not_panic() {
+        let mut engine = engine_with_chain(1);
+        let (tx, rx) = tokio::sync::broadcast::channel::<StoredEvent>(16);
+        drop(rx);
+
+        // `tx.send` errors with no live receiver; must be silently ignored (R7).
+        drain_room_events(&mut engine, &tx);
+    }
+
+    #[test]
+    fn drain_lagged_then_recovers() {
+        // genesis + 4 admin messages = 5 accepted events.
+        let mut engine = engine_with_chain(4);
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<StoredEvent>(2);
+
+        drain_room_events(&mut engine, &tx);
+
+        // tokio broadcast does not round capacity: with cap 2 and 5 sent while
+        // subscribed from the start, the receiver lags by exactly 3.
+        match rx.try_recv() {
+            Err(TryRecvError::Lagged(n)) => assert_eq!(n, 3, "exact lag count, not rounded"),
+            other => panic!("expected Lagged(3), got {other:?}"),
+        }
+        // The two most recent events are still there to recover.
+        assert!(rx.try_recv().is_ok(), "first surviving event after lag");
+        assert!(rx.try_recv().is_ok(), "second surviving event after lag");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn drain_does_not_replay_to_a_late_subscriber() {
+        // Live-tap contract (`Node::room_events` doc): a subscriber receives only
+        // events drained *after* it subscribes. Events fanned out before it
+        // subscribed are gone from this channel — the reason a `Lagged` consumer
+        // must rebuild from `room_tail`, and why the e2e subscribes before the
+        // first publish. Proven here with no network.
+        let (mut engine, host, room, genesis_id) = engine_and_author();
+        let (tx, _) = tokio::sync::broadcast::channel::<StoredEvent>(16);
+
+        // Genesis is drained with no live subscriber — discarded, not buffered.
+        drain_room_events(&mut engine, &tx);
+
+        // Subscribe, then author + accept one more event and drain it.
+        let mut late = tx.subscribe();
+        let (msg_id, wire) = demo::admin_message(&host, room, genesis_id, 0);
+        engine
+            .publish(&wire)
+            .expect("publish post-subscribe message");
+        drain_room_events(&mut engine, &tx);
+
+        let ev = late
+            .try_recv()
+            .expect("late subscriber must receive the post-subscribe event");
+        assert_eq!(
+            ev.event_id, msg_id,
+            "a late subscriber sees only events drained after it subscribed"
+        );
+        assert_eq!(
+            late.try_recv(),
+            Err(TryRecvError::Empty),
+            "genesis (drained before subscribe) must never be replayed"
+        );
+    }
+
+    #[test]
+    fn drain_fans_out_to_every_live_subscriber() {
+        // A daemon may open several `room_events()` receivers (e.g. one per UI
+        // client); a single drain must deliver its own copy of every event to
+        // each live subscriber.
+        let mut engine = engine_with_chain(2); // genesis + 2 messages = 3 events
+        let (tx, mut rx1) = tokio::sync::broadcast::channel::<StoredEvent>(16);
+        let mut rx2 = tx.subscribe();
+
+        drain_room_events(&mut engine, &tx);
+
+        for (label, rx) in [("rx1", &mut rx1), ("rx2", &mut rx2)] {
+            let mut n = 0;
+            while rx.try_recv().is_ok() {
+                n += 1;
+            }
+            assert_eq!(
+                n, 3,
+                "{label} must receive its own copy of all three events"
+            );
+        }
+    }
 }

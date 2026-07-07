@@ -34,8 +34,9 @@ mod schema;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::event::cbor::{self, CborValue};
 use crate::event::constants::DIGEST_LEN;
@@ -55,40 +56,122 @@ type RawId = [u8; DIGEST_LEN];
 /// The `events` columns a [`StoredEvent`] is built from, in select order.
 const STORED_COLS: &str = "event_id, wire, room_id, event_type, lamport, admin_seq";
 
+/// Connection configuration for [`EventStore::open_with`] /
+/// [`EventStore::open_in_memory_with`].
+///
+/// `busy_timeout` controls how long a writer waits for a competing writer's
+/// lock before failing with `SQLITE_BUSY` (issue #85). `Some(d)` installs a `d`
+/// busy timeout; `None` opts out and fails fast on any lock collision.
+///
+/// Note: `rusqlite` (bundled `SQLite`) pre-installs a 5000ms `busy_timeout` on
+/// every `Connection::open`/`open_in_memory`, so `None` must actively *clear*
+/// that default (`sqlite3_busy_timeout(db, 0)`) rather than merely skip setting
+/// one — [`EventStore::open_with`] does this unconditionally.
+///
+/// `#[non_exhaustive]` so future knobs are additive, but that also means a
+/// crate other than this one (e.g. the SDK façade, or an embedder like
+/// Bantaba) cannot build a non-default value with struct-literal syntax —
+/// not even `StoreOptions { busy_timeout: Some(d), ..Default::default() }`,
+/// since `non_exhaustive` rejects *any* named-field struct expression from
+/// outside the defining crate. [`StoreOptions::new`] is the constructor that
+/// keeps the hook actually reachable from downstream crates.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StoreOptions {
+    pub busy_timeout: Option<Duration>,
+}
+
+impl StoreOptions {
+    /// Build options with an explicit `busy_timeout` (see the field doc for
+    /// what `None` does).
+    #[must_use]
+    pub fn new(busy_timeout: Option<Duration>) -> Self {
+        Self { busy_timeout }
+    }
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            busy_timeout: Some(Duration::from_secs(5)),
+        }
+    }
+}
+
 /// A synchronous, `rusqlite`-backed local event store.
 ///
-/// Wraps a single [`Connection`]. Writes go through a transaction; reads use the
-/// connection's prepared-statement cache. Not `Sync`; share across threads behind
-/// your own `Mutex` if needed (spec §10, multi-connection pooling is future work).
+/// Wraps a single [`Connection`]. Write transactions use `BEGIN IMMEDIATE`
+/// (rather than the rusqlite default `BEGIN DEFERRED`), so a colliding writer
+/// waits (bounded by the connection's `busy_timeout`, see [`StoreOptions`])
+/// instead of failing with an un-retryable lock-upgrade `SQLITE_BUSY`. Reads use
+/// the connection's prepared-statement cache. Not `Sync`; share across threads
+/// behind your own `Mutex` if needed — opening multiple `EventStore` connections
+/// onto the same file is the supported way to get concurrent writers today
+/// (spec §10, multi-connection pooling is future work).
 pub struct EventStore {
     conn: Connection,
 }
 
 impl EventStore {
-    /// Open (creating if absent) a store at `path`, applying pragmas and the
+    /// Open (creating if absent) a store at `path` with the default
+    /// [`StoreOptions`] (a 5000ms `busy_timeout`), applying pragmas and the
     /// idempotent schema migration.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened, or
     /// [`StoreError::Migration`] if it carries a newer unknown schema version.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        Self::open_with(path, &StoreOptions::default())
     }
 
-    /// Open a private in-memory store (tests / ephemeral derivations).
+    /// Open (creating if absent) a store at `path` with explicit [`StoreOptions`].
+    ///
+    /// # Errors
+    /// As [`EventStore::open`].
+    pub fn open_with(path: &Path, opts: &StoreOptions) -> Result<Self, StoreError> {
+        let conn = Connection::open(path)?;
+        Self::from_connection_with(conn, opts)
+    }
+
+    /// Open a private in-memory store (tests / ephemeral derivations) with the
+    /// default [`StoreOptions`].
     ///
     /// # Errors
     /// As [`EventStore::open`].
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        Self::open_in_memory_with(&StoreOptions::default())
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+    /// Open a private in-memory store with explicit [`StoreOptions`].
+    ///
+    /// # Errors
+    /// As [`EventStore::open`].
+    pub fn open_in_memory_with(opts: &StoreOptions) -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        Self::from_connection_with(conn, opts)
+    }
+
+    fn from_connection_with(conn: Connection, opts: &StoreOptions) -> Result<Self, StoreError> {
         schema::apply_pragmas(&conn)?;
+        // Unconditional: rusqlite pre-installs a 5000ms busy_timeout on open, so a
+        // conditional `if let Some(d) = ...` would leave that default in place and
+        // make `busy_timeout: None` a silent no-op instead of a real fail-fast
+        // opt-out. `Duration::ZERO` clears the handler (`sqlite3_busy_timeout(db, 0)`).
+        conn.busy_timeout(opts.busy_timeout.unwrap_or(Duration::ZERO))?;
         schema::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Begin a write transaction that grabs the write lock up front
+    /// (`BEGIN IMMEDIATE`), so a colliding writer *waits* (bounded by the
+    /// connection's `busy_timeout`) instead of failing with `SQLITE_BUSY`, and
+    /// read-then-write bodies (e.g. [`EventStore::append_trust_decision`]) never
+    /// hit the un-retryable lock-upgrade deadlock a `BEGIN DEFERRED` transaction
+    /// can hit under concurrent writers (issue #85).
+    fn begin_write(&mut self) -> Result<rusqlite::Transaction<'_>, StoreError> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
 
     // -- write path -----------------------------------------------------------
@@ -104,7 +187,7 @@ impl EventStore {
     /// [`StoreError::Integrity`] if `BLAKE3(wire.signed) != ev.event_id` (a caller
     /// passed a mismatched id/bytes pair); [`StoreError::Sqlite`] on a DB error.
     pub fn insert(&mut self, ev: &ValidatedEvent) -> Result<InsertOutcome, StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         let outcome = insert_in_tx(&tx, ev)?;
         tx.commit()?;
         Ok(outcome)
@@ -116,7 +199,7 @@ impl EventStore {
     /// # Errors
     /// As [`EventStore::insert`]; the whole batch rolls back on the first error.
     pub fn insert_all(&mut self, evs: &[ValidatedEvent]) -> Result<InsertStats, StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         let mut stats = InsertStats::default();
         for ev in evs {
             stats.record(insert_in_tx(&tx, ev)?);
@@ -389,7 +472,7 @@ impl EventStore {
     /// [`StoreError::Integrity`] if a recomputed id disagrees with its key, or
     /// [`StoreError::Sqlite`] on a DB error. Never panics on stored bytes.
     pub fn rebuild(&mut self) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         rebuild_in_tx(&tx)?;
         tx.commit()?;
         Ok(())
@@ -469,7 +552,7 @@ impl EventStore {
             ),
             None => (None, None, 0_i64),
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         tx.prepare_cached(
             "INSERT INTO sync_state \
                 (room_id, chat_cursor_lamport, chat_cursor_event, \
@@ -531,7 +614,7 @@ impl EventStore {
         room: &RoomId,
         tokens: &BTreeMap<IdentityKey, u32>,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         tx.execute(
             "DELETE FROM sync_backfill_tokens WHERE room_id = ?1",
             params![&room.as_bytes()[..]],
@@ -622,7 +705,7 @@ impl EventStore {
     /// `park_seq` exceeds the `SQLite` INTEGER range.
     pub fn upsert_parked(&mut self, room: &RoomId, row: &ParkedRow) -> Result<(), StoreError> {
         let park_seq = u64_to_sql(row.park_seq)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         tx.prepare_cached(
             "INSERT INTO sync_parked (room_id, event_id, wire, author_id, park_seq, depth) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -723,7 +806,7 @@ impl EventStore {
         let admin_seq = row.admin_seq.map(u64_to_sql).transpose()?;
         let created_at = u64_to_sql(row.created_at)?;
         let event_ids = encode_id_array(&row.event_ids);
-        let tx = self.conn.transaction()?;
+        let tx = self.begin_write()?;
         let next: i64 = tx
             .prepare_cached(
                 "SELECT COALESCE(MAX(seq) + 1, 0) FROM trust_decisions WHERE room_id = ?1",

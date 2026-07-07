@@ -74,6 +74,14 @@ fn wire(ev: &SignedEvent, dev: &SigningKey) -> Vec<u8> {
     WireEvent::seal(csb, sig).to_bytes()
 }
 
+/// Recompute the dedup `EventId` of a raw wire frame the same way the validator
+/// does (decode transport, hash the canonical signed bytes) — used by the
+/// `take_ingested` tests to identify which `StoredEvent` came out of a drain.
+fn frame_event_id(bytes: &[u8]) -> EventId {
+    let wire = WireEvent::decode(bytes).expect("decode wire frame");
+    signed::event_id_from_bytes(&wire.signed)
+}
+
 /// A built room log: causally-ordered wire frames + the cast for assertions.
 struct Built {
     room: RoomId,
@@ -1321,5 +1329,218 @@ fn room_tail_returns_empty_on_fresh_engine() {
     assert!(
         tail.is_empty(),
         "fresh engine with no seeded events must return an empty tail"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `take_ingested` — the push-subscription feed (issue #83 / IR-0307)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn take_ingested_emits_on_own_publish() {
+    let built = build_log(2, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    for frame in &built.events {
+        engine.publish(frame).expect("seed publish");
+    }
+
+    let ingested = engine.take_ingested();
+    assert_eq!(
+        ingested.len(),
+        built.events.len(),
+        "every accepted event must appear exactly once"
+    );
+    // publish order == emission order when nothing parks.
+    for (se, frame) in ingested.iter().zip(built.events.iter()) {
+        assert_eq!(
+            se.event_id,
+            frame_event_id(frame),
+            "take_ingested must preserve publish order"
+        );
+    }
+}
+
+#[test]
+fn take_ingested_skips_duplicates() {
+    let built = build_log(0, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    engine.publish(&built.events[0]).expect("publish genesis");
+    assert_eq!(engine.take_ingested().len(), 1, "genesis emits once");
+
+    // Re-deliver the already-stored genesis frame: a Duplicate re-see must never
+    // reach the emit point (exactly-once).
+    engine
+        .publish(&built.events[0])
+        .expect("re-publish genesis");
+    assert!(
+        engine.take_ingested().is_empty(),
+        "a duplicate re-see must not re-emit"
+    );
+}
+
+#[test]
+fn take_ingested_is_destructive() {
+    let built = build_log(0, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    engine.publish(&built.events[0]).expect("publish genesis");
+    let first = engine.take_ingested();
+    assert_eq!(first.len(), 1, "first drain gets the genesis event");
+
+    engine
+        .publish(&built.events[1])
+        .expect("publish invite_bob");
+    let second = engine.take_ingested();
+    assert_eq!(
+        second.len(),
+        1,
+        "second drain must contain only events accepted since the first drain"
+    );
+
+    assert!(
+        engine.take_ingested().is_empty(),
+        "a third drain with nothing new accepted must be empty"
+    );
+}
+
+#[test]
+fn take_ingested_emits_on_park_promotion() {
+    let built = build_log(0, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    // Genesis must be pre-published so alice is already a known admin: only then
+    // does the admin-authored `inv_carol` (parked below) survive the §6.2
+    // signer-plausibility pre-gate instead of being dropped outright.
+    engine.publish(&built.events[0]).expect("publish genesis");
+    let _ = engine.take_ingested();
+
+    // Deliver inv_carol (admin event, parent = inv_bob) before inv_bob lands: it
+    // must park, not drop or insert.
+    let inv_carol_id = frame_event_id(&built.events[3]);
+    engine
+        .publish(&built.events[3])
+        .expect("publish inv_carol (parks)");
+    assert_eq!(engine.parked_len(), 1, "inv_carol buffered pending inv_bob");
+    assert!(
+        engine.take_ingested().is_empty(),
+        "nothing is inserted while a frame is only parked"
+    );
+
+    // Deliver inv_bob: directly accepted (its parent, genesis, is present) and
+    // triggers wake_park, which promotes the parked inv_carol in the same drive.
+    let inv_bob_id = frame_event_id(&built.events[1]);
+    engine.publish(&built.events[1]).expect("publish inv_bob");
+
+    assert_eq!(engine.parked_len(), 0, "park fully drained by wake_park");
+    let ingested = engine.take_ingested();
+    assert_eq!(
+        ingested.len(),
+        2,
+        "both the trigger and its promoted descendant must appear, exactly once"
+    );
+    // Set-membership + exactly-once hold; strict causal ordering does not (§6.2).
+    let ids: std::collections::BTreeSet<_> = ingested.iter().map(|se| se.event_id).collect();
+    assert_eq!(
+        ids,
+        std::collections::BTreeSet::from([inv_bob_id, inv_carol_id]),
+        "both events must appear as a set"
+    );
+    assert_eq!(
+        ingested[0].event_id, inv_bob_id,
+        "the directly-accepted trigger must be recorded first"
+    );
+}
+
+#[test]
+fn take_ingested_emits_on_peer_sync() {
+    // AC-1 second ingest path: the existing `take_ingested_*` tests all drive
+    // `publish` (`from = None`); this proves an event arriving over the wire via
+    // `ingest_frame` (`from = Some(peer)`) is surfaced too — the daemon's actual
+    // motivation, a peer's message landing on the push feed as it is ingested.
+    // build_log(1, false): 5 membership events + 1 MessageText from bob (events[5]).
+    let built = build_log(1, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    // Seed the 5 membership events via own-publish so bob is an active member,
+    // then drain — we assert only on the frame that arrives from a peer next.
+    for frame in &built.events[..5] {
+        engine.publish(frame).expect("seed membership");
+    }
+    let _ = engine.take_ingested();
+
+    // Bob's chat arrives over the wire; its parent (join_bob) is already present,
+    // so it is directly Accepted → inserted → emitted on the ingest feed.
+    let chat = &built.events[5];
+    let chat_id = frame_event_id(chat);
+    let _ = engine.ingest_frame(NODE_B, chat);
+
+    let ingested = engine.take_ingested();
+    assert_eq!(
+        ingested.len(),
+        1,
+        "the peer-delivered event is emitted exactly once"
+    );
+    assert_eq!(
+        ingested[0].event_id, chat_id,
+        "take_ingested must surface the event ingested over the wire (peer-sync path)"
+    );
+}
+
+#[test]
+fn take_ingested_skips_peer_delivered_duplicate() {
+    // Exactly-once across the peer path: a peer re-delivering an event the store
+    // already holds takes the `InsertOutcome::Duplicate` arm, which never reaches
+    // the emit point. This is the concrete de-dupe the issue calls out (peers
+    // re-advertising), complementing `take_ingested_skips_duplicates` (re-publish).
+    let built = build_log(0, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    engine.publish(&built.events[0]).expect("publish genesis");
+    engine
+        .publish(&built.events[1])
+        .expect("publish invite_bob");
+    let _ = engine.take_ingested();
+
+    let dups_before = engine.counters().duplicates;
+    let _ = engine.ingest_frame(NODE_B, &built.events[1]);
+
+    assert!(
+        engine.take_ingested().is_empty(),
+        "a peer re-delivering a stored event must not re-emit"
+    );
+    assert_eq!(
+        engine.counters().duplicates,
+        dups_before + 1,
+        "the re-see took the Duplicate arm (exactly-once for free)"
+    );
+}
+
+#[test]
+fn take_ingested_never_emits_a_dropped_frame() {
+    // Security (§10): "no event that fails validation, is parked, or is rejected
+    // ever reaches a subscriber." Here bob's chat is delivered with only genesis
+    // seeded, so bob is not yet a member and the frame (parent join_bob missing →
+    // would_buffer) is dropped at the anti-amplification signer pre-gate — never
+    // folded, never stored, and therefore never emitted on the ingest feed.
+    // build_log(1, false): events[5] is bob's chat.
+    let built = build_log(1, false);
+    let mut engine = fresh_engine(built.room, SyncConfig::default());
+
+    engine.publish(&built.events[0]).expect("seed genesis");
+    let _ = engine.take_ingested();
+
+    let chat = &built.events[built.events.len() - 1];
+    let _ = engine.ingest_frame(NODE_A, chat);
+
+    assert_eq!(
+        engine.counters().signer_dropped,
+        1,
+        "chat from a non-member is dropped at the signer pre-gate"
+    );
+    assert!(
+        engine.take_ingested().is_empty(),
+        "a dropped frame must never appear on the ingest feed"
     );
 }

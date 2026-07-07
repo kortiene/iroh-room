@@ -60,7 +60,7 @@ separate command list to keep in sync here (single source of truth).
 | Integration (CI tier) | `cargo test -p iroh-rooms-cli --test two_peer_e2e` / `--test full_demo_e2e` | deterministic, network-free backbone |
 | Blob verification | `cargo test -p iroh-rooms-net --test blob_e2e --test file_e2e` + `cargo test -p iroh-rooms-cli --test file_cli` | BLAKE3-256 verify, two-gate ACL, hash-mismatch hard stop |
 | Agent flow (CI tier) | `cargo test -p iroh-rooms-cli --test agent_cli --test agent_invite_flow` | offline matrix + ticket-rejection legs |
-| SDK surface (incl. real-loopback façade) | `cargo test -p iroh-rooms --doc` + `cargo build -p iroh-rooms --examples` + `cargo test -p iroh-rooms --test facade_e2e --features experimental` | façade doctests, example builds, and `facade_e2e.rs`'s two real-QUIC-loopback tests — these are **not** `#[ignore]`-gated, so `--all-features` below already runs them |
+| SDK surface (incl. real-loopback façade) | `cargo test -p iroh-rooms --doc` + `cargo build -p iroh-rooms --examples` + `cargo test -p iroh-rooms --test facade_e2e --features experimental` | façade doctests, example builds, and `facade_e2e.rs`'s four real-QUIC-loopback tests — these are **not** `#[ignore]`-gated, so `--all-features` below already runs them |
 | Full workspace | `cargo test --workspace --all-targets --all-features` | superset that also runs pipe/manager/store/sync suites and `facade_e2e.rs` |
 
 ### P0 — gated online tiers (loopback)
