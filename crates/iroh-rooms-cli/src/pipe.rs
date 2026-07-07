@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn local_pipe_audit_persists_ndjson_events() {
-        use iroh::SecretKey;
+        use iroh_rooms::experimental::session::SecretKey;
         let home = tempdir().unwrap();
         let persistent = PersistentAudit::open(home.path()).unwrap();
         let sink = LocalPipeAudit::new(false, persistent);
