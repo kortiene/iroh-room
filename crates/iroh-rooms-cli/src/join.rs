@@ -165,10 +165,11 @@ pub async fn join(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn(
         secret_key,
         Arc::new(admission),
-        Arc::new(audit::StderrAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,

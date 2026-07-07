@@ -42,9 +42,7 @@ use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
 use iroh_rooms_core::membership::Ingest;
 use iroh_rooms_core::store::{EventStore, StoredEvent};
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_net::{
-    BlobError, BlobStore, FetchOutcome, NetConfig, Node, TracingAudit, DEFAULT_TICK,
-};
+use iroh_rooms_net::{BlobError, BlobStore, FetchOutcome, NetConfig, Node, DEFAULT_TICK};
 use serde_json::json;
 
 use crate::error::{CodedResultExt, ErrorCode};
@@ -52,7 +50,7 @@ use crate::message::{
     build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
     select_heads, DB_FILE,
 };
-use crate::{clock, identity, paths};
+use crate::{audit, clock, identity, paths};
 
 /// Directory (under the data-directory home) rooting the durable blob store (spec
 /// §4.1 / §5.5). Lives inside the `0700` home; `file share` tightens it to `0700`.
@@ -521,10 +519,11 @@ pub async fn fetch(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(TracingAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,

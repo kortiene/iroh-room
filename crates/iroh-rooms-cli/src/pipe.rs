@@ -25,6 +25,7 @@ use iroh_rooms_net::pipe::is_loopback_target;
 use iroh_rooms_net::{
     NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome, DEFAULT_TICK,
 };
+use serde_json::json;
 
 use crate::error::CodedResultExt;
 use crate::message::{
@@ -142,17 +143,18 @@ pub async fn expose(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
-    // The owner installs a stderr pipe-audit sink so reject/teardown decisions are
-    // "locally logged" where the operator can see them (AC3 / §4.3); the CLI has no
-    // `tracing` subscriber, so the default sink would be silent.
+    // The owner installs a CLI-local pipe audit sink so reject/teardown decisions
+    // are locally logged both on stderr and in audit.ndjson (AC3 / §4.3); the CLI
+    // has no `tracing` subscriber, so the default sink would be silent.
+    let persistent_audit = audit::PersistentAudit::open(home)?;
     let node = Node::spawn_with_pipe_audit(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(audit::StderrAudit),
+        audit::sink_with(persistent_audit.clone()),
         engine,
         cfg,
         DEFAULT_TICK,
-        std::sync::Arc::new(StderrPipeAudit::new(verbose)),
+        std::sync::Arc::new(LocalPipeAudit::new(verbose, persistent_audit)),
     )
     .await
     .context("could not bring up the network node")?;
@@ -255,10 +257,11 @@ pub async fn connect(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(audit::StderrAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,
@@ -407,10 +410,11 @@ pub async fn close(
         mode: net_mode(loopback),
         ..NetConfig::default()
     };
+    let audit_sink = audit::sink(home)?;
     let node = Node::spawn(
         secret_key,
         std::sync::Arc::new(admission),
-        std::sync::Arc::new(audit::StderrAudit),
+        audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,
@@ -717,6 +721,86 @@ impl StderrPipeAudit {
     }
 }
 
+/// Pipe audit sink for the CLI: keeps the existing stderr vocabulary and persists
+/// the same decisions to the shared local audit log.
+struct LocalPipeAudit {
+    stderr: StderrPipeAudit,
+    persistent: audit::PersistentAudit,
+}
+
+impl LocalPipeAudit {
+    fn new(verbose: bool, persistent: audit::PersistentAudit) -> Self {
+        Self {
+            stderr: StderrPipeAudit::new(verbose),
+            persistent,
+        }
+    }
+}
+
+impl PipeAuditSink for LocalPipeAudit {
+    fn opened(&self, pipe_id: &[u8; 16], allowed: usize) {
+        self.persistent.record(
+            "pipe.opened",
+            json!({
+                "pipe": hex16(pipe_id),
+                "allowed": allowed,
+            }),
+        );
+        self.stderr.opened(pipe_id, allowed);
+    }
+
+    fn closed(&self, pipe_id: &[u8; 16], reason: &str) {
+        self.persistent.record(
+            "pipe.closed",
+            json!({
+                "pipe": hex16(pipe_id),
+                "reason": reason,
+            }),
+        );
+        self.stderr.closed(pipe_id, reason);
+    }
+
+    fn connect_accepted(&self, device: EndpointId, pipe_id: &[u8; 16]) {
+        self.persistent.record(
+            "pipe.connect.accepted",
+            json!({
+                "peer": device.to_string(),
+                "pipe": hex16(pipe_id),
+            }),
+        );
+        self.stderr.connect_accepted(device, pipe_id);
+    }
+
+    fn connect_rejected(
+        &self,
+        device: EndpointId,
+        pipe_id: Option<&[u8; 16]>,
+        cause: PipeDenyCause,
+    ) {
+        self.persistent.record(
+            "pipe.connect.rejected",
+            json!({
+                "peer": device.to_string(),
+                "pipe": pipe_id.map(hex16),
+                "cause": cause.code(),
+            }),
+        );
+        self.stderr.connect_rejected(device, pipe_id, cause);
+    }
+
+    fn torndown(&self, device: EndpointId, pipe_id: &[u8; 16], cause: PipeDenyCause) {
+        self.persistent.record(
+            "pipe.torndown",
+            json!({
+                "peer": device.to_string(),
+                "pipe": hex16(pipe_id),
+                "cause": cause.code(),
+            }),
+        );
+        self.stderr.torndown(device, pipe_id, cause);
+    }
+}
+
 impl PipeAuditSink for StderrPipeAudit {
     fn opened(&self, _pipe_id: &[u8; 16], _allowed: usize) {
         // `expose` prints its own richer `pipe_id:` / `allow:` summary on stdout.
@@ -764,7 +848,7 @@ impl PipeAuditSink for StderrPipeAudit {
 mod tests {
     use super::{
         hex16, parse_expires, parse_pipe_id, resolve_owner_addr, resolve_pipe_room, short_identity,
-        short_pipe, StderrPipeAudit,
+        short_pipe, LocalPipeAudit, StderrPipeAudit,
     };
 
     use iroh::EndpointAddr;
@@ -774,6 +858,10 @@ mod tests {
     use iroh_rooms_core::event::{build_pipe_opened, build_room_created};
     use iroh_rooms_core::store::EventStore;
     use iroh_rooms_net::{PipeAuditSink, PipeDenyCause};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use crate::audit::{PersistentAudit, AUDIT_LOG_FILE};
 
     const OWNER_IDENTITY_SEED: [u8; 32] = [0x50; 32];
     const OWNER_DEVICE_SEED: [u8; 32] = [0x51; 32];
@@ -985,6 +1073,34 @@ mod tests {
         let dummy_pipe: [u8; 16] = [0x42; 16];
         quiet.connect_accepted(dummy_device, &dummy_pipe);
         loud.connect_accepted(dummy_device, &dummy_pipe);
+    }
+
+    #[test]
+    fn local_pipe_audit_persists_ndjson_events() {
+        use iroh::SecretKey;
+        let home = tempdir().unwrap();
+        let persistent = PersistentAudit::open(home.path()).unwrap();
+        let sink = LocalPipeAudit::new(false, persistent);
+        let dummy_device = SecretKey::from_bytes(&[0u8; 32]).public();
+        let dummy_pipe: [u8; 16] = [0x42; 16];
+
+        sink.opened(&dummy_pipe, 2);
+        sink.connect_rejected(dummy_device, Some(&dummy_pipe), PipeDenyCause::NotAllowed);
+        sink.torndown(dummy_device, &dummy_pipe, PipeDenyCause::Closed);
+
+        let content = std::fs::read_to_string(home.path().join(AUDIT_LOG_FILE)).unwrap();
+        let lines = content
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines[0]["event"], "pipe.opened");
+        assert_eq!(lines[0]["allowed"], 2);
+        assert_eq!(lines[1]["event"], "pipe.connect.rejected");
+        assert_eq!(lines[1]["cause"], "not_allowed");
+        assert_eq!(lines[2]["event"], "pipe.torndown");
+        assert_eq!(lines[2]["cause"], "closed");
+        assert_eq!(lines[0]["pipe"], hex16(&dummy_pipe));
+        assert!(!content.contains("identity.secret"));
     }
 
     // ── parse_expires ─────────────────────────────────────────────────────────
