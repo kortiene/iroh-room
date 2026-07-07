@@ -89,9 +89,13 @@ fn room_id() -> RoomId {
     iroh_rooms_core::event::signed::derive_room_id(&alice.identity_key(), &ROOM_NONCE, T0)
 }
 
-fn validate_fixture_wire(wire: WireEvent) -> ValidatedEvent {
+fn validate_fixture_wire(wire: &WireEvent) -> ValidatedEvent {
     validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room_id()))
         .expect("generated fixture event must validate")
+}
+
+fn fixture_limit(len: usize) -> u32 {
+    u32::try_from(len).expect("fixture record count must fit in u32")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -104,7 +108,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     let agent_device = sk(0x06);
     let room = room_id();
 
-    let e_create = validate_fixture_wire(build_room_created(
+    let e_create = validate_fixture_wire(&build_room_created(
         &alice_identity,
         &alice_device,
         "Compatibility Room",
@@ -113,7 +117,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let bob_cap = capability_hash(&room, &BOB_INVITE_ID, &BOB_SECRET);
-    let e_invite_bob = validate_fixture_wire(build_member_invited(
+    let e_invite_bob = validate_fixture_wire(&build_member_invited(
         &alice_identity,
         &alice_device,
         &room,
@@ -128,7 +132,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let bob_binding = DeviceBinding::create(&room, &bob_identity, bob_device.device_key());
-    let e_join_bob = validate_fixture_wire(build_member_joined(
+    let e_join_bob = validate_fixture_wire(&build_member_joined(
         &bob_identity,
         &bob_device,
         &room,
@@ -141,7 +145,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
         T0 + 2_000,
     ));
 
-    let e_message = validate_fixture_wire(build_message_text(
+    let e_message = validate_fixture_wire(&build_message_text(
         &bob_identity,
         &bob_device,
         &room,
@@ -154,7 +158,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let providers = [bob_device.device_key()];
-    let e_file = validate_fixture_wire(build_file_shared(
+    let e_file = validate_fixture_wire(&build_file_shared(
         &bob_identity,
         &bob_device,
         &room,
@@ -170,7 +174,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let allowed_members = [alice_identity.identity_key(), bob_identity.identity_key()];
-    let e_pipe_opened = validate_fixture_wire(build_pipe_opened(
+    let e_pipe_opened = validate_fixture_wire(&build_pipe_opened(
         &bob_identity,
         &bob_device,
         &room,
@@ -185,7 +189,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
         T0 + 5_000,
     ));
 
-    let e_pipe_closed = validate_fixture_wire(build_pipe_closed(
+    let e_pipe_closed = validate_fixture_wire(&build_pipe_closed(
         &bob_identity,
         &bob_device,
         &room,
@@ -196,7 +200,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let agent_cap = capability_hash(&room, &AGENT_INVITE_ID, &AGENT_SECRET);
-    let e_invite_agent = validate_fixture_wire(build_member_invited(
+    let e_invite_agent = validate_fixture_wire(&build_member_invited(
         &alice_identity,
         &alice_device,
         &room,
@@ -211,7 +215,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let agent_binding = DeviceBinding::create(&room, &agent_identity, agent_device.device_key());
-    let e_join_agent = validate_fixture_wire(build_member_joined(
+    let e_join_agent = validate_fixture_wire(&build_member_joined(
         &agent_identity,
         &agent_device,
         &room,
@@ -225,7 +229,7 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ));
 
     let artifacts = [STATUS_ARTIFACT_ID];
-    let e_agent_status = validate_fixture_wire(build_agent_status(
+    let e_agent_status = validate_fixture_wire(&build_agent_status(
         &agent_identity,
         &agent_device,
         &room,
@@ -476,7 +480,7 @@ fn v1_wire_fixture_imports_into_current_store_byte_for_byte() {
     }
 
     let tail = store
-        .room_tail(&room_id(), records.len() as u32)
+        .room_tail(&room_id(), fixture_limit(records.len()))
         .expect("room tail");
     assert_eq!(tail.len(), records.len());
 }
@@ -511,7 +515,7 @@ fn v1_sqlite_fixture_migrates_to_current_schema_and_rebuilds() {
         );
         assert_eq!(
             store
-                .room_tail(&room_id(), records.len() as u32)
+                .room_tail(&room_id(), fixture_limit(records.len()))
                 .expect("migrated room tail")
                 .len(),
             records.len()
@@ -519,7 +523,7 @@ fn v1_sqlite_fixture_migrates_to_current_schema_and_rebuilds() {
         store.rebuild().expect("rebuild migrated fixture");
         assert_eq!(
             store
-                .room_tail(&room_id(), records.len() as u32)
+                .room_tail(&room_id(), fixture_limit(records.len()))
                 .expect("rebuilt room tail")
                 .len(),
             records.len()
