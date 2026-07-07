@@ -14,7 +14,7 @@ full-mesh direct-QUIC carrier behind the landed, sans-IO `SyncEngine`.
 | 3 | Connection state distinguishes connected / offline / unauthorized | ✅ | `tests/loopback.rs::t3_*`; `PeerConnState` + `ConnEvent` stream + `peer_states()`. |
 | 4 | Basic reconnect behavior observed and documented | ✅ | `tests/loopback.rs::t4_*` (`Connected → Offline/Connecting → Connected`, then a post-reconnect event still arrives); see **Reconnect** below. |
 | — | Security: admission via iroh-authenticated remote endpoint identity | ✅ | The gate authorizes on `Connection::remote_id()` **only**, reject-before-`accept_bi()` (T2; §6 of the spec). |
-| — | Test plan: two local peers + ≥1 real-network run *if available* | ⚠️ partial | Loopback CI suite present (T1–T4). The real-NAT Gate-A run was **not** performed (no two-NAT rig during this phase); carried as a residual — see **Gate A**. |
+| — | Test plan: two local peers + ≥1 real-network run *if available* | ✅ | Loopback CI suite present (T1–T4). Real-NAT Gate A measured in S1/S2 and refreshed on 2026-07-07 local↔`demo1`; residual caveats remain in **Gate A**. |
 
 `cargo test -p iroh-rooms-net`: 67 unit + 9 frame-codec integration
 (`tests/frame.rs`) + 9 loopback integration (`tests/loopback.rs`, T1–T9) = **85
@@ -112,7 +112,7 @@ Confirmed against the pinned source; no blocking divergences:
   `identity_of_device` + the Active set). The production re-point is a swap of those
   two lookups, not a reshape.
 
-## Gate A (real-network) — STATUS: MEASURED 2026-07-03/04, both environments (CONDITIONAL GO)
+## Gate A (real-network) — STATUS: MEASURED 2026-07-03/04 + refreshed 2026-07-07 (CONDITIONAL GO)
 
 **A green loopback run is NOT Gate A.** Two real NAT environments were measured
 (37 JSONs): **S1** home-broadband (Spectrum home-router NAT, wifi) ↔ Hetzner
@@ -130,6 +130,8 @@ artifact, unchanged at `--settle 30`, corroborated on S1 by the #43 SDK-daemon r
 **Residuals are non-connectivity:** forced-relay throughput over the cellular
 uplink read 0.1–0.2 Mbit/s on 256 KiB samples (below the ≥1 Mbit/s target — a
 larger-sample re-measure is owed), and the home-NAT→CGNAT reverse leg was not run.
+Refresh: a 2026-07-07 operator-local ↔ `demo1` cloud run passed both directions,
+natural and relay-only; relay-only measured 4.1 Mbit/s BtoA and 1.3 Mbit/s AtoB.
 Findings block: `crates/spike-nat/NOTES.md` §6.
 
 Two complementary runs close Gate A (see `crates/spike-nat/NOTES.md` for the full
@@ -147,8 +149,8 @@ runbook):
      (same `remote_info` method). This closes the IR-0005 Gate-A residual for the
      event plane.
    - Pipe ALPN: bring up `iroh-rooms pipe` across the two hosts (IR-0010) and
-     confirm a byte crosses `/iroh-rooms/pipe/1` over the real NAT — closes the
-     pipe ALPN's owed Gate A (see below).
+     confirm a byte crosses `/iroh-rooms/pipe/1` over the real NAT — confirming
+     the pipe ALPN over the measured Gate A carrier (see below).
 
 Run ≥2 NAT scenarios incl. ≥1 likely-symmetric (CGNAT/mobile), both directions.
 GO iff a path is established both directions within ≤10 s in every scenario via at
@@ -188,6 +190,18 @@ re-measure is owed (natural S2 sessions used the healthy direct path).
 \* failed only at the bulk-transfer stage: the probe's fixed 30 s per-op budget
 vs 0.6–3.8 Mbit/s sustained on the auto-selected path; connect/TTFB/RTT
 succeeded in every paired supplement run. Confirmation pass over this carrier:
+
+2026-07-07 refresh using `root@demo1` as the cloud peer:
+
+| scenario | direction | mode | established | settled path | ttfb (ms) | rtt (ms) | tput (Mbit/s) |
+|----------|-----------|------|-------------|--------------|-----------|----------|---------------|
+| operator-local↔demo1 | BtoA | natural | yes | mixed | 1116 | 108.7 | 5.3 |
+| operator-local↔demo1 | BtoA | relay-only | yes | relay | 789 | 129.1 | 4.1 |
+| operator-local↔demo1 | AtoB | natural | yes | mixed | 889 | 123.7 | 8.6 |
+| operator-local↔demo1 | AtoB | relay-only | yes | relay | 1124 | 143.6 | 1.3 |
+
+The refresh did not independently verify VPN/shared-LAN status, so it is a
+current evidence refresh rather than a replacement for the S1/S2 coverage.
 event ALPN ✓ both directions (signed genesis across the NAT in 1.06/1.08 s;
 non-member rejected before any event bytes, `unknown_device`); pipe ALPN ✓
 (HTTP round-trip through an authenticated `pipe expose`/`pipe connect` across
@@ -236,10 +250,10 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
   before the first access decision; per-mutation checkpoint hooks persist each state
   change transactionally inside the `Node` pump.
 - Deterministic double-connect tie-break (D8 / OQ-4) — still a follow-up.
-- **Run Gate A** and record the table above. The measurement harness is landed
-  (`crates/spike-nat` / `nat-probe`, IR-0012) with a full runbook; what remains is
-  the manual two-host execution (substrate probe + this carrier's confirmation
-  pass) and pasting the results table here.
+- **Gate A measured; keep refresh evidence current.** The measurement harness is
+  landed (`crates/spike-nat` / `nat-probe`, IR-0012), S1/S2 are committed, and
+  a 2026-07-07 local↔`demo1` refresh is recorded. Remaining work is sign-off on
+  the cellular relay-throughput caveat and the home-NAT→CGNAT reverse leg.
 - ~~ADR-1 mesh choice validated only on this landed loopback carrier, not
   measured against gossip.~~ **Closed by IR-0006** (#10): `spike-transport`
   measured full-mesh against a minimal `iroh-gossip` backend at N=2..5 and

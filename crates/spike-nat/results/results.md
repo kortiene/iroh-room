@@ -4,6 +4,9 @@ Rendered from the committed per-run JSON in this directory (schema = [`report::r
 Findings + method caveats: [`../NOTES.md`](../NOTES.md) §6. **Both required environments measured** (2026-07-03/04):
 S1 home-broadband NAT ↔ Hetzner cloud (non-symmetric); S2 cellular CGNAT ↔ {Hetzner cloud, home-broadband NAT} (the likely-symmetric environment).
 The `settle30` rows are the issue-#43 `--settle 30` reconciliation runs (path-type only, `--xfer 0`).
+S3 is a 2026-07-07 refresh run using `root@demo1` as the cloud peer; it is not a
+replacement for S1/S2, but it refreshes both directions plus controlled
+relay-only throughput.
 
 ## S1 — home-broadband ↔ hetzner-server (2026-07-03/04, 23 runs)
 
@@ -53,3 +56,18 @@ Mac on iPhone cellular Personal Hotspot (carrier CGNAT). `AtoB` = Mac dials peer
 | hotspot-cgnat<->home-broadband | AtoB | natural | yes | mixed | 403 | 96.9 | — | 1127 |
 | hotspot-cgnat<->home-broadband | AtoB | natural | yes | mixed | 650 | 131.3 | — | 1501 |
 | hotspot-cgnat<->home-broadband | AtoB | relay-only | yes | relay | 648 | 113.2 | 0.1 | 2521 |
+
+## S3 — operator-local ↔ demo1-cloud refresh (2026-07-07, 4 runs)
+
+`AtoB` = local workstation dials `demo1`; `BtoA` = `demo1` dials the local
+workstation. Both natural runs upgraded `relay -> mixed` within the settle
+window, meaning a direct addr was Active while relay remained warm. The tool did
+not independently verify VPN/shared-LAN status; treat this as a current refresh,
+not a replacement for the S1/S2 Gate-A coverage above.
+
+| scenario | direction | mode | established | path type | ttfb (ms) | rtt median (ms) | throughput (Mbit/s) | setup (ms) |
+|---|---|---|---|---|---|---|---|---|
+| operator-local<->demo1-cloud | BtoA | natural | yes | mixed | 1116 | 108.7 | 5.3 | 1361 |
+| operator-local<->demo1-cloud | BtoA | relay-only | yes | relay | 789 | 129.1 | 4.1 | 1744 |
+| operator-local<->demo1-cloud | AtoB | natural | yes | mixed | 889 | 123.7 | 8.6 | 1464 |
+| operator-local<->demo1-cloud | AtoB | relay-only | yes | relay | 1124 | 143.6 | 1.3 | 2581 |

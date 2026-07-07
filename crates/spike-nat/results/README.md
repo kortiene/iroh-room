@@ -41,3 +41,11 @@ forced-relay **throughput** re-measure (the 256 KiB samples read below the
 ≥1 Mbit/s target over the mobile uplink) and the home-NAT→CGNAT reverse leg. CI
 proves the harness builds and its loopback self-check passes; it **cannot** prove
 NAT traversal.
+
+Additional refresh:
+
+- **S3** operator-local ↔ `demo1` cloud (2026-07-07) — 4 runs, both
+  directions, natural + relay-only. Establishment passed in all rows; natural
+  rows settled `mixed`; relay-only rows measured 4.1 Mbit/s BtoA and
+  1.3 Mbit/s AtoB. VPN/shared-LAN status was not independently verified by the
+  tool, so S3 is a current refresh and not a replacement for S1/S2.

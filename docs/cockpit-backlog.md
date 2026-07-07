@@ -16,7 +16,8 @@ Status assumptions (verified against the Developer Preview state of this repo):
 suites, and the public Rust SDK façade (`crates/iroh-rooms`) have all landed.
 Known gaps still open: no `room list --json`, no live all-event
 `room tail --json`, no `pipe list --json`, no sync percentage, limited pipe
-metrics, Gate A real-NAT pending.
+metrics, Gate A real-NAT measured but still carrying production sign-off
+caveats.
 
 ---
 
@@ -487,8 +488,9 @@ equivalent is path classification + peer availability.
 
 **Solution:** Render from `diag:` lines (verbose session) + roster summaries:
 local endpoint id + relay URL, per-peer `direct/relay/mixed/none`, aggregate
-counts, last-event age, total event count. Explicit
-`Gate A pending — real-NAT unverified` footnote when not on loopback.
+counts, last-event age, total event count. Explicit production-connectivity
+footnote when not on loopback, pointing to the measured Gate A caveats instead
+of inferring guarantees from a single live path.
 
 **AC:**
 - matches `diag:` fixture data exactly
@@ -820,8 +822,9 @@ cockpit should meet the same bar.
 **Solution:** `RELEASE.md`: P0 test list (parsers, goldens, supervisor cleanup,
 tool redaction), demo verification pass, and verbatim known limitations:
 polling latency vs true streaming (until M3/UP-102), no traffic/sync metrics
-(upstream), Gate A pending (upstream), blob-lock `unknown` provider state,
-live-tail gap workaround, `experimental` SDK caveat for the sidecar.
+(upstream), Gate A measured with sign-off caveats (upstream), blob-lock
+`unknown` provider state, live-tail gap workaround, `experimental` SDK caveat
+for the sidecar.
 
 **AC:**
 - checklist exists and is filled for the first tagged preview
@@ -892,7 +895,7 @@ graph LR
 | R2 | Live tail renders only `message.text` → feed lag/complexity | Certain (today) | Med | Poll-diff engine as v0; UP-102/UP-103 upstream; sidecar in M3 | CPT-015, UP-102 |
 | R3 | No `room list` → onboarding friction | Certain (today) | Med | Room registry from user actions + validation; UP-101 | CPT-013, UP-101 |
 | R4 | Blob-store lock contention (`room tail` serving vs `file list`) | High | Low | Render `provider: unknown` honestly with explanation; never open the store directly | CPT-016/017 |
-| R5 | Gate A real-NAT pending → cockpit over-promises connectivity | Med | Med | "Gate A pending" footnote; path classification shown, never inferred | CPT-019 |
+| R5 | Gate A real-NAT caveats → cockpit over-promises connectivity | Med | Med | Production-connectivity footnote; path classification shown, never inferred | CPT-019 |
 | R6 | SDK `experimental` API churn breaks sidecar | High | Med | Pin crate rev; contract tests both backends; CLI fallback always works | CPT-032/033 |
 | R7 | TUI width/redraw violations (flicker, overflow) | Med | Med | Width property tests, render throttling, golden tests at 4 widths | CPT-011/024/025 |
 | R8 | Full-screen TUI hard to test | Med | Med | Golden `render(width)` snapshots + fixture-driven feeds (no real terminal needed) | CPT-025 |
