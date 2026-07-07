@@ -7,6 +7,10 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Nothing yet.
+
+## 0.1.0-rc.1 - 2026-07-07
+
 - Re-exported the online tier's `iroh` transport identities — `EndpointAddr`,
   `EndpointId`, `SecretKey`, `Endpoint` — from `experimental::session`
   (`EndpointId` also from `experimental::blob` and `experimental::pipe_runtime`,

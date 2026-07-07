@@ -1,6 +1,6 @@
 [package]
 name = "iroh-rooms-cli"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -93,4 +93,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net",
 # Hex encoding/decoding used by the file_cli.rs hash-verification test. Already
 # a resolved crate in Cargo.lock (used by core and net).
 hex = "0.4"
-
