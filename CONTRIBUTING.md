@@ -109,3 +109,28 @@ security, blob verification, and agent flow review; known MVP limitations;
 security warnings; dependency/churn review; demo verification against
 `docs/getting-started.md`; and the release-notes template), and paste the
 verdict line into its Sign-off section.
+
+## Production Readiness
+
+Do not treat a green Developer Preview gate as a production-grade release.
+Production-grade post-MVP work is governed by
+[`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md), which defines the Phase 2.5
+bar for security, local data handling, networking evidence, compatibility,
+release operations, and beta validation.
+
+For production-candidate preparation, run:
+
+```bash
+scripts/production-readiness.sh
+```
+
+For fast local checks that do not run the full preview gate:
+
+```bash
+scripts/production-readiness.sh --offline-only
+```
+
+`--offline-only` is an iteration aid, not a production-ready verdict. It may
+fail while production P0 artifacts are still missing. Manual P0 sign-offs in
+`PRODUCTION-READINESS.md` remain required before any Production Beta or GA
+label.

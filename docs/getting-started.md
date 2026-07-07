@@ -321,7 +321,9 @@ iroh-rooms room members <ROOM_ID> --json
 it names the invitee's identity key and carries a secret out-of-band inside the ticket
 string. Expiry is supported; **native revocation is not** (spike §6 "MVP limitations") — the
 only way to undo an invite is to remove the subject. Anyone who gets the ticket before it
-expires can attempt to join as the named key. Handle it like a password.
+expires can attempt to join as the named key. Phase 2.5 Production Beta accepts this
+bounded leaked-ticket model in `docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md`.
+Handle tickets like passwords.
 
 ### Invite and join Bob
 
@@ -971,7 +973,9 @@ reason codes are stable identifiers also written to the local audit log.
   IR-0207, which pins the parity with agent-flavored regression tests).
 
 - **Next action:** ask the admin for a fresh `room invite` (re-issue, optionally with a longer
-  `--expires`). There is no native revocation, so a re-issue is the fix.
+  `--expires`). There is no native ticket-specific revocation. If a ticket may have leaked
+  before use, stop sharing it, wait for expiry, and remove the subject if the ticket may already
+  have been redeemed.
 
 ### Admin not hosting joins
 
