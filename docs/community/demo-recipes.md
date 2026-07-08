@@ -47,15 +47,6 @@ Save:
 - Alice identity id as `<ALICE_ID>`.
 - Room id as `<ROOM_ID>`.
 
-Start Alice's join host:
-
-```bash
-iroh-rooms room tail <ROOM_ID> --accept-joins -v
-```
-
-Keep this process running while Bob joins. If `-v` prints a `listening:`
-address, Bob can pass it as `--peer <ALICE_ENDPOINT_OR_ADDR>`.
-
 ### Bob Terminal
 
 ```bash
@@ -75,6 +66,15 @@ iroh-rooms room invite <ROOM_ID> --invitee <BOB_ID> --expires 24h
 ```
 
 Send the `roomtkt1...` ticket to Bob over a private channel.
+
+Start Alice's join host after the invite exists:
+
+```bash
+iroh-rooms room tail <ROOM_ID> --accept-joins -v
+```
+
+Keep this process running while Bob joins. If `-v` prints a `listening:`
+address, Bob can pass it as `--peer <ALICE_ENDPOINT_OR_ADDR>`.
 
 ### Bob Terminal
 
@@ -105,10 +105,16 @@ iroh-rooms room send <ROOM_ID> "hello from Bob"
 
 Alice's running `room tail` should observe Bob's message.
 
+Before continuing to Recipe 2 or Recipe 3, stop Alice's running `room tail`
+with Ctrl-C. The beta CLI uses local store and blob-store locks; leaving a
+long-running Alice process open can make the next Alice command fail with
+`blob_store_locked`.
+
 ### Common Failures
 
-- `no_admin_reachable`: Alice is not running `room tail <ROOM_ID> --accept-joins`
-  or Bob needs `--peer`.
+- `no_admin_reachable`: Alice started `room tail --accept-joins` before creating
+  the invite, Alice is not running `room tail <ROOM_ID> --accept-joins`, or Bob
+  needs `--peer`.
 - `ticket_*`: the ticket was truncated or copied incorrectly.
 - `expired_invite`: ask Alice to mint a new invite.
 
@@ -120,6 +126,9 @@ content hash.
 Prerequisite: complete Recipe 1.
 
 ### Alice Terminal
+
+If Alice still has a `room tail` or `pipe expose` process running from a prior
+recipe, stop it with Ctrl-C before sharing the file.
 
 Create a small file:
 
@@ -175,6 +184,8 @@ hello from iroh rooms
 
 - `blob_unavailable`: Alice is not running `room tail`, or the wrong peer is
   serving.
+- `blob_store_locked`: another Alice process is still using the blob store.
+  Stop Alice's prior `room tail` or `pipe expose` process, then retry.
 - `no_such_file`: Bob has not yet learned the `file.shared` event. Run
   `iroh-rooms room tail <ROOM_ID> --peer <ALICE_ENDPOINT_OR_ADDR>` briefly or
   ask Alice to stay online.
@@ -187,6 +198,9 @@ Goal: Alice exposes a local web app to Bob without publishing a public URL.
 Prerequisite: complete Recipe 1.
 
 ### Alice Terminal
+
+If Alice still has a `room tail` process running from a prior recipe, stop it
+with Ctrl-C before exposing the pipe.
 
 Start a local test server:
 
@@ -251,6 +265,8 @@ Hello from private Live Pipe
 
 - `peer_offline`: Alice's `pipe expose` process is not running.
 - `peer_unauthorized`: Bob's identity id is not in Alice's `--allow` list.
+- `blob_store_locked`: another Alice process is still using the blob store.
+  Stop Alice's prior `room tail` process, then retry `pipe expose`.
 - local port already used: choose another `--local` port, such as `3002`.
 
 ## Optional Recipe 4: Agent Status
