@@ -21,6 +21,13 @@ troubleshooting guide and the availability model. Every step is implemented and 
 against the shipped binary, and the whole two-humans-plus-one-agent flow it describes is
 proven end-to-end by the automated `full_demo_e2e.rs` suite (issue #34 / IR-0209, below).
 
+## Community
+
+[`COMMUNITY.md`](COMMUNITY.md) defines the first controlled builder cohort:
+private local-first rooms for technical users who want to share local previews,
+verified artifacts, and agent status with trusted peers. The first cohort plan
+and recipes live under [`docs/community/`](docs/community/).
+
 ## Protocol
 
 [`docs/protocol.md`](docs/protocol.md) is the implementer reference for the wire/signature/
