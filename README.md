@@ -28,6 +28,7 @@ Start with one of these paths:
 - **Try the CLI demo**: follow [`docs/getting-started.md`](docs/getting-started.md)
 - **Install or remove a beta binary**: use [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md)
 - **Join the first builder cohort**: read [`COMMUNITY.md`](COMMUNITY.md) and [`docs/community/first-cohort.md`](docs/community/first-cohort.md)
+- **Share a local preview**: follow [`docs/live-pipe-preview.md`](docs/live-pipe-preview.md)
 - **Implement or audit the protocol**: read [`docs/protocol.md`](docs/protocol.md)
 - **Understand release status**: read [`docs/releases/v0.1.0-rc.1-release-notes.md`](docs/releases/v0.1.0-rc.1-release-notes.md)
 - **Review security posture**: read [`docs/security/threat-model.md`](docs/security/threat-model.md)
@@ -111,6 +112,69 @@ The beta storage, invite, and audit decisions live in:
 - [`ADR-0001: Local storage posture`](docs/decisions/ADR-0001-local-storage-posture.md)
 - [`ADR-0002: Invite revocation and bounded ticket risk`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
 - [`ADR-0003: Persistent audit posture`](docs/decisions/ADR-0003-persistent-audit-posture.md)
+
+## Error codes
+
+The `iroh-rooms` CLI renders coded failures on stderr as:
+
+```text
+error[<code>]: <message>
+next: <action>
+```
+
+The `next: <action>` line is additive. It does not replace the machine-readable `error[<code>]:` line, so scripts can still match `^error\\[` or branch on `$?`. Advisory receive-path flags render as `warning[<code>]: <message>` and do not make a successful command fail. An uncoded fallback renders as `error: <message>` and exits `1`. stdout is kept for successful command output.
+
+| Exit | Category | Meaning | Example codes |
+| ---: | --- | --- | --- |
+| `0` | Success | command completed, including best-effort sends that reach zero peers | none |
+| `1` | Internal | unexpected or uncoded failure | `internal` |
+| `2` | Usage | bad input, missing local state, or unreadable local files | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
+| `3` | Auth | membership, role, capability, identity, or peer authorization denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `wrong_identity`, `peer_unauthorized` |
+| `4` | Integrity | signature, event id, encoding, schema, content, room binding, or hash verification failure | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch` |
+| `5` | Ticket | invite ticket decoding failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
+| `6` | Connectivity | peer reachability or blob availability failure | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
+
+Per-code reference:
+
+| Code | Category | Exit | Meaning | Next action |
+| --- | --- | ---: | --- | --- |
+| `internal` | Internal | `1` | unexpected internal failure | see the message |
+| `invalid_room_id` | Usage | `2` | room id argument does not parse | copy the room id from `room create` or `room members` |
+| `invalid_argument` | Usage | `2` | an option value is malformed | see the message |
+| `no_such_file` | Usage | `2` | local path or synced file reference is missing | check the path, or run `file list` / `room tail` first |
+| `permission_denied` | Usage | `2` | local file cannot be read | check the file's read permissions |
+| `file_too_large` | Usage | `2` | local file exceeds the MVP share cap | split or compress the file |
+| `identity_not_found` | Usage | `2` | no local identity exists | run `iroh-rooms identity create --name <name>` first |
+| `room_not_found` | Usage | `2` | no room with this id is known locally | create a room, or join an invite ticket first |
+| `no_discovery_hint` | Usage | `2` | invite ticket has no admin discovery hint | pass `--peer <admin-addr>` |
+| `not_a_member` | Auth | `3` | caller is not an active room member | ask the admin to invite you and complete `room join` first |
+| `unbound_device` | Auth | `3` | sender has no bound device in membership state | complete `room join` first |
+| `insufficient_role` | Auth | `3` | role does not permit the operation | ask the admin to invite you with the intended role |
+| `expired_invite` | Auth | `3` | invite expired or was consumed | ask the admin for a fresh `room invite` |
+| `bad_capability` | Auth | `3` | invite capability secret does not match | ask the admin to re-issue the invite |
+| `wrong_identity` | Auth | `3` | local identity does not match the ticket binding | run `identity show`, then ask the admin to re-issue the invite for that identity |
+| `peer_unauthorized` | Auth | `3` | reachable peer refused this caller | ask the admin to confirm membership has synced |
+| `bad_signature` | Integrity | `4` | event signature failed verification | structural rejection, not user-fixable |
+| `id_mismatch` | Integrity | `4` | event id does not match signed bytes | structural rejection, not user-fixable |
+| `non_canonical_encoding` | Integrity | `4` | event bytes are not canonical CBOR | structural rejection, not user-fixable |
+| `invalid_content` | Integrity | `4` | event content failed strict validation | structural rejection, not user-fixable |
+| `unknown_schema_version` | Integrity | `4` | event schema version is unsupported | structural rejection, not user-fixable |
+| `unknown_event_type` | Integrity | `4` | event type is not in the registry | structural rejection, not user-fixable |
+| `too_many_parents` | Integrity | `4` | event exceeds the parent-count bound | structural rejection, not user-fixable |
+| `not_genesis_descended` | Integrity | `4` | non-genesis event has no parent | structural rejection, not user-fixable |
+| `room_id_mismatch` | Integrity | `4` | event room does not match the command context | structural rejection, not user-fixable |
+| `hash_mismatch` | Integrity | `4` | fetched bytes do not match the declared BLAKE3 hash | do not trust this file |
+| `ticket_bad_prefix` | Ticket | `5` | ticket prefix is wrong | check the whole ticket was copied |
+| `ticket_bad_base32` | Ticket | `5` | ticket body is not valid base32 | check the whole ticket was copied |
+| `ticket_truncated` | Ticket | `5` | ticket is incomplete | check the whole ticket was copied |
+| `ticket_unsupported_version` | Ticket | `5` | ticket version is not supported | ask the admin for a fresh `room invite` |
+| `ticket_bad_checksum` | Ticket | `5` | ticket checksum failed | check the whole ticket was copied |
+| `ticket_malformed` | Ticket | `5` | ticket payload is malformed | ask the admin for a fresh `room invite` |
+| `no_admin_reachable` | Connectivity | `6` | join could not reach an admin before timeout | ask the admin to run `room tail <ROOM_ID> --accept-joins`, or pass `--peer <admin-addr>` |
+| `peer_offline` | Connectivity | `6` | authorized peer is not reachable right now | ask the peer to come online |
+| `blob_unavailable` | Connectivity | `6` | no reachable provider currently serves the requested blob | ask a peer that holds it to run `room tail <ROOM_ID>`, then retry `file fetch` |
+
+Verbose network diagnostics are opt-in. `room members <ROOM_ID> --status --verbose` and `room tail <ROOM_ID> --verbose` append stderr-only `diag:` lines with this node's dialable addresses, `relay=...`, and per-peer path classifications such as `path=direct`, `path=relay`, `path=mixed`, or `path=none`. These diagnostics help explain reachability; they grant no trust and do not expose private key material.
 
 ## How it works
 

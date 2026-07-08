@@ -38,9 +38,13 @@ enum Verdict {
 struct Node {
     event: ValidatedEvent,
     verdict: Verdict,
-    /// Transitive `prev_events` (structural ancestors), memoized once classified.
+    /// Transitive membership-relevant ancestors, memoized once classified.
+    ///
+    /// Non-membership events can be numerous (`message.text`, `agent.status`,
+    /// files, pipes) but never change membership. Keeping them out of this set
+    /// prevents a busy room's causal tail from making the fold `O(total_events^2)`.
     /// Empty while [`Verdict::Pending`].
-    ancestors: BTreeSet<EventId>,
+    membership_ancestors: BTreeSet<EventId>,
 }
 
 impl Node {
@@ -92,6 +96,9 @@ pub struct RoomMembership {
     /// Reverse edges: parent id → ids that cite it, so a newly-classified parent
     /// can wake its buffered children.
     children: BTreeMap<EventId, Vec<EventId>>,
+    /// Accepted structural heads per author, used for equivocation without
+    /// retaining full transitive ancestor sets on every node.
+    sender_heads: BTreeMap<IdentityKey, BTreeSet<EventId>>,
 }
 
 impl RoomMembership {
@@ -102,6 +109,7 @@ impl RoomMembership {
             room_id,
             nodes: BTreeMap::new(),
             children: BTreeMap::new(),
+            sender_heads: BTreeMap::new(),
         }
     }
 
@@ -149,7 +157,7 @@ impl RoomMembership {
             Node {
                 event,
                 verdict: Verdict::Pending,
-                ancestors: BTreeSet::new(),
+                membership_ancestors: BTreeSet::new(),
             },
         );
 
@@ -217,7 +225,7 @@ impl RoomMembership {
     #[must_use]
     pub fn ancestor_view(&self, event_id: &EventId) -> Option<AncestorView> {
         let node = self.nodes.get(event_id)?;
-        let scope = self.accepted_ancestors(&node.ancestors);
+        let scope = self.accepted_ancestors(&node.membership_ancestors);
         Some(AncestorView {
             snapshot: self.fold(&scope),
         })
@@ -244,21 +252,29 @@ impl RoomMembership {
             }
         }
 
-        // Memoize structural ancestors from the parents' (already memoized) sets.
-        let mut ancestors = BTreeSet::new();
+        // Memoize only membership-relevant ancestors from parents' already
+        // memoized sets. Non-membership parents pass through the membership view
+        // they inherited, but do not become membership inputs themselves.
+        let mut membership_ancestors = BTreeSet::new();
         for parent in &parents {
-            ancestors.insert(*parent);
             if let Some(node) = self.nodes.get(parent) {
-                ancestors.extend(node.ancestors.iter().copied());
+                if Self::affects_membership(&node.event.event.content) {
+                    membership_ancestors.insert(*parent);
+                }
+                membership_ancestors.extend(node.membership_ancestors.iter().copied());
             }
         }
         if let Some(node) = self.nodes.get_mut(&id) {
-            node.ancestors.clone_from(&ancestors);
+            node.membership_ancestors.clone_from(&membership_ancestors);
         }
 
-        let verdict = self.gate(id, &ancestors);
+        let verdict = self.gate(id, &membership_ancestors);
+        let accepted = matches!(verdict, Verdict::Accepted(_));
         if let Some(node) = self.nodes.get_mut(&id) {
             node.verdict = verdict;
+        }
+        if accepted {
+            self.record_sender_head(id);
         }
         true
     }
@@ -307,7 +323,7 @@ impl RoomMembership {
 
     /// Decide `id`'s log-validity against its ancestor view, returning the
     /// verdict (accept with advisory flags, or a typed rejection).
-    fn gate(&self, id: EventId, ancestors: &BTreeSet<EventId>) -> Verdict {
+    fn gate(&self, id: EventId, membership_ancestors: &BTreeSet<EventId>) -> Verdict {
         let Some(node) = self.nodes.get(&id) else {
             return Verdict::Rejected(RejectReason::NotAMember);
         };
@@ -315,13 +331,11 @@ impl RoomMembership {
 
         // Advisory flags: carry the stateless ones through, add local equivocation.
         let mut flags = node.event.flags.clone();
-        if self.is_equivocation(id, event.sender_id, ancestors)
-            && !flags.contains(&Flag::Equivocation)
-        {
+        if self.is_equivocation(id, event.sender_id) && !flags.contains(&Flag::Equivocation) {
             flags.push(Flag::Equivocation);
         }
 
-        let scope = self.accepted_ancestors(ancestors);
+        let scope = self.accepted_ancestors(membership_ancestors);
         let view = self.fold(&scope);
 
         // Each arm is a distinct §6.2 gate rule; some happen to share the `Ok(())`
@@ -338,7 +352,9 @@ impl RoomMembership {
             // Self-departure is always valid (may be a no-op / inert).
             Content::MemberLeft(_) => Ok(()),
             // The full key-bound join gate (spec D4 / §3.5).
-            Content::MemberJoined(content) => self.gate_join(id, event, content, ancestors, &view),
+            Content::MemberJoined(content) => {
+                self.gate_join(id, event, content, membership_ancestors, &view)
+            }
             // Non-membership writes: author must be Active in the ancestor view.
             Content::MessageText(_)
             | Content::FileShared(_)
@@ -408,7 +424,7 @@ impl RoomMembership {
         _join_id: EventId,
         event: &SignedEvent,
         content: &MemberJoined,
-        ancestors: &BTreeSet<EventId>,
+        membership_ancestors: &BTreeSet<EventId>,
         view: &MembershipSnapshot,
     ) -> Result<(), RejectReason> {
         let subject = event.sender_id;
@@ -421,7 +437,7 @@ impl RoomMembership {
         // Bearer/open tickets are excluded from MVP: a join under a key with no
         // naming invite fails here, so ban-evasion under a fresh key is blocked.
         let mut matched: Option<EventId> = None;
-        for ancestor_id in ancestors {
+        for ancestor_id in membership_ancestors {
             let Some(node) = self.nodes.get(ancestor_id) else {
                 continue;
             };
@@ -468,7 +484,7 @@ impl RoomMembership {
 
         // Sticky departure (§3.7): the invite is consumed if any departure of the
         // subject in the join's ancestors causally descends from that invite.
-        if self.departure_consumes(subject, invite_id, ancestors) {
+        if self.departure_consumes(subject, invite_id, membership_ancestors) {
             return Err(RejectReason::ExpiredInvite);
         }
 
@@ -481,9 +497,9 @@ impl RoomMembership {
         &self,
         subject: IdentityKey,
         invite_id: EventId,
-        ancestors: &BTreeSet<EventId>,
+        membership_ancestors: &BTreeSet<EventId>,
     ) -> bool {
-        ancestors.iter().any(|ancestor_id| {
+        membership_ancestors.iter().any(|ancestor_id| {
             let Some(node) = self.nodes.get(ancestor_id) else {
                 return false;
             };
@@ -495,7 +511,7 @@ impl RoomMembership {
                 Content::MemberLeft(c) => c.member_id == subject,
                 _ => false,
             };
-            is_departure && node.ancestors.contains(&invite_id)
+            is_departure && node.membership_ancestors.contains(&invite_id)
         })
     }
 
@@ -503,19 +519,61 @@ impl RoomMembership {
     /// that is **concurrent** with the one being classified (neither is an
     /// ancestor of the other). Advisory only — never changes a verdict or the
     /// snapshot (§9).
-    fn is_equivocation(
-        &self,
-        id: EventId,
-        sender: IdentityKey,
-        ancestors: &BTreeSet<EventId>,
-    ) -> bool {
-        self.nodes.iter().any(|(other_id, other)| {
-            *other_id != id
-                && other.is_accepted()
-                && other.event.event.sender_id == sender
-                && !ancestors.contains(other_id)
-                && !other.ancestors.contains(&id)
+    fn is_equivocation(&self, id: EventId, sender: IdentityKey) -> bool {
+        self.sender_heads.get(&sender).is_some_and(|heads| {
+            heads
+                .iter()
+                .any(|head| !self.is_structural_ancestor(*head, id))
         })
+    }
+
+    /// Record a newly accepted event as one of the sender's structural causal
+    /// heads, dropping any previous head this event descends from.
+    fn record_sender_head(&mut self, id: EventId) {
+        let Some(sender) = self.nodes.get(&id).map(|node| node.event.event.sender_id) else {
+            return;
+        };
+        let existing = self.sender_heads.get(&sender).cloned().unwrap_or_default();
+        let mut retained: BTreeSet<EventId> = existing
+            .into_iter()
+            .filter(|head| !self.is_structural_ancestor(*head, id))
+            .collect();
+        retained.insert(id);
+        self.sender_heads.insert(sender, retained);
+    }
+
+    /// Whether `ancestor` is a structural ancestor of `descendant` through
+    /// `prev_events`. This is used only for same-sender head maintenance and
+    /// equivocation, so the fold no longer needs per-node full ancestor sets.
+    fn is_structural_ancestor(&self, ancestor: EventId, descendant: EventId) -> bool {
+        let mut stack = match self.nodes.get(&descendant) {
+            Some(node) => node.event.event.prev_events.clone(),
+            None => return false,
+        };
+        let mut seen = BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if current == ancestor {
+                return true;
+            }
+            if let Some(node) = self.nodes.get(&current) {
+                stack.extend(node.event.event.prev_events.iter().copied());
+            }
+        }
+        false
+    }
+
+    fn affects_membership(content: &Content) -> bool {
+        matches!(
+            content,
+            Content::RoomCreated(_)
+                | Content::MemberInvited(_)
+                | Content::MemberJoined(_)
+                | Content::MemberLeft(_)
+                | Content::MemberRemoved(_)
+        )
     }
 
     // ------------------------------------------------------------------
@@ -651,7 +709,7 @@ impl RoomMembership {
     fn is_ancestor(&self, ancestor: EventId, descendant: EventId) -> bool {
         self.nodes
             .get(&descendant)
-            .is_some_and(|node| node.ancestors.contains(&ancestor))
+            .is_some_and(|node| node.membership_ancestors.contains(&ancestor))
     }
 
     /// Removed-dominates status over the heads (spec D5 step 3): the `max` over
@@ -805,7 +863,9 @@ mod tests {
     use super::{Ingest, RoomMembership};
     use crate::event::binding::DeviceBinding;
     use crate::event::capability_hash;
-    use crate::event::content::{Content, EventType, MemberInvited, MemberJoined, RoomCreated};
+    use crate::event::content::{
+        Content, EventType, MemberInvited, MemberJoined, MessageText, RoomCreated,
+    };
     use crate::event::ids::RoomId;
     use crate::event::keys::SigningKey;
     use crate::event::reject::RejectReason;
@@ -918,6 +978,32 @@ mod tests {
             }),
         };
         validate_wire_bytes(&seal(&ev, invitee_dev), &ctx(room)).expect("join stateless-valid")
+    }
+
+    fn make_message(
+        sender_id: &SigningKey,
+        sender_dev: &SigningKey,
+        room: RoomId,
+        prev: crate::event::ids::EventId,
+        body: &str,
+        t: u64,
+    ) -> ValidatedEvent {
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: sender_id.identity_key(),
+            device_id: sender_dev.device_key(),
+            event_type: EventType::MessageText,
+            created_at: t,
+            prev_events: vec![prev],
+            content: Content::MessageText(MessageText {
+                body: body.to_owned(),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        validate_wire_bytes(&seal(&ev, sender_dev), &ctx(room)).expect("message stateless-valid")
     }
 
     // AC1 (positive): valid admin invite is accepted by the fold and marks the
@@ -1135,6 +1221,72 @@ mod tests {
             Some(Status::Active),
             "invitee must be Active after a valid join"
         );
+    }
+
+    #[test]
+    fn non_membership_tail_does_not_expand_membership_ancestor_cache() {
+        let (admin_id, admin_dev) = (sk(1), sk(2));
+        let (member_id, member_dev) = (sk(4), sk(5));
+        let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+        let cap_hash = capability_hash(&room, &INVITE_ID, &SECRET);
+        let invite = make_invite(
+            &admin_id,
+            &admin_dev,
+            room,
+            &member_id,
+            INVITE_ID,
+            cap_hash,
+            None,
+            genesis.event_id,
+            T0 + 1,
+        );
+        let join = make_join(
+            &member_id,
+            &member_dev,
+            room,
+            INVITE_ID,
+            SECRET,
+            invite.event_id,
+            T0 + 2,
+        );
+        let mut membership =
+            RoomMembership::from_events(room, [genesis.clone(), invite.clone(), join.clone()]);
+        let mut prev = join.event_id;
+
+        for i in 0..1_024_u64 {
+            let msg = make_message(
+                &member_id,
+                &member_dev,
+                room,
+                prev,
+                &format!("status {i}"),
+                T0 + 3 + i,
+            );
+            let outcome = membership.ingest(msg.clone());
+            assert!(
+                matches!(outcome, Ingest::Accepted { .. }),
+                "message {i} must be accepted; got {outcome:?}"
+            );
+            let node = membership
+                .nodes
+                .get(&msg.event_id)
+                .expect("message node must exist");
+            assert_eq!(
+                node.membership_ancestors.len(),
+                3,
+                "message {i} must inherit only genesis + invite + join as membership ancestors"
+            );
+            let heads = membership
+                .sender_heads
+                .get(&member_id.identity_key())
+                .expect("accepted member event must be a sender head");
+            assert_eq!(
+                heads.len(),
+                1,
+                "sequential same-sender messages must keep one structural head"
+            );
+            prev = msg.event_id;
+        }
     }
 
     // AC2 (negative): a join that cites the correct invite but uses the wrong
