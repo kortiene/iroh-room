@@ -1,1285 +1,221 @@
 # Iroh Rooms
 
-Iroh Rooms is a local-first, peer-to-peer collaboration runtime built on top of
-iroh. The MVP target is a CLI-first room where two humans and one agent can
-exchange signed messages, share a verified artifact, expose a private live TCP
-pipe, and keep room data locally without a central application server.
+Iroh Rooms is a local-first collaboration runtime for small trusted groups. It lets people and agents create a private room, exchange signed messages, share verified files, expose a loopback-only live TCP pipe, and keep the room state on their own machines instead of a central application server.
 
-The Phase 0/1 technical spike and MVP foundation are complete (see "Current
-Status" below); the repository is now in Phase 2, "Developer Preview." The
-product and protocol source-of-truth documents are:
+The current release is `v0.1.0-rc.1`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
 
-- `PRD.v0.3.md` — current product requirements and MVP scope.
-- `PHASE-0-SPIKE.md` — protocol design, ADRs, spike plan, and residual risks.
-- `PRD.md` — historical v0.2 context.
+## What you can do with it
 
-## Getting Started
+Use Iroh Rooms when you want a private local workspace with peers you already trust:
 
-[`docs/getting-started.md`](docs/getting-started.md) is the copy-pasteable demo walkthrough:
-identity → room → invite/join → message → file → live pipe → agent status, with a
-troubleshooting guide and the availability model. Every step is implemented and reconciled
-against the shipped binary, and the whole two-humans-plus-one-agent flow it describes is
-proven end-to-end by the automated `full_demo_e2e.rs` suite (issue #34 / IR-0209, below).
+- **Create a room without accounts**: each participant has a local identity and device key
+- **Invite a named peer or agent**: invite tickets are bound to a specific identity key
+- **Send signed room messages**: messages are validated from the room event log
+- **Share verified artifacts**: files are addressed and checked by BLAKE3 content hash
+- **Expose localhost to one allowed room member**: live pipes forward loopback TCP over an authenticated room connection
+- **Let agents report status**: invited agents can post signed `agent.status` updates and artifacts
 
-## Community
+The main product idea is not "another chat app." The wedge is private local collaboration around work in progress: local previews, build artifacts, agent output, and trusted peer access.
 
-[`COMMUNITY.md`](COMMUNITY.md) defines the first controlled builder cohort:
-private local-first rooms for technical users who want to share local previews,
-verified artifacts, and agent status with trusted peers. The first cohort plan
-and recipes live under [`docs/community/`](docs/community/).
+## A concrete example
 
-## Protocol
+Alice has a web app running on `127.0.0.1:3000` and wants Bob to review it without deploying it or creating a public tunnel URL. Alice creates a room, invites Bob, exposes that local port to Bob only, and keeps the session visible in her local audit log. Bob joins the room and connects to the pipe from his own machine. An invited agent can also post test status or attach a build artifact to the same room.
 
-[`docs/protocol.md`](docs/protocol.md) is the implementer reference for the wire/signature/
-membership contract — the byte-level rules for building or auditing an interoperable peer,
-without reading the whole `PHASE-0-SPIKE.md`.
+## What to read first
 
-## Live Pipe Preview
+Start with one of these paths:
 
-[`docs/live-pipe-preview.md`](docs/live-pipe-preview.md) is a task-focused guide to sharing a
-local dev-server or agent-generated preview with one authorized room peer — the
-expose/connect/close flow, an agent scenario, and a neutral comparison against public tunnels.
+- **Try the CLI demo**: follow [`docs/getting-started.md`](docs/getting-started.md)
+- **Install or remove a beta binary**: use [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md)
+- **Join the first builder cohort**: read [`COMMUNITY.md`](COMMUNITY.md) and [`docs/community/first-cohort.md`](docs/community/first-cohort.md)
+- **Implement or audit the protocol**: read [`docs/protocol.md`](docs/protocol.md)
+- **Understand release status**: read [`docs/releases/v0.1.0-rc.1-release-notes.md`](docs/releases/v0.1.0-rc.1-release-notes.md)
+- **Review security posture**: read [`docs/security/threat-model.md`](docs/security/threat-model.md)
 
-## Current Status
+## Install from source
 
-The **canonical signed event model** has landed in `iroh-rooms-core::event`
-(issue #6 / IR-0002). This is the byte-for-byte trust boundary the rest of the
-Room Event Plane builds on:
-
-- Deterministic-CBOR encoding (RFC 8949 §4.2.1 canonical profile, purpose-built codec).
-- BLAKE3-256 event-ID derivation and Ed25519 sign/verify under `device_id`.
-- `WireEvent` envelope with verbatim signed-byte preservation for storage and forwarding.
-- Strict per-type content validation: unknown-key rejection, length/enum bounds.
-- Stateless `validate_wire_bytes` pipeline (Event Protocol §6 stateless subset)
-  returning a `ValidatedEvent` or a typed `RejectReason`.
-- 70 conformance tests including byte-exact golden vectors (242-byte CSB, `event_id`,
-  signature, `room_id_A/B`).
-
-**Direct unit + property/fuzz tests for the strict CBOR reader** (risk R1) have
-landed in `iroh-rooms-core` and `iroh-rooms-net` (issue #45, an IR-0002
-follow-up filed by the #6 review), closing the two test-coverage gaps that
-review flagged but did not block on — the reader was previously exercised only
-indirectly, through paths that collapse every `CborError` into one
-`RejectReason::NonCanonicalEncoding`:
-
-- 25 inline unit tests in `cbor.rs`'s `#[cfg(test)] mod tests`: one case per
-  `CborError` variant (all 14, asserting the exact variant, including the
-  oversized-declared-length preallocation guard), accept-path + round-trip
-  coverage for all five `CborValue` kinds, shortest-form width boundaries,
-  canonical map-key ordering (length-first tiebreak), and nesting depth at
-  `MAX_DEPTH` (accept) / `MAX_DEPTH + 1` (reject).
-- `crates/iroh-rooms-core/tests/cbor_property.rs` — a `proptest`-driven
-  robustness suite: no-panic/typed-result over arbitrary bytes for both
-  `decode_canonical` and `validate_wire_bytes`, the canonical round-trip
-  invariant (`decode(encode(x)) == canonical(x)`), encoder-output-is-always-
-  accepted-by-the-reader, and an exhaustive single-bit-flip tamper-evidence
-  test over a genuinely valid signed `WireEvent`.
-- `crates/iroh-rooms-net/tests/malformed_cbor_e2e.rs` — proves the same
-  guarantee on the live QUIC receive path rather than as a pure function call:
-  an admitted peer's hostile raw bytes never crash or wedge a `Node`'s sync
-  pump and never pollute its store, and the node still correctly ingests a
-  valid frame sent right after.
-- `proptest = "1"` added to `iroh-rooms-core`'s `[dev-dependencies]` only
-  (dev-only, no runtime dependency added); no production code changed.
-
-The **protocol conformance test suite** has landed in
-`crates/iroh-rooms-core/tests/` (issue #7 / IR-0003). This is the §-indexed,
-traceable conformance binary the `PHASE-0-SPIKE.md` Spike Plan Gate B and Gate D
-require — one `#[test]` per spike Protocol Test Vector (§1–§20), all fast,
-network-free, and deterministic:
-
-- **`cargo test -p iroh-rooms-core --test protocol_conformance --all-features`**
-  runs the full suite. No wall-clock reads, no entropy — every key is seed-derived
-  and every clock is injected.
-- **Shared `conformance/fixtures.rs`**: deterministic Cast (Alice/Bob/Carol/Dave/Mallory,
-  seed-derived keys), Room (`room_id_A`/`room_id_B`), and a fully-assembled fixture-log
-  DAG (`E_create … E_pipe`, `E_eq_a/b`, `E_mal`). Tier-1 golden values (CSB,
-  `event_id`, signatures, `room_id`) are byte-exact reproductions asserted against
-  the spike; Tier-2 fixture-log ids are regenerated from the landed content schema
-  and pinned as regression tripwires.
-- **Taxonomy completeness gate** (`conformance/taxonomy.rs`): every `RejectReason` (14)
-  and `Flag` (3) code is exercised by a named vector or must be on an explicit `DEFERRED`
-  list — which is empty (the whole taxonomy is covered). Adding a variant to either enum
-  without extending the gate causes the test to fail; a new reason cannot land silently.
-- **Traceability table** in `conformance/mod.rs`: the §1–§20 → test-fn map and the
-  §8 taxonomy code → vector map, embedded as a module doc comment and machine-checkable
-  against the coverage registry.
-
-The **SQLite event store** has landed in `iroh-rooms-core::store` behind the
-`store` cargo feature (issue #8 / IR-0004). It provides the persistence layer
-the membership fold and sync layers will build on:
-
-- `events` table (`STRICT`, WAL, `user_version = 1`): authoritative
-  `(event_id, wire)` columns + a denormalized derived cache (`room_id`,
-  `sender_id`, `device_id`, `event_type`, `created_at`, `lamport`, `admin_seq`).
-- `event_parents` edge table modelling `prev_events` with dangling-parent
-  tolerance (out-of-order delivery records the edge; `lamport` stays `NULL` until
-  the parent arrives — no error).
-- Idempotent insert (`InsertOutcome::Inserted | Duplicate`) with an integrity
-  guard re-deriving `BLAKE3(wire.signed)` against the supplied `event_id`.
-- Query surface for the sibling fold/sync layers: `contains` / `get` / `count`,
-  `parents_of` / `children_of` / `missing_parents`, `room_tail`, `by_type` /
-  `by_sender`, `heads`, `admin_chain_tip`.
-- `rebuild()`: clears all derived state and recomputes it purely from the
-  authoritative `(event_id, wire)` rows — the restart-determinism oracle.
-- 24 tests (19 in-module + 5 file-backed e2e) covering all acceptance criteria.
-
-The **deterministic membership fold and authorization layer** has landed in
-`iroh-rooms-core::membership` (issue #12 / IR-0008). This is the second stateful
-layer of the Room Event Plane, downstream of the stateless validator:
-
-- `RoomMembership`: ingests `ValidatedEvent`s in any order; buffers causally-
-  incomplete events (no error — out-of-order tolerance); re-evaluates when
-  missing parents arrive.
-- **Ancestor-stable authorization**: every event's log-validity is judged only
-  against its own causal ancestors, so any two peers holding the identical
-  validated set compute a byte-identical verdict regardless of arrival order
-  (the §0 same-set convergence guarantee).
-- **Removed-dominates causal fold**: per-subject status derived from causal heads
-  (`Invited < Active < Removed` lattice max); least-privilege role merge
-  (`Agent < Member < Admin` lattice min) tie-broken by lowest `event_id`.
-- **Sticky departure**: `member.removed` and `member.left` both consume prior
-  invitations; re-admission requires a fresh post-departure `member.invited`.
-- **Key-bound invite capabilities only**: a join under a key with no naming
-  invite fails the gate, so ban-evasion under a fresh key is blocked.
-- `MembershipSnapshot`: the deterministic fold result — per-identity `status`,
-  `role`, and bound device; device → identity reverse map for QUIC identity
-  resolution (§5).
-- **Access-decision predicates** (`blob_serve_allowed`, `pipe_connect_allowed`):
-  pure functions the Blob/Pipe planes call; consult the **current snapshot**,
-  not the ancestor view — a since-removed member's log-valid events grant zero
-  capabilities.
-- `validate_with_membership`: completes Event Protocol §6 steps 7–8 on top of
-  the stateless `validate_wire_bytes`, via the `MembershipOracle` trait;
-  re-exported at `event::validate_with_membership`.
-- No `store` feature dependency — the fold is pure in-memory over `ValidatedEvent`s.
-- Conformance tests in `tests/membership_fold.rs` covering all six acceptance
-  criteria: admin invite/remove, non-admin rejection, key-bound join gate,
-  sticky departure, concurrent join/kick convergence to Removed, and
-  current-snapshot access decisions.
-
-The **bounded recent-sync engine** has landed in `iroh-rooms-core::sync` behind the
-`sync` cargo feature (issue #11 / IR-0007). This is the sync layer over the landed
-event/store/membership stack, proving the ADR-2 bounded recent-sync path for MVP-sized
-rooms without full decentralized reconciliation:
-
-- `SyncEngine`: a deterministic, sans-IO state machine consuming inbound `SyncMessage`s
-  and emitting `Vec<Outgoing>` frames; no async, no clocks beyond an advisory `now_ms`.
-- **Never-windowed membership/admin pull** (`WantMembership`): the membership sub-DAG and
-  full admin chain are always fully reconciled regardless of chat window size.
-- **Bounded recent chat pull** (`WantRecentChat`, `Window { max_count, since_ms }`):
-  count-bounded via canonical `(lamport, event_id)` order (trustworthy); `since_ms` is
-  advisory only and not a trust input.
-- **By-id backfill** (`WantEvents`/`Events`) driven by `Ingest::Buffered.missing` and
-  `EventStore::missing_parents`, with §4 anti-amplification bounds (per-author park cap,
-  backfill token bucket, depth bound).
-- **Admin-tip incompleteness detector + fail-closed** (`AdminTip`, `Completeness`): a node
-  whose admin view may be behind a removal **fails closed** on removal-sensitive decisions
-  for affected subjects; an admin fork raises a CRITICAL `equivocation` trust decision.
-- **`SyncDigest` / `room_event_ids`**: a read-only, additive store helper (no schema
-  change) plus the engine's `digest()` — the set-equality oracle the tests assert.
-- **`SimNet` harness**: deterministic in-memory multi-peer simulation (seeded shuffle,
-  partition, disconnect/reconnect); 37 tests prove arrival-order-independent convergence
-  and anti-amplification bounds (Spike Plan Gate D).
-
-The **local identity and device CLI** has landed in `crates/iroh-rooms-cli` (issue #16 /
-IR-0101). This is the first real subcommand group in the binary, establishing the
-data-directory model and key-persistence layer every later CLI command will reuse:
-
-- `iroh-rooms identity create --name <NAME> [--force]` — generates a participant identity
-  keypair (`sender_id`) and a device keypair (`device_id`) from the OS CSPRNG, persists
-  them under the resolved data directory with owner-only file permissions (`0600` files,
-  `0700` directory on Unix), and refuses to clobber an existing identity without `--force`.
-- `iroh-rooms identity show [--json]` — prints `name`, `identity_id`, and `device_id` in a
-  script-friendly format (labeled `key: value` lines by default; single-line JSON with
-  `--json`). Never reads or prints secret key material.
-- Data directory resolution: `--data-dir <PATH>` flag > `IROH_ROOMS_HOME` env >
-  platform default (`~/.local/share/iroh-rooms` on Linux,
-  `~/Library/Application Support/iroh-rooms` on macOS, `%APPDATA%\iroh-rooms` on Windows).
-- Keys are split across two files: `identity.json` (public profile, safe for `show`) and
-  `identity.secret` (the only secret-bearing file; `show` never opens it).
-- 40+ tests (unit + CLI integration) covering all acceptance criteria, security invariants
-  (no secret bytes in any output stream), and Unix file-permission guarantees.
-
-**Room creation** has landed in `crates/iroh-rooms-cli` (issue #17 / IR-0102), wiring the
-second subcommand group and completing the genesis-event flow end-to-end:
-
-- `iroh-rooms room create <NAME>` — loads the local identity secrets, draws a 16-byte
-  CSPRNG nonce, derives the `room_id` via the §5 `BLAKE3` derivation, assembles and signs
-  a `room.created` genesis event (Event Protocol §7), self-validates it through the full
-  stateless §6 pipeline, and persists the verbatim wire bytes into `<HOME>/rooms.db`.
-  The creator becomes the room's **single immutable admin**. Prints `room_id`,
-  `admin` (`identity_id`), and a next-step hint; exits non-zero and writes nothing on any
-  error (name validation runs before any IO).
-- `iroh-rooms room members <ROOM_ID>` — re-derives the room's membership by re-validating
-  and folding the persisted event log; prints `room`, `admin`, and each `member` row with
-  `role` and `status`. For a freshly created room this is one row: the creator, `admin`,
-  `active`. Room state is **derived from the append-only event log** (no separate
-  `rooms`/`members` table), so a room survives CLI restart by design.
-- A `build_room_created` pure genesis builder lives in `iroh-rooms-core::event::genesis`,
-  deterministic in its inputs (the caller injects the nonce and clock), golden-tested
-  against the §5 `room_id` vector, and reusable by future flows.
-- Secret hygiene: signing secrets are held in `Zeroizing` buffers and never appear in any
-  output or error path.
-- 30+ tests (core unit tests including the §5 golden `room_id` vector, CLI integration
-  tests via `assert_cmd`) covering all five acceptance criteria.
-
-The **full-mesh QUIC event transport prototype** has landed in
-`crates/iroh-rooms-net` (issue #9 / IR-0005). This is the real iroh adapter — the
-shipping carrier behind the landed, sans-IO `SyncEngine` — proving the
-`PHASE-0-SPIKE.md` ADR-1 path (full-mesh direct QUIC over the custom ALPN):
-
-- `NetTransport`: an `iroh::Endpoint` keyed by the node's `device_id` secret
-  (`endpoint.id() == device_id == EndpointId`) + a `Router` carrying ALPN
-  `/iroh-rooms/event/1`, implementing `iroh_rooms_core::sync::SyncTransport` so the
-  deterministic engine drives it unchanged.
-- **Admission before bytes**: the `ProtocolHandler` authorizes the QUIC/TLS-proven
-  remote `EndpointId` against a `device → identity → Active?` allowlist (the
-  `MembershipSnapshot` shape) and closes the connection **before** `accept_bi()` for
-  any non-member — an unauthorized peer's event bytes are never read.
-- **Observable connection state** (`PeerConnState`): the PRD §16.3 trichotomy —
-  connected / offline / unauthorized — as a snapshot + a live `ConnEvent` stream.
-- **Per-peer bidi-stream framing** (length-prefixed canonical-CBOR `SyncMessage`
-  frames; live `WireEvent` push = `SyncMessage::Events`) + a dial-with-backoff
-  reconnect loop.
-- 85 tests: 67 unit tests, a 9-test frame-codec integration suite (`tests/frame.rs`,
-  real QUIC loopback), and a 9-test loopback integration suite (`tests/loopback.rs`,
-  T1–T9) covering all four acceptance criteria (deterministic, no relay/network).
-- **Gate A is measured, not only loopback**: S1/S2 real-network runs are recorded
-  under `crates/spike-nat/results/`, with a 2026-07-07 local↔`demo1` refresh.
-  Remaining caveats are documented in `crates/iroh-rooms-net/NOTES.md`.
-
-**Key-bound room invite** has landed in `crates/iroh-rooms-cli` (issue #18 / IR-0103),
-adding the second authoring command and the first out-of-band capability artifact:
-
-- `iroh-rooms room invite <ROOM_ID> --invitee <IDENTITY_ID> [--role member|agent] [--expires <DURATION>]`
-  — admin-only; confirms the caller is the room's single immutable admin via the membership
-  fold, draws a fresh `invite_id` and capability **secret** from the OS CSPRNG, computes
-  `capability_hash = BLAKE3-256(INVITE_CONTEXT ‖ room_id ‖ invite_id ‖ secret)`, assembles
-  and signs a `member.invited` event (carrying the hash, **never** the secret), self-validates
-  and fold-checks the event before persisting, then emits an out-of-band `RoomInviteTicket`
-  token (`roomtkt1…`) carrying the room id, invite id, capability secret, bound invitee key,
-  role, optional expiry, and a discovery hint (admin `device_id`).
-- `RoomInviteTicket` lives in `iroh-rooms-core::ticket`: a canonical, round-trippable text
-  token (`roomtkt1<base32-lowercase-nopad(version ‖ CBOR ‖ BLAKE3-checksum)>`) with a
-  redacted `Debug` (secret masked) and a `capability_hash()` method that recomputes the
-  on-log hash from the ticket secret (AC4). Placed in `core` so the sibling `room join`
-  flow can decode it without duplicating the codec.
-- `--expires <DURATION>` supports `<int>{s|m|h|d}` (e.g. `24h`, `7d`); expiry is encoded
-  as `expires_at` (ms since Unix epoch) in the event content, log-only and advisory-clock-free
-  — enforcement lives in the landed `gate_join`, not the local clock. `expires: never` when
-  absent.
-- `--role admin` is rejected at the CLI (single immutable admin; the fold has no second-admin
-  semantics). `agent` and `member` are accepted.
-- Tickets are key-bound to the named `--invitee`; open/bearer tickets are out of scope for MVP.
-  There is no native ticket-specific revocation in Phase 2.5 Production Beta;
-  the bounded leaked-ticket model is accepted in
-  [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md).
-- Output is script-friendly labeled lines, ending with the ticket token and a password-grade warning.
-- 20+ tests (core unit: deterministic builder, golden event id, secret-absent-from-log AC3,
-  capability-hash AC4, ticket round-trip + corruption rejection; CLI integration: admin path,
-  non-admin rejection, bad args, secret-not-in-output).
-
-**Room join by ticket** has landed in `crates/iroh-rooms-cli`, `crates/iroh-rooms-core`,
-and `crates/iroh-rooms-net` (issue #19 / IR-0104), closing the invite handshake and
-making the full two-human exchange end-to-end runnable:
-
-- `iroh-rooms room join <TICKET> [--peer <ENDPOINT_ADDR>]… [--display-name <NAME>] [--timeout <DUR>]`
-  — redeems a `roomtkt1…` ticket from `room invite`, becoming an `Active` member whose join
-  both peers converge on. Concretely: decodes the ticket (fail-closed), pre-checks the local
-  identity matches `ticket.invitee_key` (wrong identity is an actionable error before any
-  network IO), brings up an ephemeral `Node`, dials the admin, pulls the never-windowed
-  membership sub-DAG via the engine's existing `WantMembership` handshake, assembles and signs
-  a `member.joined` via the new `build_member_joined` core builder, self-validates it through
-  the full stateless §6 pipeline, fold-checks it locally (bad secret → `BadCapability`,
-  expired invite → `ExpiredInvite`, role mismatch → `InsufficientRole` — all deterministic,
-  the same verdict every peer reaches), publishes it to the admin, waits for the local
-  `Active` transition, then prints the `JoinSummary` (join `event_id`, room, name, role,
-  active-member count, and a next-step hint). A join that never reaches the admin is a
-  **failure**, not a silent local success — unlike `send`, join is inherently online.
-- `iroh-rooms room tail <ROOM_ID> --accept-joins` — the admin side of the bootstrap: runs
-  the existing `room tail` session with the new `--accept-joins` flag, which engages the
-  `JoinBootstrapAdmission` gate (provisional admission). Without this flag on the admin's
-  node, the joiner's connection is rejected before bytes (the default fail-closed behaviour);
-  with it, a genuinely unknown device (a first-time invitee) is admitted **provisionally** —
-  served only the secret-free membership sub-DAG and allowed to push a single
-  `member.joined`, then upgraded to full membership when the fold accepts the join
-  (`upgrade-on-learn`). Chat/file/pipe planes remain off-limits to provisional peers.
-- A pure `build_member_joined(...)` assembler lands in `iroh-rooms-core::event::join`,
-  the sibling of `build_room_created` / `build_member_invited`: deterministic, clock-/RNG-free,
-  accepting the joiner's identity and device signing keys, `via_invite_id`, `capability_secret`,
-  `role`, an already-built `DeviceBinding`, optional `display_name`, `prev_events`, and
-  `created_at`. The `capability_secret` legitimately lands on the log inside the join (Spike §7
-  — the join is the proof of the capability; key-binding + departure-consumption keep a replay
-  under another key inert). The CLI holds it in a `Zeroizing` buffer from ticket-decode until
-  it is placed in the content and never prints it.
-- `JoinBootstrapAdmission` in `iroh-rooms-net::admission` (Approach A): wraps
-  `AllowlistAdmission` and changes exactly one outcome — an **unknown** device (no prior
-  binding) is `AdmitProvisional` when `accept_joins` is set, otherwise rejected as before.
-  Bound-but-inactive devices (removed/left members), fail-closed identities, and all
-  non-membership traffic paths are unchanged. Authorization is unchanged: `gate_join` in the
-  landed membership fold remains the convergent authority on every peer regardless of how the
-  connection was admitted. The audit log gains stable `join.bootstrap.*` vocabulary:
-  `bootstrap_admitted` / `bootstrap_upgraded` / `bootstrap_blocked`.
-- The privacy trade-off of Approach A (provisional admission discloses the secret-free
-  membership sub-DAG to a dialer who knows `room_id` + admin `EndpointId` during an open-invite
-  window) is explicitly documented and scoped: no capability secret is disclosed; a dialer who
-  fails `gate_join` is not made a member; the window closes when `--accept-joins` is not set.
-  Approach B (a dedicated capability-proving join ALPN that gates sub-DAG service on a proof)
-  is the documented hardening follow-up and is tracked separately.
-- Tests: 15+ core unit tests for `build_member_joined` (determinism, all-field round-trip,
-  stateless validation, device-binding enforcement, wrong-room, empty `prev_events`, unicode
-  display names, agent role); 15+ unit tests for `JoinBootstrapAdmission` (full decision matrix,
-  sticky-departure preservation, fail-closed priority, multi-device, join-window toggling);
-  8+ CLI unit tests for dial-set construction, timeout parsing, and rejection-message format;
-  and a two-peer loopback integration suite (`net/tests/join_e2e.rs`) covering valid join,
-  wrong identity, expired invite, and bad secret — asserting the joiner appears in `room members`
-  on **both** peers after sync (AC5).
-
-**Signed message send and receive** has landed in `crates/iroh-rooms-cli` (issue #20 /
-IR-0105), adding the first **online** commands — the first that leave the local filesystem
-and drive the `iroh-rooms-net` carrier from the binary:
-
-- `iroh-rooms room send <ROOM_ID> <MESSAGE> [--format plain|markdown] [--reply-to <EVENT_ID>]
-  [--peer <ENDPOINT_ADDR>]… [--timeout <DUR>]` — offline-first, online-best-effort: confirms
-  the caller is an active member via the membership fold, selects `prev_events = heads`,
-  assembles and signs a `message.text` through the new pure `build_message_text` core builder,
-  self-validates it, then brings up an ephemeral `Node`, dials the room's other active members,
-  and lets the engine `publish` persist and fan the frame out to connected peers. The message
-  is **always** stored locally (the guarantee); reaching zero peers is reported, not an error
-  (no queue, no guaranteed offline delivery — PRD §14).
-- `iroh-rooms room tail <ROOM_ID> [--peer <ENDPOINT_ADDR>]… [--limit <N>]` — the long-running
-  receiver/session: brings up a `Node`, prints its dialable `listening:` address (so a LAN/CI
-  peer can dial it via `--peer` without discovery), accepts inbound frames (validated, deduped,
-  persisted by the landed engine), and renders the timeline in deterministic `(lamport,
-  event_id)` order until interrupted (Ctrl-C).
-- A pure `build_message_text` (the byte-exact assembly point, golden-tested) lands in
-  `iroh-rooms-core::event`, plus thin additive read passthroughs (`SyncEngine::room_tail` →
-  `Node::room_tail`) so a running node can surface its timeline for display.
-- Every message-correctness criterion — signed by the device key, duplicate event ids ignored,
-  invalid signatures rejected, non-member messages rejected, deterministic timeline order — is
-  enforced by the landed, conformance-tested validator / membership fold / store / sync engine;
-  this issue is the integration and the two new commands, not new correctness logic.
-- The full two-human exchange additionally needs `room join` (#19) to make a second participant
-  an active member; until that lands the commands run but the round trip is gated on #19. Real-NAT
-  delivery inherits the open Gate-A risk from the transport prototype (#9).
-
-**Basic offline room-read commands** have landed in `crates/iroh-rooms-cli` (issue #21 /
-IR-0106), exposing a deterministic, network-free read surface for the local event log — the
-developer-workflow and testing tier for inspecting room state without an active network
-session or membership requirement:
-
-- `iroh-rooms room tail <ROOM_ID> --offline [--json] [--limit <N>]` — a synchronous one-shot
-  read of `<home>/rooms.db`. Renders **all** validated event types (not just messages) in
-  canonical `(lamport, event_id)` order. Default text mode: one stable line per row —
-  `event=… type=… lamport=… from=… role=… status=… at=…  <summary>` — where the attribution
-  prefix is machine-parseable and the summary is human context. `--json` mode emits a single
-  JSON array of objects with stable field names and flattened type-specific fields (`body`,
-  `file_name`, `pipe_id`, …). `--offline` conflicts with the online-session flags; `--json`
-  requires `--offline`. No `Node`, no network, no secret load, no membership check.
-- `iroh-rooms room members <ROOM_ID> --json` — emits the fold-derived roster as a single-line
-  JSON object `{ room, admin, members: [{identity_id, role, status, is_admin}] }`, mirroring
-  `identity show --json`. `--json` conflicts with the online `--status` path.
-- **Removed vs left** distinction: `status=left` (voluntary self-departure, a `member.left`
-  by the subject) is now shown separately from `status=removed` (an admin-authored
-  `member.removed`) in both `room members` and `room tail --offline`. The security lattice is
-  unchanged — both are the same zero-capability `Status::Removed` state; the distinction is
-  display-only, derived from the log, and admin-removal dominates a concurrent self-leave.
-- A new `src/display.rs` helper module backs the display logic for offline members, offline
-  tail, and the online `members --status` path so all three surfaces use the same code.
-- Two new pure core builders — `build_member_left` / `build_member_removed` — land in
-  `iroh-rooms-core::event` as siblings of the invite/join builders. They are not wired to any
-  CLI command here; the future `room leave` / `member remove` authoring issues reuse them.
-- 35+ tests: `tests/tail_cli.rs` (offline order, validated-event coverage, JSON contract,
-  restart determinism, error cases, flag conflicts, secret hygiene, AC3 removed/left/dominance)
-  and `tests/room_cli.rs` (JSON roster, AC2/AC4), plus golden `event_id` regression locks for
-  both new core builders.
-
-The **live TCP pipe prototype** has landed in `crates/iroh-rooms-net` and
-`crates/iroh-rooms-cli` (issue #14 / IR-0010). This is the PRD's most differentiated feature
-— authenticated TCP-over-QUIC forwarding that exposes a local loopback service to an
-**explicitly authorized** room peer, and only to that peer:
-
-- `/iroh-rooms/pipe/1` ALPN chained as the second `.accept()` on the shared `Router`
-  (one `Endpoint`, two planes: event + pipe).
-- **Two-stage connect gate**: stage 1 closes a non-member / non-Active device before
-  `accept_bi()` — no handshake byte is read; stage 2 reads `PipeHello{pipe_id}`, runs
-  `pipe_connect_allowed` + `pipe.closed`-known + expiry, and only on `Accept` splices
-  QUIC↔loopback TCP. Every lookup fails closed.
-- **Tear-down-on-learn** watcher re-evaluates each live session every tick and severs any
-  that no longer pass the gate (membership removal, explicit close, or expiry).
-- **Loopback-only binds** (PRD §13.2.3): non-loopback `--tcp` targets are refused; the
-  connector's local listener binds `127.0.0.1` only.
-- Stable, greppable audit vocabulary: `pipe.opened` / `pipe.closed` /
-  `pipe.connect.accepted` / `pipe.connect.rejected:<cause>` / `pipe.torndown:<cause>`,
-  written to stderr for operator visibility and to `<IROH_ROOMS_HOME>/audit.ndjson`
-  for local incident reconstruction.
-- `iroh-rooms pipe expose | connect | close | list` CLI subcommands with the PRD §13.2
-  security warning, loopback enforcement, non-empty `--allow`, active-member pre-check,
-  and §16.3 failure-mode distinction.
-- `crates/iroh-rooms-net/tests/pipe_e2e.rs` proves P1–P6 (AC1–AC5 + expiry) on
-  in-process loopback nodes with an in-test echo server; every await is timeout-bounded.
-- **Gate A is measured** for the transport substrate and a prior pipe ALPN
-  confirmation exists; current caveats remain the cellular relay-throughput
-  re-measure and one home-NAT→CGNAT reverse leg.
-
-Issue **#23 / IR-0108** reconciles that prototype to the PRD's canonical, user-facing contract
-(no change to the authorization model, event schema, gate, or splice logic):
-
-- `iroh-rooms pipe close <PIPE_ID>` now takes a **bare pipe id** — the room is inferred from the
-  local log (backed by the additive read-only `EventStore::room_ids()`), with an optional
-  `--room <ROOM_ID>` disambiguator that fails closed on an unknown or ambiguous pipe.
-- The owner's `pipe expose` installs a **CLI-local audit sink** (`Node::spawn_with_pipe_audit`),
-  so an unauthorized connect is rejected **and locally visible** as
-  `pipe.connect.rejected:<cause>` on stderr and in `<IROH_ROOMS_HOME>/audit.ndjson`;
-  `-v` also logs each accepted connection. stdout stays clean for scripting.
-- The §13.2.4 security warning names the exposed **target and each allowed member**, and graceful
-  owner exit now covers **SIGINT and SIGTERM** (`pipe.closed{owner_exit}`); a hard kill
-  (SIGKILL / power loss) still stops forwarding but leaves the pipe open on the log until an
-  owner/admin `pipe close` — a documented reachability bound.
-
-The **Gate-A real-NAT measurement harness** has landed in `crates/spike-nat`
-(issue #43 / IR-0012), providing the purpose-built `nat-probe` tool and a complete
-runbook + results schema for closing the one load-bearing Phase-0 assumption still
-without measured evidence. No shipping code changes; this is a throwaway spike crate
-on the same pattern as `spike-blobs`:
-
-- **`nat-probe listen [--relay-only] [--loopback] [--seed <N>]`** — stands up a
-  minimal `iroh::Endpoint` on the n0 stack (DNS discovery + default relay), serves a
-  trivial echo protocol on `/iroh-rooms/nat-probe/1` (no room data; spec §8), prints
-  its `EndpointId` and home relay URL.
-- **`nat-probe dial <ENDPOINT_ID> …`** — dials purely by `EndpointId` (discovery
-  resolves the path), measures TTFB / RTT / throughput, reads the **settled path type
-  directly off iroh** (active-addr set on `Endpoint::remote_info` — the `ConnectionType`
-  watcher is absent on iroh 1.0.1; see `crates/spike-nat/NOTES.md §2`), and emits a
-  `ProbeResult` as human summary on stdout and structured JSON on `--json`.
-- **`--relay-only`** suppresses direct paths (`clear_ip_transports`) for a controlled
-  relay measurement. **`--loopback`** is the offline self-check (relay disabled, dial
-  by `--addr`); it proves the harness works but is NOT Gate A.
-- **`ProbeResult`** (spec §5 field table): `scenario`, `direction`, `nat_a`/`nat_b`,
-  `established`, `path_type`, `initial_path_type`, `hole_punched`, `ttfb_direct_ms` /
-  `ttfb_relay_ms`, `rtt_ms`, `rtt_p90_ms`, `throughput_mbit_s`, `setup_time_ms`,
-  `relay_url`, `iroh_version`, `run_at_utc`. TTFB is bucketed into the direct/relay
-  column by the settled path type (forced to relay under `--relay-only`) so natural
-  and controlled relay runs are directly comparable.
-- **Runbook** in `crates/spike-nat/NOTES.md` §4: two hosts on different real networks,
-  both directions, natural + `--relay-only`, ≥2 NAT scenarios incl. ≥1 likely-symmetric
-  (CGNAT/mobile). Operator-supplied `--nat-a`/`--nat-b`/`--scenario`/`--direction`/
-  `--run-at` carry all the context; no wall-clock is read in any decision path.
-- **GO/NO-GO rubric** (`crates/spike-nat/NOTES.md` §5): GO iff every scenario
-  establishes both directions within ≤10 s via at least relay, ≥1 non-symmetric
-  scenario achieves direct, and relay usability meets ≥1 Mbit/s / RTT ≤300 ms. A
-  NO-GO is a hard input to the Gate E memo (#15).
-- **Results artifact**: `crates/spike-nat/results/` — one JSON per run + a rolled-up
-  `results.md` table that drops verbatim into `crates/iroh-rooms-net/NOTES.md` under
-  "Gate A (real-network)".
-- CI proves the harness builds, its loopback self-check passes (a bidi echo on
-  loopback, well-formed `ProbeResult` emitted, path classification correct), and all
-  unit tests pass. Real-network results are committed for S1/S2, plus a
-  2026-07-07 local↔`demo1` refresh; CI still cannot prove NAT traversal.
-
-The **peer connection manager** has landed in `crates/iroh-rooms-net` and
-`crates/iroh-rooms-cli` (issue #22 / IR-0107), wiring the landed transport primitives
-into a roster-reactive whole and closing the ADR-1 "per-room peer manager" follow-up
-(IR-0005 NOTES D6/OQ-6, N6, and the roster-driven dial reconciliation):
-
-- **`PeerManager`** (`net/src/manager.rs`): the room-scoped owner of the outbound dial
-  set. It derives the **desired** connection set from the live membership snapshot
-  (active members' devices minus self) and **reconciles** the running `dial_loop` set
-  against it on every fold change — starting loops for newly-active members, aborting
-  and tearing down loops for since-removed ones. Idempotent: an unchanged snapshot is a
-  no-op (no loop churn, no spurious `ConnEvent`s). Replaces the flat, never-pruned
-  `dial_tasks` list.
-- **`SnapshotAdmission`** (`net/src/admission.rs`): the production re-point of the
-  accept gate (the IR-0005 NOTES D6/OQ-6 follow-up, now closed). Reads a shared
-  `AdmissionView` cell on every `authorize` call so a device removed mid-session begins
-  being rejected within one tick — not just at the next process restart. The pump is
-  the sole writer; the accept hot path takes a short, non-blocking critical section.
-  `AllowlistAdmission` is retained for fixtures and the join-bootstrap overlay;
-  `JoinBootstrapAdmission` is now generic and composes with either gate.
-- **`OfflineReason`** (`net/src/state.rs`): an additive diagnostic refinement of
-  `PeerConnState::Offline` for PRD §16.3 / §18.1. Five values:
-  `NeverDialed / Unreachable / TransportError / LinkDropped / Deauthorized`. Never a
-  trust input; the four-value `PeerConnState` enum and its pinned label strings are
-  unchanged. `PeerTable` gains `set_offline`, `entries()`, `identity_of`, and
-  `devices_of` to serve the CLI connection panel.
-- **`Node::spawn_room`** (`net/src/node.rs`): the managed-session entry point. The pump
-  constructs the manager and `SnapshotAdmission` cell, reconciles them after every
-  fold-mutating step and on each anti-entropy tick (≤250 ms reaction), and preserves
-  the join-bootstrap provisional path (IR-0104) unchanged. The `RoomReconciler`
-  change-detector ensures reconcile is a no-op when the snapshot has not moved.
-  `Node::reconcile_now()` is a test hook that forces an immediate reconcile.
-- **CLI connection panel** in `room tail <ROOM_ID>`: the `ConnEvent` subscriber prints
-  a stable, greppable per-peer status line on every transition:
-  `peer <identity-short> device=<device-short> state=<state> [reason=<reason>]`
-  and a roster summary: `peers: N connected, M offline, K unauthorized`. Reason strings
-  are pinned identically to the `PeerConnState` labels (`unreachable`, `link_dropped`,
-  `transport_error`, `deauthorized`). An `Unauthorized` peer is never rendered
-  as "offline" (PRD §16.4 honesty rule).
-- **`room members <ROOM_ID> --status`**: brings up an ephemeral managed node, waits
-  for connections to settle, then prints each member row with `role`, membership
-  `status`, and live `conn` field (`connected` / `offline reason=<reason>` /
-  `unauthorized` / `self` / `n/a`). No new CLI noun; the existing `room members`
-  mental model extended with an opt-in flag.
-- **New audit vocabulary**: `peer.deauthorized` (mid-session roster removal — terminal,
-  will not redial) and `peer.offline:<reason>` (diagnostic transition refinement).
-- **Device-selection promotion**: `build_dial_set`'s active-only, self-excluded device
-  selection delegates to `PeerManager::desired_devices` so there is a single
-  implementation shared between the CLI send/pipe paths and the runtime manager.
-- 7 unit tests for `desired_devices` (purity, self-exclusion, invited-only exclusion,
-  removed exclusion, three-actor rooms); live-flip test for `SnapshotAdmission` (proves
-  mid-session removal takes effect); full decision-matrix test and `JoinBootstrapAdmission`
-  over the live gate; `PeerTable` reason-refinement and label-stability tests.
-  Gate A remains a release-signoff item with measured evidence and residual
-  caveats; see `crates/iroh-rooms-net/NOTES.md`.
-
-The **two-peer Phase 1A integration test suite** has landed in
-`crates/iroh-rooms-cli/tests/two_peer_e2e.rs` (issue #24 / IR-0109), the PRD §19 Phase 1A
-deliverable 8 — the product-level proof that the entire Phase 1A slice works end-to-end
-across two isolated participants driven through the real `iroh-rooms` binary:
-
-- **Tiered by CI reliability:** a deterministic, network-free CI tier
-  (`full_slice_runs_without_central_server`, `message_persists_across_restart`, plus nine
-  harness unit tests) always runs in `cargo test`; an `#[ignore]`-gated online tier
-  (membership convergence, live pipe, unauthorized denial) requires two live loopback
-  processes and is run with the documented command below.
-- **No relay, no discovery, no central application server:** every online step uses the
-  hidden `--loopback` flag (`NetMode::Loopback` = `RelayMode::Disabled` + `presets::Minimal`)
-  over pure loopback QUIC. The `ChildSession` harness parses each host's `listening:` address
-  and threads it into the peer's `--peer` for deterministic dial — proving AC1 structurally.
-- **All five acceptance criteria covered:** no-central-server (CI), membership convergence
-  (gated), message restart-persistence (CI), authorized pipe bytes (gated), unauthorized
-  denial (gated — proven by zero forwarded bytes and the `pipe.connect.rejected:not_allowed`
-  owner-stderr signal from the IR-0108 audit sink).
-- **Backed at the Node layer:** `join_e2e.rs`, `message_e2e.rs`, and `pipe_e2e.rs` remain
-  the always-green CI backstop for the same ACs at the transport layer; the CLI suite adds
-  product-level coverage on top.
-
-Run the gated online tier locally (loopback only; no relay, no external tools):
+You need Rust 1.80 or newer and `git`.
 
 ```bash
-cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
+git clone https://github.com/kortiene/iroh-room.git
+cd iroh-room
+cargo build -p iroh-rooms-cli --release
+mkdir -p "$HOME/.local/bin"
+install -m 0755 target/release/iroh-rooms "$HOME/.local/bin/iroh-rooms"
+iroh-rooms --version
 ```
 
-The **hardened recent-history sync implementation** has landed in `crates/iroh-rooms-core`
-(issue #26 / IR-0201), graduating the Phase-0 bounded recent-sync prototype to the MVP
-recent-history-sync implementation by persisting the `SyncEngine`'s genuinely
-non-rebuildable in-flight state across process restarts:
+If `$HOME/.local/bin` is not on `PATH`, choose another user-writable install directory or add it to `PATH`.
 
-- **Store schema v2** (`user_version = 2`): a forward-only, additive migration adding five
-  derived-cache tables — `sync_state`, `sync_backfill_tokens`, `sync_parked`,
-  `sync_parked_missing`, and `trust_decisions` — scoped per room. The authoritative `events`
-  and `event_parents` tables are untouched; a v1 database upgrades in place (the five tables
-  are created empty). An older binary opening a v2 database fails closed with a typed
-  `StoreError::Migration`.
-- **Restore on `open`**: `SyncEngine::open` now reloads the persisted orphan park
-  (re-validating each `wire` via `validate_wire_bytes` on load — a corrupt or tampered row
-  is dropped and logged as `park_corrupt`, never a panic), the unconfirmed admin-tip
-  suspicion, the per-author backfill token buckets, and the trust-decision audit log, then
-  calls `recompute_completeness` **with the restored suspicion in hand** — so an
-  `AdminViewSuspect` fail-closed posture re-arms **before** any access decision is served
-  after a restart. A reboot cannot clear a removal-sensitive fail-closed gate.
-- **Checkpoint on mutation**: a persistence hook writes each non-rebuildable state change to
-  SQLite transactionally inside the single-owner pump — park insert/evict/wake, suspicion
-  raise/clear/attempts, token consume/refill (batched per tick), trust-decision record — so
-  a crash loses at most one tick of state. Checkpoint faults surface as `SyncError::Store`
-  (logged, non-fatal; `events` stays authoritative).
-- **Retry survives restart**: the restored park's missing-parent edges re-issue `WantEvents`
-  on the first `on_connect`/`on_tick`, gated by the **restored** token buckets (not a fresh
-  full budget) — so buffering **and** retry are durable and the anti-amplification bound
-  cannot be bypassed by crash-looping.
-- **Observable rejection (AC3)**: every invalid-event drop increments `counters().rejected`
-  and appends a stable `reject.<code>` entry to the bounded `logs()` ring; the net
-  `AuditSink` gains `event_rejected`, called from the `Node` pump on the receive path, so
-  rejections are observable without a tracing subscriber (the CLI installs none).
-- **Additive `EventStore` sync-cache API** (`store` feature):
-  `load/save_sync_state`, `load/save_backfill_tokens`, `load/upsert/delete_parked`,
-  `load/append_trust_decision`, and the `ParkedRow`/`SyncStateRow`/`TrustRow` DTOs. The
-  `SyncEngine` and `iroh-rooms-net` public surfaces are unchanged; callers require no
-  signature changes.
-- **`SimNet::restart(peer)`**: drops the engine and re-opens it over the same store,
-  enabling fast deterministic proofs of the restore path under shuffle and partition.
-- **IR-0201 integration suite** (`crates/iroh-rooms-core/tests/sync_restart.rs`): the AC5
-  restart-durability matrix — park, fail-closed re-arming, trust-audit persistence, and
-  rate-limit conservation across restart — plus migration tests (v1→v2 additive, `events`
-  byte-stable, old binary rejects v2), cache-drop equivalence (dropping the five v2 tables
-  and reconnecting converges to the same steady state), and the shuffled-delivery-after-restart
-  scenario.
-
-**File import into the blob store** has landed in `crates/iroh-rooms-cli` and
-`crates/iroh-rooms-net` (issue #27 / IR-0202), completing the producer/import half of the
-Blob Plane and making `iroh-rooms file share` operational:
-
-- `iroh-rooms file share <ROOM_ID> <PATH> [--name <NAME>] [--mime <MIME>]` — active-member
-  gate (confirmed via the membership fold before any write); classifies the path against the
-  §7 error taxonomy (missing, directory, over-cap at 100 MiB, unreadable — all before any
-  write); canonicalizes the path (relative paths such as `./f.txt` are supported); imports the
-  file into a durable content-addressed `<home>/blobs/` store (`iroh-blobs` `FsStore`, Copy
-  mode — the store holds an independent snapshot, so the original file may change or vanish
-  afterwards); independently recomputes BLAKE3-256 over the file and asserts it matches the
-  store import hash; draws a random 16-byte `file_id` from the OS CSPRNG; assembles and signs
-  a `file.shared` event (carrying the handle, display name, MIME type, byte length, content
-  hash, blob format, and asserted providers); self-validates it through the full §6 stateless
-  pipeline; fold-checks it; and persists it to the local log. Fully offline — no network is
-  contacted.
-- `iroh-rooms file list <ROOM_ID> [--json]` — offline read: lists every `file.shared` event in
-  the room log with `file_id`, name, size, content hash, and provider status (`you (local)` if
-  this node holds the blob, `reference-only` otherwise). No membership requirement. `--json`
-  emits a stable `[{"file_id", "name", "size_bytes", "blob_hash", "provider"}]` array.
-- `BlobStore` in `iroh-rooms-net::blob` — a thin, dependency-isolating wrapper over the
-  `iroh-blobs` filesystem store; all `iroh-blobs` types are confined behind it so a version
-  bump touches one file. The `FsStore` holds an exclusive on-disk lock while open;
-  `BlobStore::close` (which calls `store.shutdown()`) must be called before the same process
-  reopens the same directory (the same-process `file share` → `file list` analogue, and the
-  protection described in `FsStore exclusive lock needs shutdown` project memory).
-- A pure `build_file_shared` assembler lands in `iroh-rooms-core::event`, the sibling of
-  `build_message_text` / `build_pipe_opened`: deterministic, clock-/RNG-free, golden-tested
-  with a pinned `event_id` regression lock.
-- 35+ tests: CLI integration tests (`file_cli.rs`: small file, missing file, unreadable file,
-  hash verification, JSON contract, membership gate, size cap); `cli/src/file.rs` unit tests
-  (MIME guessing, path classification, provider labels, name validation, handle encoding,
-  env-var test seam); `BlobStore` tests (import hash matches independent BLAKE3, `has` after
-  import, durability across reopen, empty file, error codes); `build_file_shared` tests
-  (determinism, all-field round-trip, stateless validation, golden event id, signature verifies
-  under device key).
-- **The serve/fetch half** — `file fetch`, the `iroh-blobs` serve ALPN with the spike's
-  two-gate ACL, and honest "no-provider" unavailability — was **deliberately out of scope**
-  here and landed as the IR-0204 follow-up below.
-
-**`file.shared` validation hardening** has landed in `crates/iroh-rooms-core::event`
-(issue #28 / IR-0203), closing the one gap #27 left open: `parse_file_shared` now enforces
-semantic bounds on peer-asserted file metadata at the stateless trust boundary, not just
-structural shape. `name` and `mime_type` must be non-empty, control-character-free, and
-within `MAX_FILE_NAME_BYTES`/`MAX_MIME_TYPE_BYTES` (255 bytes each); `mime_type` must also be a
-well-formed `type/subtype` pair; `size_bytes` is capped at the existing `MAX_SHARED_FILE_BYTES`
-(100 MiB) at the event layer, not just the CLI's local pre-import check; an explicit
-`providers` array, when present, must be non-empty and no longer than `MAX_FILE_PROVIDERS`
-(16). Every violation returns the existing `RejectReason::InvalidContent` — no new taxonomy
-variant, no wire-schema change, and every previously-valid `file.shared` (including the pinned
-golden vectors) stays byte-identical and valid. Because `EventStore::insert` is only ever
-reached for validated events, an invalid `file.shared` — however it arrives, from a local
-build or a remote peer — can never be persisted and therefore never appears in `file list`.
-
-**Agent identity** has landed in `crates/iroh-rooms-cli` (issue #31 / IR-0206), adding the
-first-class `agent invite` noun the PRD documents:
-
-- `iroh-rooms agent invite <ROOM_ID> <AGENT_ID> [--expires <DURATION>]` — a thin, delegating
-  wrapper over the landed key-bound invite path (`room invite --invitee <AGENT_ID> --role
-  agent`, IR-0103): same admin gate, same `capability_hash`, same `member.invited` builder,
-  same ticket codec, same IR-0110 error codes. It draws no new authorization decision and mints
-  no new event type — it exists so the agent is a discoverable, first-class CLI concept
-  (`PRD.v0.3.md` §15.8/§16) rather than a `--role` flag buried under `room invite`.
-- An agent is an ordinary principal: it is created with the same `identity create` a human
-  uses, and becomes a member solely through this admin-issued, key-bound invite plus its own
-  `room join` — there is no implicit room access and no distinct agent principal type. The
-  membership fold's `Role::Agent` (least-privileged in the `Agent < Member < Admin` lattice)
-  and `gate_active_member`'s `NotAMember` rejection of any non-invited principal were already
-  landed (IR-0008); this issue is a CLI surface plus explicit conformance proof, not new
-  protocol behavior.
-- `iroh-rooms agent status <ROOM_ID> <STATUS> [--message <TEXT>] [--progress <0..100>]
-  [--artifact <FILE_ID>...]` (issue #33 / IR-0208) posts a signed `agent.status` event: build →
-  self-validate → persist locally (guaranteed) → best-effort push to connected peers, the same
-  offline-first/online-best-effort contract as `room send`. Posting is **not** role-gated — any
-  active member may post (`gate_active_member`, matching spike §7 "any current member") — the
-  CLI noun is a discoverable surface, not a new authorization tier. `status`/`message` are
-  bounded (64/4096 UTF-8 bytes) and `related_artifact_ids` (via repeatable `--artifact
-  file_<hex>`, the same handle codec `file share`/`file fetch` use) is capped at 16 entries and
-  rejected empty-but-present, mirroring `file.shared`'s trust-boundary bounds. The offline `room
-  tail [--offline] [--json]` read renders the full row (`state`, `message`, `progress`,
-  `artifacts`); the live streaming `room tail` renders only `message.text` today (a known
-  display gap, deferred).
-
-**The agent invite flow** has been proven end-to-end by a dedicated conformance suite
-(issue #32 / IR-0207), closing the one gap IR-0206 deliberately deferred — AC3, "agent
-join is rejected without valid capability" — asserted *through the agent surface*
-rather than assumed from the role-agnostic design. No production code changed:
-`agent invite`, `room join`, and `gate_join` were already role-agnostic and already
-landed (IR-0206/IR-0103/IR-0104).
-
-- `crates/iroh-rooms-cli/tests/agent_invite_flow.rs` packages the issue's four
-  Test-Plan legs in one traceable file: admin invite and non-admin rejection are thin
-  re-assertions (the exhaustive matrix stays in `agent_cli.rs`), and the new coverage
-  is the ticket-rejection leg — a corrupted or truncated agent ticket rejected
-  `ticket_*`/exit 5, and an agent ticket redeemed under the wrong identity rejected
-  `wrong_identity`/exit 3, both pre-IO with no membership persisted.
-- **Code-identity parity tests** mint an `agent`-role ticket and a `member`-role ticket
-  from the same admin, corrupt or misredeem them identically, and assert the IR-0110
-  code and exit category match byte-for-byte — the durable guard that a future
-  refactor cannot special-case the `agent` role without failing a test.
-- `crates/iroh-rooms-net/tests/join_e2e.rs` gained `agent`-role mirrors of
-  `bad_capability_secret_join_not_accepted` / `expired_invite_join_not_accepted` — the
-  online half of AC3 (wrong capability secret, expired invite), deterministic and
-  always-green since it drives two in-process `Node`s rather than a live loopback
-  session.
-
-### Error codes
-
-The `iroh-rooms` binary (issue #25 / IR-0110) renders every terminal command failure as a
-machine-parseable stderr line, `error[<code>]: <message>`, and every accepted-but-flagged
-receive-path event as `warning[<code>]: <message>` (never a failure, never a non-zero exit).
-`<code>` is a stable string a script can branch on directly; the process exit code is the
-coarser category below, aligned with `clap`'s own exit `2` for a usage error. An uncoded
-failure (the long tail of prose errors not yet adopted into the taxonomy) still renders
-`error: <message>` and exits `1`. stdout is never used for an error or a warning.
-
-| Exit | Category | Meaning | Example codes |
-| ---: | --- | --- | --- |
-| `0` | — | success (including `room send` reaching zero peers — availability, not failure) | — |
-| `1` | Internal | unexpected / uncoded internal error | `internal`, any uncoded failure |
-| `2` | Usage | bad input or environment | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
-| `3` | Auth | authorization / capability denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `wrong_identity`, `peer_unauthorized` |
-| `4` | Integrity | crypto / structural rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch` |
-| `5` | Ticket | ticket decode failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
-| `6` | Connectivity | reachability / availability | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
-
-The taxonomy **wraps** the already-pinned protocol/net vocabulary rather than re-listing it:
-`bad_signature`/`not_a_member`/… reuse `RejectReason::code()` verbatim (so `room join` and a
-`room tail` receive-path drop of the same event report the identical code — the crypto-vs-
-authorization split AC), and `ticket_*` reuses the new `TicketError::code()`. A ticket failure
-never echoes the raw token or the capability secret — only the redacted reason. An `offline`
-peer (authorized, unreachable right now) is never rendered as `unauthorized` (a peer this node
-will never talk to), and vice versa; `room members --status` / `room tail` show the connection
-panel distinguishing the two live, while `peer_offline` / `peer_unauthorized` are their
-command-failure twins (e.g. `pipe connect`). A clock-skewed but otherwise valid event is a
-`warning[clock_skew]` advisory only — it is still accepted, ordered, and displayed.
-
-**Actionable next steps (issue #38 / IR-0303).** Every terminal `error[<code>]:` line a
-script-facing coded failure can print is immediately followed, on the next stderr line, by a
-fixed, secret-free `next: <action>` line naming the concrete next step — a second, additive
-render line, never a replacement for the `error[<code>]:` contract above, so a script matching
-`^error\[` or branching on `$?` is unaffected. A structural/crypto rejection (Integrity, exit
-`4`, minus `hash_mismatch`) and `invalid_argument`/`internal` have no generic next step (the
-call-site message already carries the context); every other code below has one.
-
-| Code | Category | Exit | Meaning | Next action |
-| --- | --- | ---: | --- | --- |
-| `internal` | Internal | `1` | unexpected / uncoded internal error | — (see the message) |
-| `invalid_room_id` | Usage | `2` | room id argument does not parse | copy the room id from `room create` / `room members` (form `blake3:<hex>`) |
-| `invalid_argument` | Usage | `2` | an option value is malformed | — (see the message) |
-| `no_such_file` | Usage | `2` | `file share` path missing, or `file fetch` reference not found/synced | check the path for `file share`, or run `file list` / `room tail` first to sync the reference for `file fetch` |
-| `permission_denied` | Usage | `2` | `file share` path exists but cannot be read | check the file's read permissions, or share a copy you can read |
-| `file_too_large` | Usage | `2` | `file share` path exceeds the MVP size cap | the MVP share limit is fixed; split or compress the file |
-| `identity_not_found` | Usage | `2` | no local identity exists | run `iroh-rooms identity create --name <name>` first |
-| `room_not_found` | Usage | `2` | no room with this id is known locally | run `iroh-rooms room create <name>`, or join an invite ticket first |
-| `no_discovery_hint` | Usage | `2` | the invite ticket carries no admin discovery hint | pass `--peer <admin-addr>` (the ticket carried no discovery hint) |
-| `not_a_member` | Auth | `3` | sender/caller is not a current room member | ask the admin to invite you and complete `room join` first |
-| `unbound_device` | Auth | `3` | sender has no device bound in membership state | ask the admin to invite you and complete `room join` first |
-| `insufficient_role` | Auth | `3` | sender's role does not permit this event type | ask the admin to invite you with the intended role |
-| `expired_invite` | Auth | `3` | the cited invite was consumed or its expiry passed | ask the admin for a fresh `room invite` (optionally with a longer `--expires`) |
-| `bad_capability` | Auth | `3` | a join's capability secret did not match the invite | ask the admin to re-issue the invite for your identity id |
-| `wrong_identity` | Auth | `3` | local identity ≠ the ticket's bound `invitee_key` | ask the admin to re-issue the invite for your identity id (`identity show`) |
-| `peer_unauthorized` | Auth | `3` | a connectivity command was refused as not-a-member | ask the admin to confirm your membership has synced, then retry |
-| `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch` | Integrity | `4` | crypto / structural §8 rejections | — (structural; not user-fixable) |
-| `hash_mismatch` | Integrity | `4` | a fetched blob's independently recomputed BLAKE3-256 disagrees with the reference | do not trust this file; the reference or a provider may be corrupt — ask for a fresh `file share` |
-| `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` | Ticket | `5` | the ticket token failed to decode (see the message for which check failed) | check the whole ticket was copied (no truncation/whitespace); if it persists, ask the admin for a fresh `room invite` |
-| `no_admin_reachable` | Connectivity | `6` | `room join` never observed the admin within the timeout | ask the admin to run `room tail <ROOM_ID> --accept-joins`, then retry; or pass `--peer <admin-addr>` |
-| `peer_offline` | Connectivity | `6` | a connectivity command could not reach an authorized peer | ask the owner to come online (run `room tail <ROOM_ID>`), then retry; or pass `--peer <owner-addr>` |
-| `blob_unavailable` | Connectivity | `6` | no reachable provider holds the requested blob | ask a peer that holds the file to run `room tail <ROOM_ID>`, then retry `file fetch` |
-
-Every next-action string is a fixed, non-interpolating `&'static str` (`ErrorCode::next_action()`
-in `crates/iroh-rooms-cli/src/error.rs`) — structurally incapable of leaking a secret; runtime
-context (a path, an id, a resolved `--peer`) stays in the `error[<code>]:` message, never in the
-`next:` line.
-
-**Verbose network diagnostics (issue #38 / IR-0303).** `room members <ROOM_ID> --status
---verbose` (`-v`) and `room tail <ROOM_ID> --verbose` append a stderr-only, opt-in `diag:` block
-— hidden by default (§18.5 "hide networking details unless needed") — surfacing the network
-facts a developer needs to self-diagnose a P2P failure: this node's dialable address(es) + home
-relay url, and, per known peer, its live path classification read from iroh's `remote_info`
-*active* transport-address set (never inferred from latency — iroh 1.0.1 has no `ConnectionType`
-watcher):
-
-```text
-diag: local id=<endpoint_id> direct=<ip:port,…|none> relay=<url|none>
-diag: peer <short_id> device=<short> state=connected path=direct relay=none
-diag: peer <short_id> device=<short> state=connected path=relay  relay=<url>
-diag: transport connected=2 (direct=1 relay=1 mixed=0) offline=0 unauthorized=0
-```
-
-`path=` is `direct` (a hole-punched UDP path), `relay` (relayed only), `mixed` (both active — not
-yet fully hole-punched), or `none` (no active transport — always true for an `offline` or
-`unauthorized` peer, which never renders as reachable). The block is purely diagnostic — like
-`OfflineReason`, it is a read-only transport observation and never an authorization input — and
-never renders a private key, a ticket secret, or a message payload; only public identifiers
-(`EndpointId`/`IdentityKey`), connection-state labels, IP socket addresses, and relay URLs.
-Without `--verbose` the output is byte-identical to today (AC2: the machine surface — the
-`error[<code>]:`/`warning[<code>]:` lines and the category → exit scheme — is unchanged).
-
-**File fetch and verification** — the serve + fetch half of the Blob Plane — has landed in
-`crates/iroh-rooms-net` and `crates/iroh-rooms-cli` (issue #29 / IR-0204), closing the gap
-#27/#28 left open and completing the PRD §9.2 file-sharing journey:
-
-- **Serve plane** — the `iroh-blobs` ALPN is now a third `.accept()` on the shared `Router`
-  (`net::blob::serve::spawn_blob_gate`), gated by a fold-derived two-gate ACL
-  (`BlobAclView`): Gate 1 admits a connect only from a QUIC/TLS-proven `endpoint_id` bound to a
-  currently-active member; Gate 2 serves a hash only if it is referenced by a valid
-  `file.shared` in the room (from the new `SyncEngine::file_shared_hashes`); push and observe
-  are always denied. `iroh-rooms room tail` is the "provider stays online" surface — it opts
-  a session into serving the blobs it holds; the pump's existing reconciler refreshes the ACL
-  cell on every membership **or** newly-synced-`file.shared` change (tracked independently of
-  the membership fold-change detector, since a content event never changes `AdmissionView`).
-- **`iroh-rooms file fetch <ROOM_ID> <FILE_ID> [--out <PATH>] [--peer …] [--timeout <DUR>]`** —
-  resolves the `file.shared` reference (syncing it first if absent), discovers providers from
-  `file.shared.providers` (default: the author's device), dials each in order over the
-  ACL-gated blobs ALPN, and requires the assembled bytes' independently recomputed BLAKE3-256
-  equal the declared hash before saving — `iroh-blobs` bao verified streaming already rejects
-  tampered bytes for the requested hash in transit; the recompute additionally catches a
-  `file.shared` that declares a hash different from what it references. A hash mismatch is a
-  hard stop (never falls through to another provider); an unauthorized peer is denied at the
-  provider's connect gate; an unavailable provider is reported honestly within the bounded
-  `--timeout` (default 30s), never a hang. The peer-supplied `name` is sanitized to a safe
-  basename (path-traversal guard) before it ever touches the filesystem. On success the CLI
-  prints `saved:`, `verified:`, `size:`, and `provider:`; the verified bytes are also
-  best-effort re-imported into the local blob store so the fetcher becomes a provider too.
-- `net::blob::fetch::fetch_blob` / `FetchOutcome` (`Fetched | DeniedAtConnect | DeniedPerHash |
-  HashMismatch | Unavailable`) is the verified-fetch client, lifted from the `spike-blobs`
-  spike (#13 / IR-0009) essentially verbatim and re-pointed at the real fold instead of a fixed
-  fixture — no new authorization model, event schema, or crate version.
-
-**Honest file-unavailable state** has landed in `crates/iroh-rooms-cli` (issue #30 / IR-0205),
-a CLI-only, additive follow-up to #29/IR-0204 — no protocol, event schema, network, serve/fetch,
-or authorization behaviour changes, only how `file fetch` *names* an already-landed outcome:
-
-- `file fetch`'s terminal failure is now one of three distinct, coded, script-branchable states
-  instead of a bare `bail!`/exit 1: `error[blob_unavailable]:` (exit 6, Connectivity — no
-  reachable provider served the bytes), `error[peer_unauthorized]:` (exit 3, Auth — every
-  reachable provider refused the connection) or `error[not_a_member]:` (exit 3, Auth — the
-  caller itself is not an active member, checked before any node bring-up), and
-  `error[hash_mismatch]:` (exit 4, Integrity — the new CLI-native code; a fetched blob's
-  independently recomputed BLAKE3-256 disagrees with the reference's declared hash).
-- A `FetchTally`/`FetchFailure::classify()` aggregate over the per-provider loop's outcomes
-  (`DeniedAtConnect` / `DeniedPerHash` / `Unavailable`) decides `Unauthorized` only when
-  *every* attempted provider refused the connection; any availability gap in the mix (an
-  unreachable or per-hash-denying provider) keeps the honest headline `Unavailable`, since a
-  holder may still come online later.
-- `ErrorCode::BlobUnavailable` (defined ahead of time in IR-0110, previously unconstructed and
-  `#[allow(dead_code)]`) is now live — this issue is what emits it. Both unavailable messages
-  carry the PRD §14 availability language verbatim (no central inbox, no guaranteed offline
-  delivery) and name the concrete next step (`iroh-rooms room tail <ROOM_ID>`, then retry).
-- CLI tests cover the deterministic/offline tier (`file_cli.rs`: non-member pre-check,
-  self-only-provider and loop-exhausted `blob_unavailable`); the two live splits
-  (`peer_unauthorized`, and `hash_mismatch`'s CLI-level rendering) stay on the `#[ignore]`-gated
-  two-peer e2e tier / existing `blob_e2e.rs` + unit coverage, per `two_peer_e2e.rs`'s notes.
-
-The **full two-humans-plus-one-agent demo integration test** has landed in
-`crates/iroh-rooms-cli/tests/full_demo_e2e.rs` (issue #34 / IR-0209), the PRD §19 Phase 1B
-deliverable 8 — the product-level proof that PRD §6's full ten-step demo runs as a single flow
-across three isolated participants (two humans and an agent), driven through the real
-`iroh-rooms` binary, without a central application server:
-
-- **Tiered by CI reliability:** a deterministic, network-free CI tier (the full offline
-  backbone; restart-validation over every MVP event type — type/count, per-field content, and
-  the post-departure membership fold; the agent-posts-but-has-no-admin-privilege pair) always
-  runs in `cargo test`. An `#[ignore]`-gated online tier drives the whole cast live: three-way
-  membership convergence, a signed message, a live agent-status push, dual file fetch+verify,
-  an authorized/denied live-pipe pair, and a restart check against the wire-delivered log.
-- **All five acceptance criteria covered**, each with a product-level CLI assertion in this
-  suite *and* a green-in-CI lower-layer backstop (the Node-API e2e suites and the two existing
-  CLI online suites, `two_peer_e2e.rs` / `agent_e2e.rs`), so gating the online tier loses no
-  guaranteed coverage.
-- **Executable transcript:** the suite's centerpiece, `full_demo_two_humans_one_agent`, drives
-  every step of `docs/getting-started.md`'s demo through the binary in causal order, asserting
-  each printed line inline — the automated counterpart to that guide's manual walkthrough.
-- Purely additive: no production code, CLI surface, event schema, or migration changed; every
-  command the suite drives already shipped.
-
-Run the gated online tier locally (loopback only; no relay, no external tools; serialized to
-avoid port/resource contention across three live processes):
+For repeatable beta testing, keep room state in an explicit data directory:
 
 ```bash
-cargo test -p iroh-rooms-cli --test full_demo_e2e -- --ignored --test-threads=1
+export IROH_ROOMS_HOME="$HOME/.local/share/iroh-rooms-beta"
+mkdir -p "$IROH_ROOMS_HOME"
 ```
 
-With this the Phase-0 Room Event Plane targets (event model, store, membership fold, sync
-engine, identity CLI, room creation, room invite, room join, signed messaging, the offline
-room-read CLI, the iroh transport, the live pipe, the peer connection manager, the Phase 1A
-two-peer integration test, the hardened recent-history sync, agent identity, agent status, the
-CLI error taxonomy, the full Blob Plane — import, serve, fetch, and honest availability
-reporting — and the Phase 1B full-demo integration test) are all landed.
+Treat that directory as sensitive. It can contain identity secrets, room logs, blob data, invite material in shell history, and `audit.ndjson`.
 
-The Gate-A measurement harness (`nat-probe`, IR-0012) is also landed and CI-proven; what
-remains is the manual two-host execution and the Gate-A go/no-go verdict that feeds the
-Gate E memo (#15).
+## Try a room
 
-The **D1 transport decision is now measurement-closed** (issue #10 / IR-0006):
-`spike-transport` built minimal full-mesh and `iroh-gossip` backends behind one
-trait, measured all five ADR-1 comparison dimensions at N=2..5 on
-deterministic loopback, and ratified ADR-1 — full-mesh remains the Room Event
-Plane transport; gossip is parked as an optional off-critical-path
-liveness/admin-tip carrier. See `crates/spike-transport/NOTES.md` for the
-measured table and the decision memo.
+The full demo uses three local identities: Alice, Bob, and an agent. Each identity needs its own data directory so the CLI behaves like three separate participants.
 
-Phase 2 ("Developer Preview") opens with the **public Rust SDK façade**,
-landed in the new `crates/iroh-rooms` crate (issue #36 / IR-0301) — the first
-change since the Phase-0/1 loop above closed the MVP that adds a new
-consumer-facing surface rather than a new runtime capability:
-
-- `iroh-rooms` re-exports the already-shipped `iroh-rooms-core`/`iroh-rooms-net`
-  surface through five domain modules — `identity`, `room`, `events`, `files`,
-  `pipes` — plus an `experimental` cargo-feature-gated namespace for the
-  online runtime (`session`, `sync`, `store`, `blob`, `pipe_runtime`).
-  Re-exports, not re-wraps: a façade type and its `core`/`net` original are
-  the identical type, so mixing the façade with a direct `core`/`net`
-  dependency never produces two incompatible copies of the same type.
-- **Stable = offline/deterministic protocol, experimental = online runtime**
-  is the organizing split: the default-features **stable** tier is exactly
-  the conformance-tested, byte-stable layer (event authoring/validation, the
-  membership fold, the ticket codec), so its API shape implies no post-MVP
-  capability (no multi-device, no call plane, no availability layer) by
-  construction; every **experimental** item is feature-gated and doc-marked
-  `Experimental (unstable API)`.
-- `examples/` (`01_identity` … `07_agent_status`, plus
-  `offline_author_and_validate`) mirror `docs/getting-started.md`'s demo
-  end-to-end as compilable, runnable programs, and every stable module also
-  carries doctests. `scripts/verify.sh` now runs `cargo test -p iroh-rooms
-  --doc` and builds every example under default features (both otherwise
-  skipped by the existing `--all-targets` run).
-- `crates/iroh-rooms-cli` migrated its offline authoring path (`identity`,
-  `room` create/members, `invite`, and the `build_*` call sites in
-  `message`/`file`) to import through the façade instead of
-  `iroh-rooms-core` directly — proof the boundary is real, not just
-  documented. `docs/sdk-coverage.md` is the full audit: every symbol the CLI
-  imports from `core`/`net` maps to a façade path, with none left over.
-- `iroh-rooms-core` and `iroh-rooms-net` gained a doc note marking themselves
-  implementation crates and pointing at the façade as the supported entry
-  point; neither crate's behavior changed.
-
-The **example agent** has landed in `crates/iroh-rooms/examples/example_agent/`
-(issue #39 / IR-0304), turning `07_agent_status.rs`'s "seed for an example
-agent" doc comment into a runnable program:
-
-- A minimal, arg-driven Rust program that drives a room entirely **through the
-  SDK's `experimental` tier** (`Node::spawn`, `node.publish(...)`, …) — not by
-  shelling out to the `iroh-rooms` binary — demonstrating the intended
-  third-party integration model.
-- Sets up its own local identity (`example_agent identity`, no central-service
-  credentials), joins a room by the ticket an admin issues with
-  `agent invite` (`example_agent join --ticket … --peer …`), posts one or more
-  signed `agent.status` updates, and can optionally share one artifact via
-  `--artifact <PATH>` (`file.shared`).
-- Its capabilities are explicit and limited to the room membership its invite
-  ticket granted: admission is seeded solely from the ticket's discovery hint,
-  it joins at the least-privileged `agent` role, and it authors only
-  `member.joined`/`agent.status`/(optional) `file.shared` — never anything
-  implying admin authority. A co-located `README.md` states this posture
-  plainly and gives a line-referenced guide for adapting the example into a
-  real agent integration.
-- Proven by a new `crates/iroh-rooms/tests/example_agent_e2e.rs`: a
-  deterministic CI tier (identity persistence round-trip, offline event
-  authoring/validation) plus an `#[ignore]`-gated loopback tier that runs the
-  built example binary against an in-process admin node and asserts its
-  signed `agent.status` appears in the room tail — the issue's Test Plan.
-
-The **developer-preview release-readiness checklist** has landed at
-[`RELEASE-READINESS.md`](RELEASE-READINESS.md) (issue #41 / IR-0306),
-mirroring `PHASE-0-GO-NO-GO.md`'s once-off Phase 0 gate at preview cadence —
-turning "is this build ready?" into a mechanized gate instead of an
-honor-system checkbox:
-
-- A fill-in-per-build checklist: a P0 test taxonomy across protocol,
-  integration, pipe security, blob verification, and agent flow; every known
-  MVP limitation stated up front (Gate A caveats, no cloud inbox, unencrypted
-  local storage, no native invite revocation / ADR-0002 bounded ticket model,
-  the live-tail display gap, the 100 MiB
-  code cap vs. the PRD's 25 MB metric target, …); the security warnings a
-  shipping build must actually print/enforce; a dependency/churn review; a
-  `docs/getting-started.md` demo-verification pass with the PRD §17.2 DX
-  timings; and a fenced release-notes template.
-- `scripts/release-readiness.sh` — a manual, release-time gate (not wired
-  into CI) that runs `scripts/verify.sh` plus the `#[ignore]`-gated loopback
-  online tiers and prints a single `release-readiness: READY` / `NOT READY`
-  verdict from real exit codes. `READY` is reachable only on the all-green
-  path, and `--skip-online` forces a loud non-zero exit — a preview cannot be
-  marked ready while a P0 test is failing.
-- Proven by `crates/iroh-rooms-cli/tests/release_readiness_docs.rs`
-  (deterministic; asserts every required section exists and guards against
-  the checklist's online-tier table drifting from the script's own tier list)
-  and `release_readiness_e2e.rs` (drives the real script against faked
-  `verify.sh`/online-tier boundaries to prove the READY/NOT-READY exit-code
-  wiring).
-
-**`JoinBootstrapAdmission`'s join window is now dynamic** (issue #88), closing
-a gap a real SDK consumer hit against the developer-preview façade: a
-resident daemon holding a room session open indefinitely needs its
-pending-invite state to gate join-bootstrap admission many times within one
-session's lifetime, but the gate's `accept_joins` was a `bool` fixed at
-construction — forcing either serving the bootstrap overlay for the whole
-session or respawning the `Node` (dropping every connected peer) just to
-flip it.
-
-- `JoinBootstrapAdmission::new_dynamic(inner, Arc<AtomicBool>)` reads the
-  `accept_joins` window from a shared, caller-owned flag on every
-  `authorize()` call, instead of `new`'s fixed-at-construction `bool`. A
-  long-running host stores `true` on invite mint and `false` on
-  redemption/expiry — the same "provisional bootstrap only while an invite
-  is open" policy the type's docs already stated — with no session respawn
-  and no admission-chain rebuild.
-- `new` and its fixed-`bool` semantics (and the CLI's `room tail
-  --accept-joins`, whose command lifetime *is* the policy window) are
-  unchanged; `new_dynamic` is observationally identical to `new` for any
-  fixed flag value.
-- Because admission is consulted only on the accept path for new inbound
-  connections, flipping the flag never re-evaluates an already-established
-  connection. A new `join_e2e.rs` test proves this end-to-end: on one
-  long-lived admin `Node`, the window opens (joiner completes bootstrap +
-  `member.joined`) then closes again (a second unknown device is refused),
-  while a member connected before either flip shows no disconnect/reconnect
-  on the admin's `ConnEvent` stream.
-
-**`EventStore` now supports concurrent writers on a shared `SQLite` file**
-(issue #85), closing a gap a real SDK consumer (a resident daemon opening two
-`EventStore` connections onto one database — RPC-driven writes plus a room
-session's sync pump) hit under entirely ordinary concurrency: a colliding
-write from the second connection could surface to the caller as `SQLITE_BUSY`.
-
-- Every write transaction now uses `BEGIN IMMEDIATE` instead of the rusqlite
-  default `BEGIN DEFERRED`, so a colliding writer waits for the lock (bounded
-  by the connection's `busy_timeout`) instead of racing a read-then-write
-  upgrade that `SQLite` fails immediately, bypassing any busy handler.
-- `StoreOptions { busy_timeout: Option<Duration> }` (default `Some(5000ms)`),
-  set via the new `EventStore::open_with` / `open_in_memory_with`
-  constructors, is re-exported through `iroh_rooms::experimental::store` so
-  embedders can tune or explicitly opt out of the timeout (`None` clears
-  rusqlite's own pre-installed 5000ms default rather than leaving it in place).
-  `open`/`open_in_memory` are unchanged for existing callers.
-
-**Push-based room-event subscription** (issue #83 / IR-0307): `Node::room_events()`
-streams each newly-ingested `StoredEvent` exactly once; consumers stop polling
-`room_tail`. Filed from a real SDK consumer (Bantaba, a resident daemon + web UI)
-whose only prior option was polling `room_tail` every ~300ms per open room and
-deduping against a seen-set — a latency floor plus an ever-growing
-`room_tail(u32::MAX)` rescan to avoid silently dropping a late-arriving
-low-lamport event from a bounded poll window.
-
-- The sans-IO `SyncEngine` accumulates each freshly-`Inserted` event (own
-  publish, peer sync, or delayed park-promotion — all three routes funnel
-  through one insert choke point) into `pending_ingested`; `take_ingested()`
-  drains it, mirroring the established `pending_flags`/`take_flags` pattern.
-  The `Duplicate` insert arm never reaches the emit point, so a re-seen event
-  is never re-emitted — exactly-once for free.
-- The net-crate pump owns a `broadcast::Sender<StoredEvent>` (capacity
-  `NetConfig::room_event_capacity`, default 256, mirroring
-  `conn_event_capacity`) and drains after every engine drive that can insert
-  (`publish`, `on_message`, `on_tick`); `Node::room_events()` returns a fresh
-  subscriber. A lagging subscriber gets `RecvError::Lagged`, never silent
-  loss, and resyncs via the documented `room_tail(u32::MAX)` + seen-set
-  recipe on the method's doc comment.
-- Emission order follows insertion order, not causal/Lamport order: a
-  park-promotion cascade records the directly-accepted trigger first, then
-  its promoted descendants in engine-iteration order. Only set-membership +
-  exactly-once are guaranteed within a cascade; consumers needing a total
-  order sort by `StoredEvent.lamport`.
-- Reachable through the façade unchanged (`iroh_rooms::experimental::session::Node`)
-  since `Node` was already re-exported. Proven over real loopback QUIC by a
-  two-node test with induced out-of-order delivery (a child event parked and
-  later promoted by its backfilled parent) at both the `iroh-rooms-net` and
-  façade layers.
-- The CLI's offline authoring paths (`room`/`message`/`invite`/`file.rs`) insert
-  directly through `EventStore::insert`, bypassing `SyncEngine` entirely, and
-  never build a `Node`, so they do not emit on this channel — deliberately out
-  of scope, since they have no live subscriber to serve. A `room tail --follow`
-  renderer is deferred to a future issue; this lands only the SDK primitive.
-
-**In-session blob import** (issue #84 / IR-0308): `Node::blob_import` /
-`blob_import_bytes` import into the live session's already-open store —
-resident daemons share files and re-provide fetched bytes with **no** session
-cycle (zero peer disconnects). Filed from the same real SDK consumer
-(Bantaba): unlike the CLI's short-lived process model, a daemon keeps a room
-session (and its blob store) open indefinitely, and the store's `iroh-blobs`
-`FsStore` takes an exclusive on-disk lock for the opener's lifetime — so
-`file share` used to require a full `shutdown → open → import → close →
-respawn` cycle, and a peer's fetched bytes could never be re-provided without
-restarting.
-
-- `BlobStore::import_bytes` is a sibling to the existing `import_path`: same
-  independent-BLAKE3-256-recompute guard, same persistent (restart-surviving)
-  tag.
-- `Node::blob_import(&self, &Path)` / `Node::blob_import_bytes(&self, Bytes)`
-  delegate straight to the node's already-open `blob_store` handle — no second
-  `FsStore` open, no `BlobError::Locked`, no transport touched. `file.shared`
-  authoring stays the caller's job via the existing `build_file_shared` +
-  `Node::publish`; import before publish so a racing fetcher never sees a
-  reference to bytes the store doesn't hold yet.
-- A node spawned without a `BlobServeConfig` has no store to import into and
-  gets the new coded `BlobError::NotServing`, distinct from `Locked`.
-- Reachable through the façade unchanged
-  (`iroh_rooms::experimental::session::Node`, `experimental::blob::{BlobImport,
-  BlobError}`) since both were already re-exported.
-
-**Per-pipe live-session state on the owner side** (issue #86 / IR-0309):
-`Node::live_pipe_sessions_for` / `Node::pipe_session_info` answer "is *this*
-pipe connected, and by whom?" instead of only a node-wide total. Filed from
-the same real SDK consumer (Bantaba): its Pipes panel lists every exposed
-pipe with a live "connected" indicator, but `Node::live_pipe_sessions()`
-returns one node-wide count — with two pipes exposed and one live session,
-there was no way to tell which pipe carried it. Bantaba's honesty rule (never
-fabricate state) forced it to show `connected` only when unambiguous (exactly
-one open pipe), under-reporting real connections the moment a host exposed a
-second pipe.
-
-- `Node::live_pipe_sessions_for(&self, pipe_id: [u8; 16]) -> usize` — count of
-  live forwarding sessions for one pipe; `0` for an unknown or
-  never-connected pipe.
-- `Node::pipe_session_info(&self) -> Vec<PipeSessionInfo>` — per-session
-  detail (`pipe_id`, connecting `device`, `since_ms`) across every pipe this
-  node owns, the direct data source for a Pipes-panel row. A point-in-time,
-  unordered snapshot; sort by `pipe_id`/`since_ms` for stable display.
-- Both are pure `&self` reads that filter/project the existing `PipeSessions`
-  table (already `Arc`-held on `Node`, off the sync engine, no `Cmd`/pump
-  hop), so per-pipe counts are decrement-correct for free: every teardown
-  path (splice finish, watcher revocation, owner `pipe_close`) mutates that
-  one table, so a filtered read reflects it on the next call — no separate
-  counter to desync.
-- `live_pipe_sessions()` (node-wide) is unchanged; the new methods are purely
-  additive.
-- Reachable through the façade unchanged
-  (`iroh_rooms::experimental::session::Node`); `PipeSessionInfo` is newly
-  re-exported through `experimental::pipe_runtime`.
-
-**The façade now re-exports the online tier's `iroh` transport identities**
-(issue #87), closing the last gap in "a consumer imports only through
-`iroh_rooms::*`": driving `Node::spawn`/`connect_to`/admission wiring names
-`EndpointAddr`, `EndpointId`, and `SecretKey` in a consumer's own code, and
-the façade never re-exported them — every consumer (the CLI included) needed
-its own direct `iroh` dependency pinned byte-identical to `iroh-rooms-net`'s
-`=1.0.1`, a version-skew trap: two resolved `iroh` crates produce two
-distinct `EndpointAddr` types that don't compile against each other. Filed
-from Bantaba, a real SDK consumer hitting exactly this friction against the
-developer-preview façade.
-
-- `iroh_rooms::experimental::session` re-exports `EndpointAddr`, `EndpointId`,
-  `SecretKey`, and `Endpoint` verbatim from the pinned `iroh` release (a
-  same-type re-export, like every other façade path — not a wrapper).
-  `EndpointId` is duplicated into `experimental::blob` and
-  `experimental::pipe_runtime`, next to the `BlobAclView` / `PipeSessionInfo` /
-  `PipeAuditSink` APIs that name it, following the same duplicate-where-used
-  precedent as `RoomId` and `HashRef`.
-- `crates/iroh-rooms/Cargo.toml` promotes `iroh` from a dev-dependency to an
-  optional, `experimental`-gated direct dependency, pinned byte-identical to
-  `iroh-rooms-net`'s `=1.0.1` (kept in sync by hand — a
-  `[workspace.dependencies]` hoist was considered and deferred).
-- The reference CLI proves the claim end-to-end:
-  `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct `iroh`
-  dependency at all, and `file.rs` / `join.rs` / `message.rs` / `pipe.rs` /
-  `audit.rs` import the trio through `iroh_rooms::experimental::session`
-  instead.
-- Guarded by three checks: `experimental_surface.rs`'s compile-time
-  type-identity test (coerces real `Node` / `BlobAclView` method items to the
-  façade re-export types, so a pin drift fails the build rather than silently
-  producing two incompatible types); `iroh-rooms-cli/tests/no_direct_iroh_dep.rs`
-  (scans the CLI's own manifest and source for any bare `iroh` dependency or
-  `iroh::` path); and `iroh-rooms/tests/iroh_pin_consistency.rs` (parses both
-  manifests and asserts the pins match exactly).
-- `docs/sdk-coverage.md` gained the "iroh transport types" table; the
-  "imports only through the façade" claim is now fully true for the online
-  tier.
-
-## Repository Layout
+The guided walkthrough covers the full flow:
 
 ```text
-crates/iroh-rooms-core/   Core protocol and domain library
-crates/iroh-rooms-cli/    CLI binary (identity, room, file, pipe, agent subcommands)
-crates/iroh-rooms-net/    Full-mesh iroh QUIC transport (IR-0005/IR-0010; ALPNs /iroh-rooms/event/1 + /iroh-rooms/pipe/1)
-crates/iroh-rooms/        Public Rust SDK façade (IR-0301): curated, stability-tiered re-exports + examples/
-crates/spike-blobs/       Throwaway blob ACL spike (IR-0009; remove once Blob Plane ships)
-crates/spike-nat/         Throwaway Gate-A NAT measurement harness (`nat-probe`, IR-0012)
-crates/spike-transport/   Throwaway gossip-vs-full-mesh transport comparison (`transport-probe`, IR-0006)
-.adw/                     Switchyard / ADW project pack
-scripts/verify.sh         Local and CI verification gate
-scripts/release-readiness.sh  Manual developer-preview release gate (see RELEASE-READINESS.md)
-specs/                    Implementation specs produced during planning
+identity -> room -> invite -> join -> message -> file -> pipe -> agent status
 ```
 
-## Verify
+Run it from [`docs/getting-started.md`](docs/getting-started.md). The commands in that guide are reconciled against the shipped binary and backed by the `full_demo_e2e.rs` test suite.
+
+For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-recipes.md). It has task-focused flows for:
+
+- creating a room
+- inviting a peer
+- sending a message
+- sharing and fetching a file
+- exposing a local preview
+- inviting an agent
+
+## Current beta scope
+
+`v0.1.0-rc.1` supports:
+
+- local identity and device creation
+- room creation
+- key-bound room invites and joins
+- signed room messages
+- verified file sharing
+- authenticated loopback-only live TCP pipes
+- invited agent participants and signed agent status updates
+- local best-effort audit at `<IROH_ROOMS_HOME>/audit.ndjson`
+- a Rust SDK facade in `crates/iroh-rooms`, source/workspace use only
+
+The supported binary artifact for this candidate is `x86_64-apple-darwin`. Builders on other platforms should build from source unless a matching release artifact exists.
+
+## Limits you should understand
+
+Read these before trusting Iroh Rooms with real work:
+
+- **No central application server**: peers sync directly through the iroh transport
+- **No guaranteed offline delivery**: a peer may need to be online and serving for another peer to fetch data
+- **Plaintext local storage**: beta storage is scoped to trusted local machines
+- **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
+- **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
+- **Local audit only**: `audit.ndjson` is useful for incident reconstruction, not compliance-grade audit
+- **Unsigned release artifacts**: archives have SHA-256 checksums but no project signature in this candidate
+- **SDK publication is deferred**: the Rust SDK facade exists, but the crate remains `publish = false`
+
+The beta storage, invite, and audit decisions live in:
+
+- [`ADR-0001: Local storage posture`](docs/decisions/ADR-0001-local-storage-posture.md)
+- [`ADR-0002: Invite revocation and bounded ticket risk`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
+- [`ADR-0003: Persistent audit posture`](docs/decisions/ADR-0003-persistent-audit-posture.md)
+
+## How it works
+
+Iroh Rooms has three layers:
+
+- **Room event plane**: canonical signed events, membership, deterministic validation, local SQLite persistence, and bounded sync
+- **Blob plane**: file import, hash verification, access-controlled serve and fetch
+- **Pipe plane**: authenticated TCP-over-QUIC forwarding for loopback services, with explicit per-member allow lists
+
+Room state is derived from an append-only event log. Peers validate signed events locally and converge by syncing the event set they are allowed to see. Access to files and pipes comes from the current membership snapshot, so removed members lose those capabilities.
+
+The implementation uses iroh for peer connectivity and QUIC transport. The protocol contract is documented in [`docs/protocol.md`](docs/protocol.md), and the conformance suite lives under `crates/iroh-rooms-core/tests/`.
+
+## Repository map
+
+```text
+crates/iroh-rooms-core/   Protocol, event model, membership, store, sync
+crates/iroh-rooms-net/    iroh transport, blob serving, live pipe runtime
+crates/iroh-rooms-cli/    CLI binary: identity, room, file, pipe, agent
+crates/iroh-rooms/        Rust SDK facade and examples
+crates/spike-nat/         Real-network NAT measurement harness
+crates/spike-transport/   Full-mesh versus gossip transport comparison
+specs/                    Implementation specs and acceptance criteria
+docs/                     Guides, operations docs, ADRs, release records
+scripts/                  Verification and release scripts
+.adw/                     Optional Switchyard project pack
+```
+
+## Verify the workspace
+
+Run the standard local gate:
 
 ```bash
 scripts/verify.sh
 ```
 
-The gate runs formatting, Clippy, and tests across the workspace.
-
-## Release readiness
-
-Before cutting a developer preview build, run the release-readiness gate:
+Run the developer preview readiness gate before preview release work:
 
 ```bash
 scripts/release-readiness.sh
 ```
 
-It runs `scripts/verify.sh` plus the `#[ignore]`-gated loopback online tiers
-and prints a `release-readiness: READY` / `NOT READY` verdict from real exit
-codes — a preview cannot be marked ready while a P0 test is failing. See
-[`RELEASE-READINESS.md`](RELEASE-READINESS.md) for the full checklist (known
-limitations, security warnings, dependency/churn review, demo verification,
-and the release-notes template).
+That script follows [`RELEASE-READINESS.md`](RELEASE-READINESS.md), including the ignored loopback tiers that do not run during the standard workspace gate.
 
-## Production Readiness
-
-Production-grade post-MVP work is tracked separately from the Developer Preview
-gate in [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md). That plan defines
-the Phase 2.5 release-candidate bar: security threat model, access revocation,
-local data handling, persistent audit/diagnostics, compatibility/migration,
-release operations, and beta validation.
-
-The Phase 2.5 local-storage decision is
-[`ADR-0001`](docs/decisions/ADR-0001-local-storage-posture.md): Production Beta
-is scoped to trusted local machines, with plaintext `rooms.db`, blobs, and
-`audit.ndjson` disclosed as a release limitation.
-
-The Phase 2.5 invite-revocation decision is
-[`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md):
-Production Beta accepts key-bound, expiring, departure-consumed tickets as a
-bounded leaked-ticket model. Native ticket-specific revocation remains a GA
-decision unless the GA scope explicitly re-accepts the narrow beta posture.
-
-The Phase 2.5 audit decision is
-[`ADR-0003`](docs/decisions/ADR-0003-persistent-audit-posture.md): Production
-Beta accepts local `audit.ndjson` as a best-effort incident reconstruction trail,
-not as remote, tamper-evident, centrally retained, or compliance-grade audit.
-
-The Phase 2.5 compatibility gate is documented in
-[`docs/compatibility.md`](docs/compatibility.md). The current core fixture lives
-under `crates/iroh-rooms-core/tests/fixtures/v1/` and is verified by:
-
-```bash
-cargo test -p iroh-rooms-core --features store --test compatibility
-```
-
-Production Beta release operations are documented in
-[`docs/operations/release-operations.md`](docs/operations/release-operations.md),
-with install/uninstall/rollback steps in
-[`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md).
-Versioned binary archives and SHA-256 files are produced with:
-
-```bash
-scripts/build-release-artifacts.sh --version <VERSION>
-```
-
-The automated preflight is:
+Run the controlled beta readiness gate before release work:
 
 ```bash
 scripts/production-readiness.sh
 ```
 
-Use `scripts/production-readiness.sh --offline-only` for a fast P0 evidence
-check during local iteration. It is expected to fail until the production P0
-artifacts exist. The script does not replace manual production sign-off; it only
-verifies automatable evidence and delegates final acceptance to
-`PRODUCTION-READINESS.md`.
+The production script checks automatable evidence only. Manual sign-off still follows [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md).
 
-## Backlog
+The full online demo tiers are ignored by default because they start live loopback sessions. Run them explicitly when validating the end-to-end experience:
 
-The execution backlog lives in GitHub Issues:
+```bash
+cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
+cargo test -p iroh-rooms-cli --test full_demo_e2e -- --ignored --test-threads=1
+```
 
-- Phase 0 epic: <https://github.com/kortiene/iroh-room/issues/1>
-- First engineering slice: <https://github.com/kortiene/iroh-room/issues/5>
+## Use the SDK
 
-## Switchyard / ADW
+The public Rust facade lives in `crates/iroh-rooms`. It re-exports the stable offline protocol surface by default and gates online runtime APIs behind the `experimental` feature.
 
-This repository includes an `.adw` project pack so Switchyard can be used as an
-optional contribution orchestrator. Switchyard remains an external tool; it is
-not vendored into this repository and is not a runtime dependency of Iroh Rooms.
-When Switchyard is run from another checkout, pass `--project-root` pointing at
-this repository so it loads `.adw/config.json` and runs `scripts/verify.sh`.
+Useful starting points:
 
-See `CONTRIBUTING.md` for the recommended workflow.
+- [`crates/iroh-rooms/examples/`](crates/iroh-rooms/examples/)
+- [`crates/iroh-rooms/examples/example_agent/README.md`](crates/iroh-rooms/examples/example_agent/README.md)
+- [`docs/sdk-coverage.md`](docs/sdk-coverage.md)
+
+The SDK crate is not published for `v0.1.0-rc.1`. Use it from the workspace source until the release notes say otherwise.
+
+## Contribute
+
+Good first contributions are concrete and testable:
+
+- run the demo and file a specific setup issue
+- try Live Pipe against a real local preview
+- test source builds on Linux and macOS variants
+- improve diagnostics for confusing CLI errors
+- add real-network notes for NAT and relay behavior
+- adapt the example agent to a real workflow
+
+Open issues on GitHub with enough detail to reproduce the behavior. Do not attach full invite tickets, `identity.secret`, `rooms.db`, blob contents, unredacted `audit.ndjson`, or full data-directory backups to public reports.
+
+## Community
+
+The first community loop is intentionally small: technical builders who can tolerate beta friction and give precise feedback. The goal is to learn whether private local-first rooms are useful for sharing local previews, artifacts, and agent status without deploying anything.
+
+Read [`COMMUNITY.md`](COMMUNITY.md), then use [`docs/community/demo-recipes.md`](docs/community/demo-recipes.md) to run one workflow. File what worked, what failed, and what felt unclear.
+
+## Project history
+
+The original Phase 0 and Phase 1 planning documents remain in the repository for traceability:
+
+- [`PRD.v0.3.md`](PRD.v0.3.md): current product requirements and MVP scope
+- [`PHASE-0-SPIKE.md`](PHASE-0-SPIKE.md): protocol design, architecture decisions, spike plan, and residual risks
+- [`PHASE-0-GO-NO-GO.md`](PHASE-0-GO-NO-GO.md): Phase 0 decision record
+- [`RELEASE-READINESS.md`](RELEASE-READINESS.md): developer preview release gate
+- [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md): controlled Production Beta gate
+
+For release-specific facts, prefer the versioned records in [`docs/releases/`](docs/releases/).
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT license
