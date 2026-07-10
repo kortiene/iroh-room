@@ -53,7 +53,7 @@ use iroh_blobs::{BlobsProtocol, Hash};
 pub mod fetch;
 pub mod serve;
 
-pub use fetch::{fetch_blob, FetchOutcome};
+pub use fetch::{fetch_blob, fetch_blob_sized, FetchOutcome};
 pub use serve::spawn_blob_gate;
 
 /// Buffer size for the streaming BLAKE3 recompute. Bounds worst-case memory

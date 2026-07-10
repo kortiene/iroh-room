@@ -2156,12 +2156,14 @@ name = "iroh-rooms-net"
 version = "0.1.0-rc.1"
 dependencies = [
  "anyhow",
+ "bao-tree",
  "blake3",
  "bytes",
  "hex",
  "iroh",
  "iroh-blobs",
  "iroh-rooms-core",
+ "n0-future",
  "tempfile",
  "tokio",
  "tracing",

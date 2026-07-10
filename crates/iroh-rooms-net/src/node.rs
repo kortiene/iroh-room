@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
 use iroh_rooms_core::event::content::{Content, PipeOpened};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
@@ -894,11 +895,33 @@ impl Node {
         declared: [u8; 32],
         timeout: Duration,
     ) -> (FetchOutcome, Option<Bytes>) {
-        blob::fetch_blob(
+        self.fetch_file_sized(
+            provider_addr,
+            hash,
+            declared,
+            MAX_SHARED_FILE_BYTES,
+            timeout,
+        )
+        .await
+    }
+
+    /// Fetch a blob while refusing to buffer more than `max_bytes`. CLI callers
+    /// pass the signed `file.shared.size_bytes`; generic SDK callers use
+    /// [`Node::fetch_file`], which applies the protocol-wide 100 MiB ceiling.
+    pub async fn fetch_file_sized(
+        &self,
+        provider_addr: EndpointAddr,
+        hash: [u8; 32],
+        declared: [u8; 32],
+        max_bytes: u64,
+        timeout: Duration,
+    ) -> (FetchOutcome, Option<Bytes>) {
+        blob::fetch_blob_sized(
             &self.transport.endpoint(),
             provider_addr,
             hash,
             declared,
+            max_bytes.min(MAX_SHARED_FILE_BYTES),
             timeout,
         )
         .await

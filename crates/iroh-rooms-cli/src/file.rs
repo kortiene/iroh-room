@@ -23,7 +23,7 @@
 //!   two-gate serve, wired in via `room tail`'s [`iroh_rooms_net::BlobServeConfig`]);
 //!   an unavailable provider is reported honestly within a bounded timeout.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -575,14 +575,29 @@ pub async fn fetch(
     let declared = *shared.blob_hash.as_bytes();
     let mut fetched = None;
     let mut hash_mismatch: Option<String> = None;
+    let mut size_mismatch: Option<u64> = None;
+    let mut bounded_response_rejected = false;
     let mut tally = FetchTally::default();
     for provider_addr in &providers {
         let (outcome, data) = node
-            .fetch_file(provider_addr.clone(), declared, declared, timeout)
+            .fetch_file_sized(
+                provider_addr.clone(),
+                declared,
+                declared,
+                shared.size_bytes,
+                timeout,
+            )
             .await;
         match outcome {
             FetchOutcome::Fetched => {
-                fetched = data.map(|b| (b, provider_addr.id));
+                if let Some(bytes) = data {
+                    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    if actual_size == shared.size_bytes {
+                        fetched = Some((bytes, provider_addr.id));
+                    } else {
+                        size_mismatch = Some(actual_size);
+                    }
+                }
                 break;
             }
             FetchOutcome::DeniedAtConnect => {
@@ -602,10 +617,11 @@ pub async fn fetch(
                 );
             }
             FetchOutcome::HashMismatch => {
-                hash_mismatch = Some(data.map_or_else(
-                    || "<unknown>".to_owned(),
-                    |b| hex::encode(blake3::hash(&b).as_bytes()),
-                ));
+                if let Some(bytes) = data {
+                    hash_mismatch = Some(hex::encode(blake3::hash(&bytes).as_bytes()));
+                } else {
+                    bounded_response_rejected = true;
+                }
                 break;
             }
             FetchOutcome::Unavailable => {
@@ -616,6 +632,15 @@ pub async fn fetch(
         }
     }
 
+    if bounded_response_rejected {
+        let _ = node.shutdown().await;
+        crate::bail_coded!(
+            ErrorCode::HashMismatch,
+            "integrity check FAILED: provider response exceeded the declared file size or had an \
+             invalid verified-stream layout; refusing to save"
+        );
+    }
+
     if let Some(got) = hash_mismatch {
         let _ = node.shutdown().await;
         crate::bail_coded!(
@@ -624,6 +649,16 @@ pub async fn fetch(
              {}; refusing to save (the file reference or a provider may be corrupt — do not \
              trust this file)",
             shared.blob_hash
+        );
+    }
+
+    if let Some(got) = size_mismatch {
+        let _ = node.shutdown().await;
+        crate::bail_coded!(
+            ErrorCode::HashMismatch,
+            "integrity check FAILED: fetched content is {got} bytes but file.shared declares {} \
+             bytes; refusing to save",
+            shared.size_bytes
         );
     }
 
@@ -772,33 +807,37 @@ fn resolve_output_path(
     file_id: [u8; SHORT_ID_LEN],
 ) -> Result<PathBuf> {
     let safe_name = sanitize_name(name, file_id);
-    let Some(spec) = out else {
+    let target = if let Some(spec) = out {
+        let path = Path::new(spec);
+        let is_dir_target =
+            path.is_dir() || spec.ends_with('/') || spec.ends_with(std::path::MAIN_SEPARATOR);
+        if is_dir_target {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("could not create directory {}", path.display()))?;
+            path.join(safe_name)
+        } else {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("could not create directory {}", parent.display())
+                    })?;
+                }
+            }
+            path.to_path_buf()
+        }
+    } else {
         let downloads = downloads_dir(home);
         paths::ensure_dir(&downloads)?;
-        return Ok(downloads.join(safe_name));
+        downloads.join(safe_name)
     };
 
-    let path = Path::new(spec);
-    let is_dir_target =
-        path.is_dir() || spec.ends_with('/') || spec.ends_with(std::path::MAIN_SEPARATOR);
-    if is_dir_target {
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("could not create directory {}", path.display()))?;
-        return Ok(path.join(safe_name));
-    }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("could not create directory {}", parent.display()))?;
-        }
-    }
-    if path.exists() {
+    if target.exists() {
         bail!(
             "refusing to overwrite existing file {} (pass a different --out)",
-            path.display()
+            target.display()
         );
     }
-    Ok(path.to_path_buf())
+    Ok(target)
 }
 
 /// The configured downloads directory: [`DOWNLOADS_ENV`] if set to a non-empty
@@ -825,25 +864,38 @@ fn sanitize_name(name: &str, file_id: [u8; SHORT_ID_LEN]) -> String {
     }
 }
 
-/// Write `bytes` to `target` atomically: a temp file in the same directory, then
-/// rename (spec §5.2 step 8) — no partial/corrupt file is ever visible at
-/// `target`, and the temp file is removed on any failure.
+/// Write `bytes` to `target` atomically without replacing an existing file: a
+/// unique temp file in the same directory, then `persist_noclobber` (spec §5.2
+/// step 8). No partial/corrupt file is ever visible at `target`, and concurrent
+/// fetches cannot overwrite each other.
 fn save_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
+    if target.exists() {
+        bail!(
+            "refusing to overwrite existing file {} (pass a different --out)",
+            target.display()
+        );
+    }
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("download");
-    let tmp = dir.join(format!(".{file_name}.part"));
-    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, target));
-    if let Err(err) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err).with_context(|| format!("could not save to {}", target.display()));
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("could not save to {}", target.display()))?;
+    temp.write_all(bytes)
+        .with_context(|| format!("could not save to {}", target.display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("could not save to {}", target.display()))?;
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(()),
+        Err(err) if err.error.kind() == ErrorKind::AlreadyExists => bail!(
+            "refusing to overwrite existing file {} (pass a different --out)",
+            target.display()
+        ),
+        Err(err) => {
+            Err(err.error).with_context(|| format!("could not save to {}", target.display()))
+        }
     }
-    Ok(())
 }
 
 /// After a verified fetch, best-effort import the saved bytes into the local
@@ -1472,6 +1524,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_output_path_existing_dir_refuses_an_existing_name() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("doc.txt"), b"keep").unwrap();
+        let err = resolve_output_path(
+            tmp.path(),
+            Some(tmp.path().to_str().unwrap()),
+            "doc.txt",
+            [0u8; 16],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+    }
+
+    #[test]
     fn resolve_output_path_trailing_separator_is_treated_as_a_dir() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("downloads");
@@ -1710,19 +1776,24 @@ mod tests {
         let target = tmp.path().join("out.bin");
         save_atomic(&target, b"hello world").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"hello world");
-        assert!(
-            !tmp.path().join(".out.bin.part").exists(),
-            "the temp part file must be renamed away, never left behind"
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "the unique temp file must be removed after persistence"
         );
     }
 
     #[test]
-    fn save_atomic_replaces_an_existing_target_atomically() {
+    fn save_atomic_refuses_to_replace_an_existing_target() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("out.bin");
-        std::fs::write(&target, b"stale").unwrap();
-        save_atomic(&target, b"fresh").unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+        std::fs::write(&target, b"keep").unwrap();
+        let err = save_atomic(&target, b"replacement").unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "existing downloads must be preserved: {err}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 
     #[test]
