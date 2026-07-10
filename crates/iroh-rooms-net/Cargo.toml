@@ -54,6 +54,11 @@ blake3 = "1"
 # yields `bytes::Bytes`, spike NOTES.md §4). Already resolved transitively via
 # `iroh-blobs`; named explicitly since `net::blob::fetch` is a public boundary.
 bytes = "1"
+# Stream `iroh-blobs`' verified Bao leaves instead of calling its unbounded
+# `GetBlobResult::bytes()` collector. Exact pins match `iroh-blobs = 0.103.0`'s
+# resolved graph so this adds no second protocol/runtime implementation.
+bao-tree = "=0.16.0"
+n0-future = "=0.3.2"
 # `net` adds `TcpStream`/`TcpListener` for the Live Pipe Plane's loopback
 # forwarding splice (IR-0010); `signal` lets the CLI publish `pipe.closed` on
 # Ctrl-C (owner-exit). No new external crate — only extra tokio features.

@@ -72,14 +72,15 @@ anyhow = "1"
 # Independent BLAKE3-256 recompute for `file fetch`'s hash-mismatch diagnostic
 # (IR-0204 spec §7). Same 1.x line `iroh-rooms-net`/core already resolve.
 blake3 = "1"
+# Unique same-directory temporary files plus `persist_noclobber` keep fetched
+# artifacts atomic without silently replacing an existing user file.
+tempfile = "3"
 
 [dev-dependencies]
 # Spawn the built `iroh-rooms` binary and assert on stdout/stderr/exit code.
 assert_cmd = "2"
 # Output predicates (contains/matches) for the integration assertions.
 predicates = "3"
-# Per-test temp `IROH_ROOMS_HOME`. Already used by core's store tests.
-tempfile = "3"
 # Parse `identity show --json` output and `identity.secret` in integration tests.
 serde_json = "1"
 # Decode the `roomtkt1…` ticket token in CLI e2e tests that cross the

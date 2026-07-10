@@ -12,12 +12,15 @@
 
 use std::time::Duration;
 
+use bao_tree::io::BaoContentItem;
 use bytes::Bytes;
 use iroh::endpoint::{ApplicationClose, Connection, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
-use iroh_blobs::get::request::get_blob;
+use iroh_blobs::get::request::{get_blob, GetBlobItem, GetBlobResult};
 use iroh_blobs::get::GetError;
 use iroh_blobs::Hash;
+use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
+use n0_future::StreamExt;
 
 /// Classified outcome of one fetch attempt against one provider (the issue's
 /// acceptance criteria / spec §5.5 decision matrix).
@@ -53,6 +56,26 @@ pub async fn fetch_blob(
     declared_hash: [u8; 32],
     timeout: Duration,
 ) -> (FetchOutcome, Option<Bytes>) {
+    fetch_blob_sized(
+        endpoint,
+        provider_addr,
+        fetch_hash,
+        declared_hash,
+        MAX_SHARED_FILE_BYTES,
+        timeout,
+    )
+    .await
+}
+
+/// Fetch and verify a blob while refusing to buffer more than `max_bytes`.
+pub async fn fetch_blob_sized(
+    endpoint: &Endpoint,
+    provider_addr: EndpointAddr,
+    fetch_hash: [u8; 32],
+    declared_hash: [u8; 32],
+    max_bytes: u64,
+    timeout: Duration,
+) -> (FetchOutcome, Option<Bytes>) {
     let connect = endpoint.connect(provider_addr, iroh_blobs::ALPN);
     let conn = match tokio::time::timeout(timeout, connect).await {
         Err(_elapsed) => {
@@ -74,15 +97,19 @@ pub async fn fetch_blob(
     // connection-level error rather than a stream reset.
     let probe = conn.clone();
     let get = get_blob(conn, Hash::from(fetch_hash));
-    match tokio::time::timeout(timeout, get.bytes()).await {
+    match tokio::time::timeout(timeout, collect_bounded(get, max_bytes)).await {
         Err(_elapsed) => {
             tracing::debug!("blob fetch: transfer timed out -> Unavailable");
             (FetchOutcome::Unavailable, None)
         }
-        Ok(Err(err)) => {
+        Ok(Err(BoundedGetError::Remote(err))) => {
             let outcome = classify_get_failure(&err, &probe).await;
             tracing::debug!(%err, ?outcome, "blob fetch: get failed");
             (outcome, None)
+        }
+        Ok(Err(BoundedGetError::InvalidContent(reason))) => {
+            tracing::warn!(reason, max_bytes, "blob fetch: rejected bounded response");
+            (FetchOutcome::HashMismatch, None)
         }
         Ok(Ok(bytes)) => {
             // AC2 — independent receiver-side content verification.
@@ -93,6 +120,80 @@ pub async fn fetch_blob(
                 (FetchOutcome::HashMismatch, Some(bytes))
             }
         }
+    }
+}
+
+/// A bounded collector for the already Bao-verified leaves emitted by
+/// [`GetBlobResult`]. `iroh-blobs`' convenience `bytes()` method buffers without
+/// an application limit; this collector rejects a response before it can grow
+/// beyond the room protocol's declared file size (or the global 100 MiB cap used
+/// by callers without a narrower declaration).
+async fn collect_bounded(mut get: GetBlobResult, max_bytes: u64) -> Result<Bytes, BoundedGetError> {
+    let mut buffer = BoundedBlob::new(max_bytes);
+    loop {
+        match get.next().await {
+            Some(GetBlobItem::Item(BaoContentItem::Leaf(leaf))) => {
+                buffer.push(leaf.offset, &leaf.data)?;
+            }
+            Some(GetBlobItem::Item(BaoContentItem::Parent(_))) => {}
+            Some(GetBlobItem::Done(_stats)) => return Ok(buffer.finish()),
+            Some(GetBlobItem::Error(err)) => return Err(BoundedGetError::Remote(err)),
+            None => {
+                return Err(BoundedGetError::InvalidContent(
+                    "unexpected end of response",
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BoundedGetError {
+    Remote(GetError),
+    InvalidContent(&'static str),
+}
+
+struct BoundedBlob {
+    bytes: Vec<u8>,
+    max_bytes: u64,
+    next_offset: u64,
+}
+
+impl BoundedBlob {
+    fn new(max_bytes: u64) -> Self {
+        let initial_capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+        Self {
+            bytes: Vec::with_capacity(initial_capacity),
+            max_bytes,
+            next_offset: 0,
+        }
+    }
+
+    fn push(&mut self, offset: u64, data: &[u8]) -> Result<(), BoundedGetError> {
+        if offset != self.next_offset {
+            return Err(BoundedGetError::InvalidContent(
+                "non-contiguous blob response",
+            ));
+        }
+        let len = u64::try_from(data.len())
+            .map_err(|_| BoundedGetError::InvalidContent("blob leaf length overflow"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or(BoundedGetError::InvalidContent(
+                "blob response size overflow",
+            ))?;
+        if end > self.max_bytes {
+            return Err(BoundedGetError::InvalidContent(
+                "blob response exceeds allowed size",
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        self.next_offset = end;
+        Ok(())
+    }
+
+    fn finish(self) -> Bytes {
+        self.bytes.into()
     }
 }
 
@@ -148,7 +249,7 @@ async fn connection_denied_for_permission(conn: &Connection) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_get_error, FetchOutcome};
+    use super::{classify_get_error, BoundedBlob, FetchOutcome};
 
     #[test]
     fn fetch_outcome_variants_are_distinct() {
@@ -156,6 +257,28 @@ mod tests {
         assert_ne!(FetchOutcome::DeniedAtConnect, FetchOutcome::DeniedPerHash);
         assert_ne!(FetchOutcome::DeniedPerHash, FetchOutcome::HashMismatch);
         assert_ne!(FetchOutcome::HashMismatch, FetchOutcome::Unavailable);
+    }
+
+    #[test]
+    fn bounded_blob_accepts_contiguous_bytes_at_the_limit() {
+        let mut blob = BoundedBlob::new(5);
+        blob.push(0, b"ab").unwrap();
+        blob.push(2, b"cde").unwrap();
+        assert_eq!(blob.finish().as_ref(), b"abcde");
+    }
+
+    #[test]
+    fn bounded_blob_rejects_a_response_above_the_limit() {
+        let mut blob = BoundedBlob::new(4);
+        blob.push(0, b"abcd").unwrap();
+        assert!(blob.push(4, b"e").is_err());
+    }
+
+    #[test]
+    fn bounded_blob_rejects_non_contiguous_leaves() {
+        let mut blob = BoundedBlob::new(8);
+        blob.push(0, b"ab").unwrap();
+        assert!(blob.push(3, b"cd").is_err());
     }
 
     // `classify_get_error` needs a live `GetError` to exercise the open/

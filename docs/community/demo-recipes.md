@@ -6,6 +6,21 @@ data directories so participants do not mix beta data with personal state.
 Supported binary artifact for `v0.1.0-rc.1`: `x86_64-apple-darwin`. Other
 builders can build from source.
 
+Linux x86_64 builders should use the exact release tag rather than `main`. The
+shipping dependency graph requires Rust 1.85 or newer in practice; RC1 was built
+with Rust 1.96.0.
+
+```bash
+git clone --branch v0.1.0-rc.1 --depth 1 \
+  https://github.com/kortiene/iroh-room.git
+cd iroh-room
+cargo build --locked --release -p iroh-rooms-cli
+export PATH="$PWD/target/release:$PATH"
+iroh-rooms --version
+```
+
+Expected: `iroh-rooms 0.1.0-rc.1`. Do not continue with a different version.
+
 Before running any recipe:
 
 ```bash
@@ -149,22 +164,13 @@ Keep this process running while Bob fetches.
 
 ### Bob Terminal
 
-Sync the `file.shared` event first:
-
-```bash
-iroh-rooms room tail <ROOM_ID> --peer <ALICE_ENDPOINT_OR_ADDR>
-```
-
-Stop it with Ctrl-C once the file share appears, then fetch:
+Fetch directly from Alice. `file fetch` connects to the peer and performs a
+bounded wait for the `file.shared` event when Bob has not learned it yet. Do not
+wait for the live `room tail` to display the share: RC1's live renderer shows
+`message.text` only.
 
 ```bash
 mkdir -p ./downloads
-iroh-rooms file fetch <ROOM_ID> <FILE_ID> --out ./downloads
-```
-
-If provider discovery fails, retry with Alice's printed peer address:
-
-```bash
 iroh-rooms file fetch <ROOM_ID> <FILE_ID> --out ./downloads --peer <ALICE_ENDPOINT_OR_ADDR>
 ```
 
@@ -186,9 +192,9 @@ hello from iroh rooms
   serving.
 - `blob_store_locked`: another Alice process is still using the blob store.
   Stop Alice's prior `room tail` or `pipe expose` process, then retry.
-- `no_such_file`: Bob has not yet learned the `file.shared` event. Run
-  `iroh-rooms room tail <ROOM_ID> --peer <ALICE_ENDPOINT_OR_ADDR>` briefly or
-  ask Alice to stay online.
+- `no_such_file`: Bob could not learn the `file.shared` event within the bounded
+  wait. Confirm Alice is serving the same room and retry with the exact
+  `listening:` address passed through `--peer`.
 - `hash_mismatch`: do not trust the file. File a redacted issue.
 
 ## Recipe 3: Share A Localhost Preview With Live Pipe
@@ -207,7 +213,7 @@ Start a local test server:
 ```bash
 mkdir -p .cohort/site
 printf '<h1>Hello from private Live Pipe</h1>\n' > .cohort/site/index.html
-python3 -m http.server 3000 --directory .cohort/site
+python3 -m http.server 3000 --bind 127.0.0.1 --directory .cohort/site
 ```
 
 Leave it running.
