@@ -131,6 +131,36 @@ fn insert_persists_once_verbatim() {
     assert_eq!(got.admin_seq, Some(0), "genesis admin_seq");
 }
 
+#[test]
+fn room_scoped_point_reads_never_match_a_foreign_room() {
+    let (alice_id, alice_dev) = (sk(1), sk(2));
+    let (bob_id, bob_dev) = (sk(3), sk(4));
+    let (alice_genesis, alice_room) = genesis(&alice_id, &alice_dev);
+    let (bob_genesis, bob_room) = genesis(&bob_id, &bob_dev);
+    let mut store = EventStore::open_in_memory().unwrap();
+    store.insert(&alice_genesis).unwrap();
+    store.insert(&bob_genesis).unwrap();
+
+    assert!(store
+        .contains_in_room(&alice_room, &alice_genesis.event_id)
+        .unwrap());
+    assert!(store
+        .get_in_room(&alice_room, &alice_genesis.event_id)
+        .unwrap()
+        .is_some());
+    assert!(!store
+        .contains_in_room(&alice_room, &bob_genesis.event_id)
+        .unwrap());
+    assert!(store
+        .get_in_room(&alice_room, &bob_genesis.event_id)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_in_room(&bob_room, &bob_genesis.event_id)
+        .unwrap()
+        .is_some());
+}
+
 // AC2 — duplicate insert is ignored without error; 1x == 1000x.
 #[test]
 fn duplicate_insert_is_idempotent() {

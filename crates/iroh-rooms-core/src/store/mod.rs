@@ -223,6 +223,26 @@ impl EventStore {
         Ok(found.is_some())
     }
 
+    /// Whether an event id is stored in the specified room.
+    ///
+    /// Sync engines share one database across rooms, so an event id is never a
+    /// capability by itself. Network responders must use this room-scoped form
+    /// before treating an id as locally held.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn contains_in_room(&self, room: &RoomId, id: &EventId) -> Result<bool, StoreError> {
+        let found = self
+            .conn
+            .prepare_cached("SELECT 1 FROM events WHERE room_id = ?1 AND event_id = ?2")?
+            .query_row(
+                params![&room.as_bytes()[..], &id.as_bytes()[..]],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Fetch a single stored event by id.
     ///
     /// # Errors
@@ -231,6 +251,25 @@ impl EventStore {
     pub fn get(&self, id: &EventId) -> Result<Option<StoredEvent>, StoreError> {
         let sql = format!("SELECT {STORED_COLS} FROM events WHERE event_id = ?1");
         let mut found = stored_query(&self.conn, &sql, params![&id.as_bytes()[..]])?;
+        Ok(found.pop())
+    }
+
+    /// Fetch one event only when both its id and room match.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Decode`] /
+    /// [`StoreError::Integrity`] if the stored bytes are corrupt.
+    pub fn get_in_room(
+        &self,
+        room: &RoomId,
+        id: &EventId,
+    ) -> Result<Option<StoredEvent>, StoreError> {
+        let sql = format!("SELECT {STORED_COLS} FROM events WHERE room_id = ?1 AND event_id = ?2");
+        let mut found = stored_query(
+            &self.conn,
+            &sql,
+            params![&room.as_bytes()[..], &id.as_bytes()[..]],
+        )?;
         Ok(found.pop())
     }
 
@@ -340,6 +379,32 @@ impl EventStore {
              WHERE child_id = ?1 AND parent_id NOT IN (SELECT event_id FROM events) \
              ORDER BY ordinal",
             params![&id.as_bytes()[..]],
+        )
+    }
+
+    /// The parents of `id` that are not stored in `room`.
+    ///
+    /// A parent with the same id in a different room must remain missing for
+    /// this room's sync engine. Otherwise a shared database can make a foreign
+    /// event satisfy a local causal dependency.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn missing_parents_in_room(
+        &self,
+        room: &RoomId,
+        id: &EventId,
+    ) -> Result<Vec<EventId>, StoreError> {
+        id_query(
+            &self.conn,
+            "SELECT p.parent_id FROM event_parents p \
+             WHERE p.child_id = ?1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM events e \
+                   WHERE e.room_id = ?2 AND e.event_id = p.parent_id \
+               ) \
+             ORDER BY p.ordinal",
+            params![&id.as_bytes()[..], &room.as_bytes()[..]],
         )
     }
 
