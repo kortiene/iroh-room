@@ -26,6 +26,7 @@ use iroh_rooms_core::event::content::{
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};
+use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
 use iroh_rooms_core::event::wire::WireEvent;
 use iroh_rooms_core::membership::Status;
 use iroh_rooms_core::store::EventStore;
@@ -664,6 +665,117 @@ fn foreign_room_message_is_silently_dropped() {
         engine.logs().iter().any(|l| l.contains("foreign room")),
         "foreign-room drop must be logged"
     );
+}
+
+#[test]
+fn want_events_cannot_serve_an_id_from_another_room_in_the_shared_store() {
+    let built = build_log(0, false);
+    let foreign_admin = Principal::new(0x55);
+    let foreign_nonce = [0xcd; 16];
+    let foreign_room = signed::derive_room_id(&foreign_admin.identity(), &foreign_nonce, T0 + 100);
+    let foreign_genesis = SignedEvent {
+        schema_version: 1,
+        room_id: foreign_room,
+        sender_id: foreign_admin.identity(),
+        device_id: foreign_admin.device(),
+        event_type: iroh_rooms_core::event::content::EventType::RoomCreated,
+        created_at: T0 + 100,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Foreign Room".to_owned(),
+            room_nonce: foreign_nonce,
+            admins: vec![foreign_admin.identity()],
+            device_binding: DeviceBinding::create(
+                &foreign_room,
+                &foreign_admin.id,
+                foreign_admin.device(),
+            ),
+        }),
+    };
+    let foreign_frame = wire(&foreign_genesis, &foreign_admin.dev);
+    let foreign_validated =
+        validate_wire_bytes(&foreign_frame, &ValidationContext::for_room(foreign_room))
+            .expect("foreign genesis validates");
+    let foreign_id = foreign_validated.event_id;
+
+    let mut store = EventStore::open_in_memory().expect("store");
+    store.insert(&foreign_validated).expect("seed foreign room");
+    let mut engine = SyncEngine::open(store, built.room, SyncConfig::default()).expect("engine");
+    for frame in &built.events {
+        engine.publish(frame).expect("seed local room");
+    }
+
+    let outs = engine.on_message(
+        NODE_A,
+        SyncMessage::WantEvents {
+            room_id: built.room,
+            ids: vec![foreign_id],
+        },
+    );
+
+    assert!(
+        !outs.iter().any(|out| matches!(
+            &out.msg,
+            SyncMessage::Events { frames, .. } if !frames.is_empty()
+        )),
+        "a room-scoped engine must never serve foreign-room bytes"
+    );
+    assert!(
+        outs.iter().any(|out| matches!(
+            &out.msg,
+            SyncMessage::NotFound { room_id, ids }
+                if room_id == &built.room && ids == &vec![foreign_id]
+        )),
+        "the foreign id is indistinguishable from an unknown id in this room"
+    );
+
+    // A foreign row must not satisfy an in-room causal dependency either. The
+    // otherwise-valid local message is parked and requests its opaque parent;
+    // it is never treated as causally complete merely because another room has
+    // a row with that id in the shared database.
+    let cross_room_parent = SignedEvent {
+        schema_version: 1,
+        room_id: built.room,
+        sender_id: built.bob.identity(),
+        device_id: built.bob.device(),
+        event_type: iroh_rooms_core::event::content::EventType::MessageText,
+        created_at: T0 + 200,
+        prev_events: vec![foreign_id],
+        content: Content::MessageText(MessageText {
+            body: "must remain parked".to_owned(),
+            format: None,
+            in_reply_to: None,
+            mentions: None,
+        }),
+    };
+    let _ = engine.on_connect(NODE_A);
+    let backfill = engine.ingest_frame(NODE_A, &wire(&cross_room_parent, &built.bob.dev));
+    assert_eq!(engine.parked_len(), 1);
+    assert!(
+        backfill.iter().any(|out| matches!(
+            &out.msg,
+            SyncMessage::WantEvents { room_id, ids }
+                if room_id == &built.room && ids.contains(&foreign_id)
+        )),
+        "the foreign row must remain a missing parent in the local room"
+    );
+
+    // A peer-advertised admin tip is also room-scoped. A row for the same id
+    // in another room cannot clear the fail-closed suspect state.
+    let local_seq = engine
+        .digest()
+        .expect("local digest")
+        .admin_tip
+        .expect("local admin tip")
+        .1;
+    let _ = engine.on_message(
+        NODE_A,
+        SyncMessage::AdminTip {
+            room_id: built.room,
+            tip: Some((foreign_id, local_seq + 1)),
+        },
+    );
+    assert_eq!(engine.completeness(), Completeness::AdminViewSuspect);
 }
 
 // ---------------------------------------------------------------------------
