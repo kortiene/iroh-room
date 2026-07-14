@@ -19,6 +19,13 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Diagnostic-only build seam for controlled Gate-A relay verification. This is
+# deliberately compile-time: ordinary SDK/application binaries cannot switch
+# transport policy at runtime, and their default behavior remains unchanged.
+relay-only-test = []
+
 [lints]
 workspace = true            # inherits `unsafe_code = "forbid"` (our code only;
                             # iroh's internal unsafe lives in its dependencies).

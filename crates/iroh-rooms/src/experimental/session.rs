@@ -33,4 +33,5 @@ pub use iroh_rooms_net::{
     BlobServeConfig, ConnEvent, EventProtocolHandler, Inbound, JoinBootstrapAdmission, NetConfig,
     NetMode, NetTransport, Node, OfflineReason, PeerConnState, PeerEntry, PeerManager, PeerTable,
     RejectCause, Shared, SnapshotAdmission, TracingAudit, DEFAULT_TICK, EVENT_ALPN,
+    RELAY_ONLY_TEST_BUILD,
 };
