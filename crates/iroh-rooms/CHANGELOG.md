@@ -7,7 +7,31 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
-- Nothing yet.
+- Hardened cross-room isolation in the sync engine (PR #106,
+  `iroh-rooms-core`): every event-id lookup against the shared event store is
+  now room-scoped. Because the store holds every room in one database and
+  `event_id` is a globally-unique content hash, unscoped lookups let a row from
+  another room be served to a peer via `WantEvents` (cross-room byte
+  disclosure), satisfy a local causal dependency, or clear the fail-closed
+  admin-tip suspect state. New room-scoped store methods (`contains_in_room` /
+  `get_in_room` / `missing_parents_in_room`) close all three. Since `event_id`
+  is a unique primary key the scoping is a pure narrowing — legitimate same-room
+  sync is unchanged and the reads stay PK point lookups (perf-neutral). No
+  façade API change; a behavioral security fix that flows through to any
+  online-tier consumer. Regression-tested at both the store and sync-engine
+  layers.
+- Added a compile-time `relay-only-test` cargo feature (PR #107,
+  `iroh-rooms-net` with a façade pass-through) and re-exported the
+  `RELAY_ONLY_TEST_BUILD` build-flavor constant through `experimental::session`.
+  With the feature on, a `RealNetwork` endpoint suppresses direct UDP transports
+  (`clear_ip_transports()`) so all room, blob, and pipe traffic traverses the
+  configured relay — a controlled seam for Gate-A relay-throughput
+  verification. Off by default and compile-time only, so ordinary binaries
+  cannot switch transport policy at runtime and default behavior is unchanged.
+  Note: the feature is deliberately non-additive and is enabled by
+  `--all-features`; it is dormant under `cargo test` today (no non-ignored
+  `RealNetwork` test), but a future such test must gate the seam behind a
+  runtime switch to avoid forcing relay-only in CI.
 
 ## 0.1.0-rc.1 - 2026-07-07
 
