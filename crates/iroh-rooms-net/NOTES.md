@@ -133,6 +133,9 @@ larger-sample re-measure is owed), and the home-NAT→CGNAT reverse leg was not 
 Refresh: a 2026-07-07 operator-local ↔ `demo1` cloud run passed both directions,
 natural and relay-only; relay-only measured 4.1 Mbit/s BtoA and 1.3 Mbit/s AtoB.
 Findings block: `crates/spike-nat/NOTES.md` §6.
+Tooling: a compile-time `relay-only-test` build seam (PR #107, off by default) now
+supports a controlled relay-only run for the owed cellular re-measure and the
+reverse leg — it is tooling, not evidence, and discharges neither residual.
 
 Two complementary runs close Gate A (see `crates/spike-nat/NOTES.md` for the full
 runbook):
