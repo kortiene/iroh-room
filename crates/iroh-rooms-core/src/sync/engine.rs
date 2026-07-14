@@ -744,7 +744,7 @@ impl SyncEngine {
                 self.note_admin_event(id);
                 // Push-subscription feed (issue #83): emit exactly once, only on a real
                 // insert (the Duplicate arm never reaches here → exactly-once for free).
-                match self.store.get(&id) {
+                match self.store.get_in_room(&self.room_id, &id) {
                     Ok(Some(stored)) => self.pending_ingested.push(stored),
                     Ok(None) => self.log("room_events: inserted event vanished from store"),
                     Err(e) => self.log(&format!("room_events: store.get failed: {e}")),
@@ -846,7 +846,12 @@ impl SyncEngine {
         let to_fetch: Vec<EventId> = missing
             .iter()
             .copied()
-            .filter(|m| !self.store.contains(m).unwrap_or(false))
+            .filter(|m| {
+                !self
+                    .store
+                    .contains_in_room(&self.room_id, m)
+                    .unwrap_or(false)
+            })
             .collect();
         if to_fetch.is_empty() {
             return;
@@ -885,10 +890,12 @@ impl SyncEngine {
     /// absent (would buffer). Used by the §6.2 pre-gate so non-member junk is kept
     /// out of the fold entirely (the fold has no eviction).
     fn would_buffer(&self, ev: &ValidatedEvent) -> bool {
-        ev.event
-            .prev_events
-            .iter()
-            .any(|parent| !self.store.contains(parent).unwrap_or(false))
+        ev.event.prev_events.iter().any(|parent| {
+            !self
+                .store
+                .contains_in_room(&self.room_id, parent)
+                .unwrap_or(false)
+        })
     }
 
     /// A buffered frame's signer is plausibly in the room iff it is the admin, a
@@ -977,7 +984,7 @@ impl SyncEngine {
             .map(|(id, p)| (*id, p.author, p.depth))
             .collect();
         for (id, author, depth) in pending {
-            let missing = match self.store.missing_parents(&id) {
+            let missing = match self.store.missing_parents_in_room(&self.room_id, &id) {
                 Ok(m) => m,
                 Err(e) => {
                     self.log(&format!("missing_parents failed: {e}"));
@@ -986,7 +993,12 @@ impl SyncEngine {
             };
             let to_fetch: Vec<EventId> = missing
                 .into_iter()
-                .filter(|m| !self.store.contains(m).unwrap_or(false))
+                .filter(|m| {
+                    !self
+                        .store
+                        .contains_in_room(&self.room_id, m)
+                        .unwrap_or(false)
+                })
                 .collect();
             if to_fetch.is_empty() {
                 continue;
@@ -1058,7 +1070,7 @@ impl SyncEngine {
                 self.log("Events response capped: response_max_frames");
                 break;
             }
-            match self.store.get(id) {
+            match self.store.get_in_room(&self.room_id, id) {
                 Ok(Some(se)) => frames.push(se.wire.to_bytes()),
                 Ok(None) => missing.push(*id),
                 Err(e) => self.log(&format!("store get failed: {e}")),
@@ -1089,7 +1101,7 @@ impl SyncEngine {
         };
         let mut stored = Vec::new();
         for id in ids.difference(&have) {
-            match self.store.get(id) {
+            match self.store.get_in_room(&self.room_id, id) {
                 Ok(Some(se)) => stored.push(se),
                 Ok(None) => {}
                 Err(e) => self.log(&format!("store get failed: {e}")),
@@ -1197,7 +1209,10 @@ impl SyncEngine {
             // a bounded catch-up pull (spec D6 / §13).
             let local = self.store.admin_chain_tip(&self.room_id).ok().flatten();
             let behind = local.map_or(true, |(_, loc)| seq > loc)
-                && !self.store.contains(&id).unwrap_or(false);
+                && !self
+                    .store
+                    .contains_in_room(&self.room_id, &id)
+                    .unwrap_or(false);
             if behind {
                 self.arm_suspect_tip(id, seq);
                 // Pull the never-windowed membership sub-DAG from every connected
@@ -1281,7 +1296,12 @@ impl SyncEngine {
     fn handle_heads(&mut self, heads: &[EventId]) {
         let unknown = heads
             .iter()
-            .filter(|id| !self.store.contains(id).unwrap_or(false))
+            .filter(|id| {
+                !self
+                    .store
+                    .contains_in_room(&self.room_id, id)
+                    .unwrap_or(false)
+            })
             .count();
         if unknown > 0 {
             self.log(&format!(
@@ -1307,7 +1327,7 @@ impl SyncEngine {
             }
             let mut held = Vec::new();
             for id in ids {
-                if self.store.contains(id)? {
+                if self.store.contains_in_room(&self.room_id, id)? {
                     held.push(*id);
                 }
             }
@@ -1324,8 +1344,8 @@ impl SyncEngine {
         let local = self.store.admin_chain_tip(&self.room_id)?;
         let mut suspicion_cleared = false;
         let behind = if let Some(susp) = self.suspect_tip {
-            let still_behind =
-                local.map_or(true, |(_, loc)| susp.seq > loc) && !self.store.contains(&susp.id)?;
+            let still_behind = local.map_or(true, |(_, loc)| susp.seq > loc)
+                && !self.store.contains_in_room(&self.room_id, &susp.id)?;
             if !still_behind {
                 self.suspect_tip = None;
                 suspicion_cleared = true;
@@ -1483,7 +1503,12 @@ impl SyncEngine {
             };
             let to_fetch: Vec<EventId> = missing
                 .into_iter()
-                .filter(|m| !self.store.contains(m).unwrap_or(false))
+                .filter(|m| {
+                    !self
+                        .store
+                        .contains_in_room(&self.room_id, m)
+                        .unwrap_or(false)
+                })
                 .collect();
             if to_fetch.is_empty() {
                 continue;
@@ -1576,7 +1601,7 @@ impl SyncEngine {
     /// fork detection. Only held-and-validated events feed this state (spec §7), so
     /// a peer cannot forge a fork by advertising a fabricated tip.
     fn note_admin_event(&mut self, id: EventId) {
-        if let Ok(Some(se)) = self.store.get(&id) {
+        if let Ok(Some(se)) = self.store.get_in_room(&self.room_id, &id) {
             if let Some(seq) = se.admin_seq {
                 self.note_admin_id(seq, id);
             }
