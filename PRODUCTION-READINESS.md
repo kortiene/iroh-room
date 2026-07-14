@@ -386,7 +386,7 @@ Use these as issue seeds. Keep each issue small enough to review independently.
 | PR-0005 | Sign off persistent audit retention/privacy posture | P0 | observability | ADR-0003 accepts local `audit.ndjson` posture for Production Beta; GA should revisit retention/rotation/tamper evidence |
 | PR-0006 | Add schema migration and compatibility policy | P0 | data/protocol | Core v1 fixture gate implemented; next candidate must preserve previous-candidate data evidence |
 | PR-0007 | Add backup, restore, and export docs | P0 | operations | Avoid data-loss ambiguity |
-| PR-0008 | Refresh Gate A relay-throughput evidence | P0 | networking | 2026-07-07 local↔`demo1` refresh added; cellular relay larger-transfer caveat and home-NAT→CGNAT reverse-leg waiver/run still need sign-off |
+| PR-0008 | Refresh Gate A relay-throughput evidence | P0 | networking | 2026-07-07 local↔`demo1` refresh added; cellular relay larger-transfer caveat and home-NAT→CGNAT reverse-leg waiver/run still need sign-off; 2026-07-14 `relay-only-test` compile-time build seam landed (PR #107) as controlled tooling for the owed relay-only run — tooling only, no measurement performed, does not satisfy P0.2 |
 | PR-0009 | Add production release sign-off template | P0 | release | Implemented in `docs/operations/release-operations.md` |
 | PR-0010 | Add privacy-preserving bug report template | P1 | support | Needed for beta |
 | PR-0011 | Add macOS/Linux release artifact checklist | P1 | release | Implemented via release artifact script and install/rollback runbook |
