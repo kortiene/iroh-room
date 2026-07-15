@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-rooms"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-rooms-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-rooms-core"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-rooms-net"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "anyhow",
  "bao-tree",

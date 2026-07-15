@@ -7,6 +7,27 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+## 0.1.0-rc.2 - 2026-07-15
+
+- Fixed the join-after-conversation deadlock (PR #111, `iroh-rooms-core` /
+  `iroh-rooms-net` / `iroh-rooms-cli`): once any non-admin chat existed in a
+  room, no new participant could ever complete `room join` — the invite cites
+  the current DAG heads (chat events after a conversation), the membership fold
+  requires every `prev_events` parent before classifying, `WantMembership`
+  served only the bare authorization class, and the admin drops `WantEvents`
+  backfill from provisional peers, a circular deadlock ending in a 10s timeout.
+  `WantMembership` now serves the **causal closure** of the authorization class
+  (memoized, room-scoped), and the requester's `have` claims every held event
+  id, giving guaranteed `ceil(closure/cap)`-round bootstrap progress under the
+  512-frame response cap. The net writer now drops a locally-queued oversized
+  frame instead of killing the peer stream, and `room join` distinguishes a new
+  `membership_incomplete` error (admin responded, ancestry never completed —
+  counted per-attempt) from `no_admin_reachable`. Known residuals tracked in
+  issues #112 (provisional closure read without capability proof), #113
+  (have-list frame ceiling ~30k events), #114 (offline-member deep-chat-gap
+  wedge). **Upgrade note: a v0.1.0-rc.1 admin still serves the bare class, so
+  joins minted after a conversation keep failing in mixed-version rooms — every
+  room member, especially the admin, must run rc.2.**
 - Hardened cross-room isolation in the sync engine (PR #106,
   `iroh-rooms-core`): every event-id lookup against the shared event store is
   now room-scoped. Because the store holds every room in one database and
