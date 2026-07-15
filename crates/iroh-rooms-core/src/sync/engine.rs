@@ -860,12 +860,7 @@ impl SyncEngine {
         let to_fetch: Vec<EventId> = missing
             .iter()
             .copied()
-            .filter(|m| {
-                !self
-                    .store
-                    .contains_in_room(&self.room_id, m)
-                    .unwrap_or(false)
-            })
+            .filter(|m| self.worth_backfilling(m))
             .collect();
         if to_fetch.is_empty() {
             return;
@@ -924,6 +919,27 @@ impl SyncEngine {
         let snap = self.fold.snapshot();
         let sender = &ev.event.sender_id;
         snap.admin() == Some(sender) || snap.member(sender).is_some()
+    }
+
+    /// Whether a still-missing parent is worth a `WantEvents` fetch. A parent is
+    /// worth fetching only if it is **neither already stored** (nothing to fetch)
+    /// **nor already parked** (its own retry is already chasing *its* parents, so
+    /// re-requesting it makes no forward progress).
+    ///
+    /// Excluding already-parked parents is what un-sticks a deep single-author
+    /// backfill (issue #114): when a whole windowed run parks, every frame but the
+    /// deepest cites a parent that is itself parked, so without this filter the
+    /// rate-limited retry burns its entire per-author token budget re-requesting
+    /// frames it already holds — and the one request that would advance the gap
+    /// frontier loses the token race deterministically, freezing the chase. With
+    /// it, tokens are spent only on the true frontier (a parent that is neither
+    /// held nor in flight), so the chase descends toward the held set.
+    fn worth_backfilling(&self, parent: &EventId) -> bool {
+        !self
+            .store
+            .contains_in_room(&self.room_id, parent)
+            .unwrap_or(false)
+            && !self.park.contains_key(parent)
     }
 
     fn park_frame(&mut self, ev: ValidatedEvent, depth: usize, missing: &[EventId]) {
@@ -992,27 +1008,22 @@ impl SyncEngine {
     fn retry_park(&mut self, out: &mut Vec<Outgoing>) {
         // First promote anything the fold has since accepted.
         self.wake_park(out);
-        let pending: Vec<(EventId, IdentityKey, usize)> = self
+        // Use each frame's **recorded** missing-parent set, not a store lookup: a
+        // parked frame is not in `events`, so it has no `event_parents` rows and
+        // `missing_parents_in_room` would return empty — the tick-driven retry
+        // would then never re-fetch for a still-parked chain, stalling a deep
+        // backfill once the initial `on_buffered` token burst is spent (issue
+        // #114). `worth_backfilling` drops the parents that have since been stored
+        // or are already parked in flight.
+        let pending: Vec<(IdentityKey, usize, Vec<EventId>)> = self
             .park
-            .iter()
-            .map(|(id, p)| (*id, p.author, p.depth))
+            .values()
+            .map(|p| (p.author, p.depth, p.missing.iter().copied().collect()))
             .collect();
-        for (id, author, depth) in pending {
-            let missing = match self.store.missing_parents_in_room(&self.room_id, &id) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.log(&format!("missing_parents failed: {e}"));
-                    continue;
-                }
-            };
+        for (author, depth, missing) in pending {
             let to_fetch: Vec<EventId> = missing
                 .into_iter()
-                .filter(|m| {
-                    !self
-                        .store
-                        .contains_in_room(&self.room_id, m)
-                        .unwrap_or(false)
-                })
+                .filter(|m| self.worth_backfilling(m))
                 .collect();
             if to_fetch.is_empty() {
                 continue;
@@ -1556,12 +1567,7 @@ impl SyncEngine {
             };
             let to_fetch: Vec<EventId> = missing
                 .into_iter()
-                .filter(|m| {
-                    !self
-                        .store
-                        .contains_in_room(&self.room_id, m)
-                        .unwrap_or(false)
-                })
+                .filter(|m| self.worth_backfilling(m))
                 .collect();
             if to_fetch.is_empty() {
                 continue;

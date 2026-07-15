@@ -1171,10 +1171,10 @@ fn phantom_depth_drop_gates_backfill_chain() {
 fn tick_anti_entropy_emitted_independently_of_backfill_token_state() {
     // genesis(0) inv_bob(1) join_bob(2) inv_carol(3) join_carol(4) remove_carol(5)
     //
-    // The WantMembership / WantRecentChat anti-entropy pulls emitted on tick are
-    // the actual post-exhaustion recovery path: retry_park skips parked events
-    // because they are not in the store (only fold-accepted events are stored),
-    // so the tick's unconditional membership + chat pulls close the gap.
+    // On tick the engine unconditionally emits WantMembership / WantRecentChat
+    // anti-entropy pulls to every connected peer, regardless of the per-author
+    // backfill token state — token exhaustion must never stall the anti-entropy
+    // recovery path.
     let built = build_log(0, true);
     let config = SyncConfig {
         backfill_tokens_per_author: 1,
@@ -1194,12 +1194,9 @@ fn tick_anti_entropy_emitted_independently_of_backfill_token_state() {
         1,
         "second orphan rate-limited"
     );
-    let rate_limited_before = engine.counters().backfill_rate_limited;
 
     // Tick: refills tokens AND unconditionally emits WantMembership + WantRecentChat
-    // anti-entropy pulls to every connected peer.  retry_park finds no store entries
-    // for parked events (they are held in memory only), so it emits nothing and
-    // does not consume the refilled token.
+    // anti-entropy pulls to every connected peer — independent of token state.
     let tick_outs = engine.on_tick(1_000);
     let to_a: Vec<_> = tick_outs.iter().filter(|o| o.peer == NODE_A).collect();
 
@@ -1213,12 +1210,20 @@ fn tick_anti_entropy_emitted_independently_of_backfill_token_state() {
             .any(|o| matches!(&o.msg, SyncMessage::WantRecentChat { .. })),
         "tick must emit WantRecentChat pull even after token exhaustion"
     );
-    // retry_park finds nothing in the store for the parked events → no new
-    // suppressions; the rate-limited counter stays frozen.
+    // retry_park now re-drives the parked frames from their recorded missing sets
+    // (issue #114): the one refilled token is spent chasing the first parked
+    // frame's missing parent, and the second parked frame is rate-limited again —
+    // so the by-id backfill retry actually makes progress rather than silently
+    // doing nothing for events that are (correctly) not in the store.
     assert_eq!(
         engine.counters().backfill_rate_limited,
-        rate_limited_before,
-        "retry_park must not add new suppressions when missing_parents is empty"
+        2,
+        "retry_park re-drives parked frames and rate-limits once the refill is spent"
+    );
+    assert!(
+        to_a.iter()
+            .any(|o| matches!(&o.msg, SyncMessage::WantEvents { .. })),
+        "retry_park re-issues a by-id backfill for a still-missing parent"
     );
 }
 
