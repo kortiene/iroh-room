@@ -28,6 +28,9 @@ default = []
 # blob serve/fetch, live-pipe forwarding. Off by default so a default-features
 # consumer cannot even name an experimental type.
 experimental = ["dep:iroh-rooms-net", "iroh-rooms-core/sync", "dep:iroh"]
+# Diagnostic-only forwarding seam. A consumer must opt in explicitly; the
+# normal `experimental` and `full` features keep direct-capable networking.
+relay-only-test = ["experimental", "iroh-rooms-net/relay-only-test"]
 # Convenience alias for the full surface.
 full = ["experimental"]
 

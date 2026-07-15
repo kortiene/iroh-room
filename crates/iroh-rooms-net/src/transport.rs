@@ -46,6 +46,11 @@ pub enum NetMode {
     RealNetwork,
 }
 
+/// Whether this crate was compiled with the diagnostic relay-only transport
+/// seam. The feature is off by default and is intended only for controlled
+/// verification binaries, never ordinary application builds.
+pub const RELAY_ONLY_TEST_BUILD: bool = cfg!(feature = "relay-only-test");
+
 /// Construction parameters for a [`NetTransport`].
 #[derive(Debug, Clone, Copy)]
 pub struct NetConfig {
@@ -245,11 +250,18 @@ impl NetTransport {
                 .bind()
                 .await
                 .context("bind loopback endpoint")?,
-            NetMode::RealNetwork => Endpoint::builder(presets::N0)
-                .secret_key(secret)
-                .bind()
-                .await
-                .context("bind real-network endpoint")?,
+            NetMode::RealNetwork => {
+                let builder = Endpoint::builder(presets::N0).secret_key(secret);
+                // Compile-time diagnostic seam only. Both endpoints in a
+                // controlled verification run use a separately built binary,
+                // suppressing direct UDP transports so all room, blob, and
+                // pipe traffic must traverse the configured relay. With the
+                // default feature set this statement is not compiled and the
+                // original direct-capable builder is unchanged.
+                #[cfg(feature = "relay-only-test")]
+                let builder = builder.clear_ip_transports();
+                builder.bind().await.context("bind real-network endpoint")?
+            }
         };
 
         let me = endpoint.id();
@@ -453,7 +465,7 @@ fn loopback_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inbound, NetConfig, NetMode, Shared};
+    use super::{Inbound, NetConfig, NetMode, Shared, RELAY_ONLY_TEST_BUILD};
     use crate::admission::AllowlistAdmission;
     use crate::audit::TracingAudit;
     use crate::state::{PeerConnState, PeerTable};
@@ -509,6 +521,11 @@ mod tests {
     #[test]
     fn net_config_default_room_event_capacity_is_256() {
         assert_eq!(NetConfig::default().room_event_capacity, 256);
+    }
+
+    #[test]
+    fn relay_only_diagnostic_constant_matches_the_compile_time_feature() {
+        assert_eq!(RELAY_ONLY_TEST_BUILD, cfg!(feature = "relay-only-test"));
     }
 
     #[test]

@@ -76,4 +76,4 @@ pub use pipe::{
     PipeSessionInfo, TracingPipeAudit, PIPE_ALPN,
 };
 pub use state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
-pub use transport::{Inbound, NetConfig, NetMode, NetTransport, Shared};
+pub use transport::{Inbound, NetConfig, NetMode, NetTransport, Shared, RELAY_ONLY_TEST_BUILD};
