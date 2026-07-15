@@ -2,7 +2,7 @@
 
 Iroh Rooms is a local-first collaboration runtime for small trusted groups. It lets people and agents create a private room, exchange signed messages, share verified files, expose a loopback-only live TCP pipe, and keep the room state on their own machines instead of a central application server.
 
-The current release is `v0.1.0-rc.1`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
+The current release is `v0.1.0-rc.2`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
 
 ## What you can do with it
 
@@ -225,7 +225,7 @@ Run the controlled beta readiness gate before release work:
 scripts/production-readiness.sh
 ```
 
-The production script checks automatable evidence only. Manual sign-off still follows [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md).
+The production script checks automatable evidence only. Manual sign-off still follows the Production Readiness plan in [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md).
 
 The full online demo tiers are ignored by default because they start live loopback sessions. Run them explicitly when validating the end-to-end experience:
 
