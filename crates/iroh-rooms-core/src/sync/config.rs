@@ -44,12 +44,26 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            max_parked_per_author: 64,
+            // Per-author park cap: set equal to `max_parked_total` on purpose (issue
+            // #114). A member returning across a long offline gap must backfill a
+            // deep, often single-author, linear chat chain; the whole chain has to
+            // sit in the park at once so a bottom-up `wake_park` cascade can accept
+            // it. A per-author cap *below* the total cap would evict the middle of
+            // that legitimate chain, and its still-parked children would re-request
+            // the evicted parents — thrashing the chase to a standstill. Keeping the
+            // two equal lets one author use the whole (unchanged) park budget while
+            // memory stays bounded by `max_parked_total`.
+            max_parked_per_author: 1024,
             max_parked_total: 1024,
             max_backfill_fanout_ids: 256,
             backfill_tokens_per_author: 32,
             backfill_refill_per_tick: 8,
-            max_backfill_depth: 64,
+            // Chase depth must exceed a realistic returning-member gap so the by-id
+            // backfill can bridge it back to the held set (issue #114). Kept finite
+            // and ≤ the park budget, so a phantom-parent chain is still dropped at a
+            // hard bound (the Gate-D anti-amplification requirement) — the chase is
+            // bounded by this depth, the token bucket, and `max_parked_total`.
+            max_backfill_depth: 1024,
             response_max_frames: 512,
             chat_window_default: 200,
             chat_window_max: 1000,

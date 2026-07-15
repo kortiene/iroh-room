@@ -1317,3 +1317,257 @@ fn cross_partition_admin_fork_detected_after_membership_backfill() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #114 — offline member returning across a >64-deep pure-chat gap
+// ---------------------------------------------------------------------------
+
+/// Build `genesis → invite_bob → join_bob → m0 → m1 → … → m(n_chat-1)` where each
+/// `m[i]` is a bob `message.text` parented on `m[i-1]` — a **linear** chat chain
+/// (unlike `build_log`, whose chat events are all siblings parented directly on
+/// `join_bob` and therefore never form a deep gap).
+///
+/// Returns the room, the causally-ordered wire frames, and `prefix_len` — the
+/// number of leading frames that are the pre-chat prefix (`genesis`, `invite_bob`,
+/// `join_bob`), so a test can seed a peer with only the pre-gap prefix.
+fn build_linear_chat_log(n_chat: u32) -> (RoomId, Vec<Vec<u8>>, usize) {
+    let alice = Principal::new(0x01);
+    let bob = Principal::new(0x10);
+    let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
+
+    let mut events = Vec::new();
+    let mut t = T0;
+
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: t,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Deep Gap".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let gid = genesis.event_id();
+    events.push(wire_bytes(&genesis, &alice.dev));
+
+    t += 1;
+    let inv_bob_id = [0x01; 16];
+    let inv_bob_sec = [0x41; 16];
+    let inv_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: t,
+        prev_events: vec![gid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_bob_id,
+            capability_hash: capability_hash(&room, &inv_bob_id, &inv_bob_sec),
+            role: "member".to_owned(),
+            invitee_key: bob.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_bob_eid = inv_bob.event_id();
+    events.push(wire_bytes(&inv_bob, &alice.dev));
+
+    t += 1;
+    let join_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: bob.identity(),
+        device_id: bob.device(),
+        event_type: EventType::MemberJoined,
+        created_at: t,
+        prev_events: vec![inv_bob_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_bob_id,
+            capability_secret: inv_bob_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &bob.id, bob.device()),
+            display_name: None,
+        }),
+    };
+    let mut prev = join_bob.event_id();
+    events.push(wire_bytes(&join_bob, &bob.dev));
+    let prefix_len = events.len();
+
+    for i in 0..n_chat {
+        t += 1;
+        let msg = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: bob.identity(),
+            device_id: bob.device(),
+            event_type: EventType::MessageText,
+            created_at: t,
+            prev_events: vec![prev],
+            content: Content::MessageText(MessageText {
+                body: format!("linear msg {i}"),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        prev = msg.event_id();
+        events.push(wire_bytes(&msg, &bob.dev));
+    }
+
+    (room, events, prefix_len)
+}
+
+/// The number of chat-class (windowable) events a peer holds: the full validated
+/// set minus the never-windowed authorization class.
+fn chat_count(engine: &SyncEngine) -> usize {
+    let all = engine.digest().expect("digest").event_ids.len();
+    let membership = engine.membership_event_ids().expect("membership ids").len();
+    all - membership
+}
+
+/// Issue #114: an offline member returns across a **>64-deep linear pure-chat
+/// gap**. B holds only the pre-chat prefix and asks for a bounded chat window, so
+/// the frames it pulls float far above its held frontier. Before the fix the
+/// backfill chase could not bridge the gap — the rate-limited retry burned its
+/// token budget re-requesting already-parked parents (and never even used the
+/// parked frame's recorded missing set), so every windowed frame stayed parked
+/// and B accepted no new chat. After the fix the chase descends to the held
+/// frontier and one `wake_park` cascade accepts the whole chain.
+#[test]
+fn issue_114_deep_pure_chat_gap_returning_member_catches_up() {
+    // A chain far deeper than the default depth cap (64).
+    const N: u32 = 200;
+    let (room, events, prefix_len) = build_linear_chat_log(N);
+
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, fresh_engine(room, SyncConfig::default()));
+    // B pulls only the last few chat events on connect, so the served window
+    // floats a >64-deep gap above the pre-chat prefix it holds.
+    let tight = SyncConfig {
+        chat_window_default: 100,
+        ..SyncConfig::default()
+    };
+    net.add_peer(NODE_B, fresh_engine(room, tight));
+
+    // A holds the whole room; B holds only genesis + invite + join (zero chat).
+    seed(&mut net, NODE_A, &events);
+    seed(&mut net, NODE_B, &events[..prefix_len]);
+
+    net.connect(NODE_A, NODE_B);
+    net.run_to_quiescence();
+
+    // Membership is never windowed, so it reconciles fully.
+    net.assert_membership_converged(&[NODE_A, NODE_B]);
+
+    // Issue #114 fixed: the returning member bridges the deep gap and catches up
+    // on the whole conversation (the by-id backfill descends to the held frontier
+    // and one `wake_park` cascade accepts the chain).
+    assert_eq!(
+        chat_count(net.engine(NODE_B)),
+        N as usize,
+        "returning member catches up across the deep gap (issue #114)"
+    );
+    assert_eq!(
+        net.engine(NODE_B).parked_len(),
+        0,
+        "no frames left parked after the gap heals"
+    );
+    net.assert_converged(&[NODE_A, NODE_B]);
+}
+
+/// Issue #114, order-independence: the deep-gap heal must not depend on the order
+/// the windowed frames and backfill responses arrive in. A returning member that
+/// held a chat *prefix* (was online for the start of the conversation) goes
+/// offline through a >64-deep burst; under shuffled delivery it still bridges the
+/// gap from its held frontier and converges on the full log.
+#[test]
+fn issue_114_deep_gap_heals_under_shuffled_delivery() {
+    const N: u32 = 180;
+    const HELD_CHAT: usize = 10; // B was online for the first 10 messages
+    let (room, events, prefix_len) = build_linear_chat_log(N);
+
+    for seed_val in 0..6_u64 {
+        let mut net = SimNet::new(room);
+        net.add_peer(NODE_A, fresh_engine(room, SyncConfig::default()));
+        let tight = SyncConfig {
+            chat_window_default: 80,
+            ..SyncConfig::default()
+        };
+        net.add_peer(NODE_B, fresh_engine(room, tight));
+
+        seed(&mut net, NODE_A, &events);
+        // B holds the pre-chat prefix plus the first HELD_CHAT messages, then a
+        // >64-deep gap up to the recent tail.
+        seed(&mut net, NODE_B, &events[..prefix_len + HELD_CHAT]);
+
+        net.connect(NODE_A, NODE_B);
+        // Interleave shuffles with tick+drain rounds so arrival order varies.
+        for _ in 0..400 {
+            net.shuffle(seed_val);
+            net.tick();
+            net.shuffle(seed_val.wrapping_add(1));
+            while net.step() {}
+            if chat_count(net.engine(NODE_B)) == N as usize {
+                break;
+            }
+        }
+
+        assert_eq!(
+            chat_count(net.engine(NODE_B)),
+            N as usize,
+            "seed {seed_val}: returning member with a chat prefix catches up fully"
+        );
+        net.assert_converged(&[NODE_A, NODE_B]);
+    }
+}
+
+/// Issue #114, anti-amplification bound preserved: the relaxed depth cap is still
+/// **finite**, so a gap deeper than `max_backfill_depth` degrades gracefully — the
+/// chase is bounded (never hangs), the never-windowed membership still converges,
+/// and the depth gate is what stops the chase. This is the Gate-D "bounded
+/// backfill" requirement: the fix widened the bound, it did not remove it.
+#[test]
+fn issue_114_gap_deeper_than_depth_cap_is_bounded_not_hanging() {
+    const N: u32 = 120;
+    let (room, events, prefix_len) = build_linear_chat_log(N);
+
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, fresh_engine(room, SyncConfig::default()));
+    // A deliberately tiny depth cap (below the gap) with a small window: the chase
+    // cannot bridge the gap, but it must stay bounded and quiesce.
+    let capped = SyncConfig {
+        chat_window_default: 20,
+        max_backfill_depth: 16,
+        ..SyncConfig::default()
+    };
+    net.add_peer(NODE_B, fresh_engine(room, capped));
+
+    seed(&mut net, NODE_A, &events);
+    seed(&mut net, NODE_B, &events[..prefix_len]);
+
+    net.connect(NODE_A, NODE_B);
+    // Must terminate (the depth gate bounds the chase); a hang would blow the
+    // SimNet round bound instead of returning.
+    net.run_to_quiescence();
+
+    // Membership is never windowed → converges regardless of the chat depth cap.
+    net.assert_membership_converged(&[NODE_A, NODE_B]);
+    // The depth gate fired (the chase was bounded, not unbounded).
+    assert!(
+        net.engine(NODE_B).counters().phantom_depth_dropped > 0,
+        "the finite depth cap must bound the over-deep chase"
+    );
+    // Whatever chat B accepted is a causally-complete suffix of the held frontier,
+    // never more than A holds.
+    assert!(
+        chat_count(net.engine(NODE_B)) < N as usize,
+        "a gap beyond the depth cap does not fully heal (bounded, by design)"
+    );
+}
