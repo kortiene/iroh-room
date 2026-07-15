@@ -222,7 +222,7 @@ class:
 
 | Class | Types | Sync rule |
 |---|---|---|
-| **Authorization (never windowed)** | `room.created`, `member.invited`, `member.joined`, `member.left`, `member.removed`, **plus every admin-authored event** (any event with a defined `admin_seq`) | **Always fully reconciled.** Served in full by `WantMembership`; never dropped by a chat window (spike §0/§4/§8). |
+| **Authorization (never windowed)** | `room.created`, `member.invited`, `member.joined`, `member.left`, `member.removed`, **plus every admin-authored event** (any event with a defined `admin_seq`) | **Always fully reconciled.** Served **causally closed** by `WantMembership` — the class plus every stored `prev_events` ancestor, chat included (a membership event minted after chat cites chat heads; the fold cannot classify it without them) — never dropped by a chat window (spike §0/§4/§8). |
 | **Chat (windowed)** | `message.text`, `file.shared`, `pipe.opened`, `pipe.closed`, `agent.status` — **when not admin-authored** | Bounded by count and/or time (PRD §10.7). |
 
 Notes:
@@ -477,8 +477,14 @@ On a new authenticated peer link (both directions symmetric):
 - `WantEvents { ids }` ⇒ `Events { frames: ids.filter_map(store.get).map(wire.to_bytes) }`, capped at
   `RESPONSE_MAX_FRAMES`; ids not held ⇒ `NotFound`.
 - `WantMembership { have }` ⇒ compute the **authorization-class** set (4.1: union of `by_type` over
-  the five membership types + `by_sender(admin_identity)`), subtract `have`, return as `Events`
-  (chunked). **Never** apply a window. This is the §0 hard invariant.
+  the five membership types + `by_sender(admin_identity)`), close it over stored `prev_events`
+  ancestry (the **causal closure** — a membership event authored after chat cites chat heads as
+  structural parents, and the fold cannot classify it without them), subtract `have`, return as
+  `Events` (causal order, truncated at `RESPONSE_MAX_FRAMES`). **Never** apply a window. This is
+  the §0 hard invariant. The requester's `have` claims **every id it holds** (not just its own
+  closure): a truncated response is a causally-closed prefix that fold-accepts in full, so each
+  round's `have` shrinks the next delta — bootstrap over any closure size converges in
+  `ceil(closure/cap)` rounds, and a converged mesh quiesces (empty responses).
 - `WantRecentChat { window, have }` ⇒ take `room_tail(room, min(window.max_count, CHAT_WINDOW_MAX))`,
   keep **chat-class** events, optionally filter `created_at >= since_ms` (advisory), subtract `have`,
   return as `Events` (chunked). Count is the trustworthy bound (canonical order); time is advisory.

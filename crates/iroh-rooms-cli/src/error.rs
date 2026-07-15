@@ -43,6 +43,12 @@ pub enum ErrorCode {
     /// A join never reached the room admin within the timeout (offline/unreachable
     /// admin). Distinct from an authorization rejection (AC2).
     NoAdminReachable,
+    /// A join DID pull room history from the admin, but the membership ancestry
+    /// needed to verify the invite never completed within the timeout — e.g. the
+    /// admin runs an older version that serves the authorization class without
+    /// its causal closure. Distinct from [`Self::NoAdminReachable`]: bytes
+    /// arrived, the sub-DAG just never became verifiable.
+    MembershipIncomplete,
     /// A connectivity command could not reach an authorized peer/owner (offline).
     /// The command-failure twin of `PeerConnState::Offline` (AC2).
     PeerOffline(OfflineReason),
@@ -94,6 +100,7 @@ impl ErrorCode {
             Self::Reject(r) => r.code(),
             Self::Ticket(t) => t.code(),
             Self::NoAdminReachable => "no_admin_reachable",
+            Self::MembershipIncomplete => "membership_incomplete",
             Self::PeerOffline(_) => "peer_offline",
             Self::PeerUnauthorized => "peer_unauthorized",
             Self::WrongIdentity => "wrong_identity",
@@ -128,9 +135,10 @@ impl ErrorCode {
             Self::HashMismatch => ErrorCategory::Integrity,
             Self::Reject(reason) => reject_category(reason),
             Self::Ticket(_) => ErrorCategory::Ticket,
-            Self::NoAdminReachable | Self::PeerOffline(_) | Self::BlobUnavailable => {
-                ErrorCategory::Connectivity
-            }
+            Self::NoAdminReachable
+            | Self::MembershipIncomplete
+            | Self::PeerOffline(_)
+            | Self::BlobUnavailable => ErrorCategory::Connectivity,
         }
     }
 
@@ -175,6 +183,11 @@ impl ErrorCode {
             Self::NoAdminReachable => Some(
                 "ask the admin to run `room tail <ROOM_ID> --accept-joins`, then retry; \
                  or pass `--peer <admin-addr>`",
+            ),
+            Self::MembershipIncomplete => Some(
+                "retry with a longer `--timeout`; if it persists, the admin may be \
+                 running an older version that does not share the invite's full history — \
+                 ask them to upgrade and re-run `room tail <ROOM_ID> --accept-joins`",
             ),
             Self::PeerOffline(_) => Some(
                 "ask the owner to come online (run `room tail <ROOM_ID>`), then retry; \
@@ -389,6 +402,10 @@ mod tests {
             "ticket_bad_checksum"
         );
         assert_eq!(ErrorCode::NoAdminReachable.code(), "no_admin_reachable");
+        assert_eq!(
+            ErrorCode::MembershipIncomplete.code(),
+            "membership_incomplete"
+        );
         assert_eq!(
             ErrorCode::PeerOffline(OfflineReason::Unreachable).code(),
             "peer_offline"

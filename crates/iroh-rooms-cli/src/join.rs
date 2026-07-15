@@ -363,6 +363,10 @@ async fn wait_for_invited(
     self_id: &IdentityKey,
     timeout: Duration,
 ) -> Result<()> {
+    // Baseline BEFORE the wait: the store is persistent, so a prior partial
+    // attempt may have left room events behind. Only events pulled during THIS
+    // attempt tell "admin responded" apart from "admin unreachable".
+    let baseline_events = store.count(room_id).unwrap_or(0);
     let polled = tokio::time::timeout(timeout, async {
         loop {
             // `fold_room` errs while the store is still empty (no room yet); ignore
@@ -379,11 +383,32 @@ async fn wait_for_invited(
     // Scope item 3 (offline peer / can't reach admin): the join never observed the
     // admin within `timeout` — distinct from an authorization rejection.
     polled.map_err(|_| {
-        crate::error::CliError::new(
-            ErrorCode::NoAdminReachable,
-            format!("could not bootstrap the room membership within {timeout:?}"),
-        )
-        .into()
+        // Distinguish the two failure shapes so the error is honest: zero events
+        // pulled THIS attempt means the admin was never observed
+        // (offline/unreachable); a positive delta with an unresolved status means
+        // the admin responded but the invite's membership ancestry never
+        // completed (e.g. an older admin that serves the authorization class
+        // without its causal closure).
+        let pulled_events = store
+            .count(room_id)
+            .unwrap_or(baseline_events)
+            .saturating_sub(baseline_events);
+        if pulled_events == 0 {
+            crate::error::CliError::new(
+                ErrorCode::NoAdminReachable,
+                format!("could not bootstrap the room membership within {timeout:?}"),
+            )
+            .into()
+        } else {
+            crate::error::CliError::new(
+                ErrorCode::MembershipIncomplete,
+                format!(
+                    "pulled {pulled_events} room events from the admin, but the membership \
+                     history naming this identity did not complete within {timeout:?}"
+                ),
+            )
+            .into()
+        }
     })
 }
 
