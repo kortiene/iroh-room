@@ -254,6 +254,12 @@ pub struct SyncEngine {
     /// own a tokio broadcast sender, so it buffers and the net pump drains + fans
     /// out.
     pending_ingested: Vec<StoredEvent>,
+    /// Memoized [`authorization_closure_ids`](Self::authorization_closure_ids),
+    /// invalidated on every store insert. The closure walk is `O(events)` store
+    /// lookups; without the cache a quiesced mesh would re-pay it per peer per
+    /// tick for `serve_want_membership` (and an unauthenticated provisional
+    /// dialer could spam `WantMembership` to force it).
+    closure_cache: Option<BTreeSet<EventId>>,
 }
 
 impl SyncEngine {
@@ -304,6 +310,7 @@ impl SyncEngine {
             logs: Vec::new(),
             pending_flags: Vec::new(),
             pending_ingested: Vec::new(),
+            closure_cache: None,
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -701,6 +708,10 @@ impl SyncEngine {
         }
         match self.fold.ingest(ev.clone()) {
             crate::membership::Ingest::Accepted { .. } => {
+                // The chase for this id (if any) is over; clearing the depth entry
+                // keeps the map bounded and lets a once-depth-dropped id be
+                // re-delivered cleanly when it later arrives causally complete.
+                self.backfill_depth.remove(&ev.event_id);
                 self.store_and_fanout(&ev, from, out);
                 self.wake_park(out);
             }
@@ -711,6 +722,7 @@ impl SyncEngine {
                 // Fold-rejected (non-member, bad capability, …): counted + logged
                 // with a stable `reject.<code>`, stored nowhere, fanned out nowhere
                 // (AC3 / spec D8).
+                self.backfill_depth.remove(&ev.event_id);
                 self.counters.rejected += 1;
                 self.log(&format!("reject.{}", reason.code()));
             }
@@ -741,6 +753,8 @@ impl SyncEngine {
             }
             InsertOutcome::Inserted => {
                 self.counters.accepted += 1;
+                // The validated set grew: the memoized authorization closure is stale.
+                self.closure_cache = None;
                 self.note_admin_event(id);
                 // Push-subscription feed (issue #83): emit exactly once, only on a real
                 // insert (the Duplicate arm never reaches here → exactly-once for free).
@@ -1088,11 +1102,18 @@ impl SyncEngine {
         }
     }
 
-    /// Serve the never-windowed authorization-class set, minus what the requester
-    /// already holds, in causal order (spec §6.4 — the §0 hard invariant).
+    /// Serve the never-windowed authorization-class set **causally closed** —
+    /// the §4.1 class plus every stored `prev_events` ancestor — minus what the
+    /// requester already holds, in causal order (spec §6.4 — the §0 hard
+    /// invariant). The closure is what makes the invariant real: a membership
+    /// event authored after chat cites chat heads as structural parents, and the
+    /// fold cannot classify it until *every* parent is present, so serving the
+    /// bare class would hand a bootstrapping joiner an unverifiable sub-DAG (the
+    /// join-after-history deadlock). Ancestors ride along even when chat-class:
+    /// membership verifiability is never bounded by the chat window.
     fn serve_want_membership(&mut self, from: PeerId, have: &[EventId], out: &mut Vec<Outgoing>) {
         let have: BTreeSet<EventId> = id_set(have.iter().copied());
-        let ids = match self.authorization_class_ids() {
+        let ids = match self.authorization_closure_ids() {
             Ok(s) => s,
             Err(e) => {
                 self.log(&format!("authorization-class scan failed: {e}"));
@@ -1161,6 +1182,38 @@ impl SyncEngine {
                 ids.insert(se.event_id);
             }
         }
+        Ok(ids)
+    }
+
+    /// The causal closure of the authorization class: the §4.1 class plus every
+    /// stored ancestor reachable over `prev_events`. This — not the bare class —
+    /// is what `WantMembership` serves and claims in its `have` list: the fold's
+    /// readiness rule needs the *complete* structural ancestry of each membership
+    /// event, and once a conversation has happened that ancestry includes
+    /// non-admin chat. The store holds only fold-accepted events (whose parents
+    /// were present at accept time), so the walk terminates at genesis; a
+    /// dangling edge is skipped, never fabricated.
+    /// Memoized in `closure_cache` (invalidated on insert) so a quiesced mesh —
+    /// or a `WantMembership`-spamming provisional dialer — pays the walk once,
+    /// not per request.
+    fn authorization_closure_ids(&mut self) -> Result<BTreeSet<EventId>, StoreError> {
+        if let Some(cache) = &self.closure_cache {
+            return Ok(cache.clone());
+        }
+        let mut ids = self.authorization_class_ids()?;
+        let mut frontier: Vec<EventId> = ids.iter().copied().collect();
+        while let Some(id) = frontier.pop() {
+            // Every id in the walk is a same-room stored event (the class comes
+            // from room-scoped queries and the room-scoped contains below gates
+            // each addition), so its `event_parents` edges are same-room ancestry.
+            for parent in self.store.parents_of(&id)? {
+                if !ids.contains(&parent) && self.store.contains_in_room(&self.room_id, &parent)? {
+                    ids.insert(parent);
+                    frontier.push(parent);
+                }
+            }
+        }
+        self.closure_cache = Some(ids.clone());
         Ok(ids)
     }
 
@@ -1644,8 +1697,21 @@ impl SyncEngine {
         }
     }
 
+    /// The `have` list for a `WantMembership` pull: **every** validated id this
+    /// node holds for the room, not just the authorization class. This is the
+    /// per-round progress invariant for a truncated closure pull: a response
+    /// capped at `response_max_frames` delivers a causally-closed prefix whose
+    /// frames all fold-accept immediately, and claiming them here shrinks the
+    /// responder's next delta — so a bootstrap over any closure size converges in
+    /// `ceil(closure/cap)` rounds. (Claiming only the requester-side closure
+    /// livelocks: served chat ancestry is not yet an ancestor of any held class
+    /// event, so the delta never shrinks and the responder re-serves the same
+    /// truncated prefix forever.) Claiming extra ids is always safe — the
+    /// responder only subtracts them — and a converged responder's reply is
+    /// empty, so the anti-entropy loop still quiesces.
     fn membership_have(&self) -> Vec<EventId> {
-        self.authorization_class_ids()
+        self.store
+            .room_event_ids(&self.room_id)
             .map(|s| s.into_iter().collect())
             .unwrap_or_default()
     }

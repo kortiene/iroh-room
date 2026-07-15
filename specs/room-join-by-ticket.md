@@ -175,8 +175,15 @@ central design decision of this issue and the reason for its `risk/high` label.
   referenced invite)"). After the membership pull the joiner knows those heads; citing them
   places the invite in the join's causal ancestors, which `gate_join` requires.
 - **Membership sub-DAG is never windowed.** The complete authorization chain (genesis + all
-  membership events for relevant subjects + the full admin chain) MUST always sync (sync §4
-  / §8). The engine's `WantMembership` already implements this.
+  membership events for relevant subjects + the full admin chain), **causally closed** over
+  `prev_events` ancestry, MUST always sync (sync §4 / §8): an invite minted after a
+  conversation cites chat heads as structural parents, and the joiner's fold cannot classify
+  it without them — the closure is what keeps a post-conversation join bootstrappable while
+  the provisional filter denies by-id backfill. The engine's `WantMembership` implements this.
+  Known trade-off: while `--accept-joins` holds the bootstrap window open, a provisionally
+  admitted dialer (which has not yet proven invite possession) can pull the closure — including
+  any chat that entered the membership ancestry — just as it could already pull every
+  admin-authored event. Scoping the bootstrap serve to capability provers is future hardening.
 - **Single immutable admin.** The room has exactly one admin (the creator). The ticket's
   `inviter_identity` is that admin; `discovery[0]` is the admin's `device_id`. The admin is
   the natural bootstrap peer (it authored the invite, so it provably holds the

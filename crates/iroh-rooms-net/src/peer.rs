@@ -58,6 +58,16 @@ pub(crate) fn register_connection(
 async fn writer_task(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(body) = rx.recv().await {
         if let Err(err) = write_frame(&mut send, &body).await {
+            // A locally-queued body over MAX_FRAME_BYTES (e.g. a huge sync
+            // message in a very large room) is a per-message failure, not a link
+            // failure: drop it and keep the stream — killing the writer would
+            // silently end ALL sync to this peer. Nothing was written for an
+            // oversized body (the length check precedes any IO), so the frame
+            // boundary is intact.
+            if matches!(err, crate::frame::FrameError::Oversized { .. }) {
+                tracing::warn!(%err, "writer: dropped oversized outbound frame");
+                continue;
+            }
             tracing::warn!(%err, "writer: frame write failed; closing stream");
             break;
         }

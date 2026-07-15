@@ -661,9 +661,13 @@ fn five_peer_full_mesh_converges() {
 // ---------------------------------------------------------------------------
 
 /// The §0/§4.1 never-windowed invariant at the message level: `WantMembership`
-/// serves only the 6 authorization-class events (genesis, `inv_bob`, `join_bob`,
-/// `inv_carol`, `join_carol`, `remove_carol`) from a log of 11; the 5 chat-class
-/// `MessageText` events must never appear in the response.
+/// serves the authorization class **causally closed**. In this log the closure
+/// equals the bare class — chat is a leaf, never a `prev_events` ancestor of a
+/// membership event — so the response is exactly the 6 class events (genesis,
+/// `inv_bob`, `join_bob`, `inv_carol`, `join_carol`, `remove_carol`) from a log
+/// of 11, and no chat-class `MessageText` appears. Chat that IS membership
+/// ancestry rides along by design; see
+/// `want_membership_closure_includes_chat_ancestry`.
 #[test]
 fn want_membership_response_contains_only_auth_class_events() {
     let built = build_log(5, true); // 5 membership + 5 chat + 1 removal = 11 events
@@ -711,6 +715,333 @@ fn want_membership_response_contains_only_auth_class_events() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Join-after-history regression — an invite minted after chat must bootstrap
+// ---------------------------------------------------------------------------
+
+/// Build the production shape that used to deadlock joins: `genesis → inv_bob →
+/// join_bob → chat_1 … chat_n (a LINEAR bob-authored chain, each message citing
+/// the previous) → inv_carol citing the chat tip`. This is what `room invite`
+/// mints once a conversation has started (`prev_events = current DAG heads`).
+/// Carol has not joined; the log is what the admin holds when her bootstrap
+/// begins.
+fn build_late_invite_log(n_chat: u32) -> Built {
+    let alice = Principal::new(0x01);
+    let bob = Principal::new(0x10);
+    let carol = Principal::new(0x20);
+    let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
+
+    let mut events = Vec::new();
+    let mut t = T0;
+
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: t,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Late Invite Tests".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let gid = genesis.event_id();
+    events.push(wire_bytes(&genesis, &alice.dev));
+
+    t += 1;
+    let inv_bob_id = [0x01; 16];
+    let inv_bob_sec = [0x41; 16];
+    let inv_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: t,
+        prev_events: vec![gid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_bob_id,
+            capability_hash: capability_hash(&room, &inv_bob_id, &inv_bob_sec),
+            role: "member".to_owned(),
+            invitee_key: bob.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_bob_eid = inv_bob.event_id();
+    events.push(wire_bytes(&inv_bob, &alice.dev));
+
+    t += 1;
+    let join_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: bob.identity(),
+        device_id: bob.device(),
+        event_type: EventType::MemberJoined,
+        created_at: t,
+        prev_events: vec![inv_bob_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_bob_id,
+            capability_secret: inv_bob_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &bob.id, bob.device()),
+            display_name: None,
+        }),
+    };
+    let mut tip = join_bob.event_id();
+    events.push(wire_bytes(&join_bob, &bob.dev));
+
+    // The conversation: a linear chain so the invite's ancestry is n_chat deep.
+    for i in 0..n_chat {
+        t += 1;
+        let msg = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: bob.identity(),
+            device_id: bob.device(),
+            event_type: EventType::MessageText,
+            created_at: t,
+            prev_events: vec![tip],
+            content: Content::MessageText(MessageText {
+                body: format!("late-invite msg {i}"),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        tip = msg.event_id();
+        events.push(wire_bytes(&msg, &bob.dev));
+    }
+
+    // The invite minted AFTER the conversation, citing the chat tip — the
+    // production `prev_events = store.heads(room_id)` shape.
+    t += 1;
+    let inv_carol_id = [0x02; 16];
+    let inv_carol_sec = [0x42; 16];
+    let inv_carol = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: t,
+        prev_events: vec![tip],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_carol_id,
+            capability_hash: capability_hash(&room, &inv_carol_id, &inv_carol_sec),
+            role: "member".to_owned(),
+            invitee_key: carol.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    events.push(wire_bytes(&inv_carol, &alice.dev));
+
+    Built {
+        room,
+        events,
+        alice,
+        bob,
+        carol,
+    }
+}
+
+/// The join-after-history regression ("no one can join a room once a
+/// conversation has started"). An invite minted after chat cites chat heads; a
+/// bootstrapping joiner pulls ONLY via `WantMembership` — the admin's join
+/// bootstrap drops a provisional peer's `WantEvents`/`WantRecentChat`
+/// (`provisional_allows`, iroh-rooms-net) — so the membership response must be
+/// causally closed or the invite can never classify. The 70-deep linear chain
+/// also exceeds `max_backfill_depth` (64): even where a by-id chase is allowed,
+/// it could not have recovered this ancestry, so the closure is load-bearing.
+#[test]
+fn late_invite_after_conversation_bootstraps_without_backfill() {
+    let built = build_late_invite_log(70);
+    let mut admin = fresh_engine(built.room, SyncConfig::default());
+    for frame in &built.events {
+        admin.publish(frame).expect("seed admin");
+    }
+    let mut joiner = fresh_engine(built.room, SyncConfig::default());
+
+    // Drive the handshake by hand, modeling the admin-side provisional filter:
+    // only `WantMembership` from the joiner reaches the admin.
+    let only_want_membership = |outs: Vec<iroh_rooms_core::sync::Outgoing>| -> Vec<SyncMessage> {
+        outs.into_iter()
+            .map(|o| o.msg)
+            .filter(|m| matches!(m, SyncMessage::WantMembership { .. }))
+            .collect()
+    };
+
+    let mut pending = only_want_membership(joiner.on_connect(NODE_A));
+    let mut rounds = 0;
+    while joiner.snapshot().status(&built.carol.identity()).is_none() {
+        rounds += 1;
+        assert!(
+            rounds <= 10,
+            "bootstrap did not resolve the late invite within 10 pull rounds"
+        );
+        let mut responses = Vec::new();
+        for msg in pending {
+            responses.extend(admin.on_message(NODE_B, msg));
+        }
+        for o in responses {
+            // The joiner's reactions (WantEvents, …) are dropped: a provisional
+            // peer gets no backfill.
+            let _ = joiner.on_message(NODE_A, o.msg);
+        }
+        pending = only_want_membership(joiner.on_tick(T0));
+    }
+
+    assert_eq!(
+        joiner.snapshot().status(&built.carol.identity()),
+        Some(Status::Invited),
+        "the late invite must classify from the membership pull alone"
+    );
+    assert_eq!(
+        joiner.parked_len(),
+        0,
+        "a causally-closed response parks nothing"
+    );
+    assert_eq!(
+        joiner.counters().phantom_depth_dropped,
+        0,
+        "no depth-gate drops: the closure arrives parent-before-child"
+    );
+    let joiner_ids = joiner.digest().expect("joiner digest").event_ids;
+    let admin_ids = admin.digest().expect("admin digest").event_ids;
+    assert_eq!(
+        joiner_ids, admin_ids,
+        "every event here is membership ancestry, so the joiner converges fully"
+    );
+}
+
+/// The truncated-closure progress invariant: when the membership closure is
+/// LARGER than the responder's `response_max_frames`, every capped response is a
+/// causally-closed prefix the joiner fold-accepts in full, and — because the
+/// joiner's `have` claims every id it holds, not just its own class closure —
+/// each round's pull shrinks the delta until the late invite lands. (Claiming
+/// only the requester-side closure livelocks here: served chat ancestry is not
+/// yet an ancestor of any held class event, so the responder re-serves the same
+/// truncated prefix forever and the joiner freezes below the cap boundary.)
+#[test]
+fn truncated_closure_pull_makes_progress_every_round() {
+    let built = build_late_invite_log(20); // closure: 3 membership + 20 chat + invite = 24
+    let tight = SyncConfig {
+        response_max_frames: 8, // force ceil(24/8) = 3 pull rounds
+        ..SyncConfig::default()
+    };
+    let mut admin = fresh_engine(built.room, tight);
+    for frame in &built.events {
+        admin.publish(frame).expect("seed admin");
+    }
+    let mut joiner = fresh_engine(built.room, SyncConfig::default());
+
+    let only_want_membership = |outs: Vec<iroh_rooms_core::sync::Outgoing>| -> Vec<SyncMessage> {
+        outs.into_iter()
+            .map(|o| o.msg)
+            .filter(|m| matches!(m, SyncMessage::WantMembership { .. }))
+            .collect()
+    };
+
+    let mut pending = only_want_membership(joiner.on_connect(NODE_A));
+    let mut rounds = 0;
+    while joiner.snapshot().status(&built.carol.identity()).is_none() {
+        rounds += 1;
+        assert!(
+            rounds <= 6,
+            "truncated closure pull must converge in ~ceil(24/8) rounds, not livelock"
+        );
+        let mut responses = Vec::new();
+        for msg in pending {
+            responses.extend(admin.on_message(NODE_B, msg));
+        }
+        for o in responses {
+            let _ = joiner.on_message(NODE_A, o.msg);
+        }
+        pending = only_want_membership(joiner.on_tick(T0));
+    }
+
+    assert_eq!(
+        joiner.snapshot().status(&built.carol.identity()),
+        Some(Status::Invited),
+        "the late invite lands once the truncated rounds cover the closure"
+    );
+    assert_eq!(joiner.parked_len(), 0, "each capped prefix accepts in full");
+    let joiner_ids = joiner.digest().expect("joiner digest").event_ids;
+    let admin_ids = admin.digest().expect("admin digest").event_ids;
+    assert_eq!(
+        joiner_ids, admin_ids,
+        "full convergence across capped rounds"
+    );
+}
+
+/// The closure at the message level: chat events that are structural ancestors
+/// of a membership event ARE served by `WantMembership`, parent-before-child,
+/// and a fresh engine ingesting the response in order accepts every frame
+/// without parking (the fold's readiness rule is satisfied as frames land).
+#[test]
+fn want_membership_closure_includes_chat_ancestry() {
+    let built = build_late_invite_log(3);
+    // Log: genesis, inv_bob, join_bob, 3 chat, inv_carol = 7 events, all of them
+    // in the closure (the chat chain is inv_carol's ancestry).
+    let store = EventStore::open_in_memory().expect("store");
+    let mut engine = SyncEngine::open(store, built.room, SyncConfig::default()).expect("engine");
+    for frame in &built.events {
+        engine.publish(frame).expect("seed");
+    }
+
+    let outs = engine.on_message(
+        NODE_A,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: vec![],
+        },
+    );
+    let frames: Vec<Vec<u8>> = outs
+        .into_iter()
+        .filter_map(|o| match o.msg {
+            SyncMessage::Events { frames, .. } => Some(frames),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(
+        frames.len(),
+        7,
+        "the closure serves the class AND its chat ancestry; got {}",
+        frames.len()
+    );
+    let chat_served = frames
+        .iter()
+        .filter(|f| {
+            let wire_ev = WireEvent::decode(f).expect("valid wire event");
+            let signed_ev = SignedEvent::decode(&wire_ev.signed).expect("valid signed event");
+            matches!(signed_ev.event_type, EventType::MessageText)
+        })
+        .count();
+    assert_eq!(
+        chat_served, 3,
+        "the 3 chat ancestors of the late invite must ride along"
+    );
+
+    // A fresh engine ingesting the response in served order accepts everything.
+    let mut fresh = fresh_engine(built.room, SyncConfig::default());
+    fresh.on_connect(NODE_B);
+    for frame in &frames {
+        fresh.ingest_frame(NODE_B, frame);
+    }
+    assert_eq!(fresh.parked_len(), 0, "served order is parent-before-child");
+    assert_eq!(
+        fresh.snapshot().status(&built.carol.identity()),
+        Some(Status::Invited),
+        "the late invite classifies immediately from the closure"
+    );
 }
 
 // ---------------------------------------------------------------------------

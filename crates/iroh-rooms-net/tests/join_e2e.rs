@@ -59,7 +59,7 @@ use iroh::SecretKey;
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::build_member_joined;
 use iroh_rooms_core::event::content::{
-    capability_hash, Content, EventType, MemberInvited, RoomCreated,
+    capability_hash, Content, EventType, MemberInvited, MemberJoined, MessageText, RoomCreated,
 };
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
@@ -207,6 +207,139 @@ fn build_admin_room(
         genesis_event_id,
         invite_dag_id,
         log: vec![genesis_bytes, invite_bytes],
+    }
+}
+
+/// Resident member bob's invite id/secret (distinct from the joiner's `INV_ID`).
+const BOB_INV_ID: [u8; 16] = [0x02u8; 16];
+const BOB_SECRET: [u8; 16] = [0x43u8; 16];
+
+/// Build the admin's room WITH a conversation: genesis → invite(resident) →
+/// join(resident) → a linear `n_chat`-message resident-authored chain → the
+/// joiner's invite citing the **chat tip** — exactly the shape `room invite`
+/// mints once a conversation has started (`prev_events = current DAG heads`).
+///
+/// With `n_chat > max_backfill_depth` (64), the joiner's bootstrap can only
+/// succeed if the membership pull itself serves the causally-closed ancestry:
+/// a provisional peer gets no `WantEvents` backfill, and even a permitted
+/// chase would exceed the depth bound.
+#[allow(clippy::too_many_lines)] // one linear event-by-event fixture; splitting obscures the shape
+fn build_admin_room_with_history(
+    admin: &Principal,
+    resident: &Principal,
+    joiner_identity: IdentityKey,
+    n_chat: u32,
+) -> RoomSetup {
+    let room_id = signed::derive_room_id(&admin.identity(), &NONCE, T0);
+    let mut log = Vec::new();
+    let mut t = T0;
+
+    let genesis_ev = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: admin.identity(),
+        device_id: admin.device_key(),
+        event_type: EventType::RoomCreated,
+        created_at: t,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Join After History Room".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![admin.identity()],
+            device_binding: DeviceBinding::create(&room_id, &admin.id, admin.device_key()),
+        }),
+    };
+    let genesis_event_id = genesis_ev.event_id();
+    log.push(wire(&genesis_ev, &admin.dev));
+
+    t += 1;
+    let inv_resident = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: admin.identity(),
+        device_id: admin.device_key(),
+        event_type: EventType::MemberInvited,
+        created_at: t,
+        prev_events: vec![genesis_event_id],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: BOB_INV_ID,
+            capability_hash: capability_hash(&room_id, &BOB_INV_ID, &BOB_SECRET),
+            role: "member".to_owned(),
+            invitee_key: resident.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_resident_id = inv_resident.event_id();
+    log.push(wire(&inv_resident, &admin.dev));
+
+    t += 1;
+    let join_resident = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: resident.identity(),
+        device_id: resident.device_key(),
+        event_type: EventType::MemberJoined,
+        created_at: t,
+        prev_events: vec![inv_resident_id],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: BOB_INV_ID,
+            capability_secret: BOB_SECRET,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room_id, &resident.id, resident.device_key()),
+            display_name: None,
+        }),
+    };
+    let mut tip = join_resident.event_id();
+    log.push(wire(&join_resident, &resident.dev));
+
+    for i in 0..n_chat {
+        t += 1;
+        let msg = SignedEvent {
+            schema_version: 1,
+            room_id,
+            sender_id: resident.identity(),
+            device_id: resident.device_key(),
+            event_type: EventType::MessageText,
+            created_at: t,
+            prev_events: vec![tip],
+            content: Content::MessageText(MessageText {
+                body: format!("history msg {i}"),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        tip = msg.event_id();
+        log.push(wire(&msg, &resident.dev));
+    }
+
+    t += 1;
+    let invite_ev = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: admin.identity(),
+        device_id: admin.device_key(),
+        event_type: EventType::MemberInvited,
+        created_at: t,
+        prev_events: vec![tip],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: INV_ID,
+            capability_hash: capability_hash(&room_id, &INV_ID, &INV_SECRET),
+            role: "member".to_owned(),
+            invitee_key: joiner_identity,
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let invite_dag_id = invite_ev.event_id();
+    log.push(wire(&invite_ev, &admin.dev));
+
+    RoomSetup {
+        room_id,
+        genesis_event_id,
+        invite_dag_id,
+        log,
     }
 }
 
@@ -415,6 +548,68 @@ async fn valid_join_both_peers_show_joiner_active() {
             .await
             .expect("store_contains"),
         "joiner's store must contain the join it published"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    joiner_node.shutdown().await.expect("shutdown joiner");
+}
+
+// ── join-after-history regression ────────────────────────────────────────────
+
+/// Regression for "no one can join a room once a conversation has started": an
+/// invite minted after chat cites the chat tip as its `prev_events`; the
+/// provisionally-admitted joiner can only pull via `WantMembership` (its
+/// `WantEvents`/`WantRecentChat` are dropped by the join bootstrap), so the
+/// membership response must be causally closed for the invite to ever classify.
+/// The 70-deep member-authored chain also exceeds `max_backfill_depth` (64).
+/// Before the closure fix, the `wait_until_contains(invite)` below deadlocked
+/// until timeout and the join failed with "could not bootstrap the room
+/// membership".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_succeeds_after_conversation_has_started() {
+    let admin = Principal::new(0x01);
+    let resident = Principal::new(0x30);
+    let joiner = Principal::new(0x10);
+
+    let setup = build_admin_room_with_history(&admin, &resident, joiner.identity(), 70);
+
+    let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+
+    joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+
+    // The load-bearing wait: the joiner must obtain its naming invite — whose
+    // ancestry runs through the entire conversation — from the membership pull
+    // alone, while still provisional.
+    joiner_node
+        .wait_until_contains(setup.invite_dag_id, WAIT)
+        .await
+        .expect("joiner pulled the post-conversation invite (causally-closed WantMembership)");
+
+    let heads = joiner_node.heads().await.expect("joiner DAG heads");
+    let binding = DeviceBinding::create(&setup.room_id, &joiner.id, joiner.device_key());
+    let join_wire = build_member_joined(
+        &joiner.id,
+        &joiner.dev,
+        &setup.room_id,
+        &INV_ID,
+        &INV_SECRET,
+        "member",
+        binding,
+        Some("Late Joiner"),
+        &heads,
+        T0 + 1_000,
+    );
+
+    publish_and_wait_admin(&joiner_node, &admin_node, join_wire).await;
+
+    assert!(
+        wait_active(&admin_node, &joiner.identity(), WAIT).await,
+        "admin's snapshot must show the late joiner Active after a room with history"
+    );
+    assert!(
+        wait_active(&joiner_node, &joiner.identity(), WAIT).await,
+        "late joiner's own snapshot must show itself Active"
     );
 
     admin_node.shutdown().await.expect("shutdown admin");
@@ -723,8 +918,13 @@ async fn agent_expired_invite_join_not_accepted() {
 
 /// Security regression: a provisional peer that tries to pull non-membership
 /// events (e.g. `WantRecentChat`) should be blocked by the provisional filter in
-/// the admin's node pump. The admin's store must not deliver room-chat to an
-/// unconfirmed dialer.
+/// the admin's node pump. The admin's store must not deliver the **windowed chat
+/// plane** to an unconfirmed dialer. (Chat that is a structural `prev_events`
+/// ancestor of a membership event is different: it rides along the
+/// causally-closed `WantMembership` response by design — the fold cannot verify
+/// an invite without its ancestry; see `join_succeeds_after_conversation_has_started`.
+/// This fixture's chat-free log keeps the two planes disjoint, so the oracle
+/// below pins the boundary for chat *outside* the membership ancestry.)
 ///
 /// This tests the `provisional_allows` gate in `node.rs`: only `WantMembership`,
 /// `Events`, `AdminTip`, `Heads`, and `NotFound` pass; `WantRecentChat` is dropped.
