@@ -1203,8 +1203,11 @@ impl SyncEngine {
         let mut ids = self.authorization_class_ids()?;
         let mut frontier: Vec<EventId> = ids.iter().copied().collect();
         while let Some(id) = frontier.pop() {
+            // Every id in the walk is a same-room stored event (the class comes
+            // from room-scoped queries and the room-scoped contains below gates
+            // each addition), so its `event_parents` edges are same-room ancestry.
             for parent in self.store.parents_of(&id)? {
-                if !ids.contains(&parent) && self.store.contains(&parent)? {
+                if !ids.contains(&parent) && self.store.contains_in_room(&self.room_id, &parent)? {
                     ids.insert(parent);
                     frontier.push(parent);
                 }
