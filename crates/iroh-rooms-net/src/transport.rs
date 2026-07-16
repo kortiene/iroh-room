@@ -240,6 +240,28 @@ impl Shared {
         generation
     }
 
+    /// Bump `device`'s connection generation without registering a new link, so any
+    /// currently-live link's own [`teardown_if_current`](Self::teardown_if_current)
+    /// becomes a no-op (issue #126 follow-up). Used by the manager's deauthorize
+    /// path: it performs its own forced, unconditional teardown (`unregister` +
+    /// `Offline{Deauthorized}`), and invalidating first means the accept task's
+    /// later close — woken by `close_connection` — cannot overwrite that terminal
+    /// `Deauthorized` state with a generic `LinkDropped`. Like every generation
+    /// move this only ever *increases* the counter (never resets), so a future
+    /// re-connect cannot collide with a stale link's pending teardown.
+    pub(crate) fn invalidate_link(&self, device: EndpointId) {
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bumped = generations
+            .get(&device)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        generations.insert(device, bumped);
+    }
+
     /// Tear down `device`'s link state — but **only if `generation` is still the
     /// current generation** for the device (issue #126). A superseded link's late
     /// close is then a total no-op: it never clears a successor link's
@@ -883,6 +905,45 @@ mod tests {
             shared.table.state_of(peer),
             Some(PeerConnState::Unauthorized)
         );
+    }
+
+    #[test]
+    fn invalidate_link_makes_a_late_teardown_a_noop_preserving_deauthorized() {
+        // The #126 follow-up: the manager's forced deauthorize teardown must win
+        // over an inbound accept task's later close. Invalidating the generation
+        // first turns that close into a no-op, so `Deauthorized` is not overwritten.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x26);
+        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // An inbound accept link is live at generation `gen`.
+        let gen = shared.register_link(peer, tx, false);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        // Manager deauthorize: invalidate the generation, then force the terminal
+        // state (mirrors `PeerManager::reconcile`'s stop path).
+        shared.invalidate_link(peer);
+        shared.unregister(peer);
+        shared
+            .table
+            .set_offline(peer, OfflineReason::Deauthorized, None);
+
+        // The accept task's late close, at the now-superseded generation, no-ops.
+        assert!(!shared.teardown_if_current(
+            peer,
+            gen,
+            LinkTeardown::Offline(OfflineReason::LinkDropped)
+        ));
+
+        // The terminal `Deauthorized` reason survives — not clobbered by LinkDropped.
+        let reason = shared
+            .table
+            .entries()
+            .into_iter()
+            .find(|(d, _)| *d == peer)
+            .map(|(_, e)| e.offline_reason);
+        assert_eq!(reason, Some(OfflineReason::Deauthorized));
+        assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Offline));
     }
 
     // --- Shared::connected_peers ---

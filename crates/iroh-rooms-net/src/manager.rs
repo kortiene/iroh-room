@@ -138,6 +138,13 @@ impl PeerManager {
                 entry.handle.abort();
                 // Tear down any in-flight link so we stop serving a now-removed peer,
                 // then mark the entry terminal so the CLI can show "stopped dialing".
+                // Invalidate the connection generation *before* closing the link
+                // (issue #126 follow-up): an inbound accept task, woken by the close,
+                // would otherwise run its own `teardown_if_current` and overwrite this
+                // terminal `Deauthorized` with a generic `LinkDropped`. Bumping the
+                // generation first makes that late teardown a no-op, so our forced
+                // teardown below is the one that sticks.
+                self.shared.invalidate_link(device);
                 self.shared.close_connection(device);
                 self.shared.unregister(device);
                 self.shared
