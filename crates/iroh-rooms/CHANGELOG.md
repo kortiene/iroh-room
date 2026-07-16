@@ -7,6 +7,41 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Removed the membership-sync room-size ceiling (issue #113, `iroh-rooms-core`
+  / `iroh-rooms-net`): the `WantMembership` requester claimed **every held
+  event id** in `have` (required by #111's progress invariant), so at ~30k held
+  events the request exceeded the 1 MiB wire frame cap, was dropped at the net
+  writer, and membership anti-entropy to that peer silently stalled. The `have`
+  entries are now bounded **ancestry claims** — the requester samples its held
+  set (placed DAG heads, a recent-lamport slab, and a per-tick rotating window
+  over older history; ≤ `membership_have_max_ids`, default 512, ~17 KiB), and
+  the responder subtracts each claimed id *plus every stored ancestor of it*.
+  An old-style exhaustive claim over an intact store is causally closed and
+  expands to exactly itself, so rc.2 requesters are served identically (see the
+  upgrade note for the store-hole exception). Claims never include
+  causally-unplaced (`NULL`-lamport) rows, so a local store hole keeps being
+  re-served until it heals; the rotating window guarantees a claim cannot stay
+  pinned in peer-unknown territory (an offline suffix deeper than the whole
+  budget anchors within at most `placed-events` ticks). `Events` responses are
+  now **byte-budgeted**: a serve larger than one wire frame is split into
+  consecutive under-cap messages instead of being dropped whole and re-served
+  forever (previously reachable at any room size via ~64 near-16-KiB message
+  bodies in the membership ancestry). `SyncEngine::publish` now refuses a
+  locally-authored frame too large to ever deliver
+  (`SyncError::OversizedFrame`), and the Gate-D `SimNet` enforces the frame cap
+  at delivery so this failure class stays visible to the deterministic tests.
+  **Upgrade note: a v0.1.0-rc.2 responder subtracts the new bounded claim as an
+  exact id set, so a fresh bootstrap against an old responder hard-stalls once
+  the joiner holds more than `membership_have_max_ids` + `response_max_frames`
+  (~1k) events — every room member, especially the admin, must run a build with
+  this fix for rooms past that size. Two rc.2 residuals this fix cannot reach:
+  an rc.2 requester whose store has a hole (a swallowed insert error) claims
+  the unplaced rows above it, so an upgraded responder covers — and never
+  re-serves — the missing ancestor that rc.2-to-rc.2 exact-set subtraction
+  would have healed; and an oversized event that entered an rc.2 log before
+  the publish guard existed still re-serves-and-drops on every pull to that
+  peer (now logged at the responder).**
+
 ## 0.1.0-rc.2 - 2026-07-15
 
 - Fixed the join-after-conversation deadlock (PR #111, `iroh-rooms-core` /

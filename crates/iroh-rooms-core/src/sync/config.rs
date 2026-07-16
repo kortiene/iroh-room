@@ -39,6 +39,19 @@ pub struct SyncConfig {
     /// tip is reconciled (and the suspicion cleared) well within this budget by the
     /// never-windowed membership pull, so only a fabricated tip reaches expiry.
     pub max_unconfirmed_tip_attempts: u32,
+    /// Cap on ids in a `WantMembership` `have` **ancestry claim** (#113): the
+    /// requester claims a bounded sample of its held set — placed DAG heads, the
+    /// most recent causally-placed ids, and a per-tick rotating window over
+    /// everything older — instead of enumerating every held id (which exceeded
+    /// the 1 MiB frame ceiling near ~30k events). Each claimed id covers its
+    /// entire stored ancestry at the responder. The cap bounds how much of the
+    /// held set anchors per round: while a claim lands entirely in
+    /// responder-unknown territory the responder re-serves already-held events
+    /// (bounded duplicate re-serves per tick), and the rotating window
+    /// guarantees the claim escapes that state within at most `placed-events`
+    /// ticks. Values large enough to overflow a wire frame themselves
+    /// (~30k ids) are rejected by [`validate`](Self::validate).
+    pub membership_have_max_ids: usize,
 }
 
 impl Default for SyncConfig {
@@ -68,6 +81,10 @@ impl Default for SyncConfig {
             chat_window_default: 200,
             chat_window_max: 1000,
             max_unconfirmed_tip_attempts: 16,
+            // 512 ids ≈ 17.4 KiB on the wire — far under the 1 MiB frame cap and
+            // deep enough that a node must hold >512 events no peer has seen
+            // before any claim coverage degrades (issue #113).
+            membership_have_max_ids: 512,
         }
     }
 }
@@ -90,6 +107,18 @@ impl SyncConfig {
         }
         if self.chat_window_default > self.chat_window_max {
             return Err("chat_default_exceeds_max");
+        }
+        if self.membership_have_max_ids == 0 {
+            // A zero-id claim would make every membership pull a full re-serve —
+            // permanent duplicate churn on a converged mesh.
+            return Err("membership_have_cap_zero");
+        }
+        if self.membership_have_max_ids > 16_384 {
+            // ~34 B/id on the wire: past this the claim itself could approach
+            // the 1 MiB frame cap in a big room — the exact request-side stall
+            // #113 removes, reintroduced by configuration. 16 384 ids ≈ 557 KiB,
+            // comfortably under the cap.
+            return Err("membership_have_cap_oversized");
         }
         Ok(())
     }
@@ -123,6 +152,29 @@ mod tests {
             ..SyncConfig::default()
         };
         assert_eq!(cfg.validate(), Err("chat_default_exceeds_max"));
+    }
+
+    #[test]
+    fn rejects_zero_have_cap() {
+        let cfg = SyncConfig {
+            membership_have_max_ids: 0,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("membership_have_cap_zero"));
+    }
+
+    #[test]
+    fn rejects_oversized_have_cap() {
+        let cfg = SyncConfig {
+            membership_have_max_ids: 16_385,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("membership_have_cap_oversized"));
+        let max_ok = SyncConfig {
+            membership_have_max_ids: 16_384,
+            ..SyncConfig::default()
+        };
+        assert_eq!(max_ok.validate(), Ok(()));
     }
 
     #[test]

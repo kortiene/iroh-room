@@ -14,6 +14,28 @@ use crate::event::cbor::{self, CborValue};
 use crate::event::constants::{DIGEST_LEN, SHORT_ID_LEN};
 use crate::event::ids::{EventId, RoomId};
 
+/// Maximum encoded size of one sync-message body (1 MiB) — the **shared wire
+/// contract** with the transport's per-frame cap
+/// (`iroh-rooms-net::frame::MAX_FRAME_BYTES`, spec D4): a conformant peer
+/// closes the stream on any frame declared larger, and the net writer drops an
+/// oversized locally-queued body rather than emitting it. The engine therefore
+/// keeps every message it produces within this bound (bounded `have` claims,
+/// byte-budgeted `Events` batches); the net crate pins equality in a test so
+/// the two constants cannot drift apart silently.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Conservative fixed allowance for the CBOR envelope of one
+/// [`Events`](SyncMessage::Events) message — map head + `"type"`/`"events"` +
+/// `"room"` (32-byte id) + `"frames"` array head. Measured 60–62 bytes against
+/// [`SyncMessage::encode`] for any batch up to 65 535 frames; 128 leaves margin.
+/// Pinned by `events_overhead_fits_the_declared_allowances` so encoder drift
+/// cannot silently break the engine's byte budgeting (issue #113).
+pub(crate) const EVENTS_ENVELOPE_ALLOWANCE: usize = 128;
+
+/// Conservative per-frame overhead inside an `Events` batch: the frame's CBOR
+/// byte-string head (at most 5 bytes for any frame under 4 GiB).
+pub(crate) const EVENTS_PER_FRAME_OVERHEAD: usize = 5;
+
 /// A transport peer address: the remote device id (`device_id` == iroh
 /// `EndpointId`). The engine fans out and directs pulls by this opaque id; it is
 /// independent of the membership identity the device is bound to.
@@ -102,10 +124,23 @@ pub enum SyncMessage {
     },
     /// Pull the **never-windowed** membership sub-DAG + full admin chain; `have`
     /// lets the responder send only the delta (spec §0 hard invariant).
+    ///
+    /// Each `have` entry is an **ancestry claim** (issue #113): it asserts the
+    /// requester holds that event *and its entire stored ancestry*, so the
+    /// responder subtracts the claimed id plus every stored ancestor of it. A
+    /// bounded claim (placed DAG heads + a recent-lamport slab + a rotating
+    /// window, see [`SyncConfig::membership_have_max_ids`](super::SyncConfig))
+    /// therefore covers an arbitrarily large held set in O(cap) ids — the frame
+    /// no longer grows with room history. An old-style exhaustive claim over an
+    /// intact store (every held id, itself causally closed) expands to exactly
+    /// itself, so the semantics generalize the pre-#113 exact-set subtraction;
+    /// the exception is an old requester with a store *hole*, whose claimed
+    /// unplaced descendants now cover the missing ancestor (see CHANGELOG
+    /// upgrade note).
     WantMembership {
         /// Room scope.
         room_id: RoomId,
-        /// Authorization-class ids the requester already holds.
+        /// Ancestry claims: ids the requester holds **with complete ancestry**.
         have: Vec<EventId>,
     },
     /// Pull bounded recent chat history (spec §10.7).
@@ -530,6 +565,37 @@ mod tests {
             invite_id: [0x3c; SHORT_ID_LEN],
             capability_secret: [0x5e; SHORT_ID_LEN],
         });
+    }
+
+    #[test]
+    fn max_frame_bytes_is_one_mib() {
+        // Pin the shared wire contract (issue #113): the net transport closes a
+        // stream on any frame above this, so every engine-emitted body must fit.
+        // The net crate pins equality against its framing constant.
+        assert_eq!(MAX_FRAME_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn events_overhead_fits_the_declared_allowances() {
+        // The engine's publish guard and Events byte budgeting assume the
+        // encoded envelope costs at most EVENTS_ENVELOPE_ALLOWANCE plus
+        // EVENTS_PER_FRAME_OVERHEAD per frame (issue #113). Pin that against the
+        // real encoder at several batch shapes so a future field added to the
+        // Events encoding cannot silently under-budget and produce frames the
+        // net writer drops.
+        for (count, frame_len) in [(1usize, 0usize), (1, 1_048_000), (23, 100), (512, 2040)] {
+            let msg = SyncMessage::Events {
+                room_id: room(),
+                frames: vec![vec![0xEE; frame_len]; count],
+            };
+            let payload: usize = count * frame_len;
+            let budgeted = payload + count * EVENTS_PER_FRAME_OVERHEAD + EVENTS_ENVELOPE_ALLOWANCE;
+            let encoded = msg.encode().len();
+            assert!(
+                encoded <= budgeted,
+                "{count} frames of {frame_len} B encode to {encoded} > budget {budgeted}"
+            );
+        }
     }
 
     #[test]

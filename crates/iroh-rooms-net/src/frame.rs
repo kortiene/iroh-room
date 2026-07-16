@@ -133,6 +133,18 @@ mod tests {
     }
 
     #[test]
+    fn frame_cap_matches_the_engine_wire_contract() {
+        // The engine bounds every message it emits (`have` claims, byte-budgeted
+        // `Events` batches) by its own copy of this cap (issue #113). If the two
+        // constants drift, the engine either emits bodies the writer drops or
+        // under-fills frames — pin equality so a change must touch both.
+        assert_eq!(
+            MAX_FRAME_BYTES as usize,
+            iroh_rooms_core::sync::MAX_FRAME_BYTES
+        );
+    }
+
+    #[test]
     fn frame_error_display_is_non_empty_and_stable() {
         // Stable display strings appear in logs/audit; verify they are non-empty
         // and contain diagnostic context (length, error type).

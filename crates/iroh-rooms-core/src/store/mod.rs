@@ -476,8 +476,15 @@ impl EventStore {
         )
     }
 
-    /// The DAG heads of a room: stored events that no stored event cites as a
-    /// parent (Membership §3.4 causal heads), ordered by `event_id`.
+    /// The DAG heads of a room: stored events that no stored **same-room** event
+    /// cites as a parent (Membership §3.4 causal heads), ordered by `event_id`.
+    ///
+    /// The citing child is required to live in the same room (mirroring
+    /// [`missing_parents_in_room`](Self::missing_parents_in_room)): in a shared
+    /// database a foreign room's edge row must not un-head a local event. Ids
+    /// are content hashes over bytes that include the `room_id`, so a cross-room
+    /// citation cannot occur without a hash collision — the scoping is defensive
+    /// hardening now that heads feed the `WantMembership` `have` claim (#113).
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] on a DB error.
@@ -486,10 +493,81 @@ impl EventStore {
             &self.conn,
             "SELECT e.event_id FROM events e \
              WHERE e.room_id = ?1 \
-               AND NOT EXISTS (SELECT 1 FROM event_parents p WHERE p.parent_id = e.event_id) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM event_parents p \
+                   JOIN events c ON c.event_id = p.child_id \
+                   WHERE p.parent_id = e.event_id AND c.room_id = ?1 \
+               ) \
              ORDER BY e.event_id",
             params![&room.as_bytes()[..]],
         )
+    }
+
+    /// A `limit`-sized page of the room's **causally-placed** event ids, in
+    /// descending canonical `(lamport, event_id)` order, starting `offset` rows
+    /// from the newest — the recent-lamport slab and the rotating claim window
+    /// of the `WantMembership` `have` claim (#113).
+    ///
+    /// Only rows with a non-`NULL` `lamport` qualify. A non-`NULL` lamport is
+    /// derived as `1 + max(parent lamports)` and poisoned by any absent or
+    /// unplaced parent, so — inductively — every id returned here is held **with
+    /// its complete ancestry**, which is exactly what an ancestry claim asserts.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn recent_event_ids(
+        &self,
+        room: &RoomId,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventId>, StoreError> {
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        id_query(
+            &self.conn,
+            "SELECT event_id FROM events \
+             WHERE room_id = ?1 AND lamport IS NOT NULL \
+             ORDER BY lamport DESC, event_id DESC \
+             LIMIT ?2 OFFSET ?3",
+            params![&room.as_bytes()[..], i64::from(limit), offset],
+        )
+    }
+
+    /// The room's **causally-placed** DAG heads: [`heads`](Self::heads) restricted
+    /// to rows with a derived lamport, ordered by `event_id`. These are the only
+    /// heads a `WantMembership` ancestry claim may cite (#113): a `NULL`-lamport
+    /// head sits above a local hole and cannot back an ancestry claim.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn placed_heads(&self, room: &RoomId) -> Result<Vec<EventId>, StoreError> {
+        id_query(
+            &self.conn,
+            "SELECT e.event_id FROM events e \
+             WHERE e.room_id = ?1 AND e.lamport IS NOT NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM event_parents p \
+                   JOIN events c ON c.event_id = p.child_id \
+                   WHERE p.parent_id = e.event_id AND c.room_id = ?1 \
+               ) \
+             ORDER BY e.event_id",
+            params![&room.as_bytes()[..]],
+        )
+    }
+
+    /// How many **causally-placed** (non-`NULL` lamport) events the room holds —
+    /// the span the `WantMembership` claim's rotating window sweeps (#113).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] on a
+    /// negative count.
+    pub fn placed_count(&self, room: &RoomId) -> Result<u64, StoreError> {
+        let n: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM events WHERE room_id = ?1 AND lamport IS NOT NULL",
+            )?
+            .query_row(params![&room.as_bytes()[..]], |row| row.get(0))?;
+        u64::try_from(n).map_err(|_| StoreError::integrity("negative placed count"))
     }
 
     // -- admin tip ------------------------------------------------------------

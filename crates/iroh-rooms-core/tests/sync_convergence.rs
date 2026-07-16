@@ -24,11 +24,14 @@ use iroh_rooms_core::event::content::{
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};
+use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
 use iroh_rooms_core::event::wire::WireEvent;
 use iroh_rooms_core::membership::Status;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::sim::SimNet;
-use iroh_rooms_core::sync::{Completeness, PeerId, SyncConfig, SyncEngine, SyncMessage};
+use iroh_rooms_core::sync::{
+    Completeness, Outgoing, PeerId, SyncConfig, SyncEngine, SyncError, SyncMessage, MAX_FRAME_BYTES,
+};
 
 // ---------------------------------------------------------------------------
 // Shared fixtures (duplicated from sync_smoke; Rust integration-test binaries
@@ -728,6 +731,13 @@ fn want_membership_response_contains_only_auth_class_events() {
 /// Carol has not joined; the log is what the admin holds when her bootstrap
 /// begins.
 fn build_late_invite_log(n_chat: u32) -> Built {
+    build_late_invite_log_padded(n_chat, 0)
+}
+
+/// [`build_late_invite_log`] with each chat body padded by `pad` filler bytes —
+/// near-`MAX_MESSAGE_BODY_BYTES` bodies push the served closure past the 1 MiB
+/// wire frame cap (issue #113 `Events` byte-budget tests).
+fn build_late_invite_log_padded(n_chat: u32, pad: usize) -> Built {
     let alice = Principal::new(0x01);
     let bob = Principal::new(0x10);
     let carol = Principal::new(0x20);
@@ -809,7 +819,7 @@ fn build_late_invite_log(n_chat: u32) -> Built {
             created_at: t,
             prev_events: vec![tip],
             content: Content::MessageText(MessageText {
-                body: format!("late-invite msg {i}"),
+                body: format!("late-invite msg {i}{}", "x".repeat(pad)),
                 format: None,
                 in_reply_to: None,
                 mentions: None,
@@ -924,11 +934,13 @@ fn late_invite_after_conversation_bootstraps_without_backfill() {
 /// The truncated-closure progress invariant: when the membership closure is
 /// LARGER than the responder's `response_max_frames`, every capped response is a
 /// causally-closed prefix the joiner fold-accepts in full, and — because the
-/// joiner's `have` claims every id it holds, not just its own class closure —
-/// each round's pull shrinks the delta until the late invite lands. (Claiming
-/// only the requester-side closure livelocks here: served chat ancestry is not
-/// yet an ancestor of any held class event, so the responder re-serves the same
-/// truncated prefix forever and the joiner freezes below the cap boundary.)
+/// joiner's `have` ancestry claim covers everything it holds (heads + the
+/// recent-lamport slab, each claimed id covering its whole stored ancestry at
+/// the responder, issue #113) — each round's pull shrinks the delta until the
+/// late invite lands. (Claiming only the requester-side closure livelocks here:
+/// served chat ancestry is not yet an ancestor of any held class event, so the
+/// responder re-serves the same truncated prefix forever and the joiner freezes
+/// below the cap boundary.)
 #[test]
 fn truncated_closure_pull_makes_progress_every_round() {
     let built = build_late_invite_log(20); // closure: 3 membership + 20 chat + invite = 24
@@ -1569,5 +1581,838 @@ fn issue_114_gap_deeper_than_depth_cap_is_bounded_not_hanging() {
     assert!(
         chat_count(net.engine(NODE_B)) < N as usize,
         "a gap beyond the depth cap does not fully heal (bounded, by design)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #113 — bounded `have` ancestry claims + byte-budgeted Events batches
+// ---------------------------------------------------------------------------
+
+/// The `event_id` of a built wire frame.
+fn frame_id(frame: &[u8]) -> EventId {
+    let wire = WireEvent::decode(frame).expect("valid wire frame");
+    SignedEvent::decode(&wire.signed)
+        .expect("valid signed event")
+        .event_id()
+}
+
+/// Flatten the `Events` messages in `outs` into their frame list, in order.
+fn events_frames(outs: &[Outgoing]) -> Vec<Vec<u8>> {
+    outs.iter()
+        .filter_map(|o| match &o.msg {
+            SyncMessage::Events { frames, .. } => Some(frames.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// The `have` list of the first `WantMembership` in `outs`.
+fn want_membership_have(outs: &[Outgoing]) -> Vec<EventId> {
+    outs.iter()
+        .find_map(|o| match &o.msg {
+            SyncMessage::WantMembership { have, .. } => Some(have.clone()),
+            _ => None,
+        })
+        .expect("a WantMembership message")
+}
+
+/// A bob-authored chat frame citing `prev` — the "own newest event no peer has
+/// seen yet" a returning member holds.
+fn bob_chat(built: &Built, prev: Vec<EventId>, t: u64, body: &str) -> Vec<u8> {
+    let msg = SignedEvent {
+        schema_version: 1,
+        room_id: built.room,
+        sender_id: built.bob.identity(),
+        device_id: built.bob.device(),
+        event_type: EventType::MessageText,
+        created_at: t,
+        prev_events: prev,
+        content: Content::MessageText(MessageText {
+            body: body.to_owned(),
+            format: None,
+            in_reply_to: None,
+            mentions: None,
+        }),
+    };
+    wire_bytes(&msg, &built.bob.dev)
+}
+
+/// The `have` claim is bounded by `membership_have_max_ids` and anchored on the
+/// DAG heads plus the most recent causally-placed events — its wire size no
+/// longer grows with room history (the #113 ceiling: an exhaustive claim of
+/// ~30k held ids exceeds the 1 MiB frame cap).
+#[test]
+fn issue_113_have_claim_is_bounded_and_contains_heads() {
+    let built = build_late_invite_log(40); // 44 events, linear
+    let capped = SyncConfig {
+        membership_have_max_ids: 8,
+        ..SyncConfig::default()
+    };
+    let mut engine = fresh_engine(built.room, capped);
+    for frame in &built.events {
+        engine.publish(frame).expect("seed");
+    }
+
+    let have = want_membership_have(&engine.on_connect(NODE_A));
+    assert_eq!(
+        have.len(),
+        8,
+        "claim must be capped at membership_have_max_ids"
+    );
+    let claim: std::collections::BTreeSet<EventId> = have.iter().copied().collect();
+    for head in engine.heads().expect("heads") {
+        assert!(claim.contains(&head), "claim must contain every DAG head");
+    }
+    // The slab is the most recent causally-placed events: the last 8 by build
+    // order of this linear log (chat33..chat39 + inv_carol).
+    let expected: std::collections::BTreeSet<EventId> = built.events[built.events.len() - 8..]
+        .iter()
+        .map(|f| frame_id(f))
+        .collect();
+    assert_eq!(claim, expected, "claim = heads + recent-lamport slab");
+    let frame = SyncMessage::WantMembership {
+        room_id: built.room,
+        have,
+    }
+    .encode();
+    assert!(
+        frame.len() < 1024,
+        "a capped claim stays tiny on the wire; got {}",
+        frame.len()
+    );
+
+    // Below the cap the claim is the entire held set — byte-compatible with the
+    // pre-#113 exhaustive behavior for small rooms.
+    let mut small = fresh_engine(built.room, SyncConfig::default());
+    for frame in &built.events {
+        small.publish(frame).expect("seed");
+    }
+    let have: std::collections::BTreeSet<EventId> = want_membership_have(&small.on_connect(NODE_A))
+        .into_iter()
+        .collect();
+    assert_eq!(
+        have,
+        small.digest().expect("digest").event_ids,
+        "below the cap the claim covers every held id explicitly"
+    );
+}
+
+/// The truncated-bootstrap progress invariant (#111) survives claim capping: a
+/// joiner whose claim is capped far below its held set still converges in
+/// `ceil(closure/cap)` rounds, because each accepted prefix's tips are heads —
+/// and responder-known — so the next claim covers everything already delivered.
+#[test]
+fn issue_113_bounded_claim_bootstrap_still_converges_in_cap_rounds() {
+    let built = build_late_invite_log(20); // closure: 24 events
+    let tight = SyncConfig {
+        response_max_frames: 8,
+        ..SyncConfig::default()
+    };
+    let mut admin = fresh_engine(built.room, tight);
+    for frame in &built.events {
+        admin.publish(frame).expect("seed admin");
+    }
+    let claim_capped = SyncConfig {
+        membership_have_max_ids: 4, // far below the 24-event closure
+        ..SyncConfig::default()
+    };
+    let mut joiner = fresh_engine(built.room, claim_capped);
+
+    let only_want_membership = |outs: Vec<Outgoing>| -> Vec<SyncMessage> {
+        outs.into_iter()
+            .map(|o| o.msg)
+            .filter(|m| matches!(m, SyncMessage::WantMembership { .. }))
+            .collect()
+    };
+
+    let mut pending = only_want_membership(joiner.on_connect(NODE_A));
+    let mut rounds = 0;
+    while joiner.snapshot().status(&built.carol.identity()).is_none() {
+        rounds += 1;
+        assert!(
+            rounds <= 6,
+            "a capped claim must not break ceil(closure/cap) convergence"
+        );
+        let mut responses = Vec::new();
+        for msg in pending {
+            responses.extend(admin.on_message(NODE_B, msg));
+        }
+        for o in responses {
+            let _ = joiner.on_message(NODE_A, o.msg);
+        }
+        pending = only_want_membership(joiner.on_tick(T0));
+    }
+
+    assert_eq!(joiner.parked_len(), 0, "each capped prefix accepts in full");
+    assert_eq!(
+        joiner.digest().expect("joiner").event_ids,
+        admin.digest().expect("admin").event_ids,
+        "full convergence across capped rounds under a capped claim"
+    );
+}
+
+/// An old-style exhaustive claim (every held id) and the bounded frontier claim
+/// of the same held set are served **identically**: a causally-closed claim's
+/// ancestry expansion is exactly itself, so the semantics strictly generalize
+/// the pre-#113 exact-set subtraction (mixed-version requesters keep working).
+#[test]
+fn issue_113_exhaustive_and_frontier_claims_serve_identically() {
+    let built = build_late_invite_log(10); // 14 events, linear
+    let mut admin = fresh_engine(built.room, SyncConfig::default());
+    for frame in &built.events {
+        admin.publish(frame).expect("seed");
+    }
+
+    // A causally-closed prefix a requester might hold: genesis..chat4 (8 events).
+    let prefix: Vec<EventId> = built.events[..8].iter().map(|f| frame_id(f)).collect();
+    let tip = prefix[7];
+
+    let exhaustive = events_frames(&admin.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: prefix.clone(),
+        },
+    ));
+    let frontier = events_frames(&admin.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: vec![tip],
+        },
+    ));
+    assert!(!exhaustive.is_empty(), "the delta is non-empty");
+    assert_eq!(
+        exhaustive, frontier,
+        "one ancestry claim must subtract exactly what the exhaustive list did"
+    );
+    let expected: Vec<EventId> = built.events[8..].iter().map(|f| frame_id(f)).collect();
+    let served: Vec<EventId> = frontier.iter().map(|f| frame_id(f)).collect();
+    assert_eq!(served, expected, "delta is the remainder, causal order");
+}
+
+/// Claimed ids the responder does not hold are skipped: a stale, foreign, or
+/// fabricated claim can only make the responder over-serve (idempotent
+/// duplicates at the requester) — never withhold an event (§0 stays intact).
+#[test]
+fn issue_113_unknown_or_foreign_claims_only_over_serve() {
+    let built = build_late_invite_log(5);
+    let mut admin = fresh_engine(built.room, SyncConfig::default());
+    for frame in &built.events {
+        admin.publish(frame).expect("seed");
+    }
+
+    let baseline = events_frames(&admin.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: vec![],
+        },
+    ));
+    assert_eq!(
+        baseline.len(),
+        built.events.len(),
+        "empty claim ⇒ everything"
+    );
+
+    // A fabricated id and a genuine id from a *different* room.
+    let foreign = build_log(2, false);
+    let junk = events_frames(&admin.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: vec![
+                EventId::from_bytes([0x77; 32]),
+                frame_id(&foreign.events[0]),
+            ],
+        },
+    ));
+    assert_eq!(
+        junk, baseline,
+        "unknown/foreign claims subtract nothing — the safe direction"
+    );
+}
+
+/// The returning-member regression the pure-heads design livelocks on: bob is
+/// back online holding an old prefix **plus his own newest chat event X that no
+/// peer has ever seen**. X dominates everything bob holds, so a heads-only
+/// claim anchors nothing at the admin (covered = ∅) and every capped response
+/// would re-serve the same oldest-first duplicates forever. The recent-lamport
+/// slab in the claim anchors bob's shared history, so the pull progresses and
+/// the late invite lands — through the membership plane alone (the join
+/// bootstrap drops a provisional peer's other pulls).
+#[test]
+fn issue_113_returning_member_unknown_head_pull_progresses() {
+    let built = build_late_invite_log(20); // 24 events
+    let tight = SyncConfig {
+        response_max_frames: 8,
+        ..SyncConfig::default()
+    };
+    let mut admin = fresh_engine(built.room, tight);
+    for frame in &built.events {
+        admin.publish(frame).expect("seed admin");
+    }
+
+    let claim_capped = SyncConfig {
+        membership_have_max_ids: 4,
+        ..SyncConfig::default()
+    };
+    let mut bob = fresh_engine(built.room, claim_capped);
+    // Bob's held prefix: genesis, inv_bob, join_bob, chat0..chat5 (9 events).
+    for frame in &built.events[..9] {
+        bob.publish(frame).expect("seed bob prefix");
+    }
+    // Bob's own tail event, authored offline — no peer holds it.
+    let x = bob_chat(
+        &built,
+        bob.heads().expect("heads"),
+        T0 + 100_000,
+        "offline note",
+    );
+    bob.publish(&x).expect("publish X");
+    assert_eq!(
+        bob.heads().expect("heads"),
+        vec![frame_id(&x)],
+        "X dominates everything bob holds — the heads-only livelock shape"
+    );
+
+    let only_want_membership = |outs: Vec<Outgoing>| -> Vec<SyncMessage> {
+        outs.into_iter()
+            .map(|o| o.msg)
+            .filter(|m| matches!(m, SyncMessage::WantMembership { .. }))
+            .collect()
+    };
+
+    let mut pending = only_want_membership(bob.on_connect(NODE_A));
+    let mut rounds = 0;
+    while bob.snapshot().status(&built.carol.identity()).is_none() {
+        rounds += 1;
+        assert!(
+            rounds <= 6,
+            "an unknown own head must not stall the membership pull"
+        );
+        let mut responses = Vec::new();
+        for msg in pending {
+            responses.extend(admin.on_message(NODE_B, msg));
+        }
+        for o in responses {
+            let _ = bob.on_message(NODE_A, o.msg);
+        }
+        pending = only_want_membership(bob.on_tick(T0));
+    }
+
+    assert_eq!(
+        bob.snapshot().status(&built.carol.identity()),
+        Some(Status::Invited),
+        "the late invite lands despite the responder-unknown head"
+    );
+    let bob_ids = bob.digest().expect("bob").event_ids;
+    let admin_ids = admin.digest().expect("admin").event_ids;
+    assert!(
+        bob_ids.is_superset(&admin_ids),
+        "bob caught up on everything the admin holds"
+    );
+}
+
+/// The same returning-member shape over the full bidirectional mesh: both sides
+/// converge (X flows admin-ward too) and the mesh then **quiesces** — one more
+/// tick+drain round moves no event frames and re-serves no duplicates. This is
+/// the anti-entropy noise floor: an ancestry claim that under-covered at
+/// convergence would show up here as per-tick duplicate churn.
+#[test]
+fn issue_113_returning_member_mesh_converges_and_quiesces() {
+    let built = build_late_invite_log(12); // 16 events
+    let mut net = SimNet::new(built.room);
+    let claim_capped = SyncConfig {
+        membership_have_max_ids: 4,
+        ..SyncConfig::default()
+    };
+    net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
+    net.add_peer(NODE_B, fresh_engine(built.room, claim_capped));
+    seed(&mut net, NODE_A, &built.events);
+    seed(&mut net, NODE_B, &built.events[..9]);
+    let x = bob_chat(
+        &built,
+        net.engine(NODE_B).heads().expect("heads"),
+        T0 + 100_000,
+        "offline note",
+    );
+    net.publish(NODE_B, &x).expect("publish X");
+
+    net.connect(NODE_A, NODE_B);
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    let noise = |net: &SimNet| {
+        [NODE_A, NODE_B]
+            .iter()
+            .map(|p| {
+                let c = net.engine(*p).counters();
+                c.frames_sent + c.duplicates + c.accepted
+            })
+            .sum::<u64>()
+    };
+    let before = noise(&net);
+    net.tick();
+    while net.step() {}
+    assert_eq!(
+        noise(&net),
+        before,
+        "a converged mesh must serve nothing — no duplicate churn per tick"
+    );
+}
+
+/// A store hole (e.g. a swallowed insert error left a descendant without its
+/// parent) must keep being re-served by peers until it heals. The claim never
+/// includes causally-incomplete rows (`NULL` lamport ⇒ ancestry incomplete), so
+/// the responder keeps the hole and its descendants uncovered; once the missing
+/// parent arrives, the store's insert-time propagation recomputes descendant
+/// lamports and the room is whole again.
+#[test]
+fn issue_113_store_hole_is_reserved_and_heals() {
+    let built = build_late_invite_log(3); // genesis..chat2 + inv_carol = 7 events
+    let ctx = ValidationContext::for_room(built.room);
+
+    // Bob's store holds everything EXCEPT chat1 (index 4): chat2 and inv_carol
+    // sit above the hole with NULL lamport.
+    let mut store = EventStore::open_in_memory().expect("store");
+    for (i, frame) in built.events.iter().enumerate() {
+        if i == 4 {
+            continue;
+        }
+        let ev = validate_wire_bytes(frame, &ctx).expect("valid frame");
+        store.insert(&ev).expect("insert");
+    }
+    let mut bob = SyncEngine::open(store, built.room, SyncConfig::default()).expect("open");
+    assert!(
+        bob.room_tail(100).expect("tail").len() < 6,
+        "rows above the hole are causally unplaced before healing"
+    );
+
+    let mut admin = fresh_engine(built.room, SyncConfig::default());
+    for frame in &built.events {
+        admin.publish(frame).expect("seed admin");
+    }
+
+    // One membership pull round: bob's claim must exclude the unplaced rows, so
+    // the admin re-serves the hole (and the rows above it, as duplicates).
+    let have = want_membership_have(&bob.on_connect(NODE_A));
+    for id in &have {
+        assert_ne!(*id, frame_id(&built.events[5]), "NULL-lamport id claimed");
+        assert_ne!(*id, frame_id(&built.events[6]), "NULL-lamport id claimed");
+    }
+    let responses = admin.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have,
+        },
+    );
+    let served: Vec<EventId> = events_frames(&responses)
+        .iter()
+        .map(|f| frame_id(f))
+        .collect();
+    assert!(
+        served.contains(&frame_id(&built.events[4])),
+        "the hole itself must be re-served"
+    );
+    for o in responses {
+        let _ = bob.on_message(NODE_A, o.msg);
+    }
+
+    assert_eq!(
+        bob.room_tail(100).expect("tail").len(),
+        7,
+        "healing the hole recomputes the descendants' lamports"
+    );
+    assert_eq!(
+        bob.digest().expect("bob").event_ids,
+        admin.digest().expect("admin").event_ids,
+        "full convergence after the hole heals"
+    );
+}
+
+/// A serve whose frames exceed the 1 MiB wire cap is split into multiple
+/// `Events` messages, each under the cap, order preserved and no frame lost —
+/// the unchunked batch would be dropped whole at the net writer and re-served
+/// identically forever (a permanent membership-sync stall).
+#[test]
+fn issue_113_oversized_closure_serve_splits_into_capped_events() {
+    // 70 chat events with ~16 KiB bodies inside the invite's ancestry: the
+    // closure (~1.15 MiB) cannot fit one wire frame.
+    let built = build_late_invite_log_padded(70, 16_000);
+    let mut admin = fresh_engine(built.room, SyncConfig::default());
+    for frame in &built.events {
+        admin.publish(frame).expect("seed");
+    }
+
+    let outs = admin.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: vec![],
+        },
+    );
+    assert!(
+        outs.len() >= 2,
+        "an over-budget serve must split; got {} message(s)",
+        outs.len()
+    );
+    for o in &outs {
+        let body = o.msg.encode();
+        assert!(
+            body.len() <= MAX_FRAME_BYTES,
+            "every chunk must fit a wire frame; got {} bytes",
+            body.len()
+        );
+    }
+    let served: Vec<EventId> = events_frames(&outs).iter().map(|f| frame_id(f)).collect();
+    let expected: Vec<EventId> = built.events.iter().map(|f| frame_id(f)).collect();
+    assert_eq!(
+        served, expected,
+        "chunking preserves the full causal closure, in order"
+    );
+}
+
+/// End-to-end: a fresh joiner bootstraps a room whose closure exceeds the wire
+/// frame cap. Pre-#113 the single oversized `Events` body is dropped at the
+/// writer (modeled by the sim's frame-cap enforcement) and the bootstrap
+/// livelocks; with byte-budgeted batches nothing oversized is ever emitted.
+#[test]
+fn issue_113_big_body_bootstrap_converges_under_frame_cap() {
+    let built = build_late_invite_log_padded(70, 16_000);
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
+    net.add_peer(NODE_B, fresh_engine(built.room, SyncConfig::default()));
+    seed(&mut net, NODE_A, &built.events);
+
+    net.connect(NODE_A, NODE_B);
+    net.run_to_quiescence();
+
+    assert_eq!(
+        net.dropped_oversized(),
+        0,
+        "the engine must never emit a frame the transport would drop"
+    );
+    net.assert_converged(&[NODE_A, NODE_B]);
+    assert_eq!(
+        net.engine(NODE_B)
+            .snapshot()
+            .status(&built.carol.identity()),
+        Some(Status::Invited),
+        "the late invite lands across the byte-budgeted bootstrap"
+    );
+}
+
+/// The sim now models the transport's frame cap: a validated event too large to
+/// ever deliver (unbounded content fields can exceed the cap) is dropped at
+/// delivery and counted, leaving the mesh visibly diverged instead of silently
+/// pretending such frames can move.
+#[test]
+fn issue_113_sim_drops_oversized_frames() {
+    let alice = Principal::new(0x01);
+    let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            // `room_name` is not length-bounded by stateless validation: this
+            // event validates but can never cross the wire.
+            room_name: "x".repeat(MAX_FRAME_BYTES + 1024),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let bytes = wire_bytes(&genesis, &alice.dev);
+
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, fresh_engine(room, SyncConfig::default()));
+    net.add_peer(NODE_B, fresh_engine(room, SyncConfig::default()));
+    net.connect(NODE_A, NODE_B);
+    while net.step() {}
+
+    // Inject the oversized event at A as if it arrived out-of-band (from a
+    // third peer — fan-out skips the sender); its live fan-out to B is an
+    // oversized single-frame Events body.
+    net.deliver_raw(NODE_A, PeerId::from_bytes([0xC3; 32]), &bytes);
+    while net.step() {}
+
+    assert!(
+        net.dropped_oversized() > 0,
+        "the oversized fan-out must be dropped at delivery"
+    );
+    assert_eq!(
+        net.engine(NODE_B).digest().expect("digest").event_ids.len(),
+        0,
+        "the undeliverable event never reaches the peer"
+    );
+}
+
+/// `publish` refuses a locally-authored frame that could never be delivered:
+/// without the guard the event enters the log, every send of it is dropped at
+/// the writer, and the author diverges silently from every peer.
+#[test]
+fn issue_113_publish_rejects_undeliverable_frame() {
+    let alice = Principal::new(0x01);
+    let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "x".repeat(MAX_FRAME_BYTES + 1024),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let bytes = wire_bytes(&genesis, &alice.dev);
+
+    let mut engine = fresh_engine(room, SyncConfig::default());
+    assert!(
+        matches!(
+            engine.publish(&bytes),
+            Err(SyncError::OversizedFrame { .. })
+        ),
+        "an undeliverable frame must be refused at authoring time"
+    );
+    assert_eq!(
+        engine.digest().expect("digest").event_ids.len(),
+        0,
+        "the refused frame never enters the log"
+    );
+}
+
+/// The deep-suffix regression the heads+slab claim livelocks on (review of
+/// #113): bob returns holding a shared prefix plus an offline suffix DEEPER
+/// than his whole claim budget, and the chat plane is too bounded to bridge it.
+/// Heads and slab are then all responder-unknown (covered = ∅) and the admin
+/// would re-serve the same oldest `response_max_frames` duplicates forever —
+/// withholding the late invite on the never-windowed plane. The claim's
+/// rotating window sweeps into shared territory within at most `placed` ticks
+/// and breaks the lock.
+#[test]
+fn issue_113_suffix_deeper_than_claim_budget_still_converges() {
+    let built = build_late_invite_log(20); // 24 events; closure 24 > cap 8
+    let tiny_chat = SyncConfig {
+        response_max_frames: 8,
+        membership_have_max_ids: 4,
+        chat_window_default: 2,
+        chat_window_max: 2,
+        max_backfill_depth: 2,
+        ..SyncConfig::default()
+    };
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, tiny_chat));
+    net.add_peer(NODE_B, fresh_engine(built.room, tiny_chat));
+    seed(&mut net, NODE_A, &built.events);
+    // Bob misses ONLY the late invite — auth-class, so the chat plane has
+    // nothing to deliver that could advance his heads into admin-known ids...
+    seed(&mut net, NODE_B, &built.events[..23]);
+    // ...and he authored a 10-deep offline chain no peer has seen — deeper than
+    // membership_have_max_ids (4), so heads AND slab are all admin-unknown, and
+    // deeper than the admin's tiny chat window + backfill depth, so the admin
+    // cannot learn bob's tips either. Without the rotating window both
+    // directions pin at covered = ∅ and the invite (sorting last, beyond the
+    // 8-frame response cap) is withheld forever.
+    for i in 0..10u64 {
+        let x = bob_chat(
+            &built,
+            net.engine(NODE_B).heads().expect("heads"),
+            T0 + 200_000 + i,
+            &format!("offline {i}"),
+        );
+        net.publish(NODE_B, &x).expect("publish suffix");
+    }
+
+    net.connect(NODE_A, NODE_B);
+    // Drive explicit tick rounds: the rotating window advances once per tick,
+    // and the sweep needs up to `placed` (~31) rounds to anchor shared history.
+    // (run_to_quiescence would exit early on the zero-progress rounds.)
+    let mut rounds = 0;
+    while net
+        .engine(NODE_B)
+        .snapshot()
+        .status(&built.carol.identity())
+        .is_none()
+    {
+        rounds += 1;
+        assert!(
+            rounds <= 60,
+            "the rotating claim window must break the deep-suffix livelock"
+        );
+        net.tick();
+        while net.step() {}
+    }
+
+    assert_eq!(
+        net.engine(NODE_B)
+            .snapshot()
+            .status(&built.carol.identity()),
+        Some(Status::Invited),
+        "the late invite lands despite a suffix deeper than the claim budget"
+    );
+    let bob_ids = net.engine(NODE_B).digest().expect("bob").event_ids;
+    let admin_ids = net.engine(NODE_A).digest().expect("admin").event_ids;
+    assert!(
+        bob_ids.is_superset(&admin_ids),
+        "bob caught up on everything the admin holds (the reverse direction is \
+         bounded by the tiny chat window, by design)"
+    );
+}
+
+/// The serve-side half of "`NULL`-lamport rows are never claimed and never
+/// served": a responder whose own store has a hole must not serve the rows
+/// sitting above it — their ancestry cannot be served complete, and `None`
+/// sorts before genesis in `causal_order`, which would corrupt the
+/// causally-closed prefix a truncated response must be.
+#[test]
+fn issue_113_responder_with_hole_never_serves_unplaced_rows() {
+    let built = build_late_invite_log(3); // 7 events
+    let ctx = ValidationContext::for_room(built.room);
+    // The responder holds everything EXCEPT chat1 (index 4): chat2 and
+    // inv_carol sit above the hole, stored but unplaced.
+    let mut store = EventStore::open_in_memory().expect("store");
+    for (i, frame) in built.events.iter().enumerate() {
+        if i == 4 {
+            continue;
+        }
+        let ev = validate_wire_bytes(frame, &ctx).expect("valid frame");
+        store.insert(&ev).expect("insert");
+    }
+    let mut holed = SyncEngine::open(store, built.room, SyncConfig::default()).expect("open");
+
+    let served: Vec<EventId> = events_frames(&holed.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: vec![],
+        },
+    ))
+    .iter()
+    .map(|f| frame_id(f))
+    .collect();
+
+    let expected: Vec<EventId> = built.events[..3].iter().map(|f| frame_id(f)).collect();
+    assert_eq!(
+        served, expected,
+        "only the placed, causally-complete prefix below the hole is served"
+    );
+    assert!(
+        !served.contains(&frame_id(&built.events[5]))
+            && !served.contains(&frame_id(&built.events[6])),
+        "rows above the responder's hole must never be served"
+    );
+}
+
+/// `covered_cache` must reset on insert: a cached downset walk stops at the
+/// responder's own store holes, and once the hole heals the same repeated claim
+/// must cover deeper — otherwise the responder re-serves the claimant's held
+/// ancestry every tick forever (permanent duplicate churn at quiescence).
+#[test]
+fn issue_113_covered_cache_resets_when_a_hole_heals() {
+    let built = build_late_invite_log(3); // 7 events
+    let ctx = ValidationContext::for_room(built.room);
+    let mut store = EventStore::open_in_memory().expect("store");
+    for (i, frame) in built.events.iter().enumerate() {
+        if i == 4 {
+            continue; // the hole: chat1
+        }
+        let ev = validate_wire_bytes(frame, &ctx).expect("valid frame");
+        store.insert(&ev).expect("insert");
+    }
+    let mut holed = SyncEngine::open(store, built.room, SyncConfig::default()).expect("open");
+
+    // A fully-caught-up claimant claims chat2; the responder's walk stops at
+    // its own hole, so genesis..join_bob stay uncovered and get re-served.
+    let claim = vec![frame_id(&built.events[5])];
+    let first = events_frames(&holed.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: claim.clone(),
+        },
+    ));
+    assert_eq!(
+        first.len(),
+        3,
+        "before healing, the walk stops at the hole and re-serves the base"
+    );
+
+    // The hole heals (chat1 arrives); the SAME claim must now cover the full
+    // ancestry, leaving exactly the newly-placed invite to serve.
+    let _ = holed.ingest_frame(NODE_B, &built.events[4]);
+    let second: Vec<EventId> = events_frames(&holed.on_message(
+        NODE_B,
+        SyncMessage::WantMembership {
+            room_id: built.room,
+            have: claim,
+        },
+    ))
+    .iter()
+    .map(|f| frame_id(f))
+    .collect();
+    assert_eq!(
+        second,
+        vec![frame_id(&built.events[6])],
+        "after healing, a stale cached downset must not re-serve covered ancestry"
+    );
+}
+
+/// A pathologically WIDE DAG (every chat event a permanent parallel head, more
+/// heads than the whole claim budget) must not starve the claim's anchors: the
+/// head portion is capped at half the budget, the recent-lamport slab still
+/// claims the newest auth-class events, and a converged pair still quiesces.
+#[test]
+fn issue_113_wide_dag_heads_do_not_starve_the_claim() {
+    let built = build_log(30, true); // 30 parallel chat heads + removal
+    let capped = SyncConfig {
+        membership_have_max_ids: 8,
+        ..SyncConfig::default()
+    };
+    let mut engine = fresh_engine(built.room, capped);
+    for frame in &built.events {
+        engine.publish(frame).expect("seed");
+    }
+    let have = want_membership_have(&engine.on_connect(NODE_A));
+    assert_eq!(have.len(), 8, "claim stays capped under a head flood");
+
+    // Converged pair: despite heads >> cap, the mesh must not churn.
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, capped));
+    net.add_peer(NODE_B, fresh_engine(built.room, capped));
+    seed(&mut net, NODE_A, &built.events);
+    seed(&mut net, NODE_B, &built.events);
+    net.connect(NODE_A, NODE_B);
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    let noise = |net: &SimNet| {
+        [NODE_A, NODE_B]
+            .iter()
+            .map(|p| {
+                let c = net.engine(*p).counters();
+                c.frames_sent + c.duplicates + c.accepted
+            })
+            .sum::<u64>()
+    };
+    let before = noise(&net);
+    net.tick();
+    while net.step() {}
+    assert_eq!(
+        noise(&net),
+        before,
+        "a converged wide-DAG pair must not re-serve events every tick"
     );
 }

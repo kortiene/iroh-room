@@ -38,5 +38,7 @@ pub use config::SyncConfig;
 pub use engine::{
     Completeness, Severity, SyncCounters, SyncDigest, SyncEngine, SyncError, TrustDecision,
 };
-pub use message::{MessageError, Outgoing, PeerId, SyncMessage, Window, WireBytes};
+pub use message::{
+    MessageError, Outgoing, PeerId, SyncMessage, Window, WireBytes, MAX_FRAME_BYTES,
+};
 pub use transport::SyncTransport;

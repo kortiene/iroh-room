@@ -62,6 +62,12 @@ Protocol-breaking changes require at least one of:
 
 Never silently reinterpret existing `schema_version = 1` fields.
 
+Sync-message semantics (the `SyncMessage` control plane: `have` claims, response batching,
+windows) are network runtime behavior: a change may ship without a protocol bump, but it MUST be
+release-noted together with its mixed-version behavior, including any convergence degradation and
+whether a coordinated upgrade is required (precedents: PR #111 and issue #113, both of which
+shipped mandatory-upgrade notes because mixed-version rooms degrade past a size threshold).
+
 Allowed without schema bump:
 
 - New tests.

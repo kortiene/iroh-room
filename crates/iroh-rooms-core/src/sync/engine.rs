@@ -44,6 +44,17 @@ pub enum SyncError {
     InvalidFrame(crate::event::RejectReason),
     /// The [`SyncConfig`] bounds were unusable.
     Config(&'static str),
+    /// A frame handed to [`SyncEngine::publish`] is too large to ever deliver:
+    /// even alone in an [`Events`](SyncMessage::Events) message it would exceed
+    /// the [`MAX_FRAME_BYTES`](super::message::MAX_FRAME_BYTES) wire cap, so
+    /// every peer's writer would drop it and the author would diverge silently
+    /// (issue #113). Refusing at publish keeps undeliverable events off the log.
+    /// This is a **local authoring** bound only — never a validation rule for
+    /// remote frames, whose size the inbound framing layer already caps.
+    OversizedFrame {
+        /// The encoded `WireEvent` length.
+        frame_len: usize,
+    },
 }
 
 impl core::fmt::Display for SyncError {
@@ -52,6 +63,9 @@ impl core::fmt::Display for SyncError {
             Self::Store(e) => write!(f, "sync_store_error: {e}"),
             Self::InvalidFrame(r) => write!(f, "sync_invalid_frame: {}", r.code()),
             Self::Config(c) => write!(f, "sync_config_error: {c}"),
+            Self::OversizedFrame { frame_len } => {
+                write!(f, "sync_oversized_frame: {frame_len}")
+            }
         }
     }
 }
@@ -192,6 +206,11 @@ struct SuspectTip {
 /// Maximum retained log lines (bounded, in-memory; spec §9 / R4).
 const MAX_LOG_LINES: usize = 256;
 
+use super::message::{EVENTS_ENVELOPE_ALLOWANCE, EVENTS_PER_FRAME_OVERHEAD};
+
+/// Bounded entries in the memoized `covered_cache` (deterministic eviction).
+const COVERED_CACHE_ENTRIES: usize = 4;
+
 /// The membership event types that are **never windowed** (spec §4.1).
 const MEMBERSHIP_TYPES: [EventType; 5] = [
     EventType::RoomCreated,
@@ -260,6 +279,28 @@ pub struct SyncEngine {
     /// tick for `serve_want_membership` (and an unauthenticated provisional
     /// dialer could spam `WantMembership` to force it).
     closure_cache: Option<BTreeSet<EventId>>,
+    /// Memoized [`covered_by_claim`](Self::covered_by_claim) downsets, keyed by
+    /// the exact claimed-and-held frontier and invalidated on every store insert
+    /// (issue #113). Bounded to [`COVERED_CACHE_ENTRIES`] with deterministic
+    /// smallest-key eviction (spec R4). The converged-mesh case normally never
+    /// reaches this map — a claim containing every local head is answered by a
+    /// fast path — so entries typically exist only while peers are catching up.
+    covered_cache: BTreeMap<BTreeSet<EventId>, BTreeSet<EventId>>,
+    /// Ticks seen since `open`, driving the claim's rotating window
+    /// ([`membership_have`](Self::membership_have), issue #113). In-memory
+    /// session state like the caches: a restart resets the sweep phase, never
+    /// its guarantees (the window position is coverage-only, not trust).
+    claim_rotation: u64,
+}
+
+/// How much of the responder's held set a `WantMembership` `have` ancestry
+/// claim covers (issue #113; see [`SyncEngine::covered_by_claim`]).
+enum Coverage {
+    /// The claim contains every local DAG head, so its downset covers the entire
+    /// held set — nothing to serve.
+    Everything,
+    /// The downset of the claimed-and-held ids.
+    Set(BTreeSet<EventId>),
 }
 
 impl SyncEngine {
@@ -311,6 +352,8 @@ impl SyncEngine {
             pending_flags: Vec::new(),
             pending_ingested: Vec::new(),
             closure_cache: None,
+            covered_cache: BTreeMap::new(),
+            claim_rotation: 0,
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -361,8 +404,21 @@ impl SyncEngine {
     /// accept, fan it out to every connected peer.
     ///
     /// # Errors
-    /// [`SyncError::InvalidFrame`] if the bytes fail stateless validation.
+    /// [`SyncError::InvalidFrame`] if the bytes fail stateless validation, or
+    /// [`SyncError::OversizedFrame`] if the frame could never fit a wire frame
+    /// even as a single-frame `Events` message (a locally-authored event several
+    /// content fields of which are unbounded could otherwise enter the log yet be
+    /// undeliverable to every peer — permanent silent divergence, issue #113).
     pub fn publish(&mut self, bytes: &[u8]) -> Result<Vec<Outgoing>, SyncError> {
+        if bytes
+            .len()
+            .saturating_add(EVENTS_ENVELOPE_ALLOWANCE + EVENTS_PER_FRAME_OVERHEAD)
+            > super::message::MAX_FRAME_BYTES
+        {
+            return Err(SyncError::OversizedFrame {
+                frame_len: bytes.len(),
+            });
+        }
         let ctx = ValidationContext::for_room(self.room_id);
         let ev = validate_wire_bytes(bytes, &ctx).map_err(SyncError::InvalidFrame)?;
         let mut out = Vec::new();
@@ -454,6 +510,9 @@ impl SyncEngine {
     /// per-call, not clock-driven, to stay deterministic — spec R4).
     pub fn on_tick(&mut self, _now_ms: u64) -> Vec<Outgoing> {
         let mut out = Vec::new();
+        // Advance the claim's rotating window (issue #113) — per tick, not per
+        // peer, so every peer sees the same claim this round (determinism, R4).
+        self.claim_rotation = self.claim_rotation.wrapping_add(1);
         self.refill_tokens();
         self.expire_suspect_tip();
         self.retry_park(&mut out);
@@ -793,8 +852,14 @@ impl SyncEngine {
             }
             InsertOutcome::Inserted => {
                 self.counters.accepted += 1;
-                // The validated set grew: the memoized authorization closure is stale.
+                // The validated set grew: the memoized authorization closure is
+                // stale, and a memoized covered-downset may under-cover (a
+                // claimed id we lacked — skipped then — may now be held, and a
+                // healed hole lets the walk reach deeper). Under-covering only
+                // over-serves, but pinning it forever would leave a converged
+                // peer re-serving duplicates every tick, so both caches reset.
                 self.closure_cache = None;
+                self.covered_cache.clear();
                 self.note_admin_event(id);
                 // Push-subscription feed (issue #83): emit exactly once, only on a real
                 // insert (the Duplicate arm never reaches here → exactly-once for free).
@@ -1155,15 +1220,22 @@ impl SyncEngine {
 
     /// Serve the never-windowed authorization-class set **causally closed** —
     /// the §4.1 class plus every stored `prev_events` ancestor — minus what the
-    /// requester already holds, in causal order (spec §6.4 — the §0 hard
-    /// invariant). The closure is what makes the invariant real: a membership
-    /// event authored after chat cites chat heads as structural parents, and the
-    /// fold cannot classify it until *every* parent is present, so serving the
-    /// bare class would hand a bootstrapping joiner an unverifiable sub-DAG (the
-    /// join-after-history deadlock). Ancestors ride along even when chat-class:
-    /// membership verifiability is never bounded by the chat window.
+    /// requester's `have` **ancestry claims** cover, in causal order (spec §6.4 —
+    /// the §0 hard invariant). The closure is what makes the invariant real: a
+    /// membership event authored after chat cites chat heads as structural
+    /// parents, and the fold cannot classify it until *every* parent is present,
+    /// so serving the bare class would hand a bootstrapping joiner an
+    /// unverifiable sub-DAG (the join-after-history deadlock). Ancestors ride
+    /// along even when chat-class: membership verifiability is never bounded by
+    /// the chat window.
+    ///
+    /// Each claimed id covers itself plus every stored ancestor
+    /// ([`covered_by_claim`](Self::covered_by_claim), issue #113), so a bounded
+    /// claim subtracts an arbitrarily large held set — a pre-#113 exhaustive
+    /// claim over an intact store (itself causally closed) expands to exactly
+    /// itself and is served identically (see the `WantMembership` doc for the
+    /// old-requester store-hole exception).
     fn serve_want_membership(&mut self, from: PeerId, have: &[EventId], out: &mut Vec<Outgoing>) {
-        let have: BTreeSet<EventId> = id_set(have.iter().copied());
         let ids = match self.authorization_closure_ids() {
             Ok(s) => s,
             Err(e) => {
@@ -1171,10 +1243,25 @@ impl SyncEngine {
                 return;
             }
         };
+        let covered = match self.covered_by_claim(have) {
+            Ok(Coverage::Everything) => return, // converged: nothing to serve
+            Ok(Coverage::Set(covered)) => covered,
+            Err(e) => {
+                self.log(&format!("have-claim expansion failed: {e}"));
+                return;
+            }
+        };
         let mut stored = Vec::new();
-        for id in ids.difference(&have) {
+        for id in ids.difference(&covered) {
             match self.store.get_in_room(&self.room_id, id) {
-                Ok(Some(se)) => stored.push(se),
+                // A NULL-lamport row sits above a local store hole (an ancestor
+                // was never persisted): its ancestry cannot be served complete,
+                // and `None` sorts before genesis in `causal_order`, so it would
+                // corrupt the causally-closed prefix a truncated response must
+                // be. Skip it — the row re-qualifies once the hole heals and the
+                // store's insert-time propagation recomputes its lamport.
+                Ok(Some(se)) if se.lamport.is_some() => stored.push(se),
+                Ok(Some(_)) => self.log("WantMembership: skipped causally-incomplete row"),
                 Ok(None) => {}
                 Err(e) => self.log(&format!("store get failed: {e}")),
             }
@@ -1182,6 +1269,67 @@ impl SyncEngine {
         stored.sort_by(causal_order);
         let frames = self.frames_from_stored(&stored, "WantMembership");
         self.emit_events(from, frames, out);
+    }
+
+    /// Expand a `WantMembership` `have` **ancestry claim** (issue #113) into the
+    /// ids it covers: every claimed id held in this room, plus every stored
+    /// ancestor of one.
+    ///
+    /// Soundness (no under-serve): an honest requester claims only ids whose
+    /// entire ancestry it holds (non-NULL lamport — see
+    /// [`membership_have`](Self::membership_have)), and ids are content hashes,
+    /// so the ancestry expanded here is byte-identical to what the requester
+    /// holds: covered ⊆ requester-held, always. A claimed id we do not hold is
+    /// skipped, and skipping only **under**-covers — the responder then
+    /// over-serves idempotent duplicates, the safe direction — so a stale,
+    /// foreign, or malicious claim can waste bandwidth but never withhold an
+    /// event (§0 stays intact; a false claim only starves the claimant itself).
+    ///
+    /// Fast path: a claim containing every local DAG head covers the entire held
+    /// set (every held event is an ancestor-or-self of some head), so the
+    /// converged mesh answers without any walk. Otherwise the downset BFS is
+    /// `O(held)` `parents_of` lookups, memoized per exact claimed-and-held
+    /// frontier in `covered_cache` (invalidated on insert) so a peer repeating
+    /// the same claim across ticks pays it once.
+    fn covered_by_claim(&mut self, have: &[EventId]) -> Result<Coverage, StoreError> {
+        let mut frontier = BTreeSet::new();
+        for id in have {
+            if self.store.contains_in_room(&self.room_id, id)? {
+                frontier.insert(*id);
+            }
+        }
+        if frontier.is_empty() {
+            return Ok(Coverage::Set(BTreeSet::new()));
+        }
+        let heads = self.store.heads(&self.room_id)?;
+        if !heads.is_empty() && heads.iter().all(|h| frontier.contains(h)) {
+            return Ok(Coverage::Everything);
+        }
+        if let Some(covered) = self.covered_cache.get(&frontier) {
+            return Ok(Coverage::Set(covered.clone()));
+        }
+        let mut covered = frontier.clone();
+        let mut stack: Vec<EventId> = frontier.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            // Every id expanded here descends from a held same-room event (the
+            // frontier is gated on `contains_in_room`, and a stored event's
+            // parent edges are same-room ancestry — the id content-hashes the
+            // room), so the walk is bounded by the held set. A dangling parent
+            // edge (a local hole) ends its branch: the absent id has no stored
+            // edges of its own, and subtracting a non-stored id from the closure
+            // is a no-op, so no per-parent `contains` re-check is needed.
+            for parent in self.store.parents_of(&id)? {
+                if covered.insert(parent) {
+                    stack.push(parent);
+                }
+            }
+        }
+        if self.covered_cache.len() >= COVERED_CACHE_ENTRIES {
+            // Deterministic eviction (spec R4): drop the smallest key.
+            self.covered_cache.pop_first();
+        }
+        self.covered_cache.insert(frontier, covered.clone());
+        Ok(Coverage::Set(covered))
     }
 
     fn serve_want_recent_chat(
@@ -1238,12 +1386,12 @@ impl SyncEngine {
 
     /// The causal closure of the authorization class: the §4.1 class plus every
     /// stored ancestor reachable over `prev_events`. This — not the bare class —
-    /// is what `WantMembership` serves and claims in its `have` list: the fold's
-    /// readiness rule needs the *complete* structural ancestry of each membership
-    /// event, and once a conversation has happened that ancestry includes
-    /// non-admin chat. The store holds only fold-accepted events (whose parents
-    /// were present at accept time), so the walk terminates at genesis; a
-    /// dangling edge is skipped, never fabricated.
+    /// is what `WantMembership` serves: the fold's readiness rule needs the
+    /// *complete* structural ancestry of each membership event, and once a
+    /// conversation has happened that ancestry includes non-admin chat. The
+    /// store holds only fold-accepted events (whose parents were present at
+    /// accept time), so the walk terminates at genesis; a dangling edge is
+    /// skipped, never fabricated.
     /// Memoized in `closure_cache` (invalidated on insert) so a quiesced mesh —
     /// or a `WantMembership`-spamming provisional dialer — pays the walk once,
     /// not per request.
@@ -1284,18 +1432,55 @@ impl SyncEngine {
         frames
     }
 
+    /// Emit `frames` as one or more [`Events`](SyncMessage::Events) messages,
+    /// each staying under the [`MAX_FRAME_BYTES`](super::message::MAX_FRAME_BYTES)
+    /// wire cap (issue #113): a single unchunked batch of `response_max_frames`
+    /// frames can encode to several MiB (frames run up to ~17 KiB), and an
+    /// oversized body is dropped at the net writer — the responder would then
+    /// re-serve the identical batch every tick, a permanent stall. Chunks are
+    /// consecutive, so causal order is preserved across the split; the
+    /// `response_max_frames` cap was applied upstream, so total frames per serve
+    /// — the anti-amplification quantity — are unchanged.
     fn emit_events(&mut self, from: PeerId, frames: Vec<Vec<u8>>, out: &mut Vec<Outgoing>) {
         if frames.is_empty() {
             return;
         }
         self.counters.frames_sent += frames.len() as u64;
-        out.push(to(
-            from,
-            SyncMessage::Events {
-                room_id: self.room_id,
-                frames,
-            },
-        ));
+        let budget = super::message::MAX_FRAME_BYTES - EVENTS_ENVELOPE_ALLOWANCE;
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let mut batch_cost = 0usize;
+        for frame in frames {
+            let cost = frame.len() + EVENTS_PER_FRAME_OVERHEAD;
+            if !batch.is_empty() && batch_cost + cost > budget {
+                out.push(to(
+                    from,
+                    SyncMessage::Events {
+                        room_id: self.room_id,
+                        frames: std::mem::take(&mut batch),
+                    },
+                ));
+                batch_cost = 0;
+            }
+            if batch.is_empty() && cost > budget {
+                // A frame cannot be split. Anything that arrived over the wire
+                // re-sends alone within the cap (a single-frame envelope costs
+                // less than this allowance); only a pre-guard oversized local
+                // event can still exceed it, and that is the writer's logged
+                // drop — same as before, now visible here too.
+                self.log("Events frame exceeds wire budget; sent alone");
+            }
+            batch_cost += cost;
+            batch.push(frame);
+        }
+        if !batch.is_empty() {
+            out.push(to(
+                from,
+                SyncMessage::Events {
+                    room_id: self.room_id,
+                    frames: batch,
+                },
+            ));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1743,23 +1928,94 @@ impl SyncEngine {
         }
     }
 
-    /// The `have` list for a `WantMembership` pull: **every** validated id this
-    /// node holds for the room, not just the authorization class. This is the
-    /// per-round progress invariant for a truncated closure pull: a response
-    /// capped at `response_max_frames` delivers a causally-closed prefix whose
-    /// frames all fold-accept immediately, and claiming them here shrinks the
-    /// responder's next delta — so a bootstrap over any closure size converges in
-    /// `ceil(closure/cap)` rounds. (Claiming only the requester-side closure
-    /// livelocks: served chat ancestry is not yet an ancestor of any held class
-    /// event, so the delta never shrinks and the responder re-serves the same
-    /// truncated prefix forever.) Claiming extra ids is always safe — the
-    /// responder only subtracts them — and a converged responder's reply is
-    /// empty, so the anti-entropy loop still quiesces.
+    /// The `have` **ancestry claim** for a `WantMembership` pull (issue #113):
+    /// a `membership_have_max_ids`-bounded sample of the held set — placed DAG
+    /// heads (≤ half the budget), the most recent causally-placed ids, and a
+    /// per-tick rotating window over everything older. Every claimed id has a
+    /// non-`NULL` lamport, which the store derives only when the event's entire
+    /// ancestry is present — so each id soundly claims itself **and all its
+    /// stored ancestors** at the responder, and a bounded claim covers an
+    /// arbitrarily large held set: unlike the pre-#113 exhaustive claim (every
+    /// held id, ~34 B each), the frame no longer grows with room history and
+    /// stays far below the 1 MiB wire cap.
+    ///
+    /// The heads carry the per-round progress invariant (#111): a truncated
+    /// closure response is a causally-closed prefix that fold-accepts in full,
+    /// its tips become heads, and — being responder-served — they are
+    /// responder-known, so the next round's claim covers everything already
+    /// delivered and the delta shrinks by the cap each round
+    /// (`ceil(closure/cap)`-round bootstrap, quiescent when converged). The
+    /// recent-lamport slab anchors the common catch-up shapes when heads alone
+    /// are responder-unknown (a returning member whose newest events never
+    /// fanned out would otherwise anchor nothing and be re-served from genesis
+    /// every tick). The rotating window is the backstop for everything deeper:
+    /// when even the slab is responder-unknown (an exclusive suffix larger than
+    /// the whole budget), the sweep still claims every placed id within at most
+    /// `placed` ticks, so the responder eventually anchors shared history and
+    /// the pull cannot stay pinned at covered = ∅. Until the sweep lands, the
+    /// responder re-serves duplicates (bounded per tick by
+    /// `response_max_frames` and the byte budget); an adversarially **wide**
+    /// shared region can stretch that window — full immunity is the deferred
+    /// Meyer range reconciliation (a spec non-goal, tracked under #102).
+    ///
+    /// `NULL`-lamport rows (descendants stored above a local hole, e.g. after a
+    /// swallowed insert error) are never claimed, so a responder keeps
+    /// re-serving the missing ancestry until the hole heals — the same
+    /// self-repair the exhaustive claim provided by omitting the hole itself.
     fn membership_have(&self) -> Vec<EventId> {
-        self.store
-            .room_event_ids(&self.room_id)
-            .map(|s| s.into_iter().collect())
+        let cap = self.config.membership_have_max_ids;
+        let mut claim: BTreeSet<EventId> = BTreeSet::new();
+
+        // 1) Placed DAG heads — the progress-invariant backbone — bounded to
+        //    half the budget so a pathologically wide DAG (e.g. a member
+        //    flooding parallel genesis-cited junk, every one a permanent head)
+        //    cannot starve the anchors below.
+        let head_budget = cap.div_ceil(2);
+        for id in self.store.placed_heads(&self.room_id).unwrap_or_default() {
+            if claim.len() >= head_budget {
+                break;
+            }
+            claim.insert(id);
+        }
+
+        // 2) The recent-lamport slab — anchors the common catch-up shapes with
+        //    the newest shared history.
+        let slab_budget = cap.saturating_sub(claim.len()).div_ceil(2);
+        let fetch = u32::try_from(slab_budget).unwrap_or(u32::MAX);
+        for id in self
+            .store
+            .recent_event_ids(&self.room_id, fetch, 0)
             .unwrap_or_default()
+        {
+            if claim.len() >= cap {
+                break;
+            }
+            claim.insert(id);
+        }
+
+        // 3) A rotating window over everything below the slab. Advancing by
+        //    `window` per tick, it claims every placed id within at most
+        //    `placed` ticks — and in a stalled state the store (hence the sweep
+        //    span) is static, so the sweep is exact: even an exclusive suffix
+        //    deeper than the whole budget cannot pin covered = ∅ forever.
+        let window = cap.saturating_sub(claim.len());
+        if window > 0 {
+            let placed = self.store.placed_count(&self.room_id).unwrap_or(0);
+            let span = placed.saturating_sub(slab_budget as u64);
+            if span > 0 {
+                let offset =
+                    slab_budget as u64 + (self.claim_rotation.wrapping_mul(window as u64)) % span;
+                let fetch = u32::try_from(window).unwrap_or(u32::MAX);
+                for id in self
+                    .store
+                    .recent_event_ids(&self.room_id, fetch, offset)
+                    .unwrap_or_default()
+                {
+                    claim.insert(id);
+                }
+            }
+        }
+        claim.into_iter().collect()
     }
 
     fn chat_have(&self) -> Vec<EventId> {
