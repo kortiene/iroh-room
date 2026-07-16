@@ -23,7 +23,7 @@ use crate::alpn::EVENT_ALPN;
 use crate::frame::{read_frame, write_frame};
 use crate::handler::REJECT_CODE;
 use crate::state::{OfflineReason, PeerConnState};
-use crate::transport::{Inbound, Shared};
+use crate::transport::{Inbound, LinkTeardown, Shared};
 
 /// Bridge an iroh [`EndpointId`] (device key) to the engine's [`PeerId`] — both
 /// are the same raw 32 `device_id` bytes (Membership §1).
@@ -32,24 +32,31 @@ pub(crate) fn peer_id(device: EndpointId) -> PeerId {
     PeerId::from_bytes(*device.as_bytes())
 }
 
-/// Wire up a live connection: register the outbound queue + connection handle and
-/// spawn the reader and writer tasks. Called by both the accept handler (inbound)
-/// and [`dial_loop`] (outbound). The outbound queue is registered **before** the
-/// caller flips the peer to `Connected`, so the engine's `on_connect` handshake
-/// always finds a writer.
+/// Wire up a live connection: register the outbound queue + connection handle
+/// (stamping a fresh connection generation, and the provisional mark when
+/// `provisional`) and spawn the reader and writer tasks. Called by both the accept
+/// handler (inbound) and [`dial_loop`] (outbound). The outbound queue is registered
+/// **before** the caller flips the peer to `Connected`, so the engine's
+/// `on_connect` handshake always finds a writer. Returns this link's generation,
+/// which the caller passes to
+/// [`teardown_if_current`](Shared::teardown_if_current) on close so a superseded
+/// link never clobbers its successor (issue #126).
+#[must_use]
 pub(crate) fn register_connection(
     shared: Arc<Shared>,
     device: EndpointId,
     conn: Connection,
     send: SendStream,
     recv: RecvStream,
-) {
+    provisional: bool,
+) -> u64 {
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    shared.register_outbound(device, tx);
+    let generation = shared.register_link(device, tx, provisional);
     shared.register_connection(device, conn);
 
     tokio::spawn(writer_task(send, rx));
     tokio::spawn(reader_task(shared, device, recv));
+    generation
 }
 
 /// Drain the per-peer outbound frame queue, writing each body as a length-prefixed
@@ -142,25 +149,35 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                     }
                     AdmissionDecision::Admit { identity } => {
                         match establish_outbound(&shared, &conn, remote, identity).await {
-                            Established::Up => {
+                            Established::Up(generation) => {
                                 attempt = 0;
                                 // Block until the link drops.
                                 conn.closed().await;
-                                shared.unregister(remote);
-                                if rejected_by_remote(&conn) {
+                                let rejected = rejected_by_remote(&conn);
+                                let exit = if rejected {
                                     // The remote refused us mid-stream: a roster
-                                    // change, not a transient drop. Stop redialing.
-                                    shared.table.set(remote, PeerConnState::Unauthorized, None);
-                                    return;
+                                    // change, not a transient drop.
+                                    LinkTeardown::Unauthorized
+                                } else {
+                                    // Was Up, the live link fell: a transient drop.
+                                    LinkTeardown::Offline(OfflineReason::LinkDropped)
+                                };
+                                // Guarded teardown (issue #126): only touch shared
+                                // state if this link is still `remote`'s current
+                                // generation; a newer link (e.g. a crossed inbound
+                                // accept) must not be flipped Offline or lose its
+                                // writer by our late close.
+                                if shared.teardown_if_current(remote, generation, exit) {
+                                    shared.audit.disconnected(remote);
+                                    if !rejected {
+                                        shared
+                                            .audit
+                                            .offline(remote, OfflineReason::LinkDropped.label());
+                                    }
                                 }
-                                // Was Up, the live link fell: a transient drop we redial.
-                                shared
-                                    .table
-                                    .set_offline(remote, OfflineReason::LinkDropped, None);
-                                shared.audit.disconnected(remote);
-                                shared
-                                    .audit
-                                    .offline(remote, OfflineReason::LinkDropped.label());
+                                if rejected {
+                                    return; // stop redialing a peer that rejected us
+                                }
                             }
                             Established::RemoteRejected => {
                                 // The remote's accept-gate refused us (stable REJECT
@@ -208,8 +225,9 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
 
 /// Outcome of trying to bring up an outbound link after a successful dial.
 enum Established {
-    /// The bidi stream is up; the caller waits on `conn.closed()`.
-    Up,
+    /// The bidi stream is up; the caller waits on `conn.closed()`. Carries the
+    /// link's connection generation for a guarded teardown (issue #126).
+    Up(u64),
     /// The remote's accept-gate refused us (stable REJECT close): stop dialing.
     RemoteRejected,
     /// A transient failure (stream open error, not a reject): redial.
@@ -226,12 +244,15 @@ async fn establish_outbound(
     match conn.open_bi().await {
         Ok((send, recv)) => {
             shared.audit.accepted(remote, &identity);
-            register_connection(shared.clone(), remote, conn.clone(), send, recv);
+            // A dialed link is never provisional: the dialer only establishes to a
+            // fully-admitted member (a provisional verdict backs off, above).
+            let generation =
+                register_connection(shared.clone(), remote, conn.clone(), send, recv, false);
             shared
                 .table
                 .set(remote, PeerConnState::Connected, Some(identity));
             shared.audit.connected(remote);
-            Established::Up
+            Established::Up(generation)
         }
         Err(err) => {
             if rejected_by_remote(conn) {

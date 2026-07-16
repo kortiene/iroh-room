@@ -29,7 +29,7 @@ use crate::handler::EventProtocolHandler;
 use crate::peer::{dial_loop, peer_id};
 use crate::pipe::alpn::PIPE_ALPN;
 use crate::pipe::PipeProtocolHandler;
-use crate::state::{ConnEvent, PeerConnState, PeerEntry, PeerTable};
+use crate::state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
 
 /// Normal application close code for a locally-initiated disconnect (distinct from
 /// [`crate::handler::REJECT_CODE`], which means "unauthorized").
@@ -113,8 +113,28 @@ pub struct Shared {
     /// deferred, so it receives no live push and no tip/head advertisements).
     /// Cleared with the provisional mark (on upgrade-on-learn or disconnect).
     capability_proven: Mutex<HashSet<EndpointId>>,
+    /// Monotonic per-device connection generation (issue #126). Each accepted or
+    /// dialed link is stamped with a fresh generation when it registers, and it
+    /// performs its own teardown **only if it is still the current generation**
+    /// for the device ([`teardown_if_current`](Self::teardown_if_current)). This
+    /// closes a double-connect TOCTOU: without it, a superseded link's late close
+    /// would clear a successor link's provisional/proven marks, drop its writer,
+    /// and flip it `Offline` — the join-bootstrap gate bypass tracked in #126.
+    /// Never reset or pruned per device (an ABA reuse of a stamp would let a
+    /// long-superseded link's teardown clobber a same-numbered successor); one
+    /// `u64` per distinct device seen, bounded like the other per-device tables.
+    generations: Mutex<HashMap<EndpointId, u64>>,
     /// The single inbound sink feeding the engine driver.
     pub(crate) inbound_tx: mpsc::UnboundedSender<Inbound>,
+}
+
+/// The terminal peer-table state a guarded teardown writes (issue #126).
+#[derive(Clone, Copy)]
+pub(crate) enum LinkTeardown {
+    /// An observable offline with a reason (redialable, or terminal by reason).
+    Offline(OfflineReason),
+    /// The remote refused us mid-stream (stable reject close): mark `Unauthorized`.
+    Unauthorized,
 }
 
 impl Shared {
@@ -182,19 +202,90 @@ impl Shared {
         // No live writer ⇒ peer offline ⇒ drop (engine re-pulls on reconnect).
     }
 
-    /// Mark `device` as a provisional join-bootstrap peer (IR-0104, Approach A).
-    /// Set on the provisional accept, before the peer flips to `Connected`, so the
-    /// engine driver sees it provisional for the very first inbound frame.
-    pub(crate) fn mark_provisional(&self, device: EndpointId) {
+    /// Register a new live link for `device` and return its connection generation
+    /// (issue #126). Atomically, under the generations lock: assign the next
+    /// generation, set the provisional mark when `provisional` (IR-0104, Approach A
+    /// — the join-bootstrap seam needs it visible before the very first inbound
+    /// frame), and install the outbound queue (last-writer-wins on a double-connect,
+    /// spec OQ-4). Folding the generation bump and the provisional mark into one
+    /// critical section is what makes the teardown guard sound: a superseded link's
+    /// [`teardown_if_current`](Self::teardown_if_current) also takes the generations
+    /// lock, so it can never interleave *between* a successor's mark and its
+    /// generation bump and wrongly clear that mark. The connection handle is
+    /// registered separately by the caller — it feeds only `close_connection`, not
+    /// the gate decision, and its guarded removal on teardown keeps it consistent.
+    pub(crate) fn register_link(
+        &self,
+        device: EndpointId,
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+        provisional: bool,
+    ) -> u64 {
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = generations
+            .get(&device)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        generations.insert(device, generation);
+        if provisional {
+            self.provisional
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(device);
+        }
+        self.register_outbound(device, tx);
+        generation
+    }
+
+    /// Tear down `device`'s link state — but **only if `generation` is still the
+    /// current generation** for the device (issue #126). A superseded link's late
+    /// close is then a total no-op: it never clears a successor link's
+    /// provisional/proven marks, never drops its writer or connection handle, and
+    /// never flips it away from `Connected`. Returns whether the teardown ran, so
+    /// the caller gates its disconnect audit on actually having owned the link.
+    ///
+    /// The whole check-and-clear runs under the generations lock, so a concurrent
+    /// [`register_link`](Self::register_link) (which also holds it) fully
+    /// serializes against this — no window exists in which a fresh mark is dropped.
+    pub(crate) fn teardown_if_current(
+        &self,
+        device: EndpointId,
+        generation: u64,
+        exit: LinkTeardown,
+    ) -> bool {
+        let generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generations.get(&device).copied() != Some(generation) {
+            return false; // superseded by a newer link — leave its state intact
+        }
         self.provisional
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(device);
+            .remove(&device);
+        self.capability_proven
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
+        self.unregister(device);
+        match exit {
+            LinkTeardown::Offline(reason) => self.table.set_offline(device, reason, None),
+            LinkTeardown::Unauthorized => {
+                self.table.set(device, PeerConnState::Unauthorized, None);
+            }
+        }
+        true
     }
 
     /// Clear a device's provisional mark — on upgrade-on-learn (its join was
-    /// accepted, so it is now a full member) or on disconnect. Also drops any
-    /// capability-proven mark, so a re-connect must re-prove (issue #112).
+    /// accepted, so it is now a full member). Also drops any capability-proven
+    /// mark, so a re-connect must re-prove (issue #112). Disconnect teardown goes
+    /// through [`teardown_if_current`](Self::teardown_if_current) instead, so a
+    /// superseded link cannot clear a live successor's mark (issue #126).
     pub(crate) fn clear_provisional(&self, device: EndpointId) {
         self.provisional
             .lock()
@@ -307,6 +398,7 @@ impl NetTransport {
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
+            generations: Mutex::new(HashMap::new()),
             inbound_tx,
         });
 
@@ -498,10 +590,10 @@ fn loopback_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inbound, NetConfig, NetMode, Shared, RELAY_ONLY_TEST_BUILD};
+    use super::{Inbound, LinkTeardown, NetConfig, NetMode, Shared, RELAY_ONLY_TEST_BUILD};
     use crate::admission::AllowlistAdmission;
     use crate::audit::TracingAudit;
-    use crate::state::{PeerConnState, PeerTable};
+    use crate::state::{OfflineReason, PeerConnState, PeerTable};
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::ids::RoomId;
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
@@ -525,6 +617,7 @@ mod tests {
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
+            generations: Mutex::new(HashMap::new()),
             inbound_tx,
         });
         (shared, inbound_rx)
@@ -612,6 +705,183 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no frame must arrive after the peer is unregistered"
+        );
+    }
+
+    // --- Issue #126: connection-generation guard on teardown -----------------
+
+    #[test]
+    fn register_link_generations_increase_per_device_and_start_fresh_per_device() {
+        let (shared, _rx) = make_shared();
+        let a = device(0x20);
+        let b = device(0x21);
+        let (tx, _rx1) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Each successive link on the same device gets a strictly greater stamp,
+        // so a superseded link can always be distinguished from its successor.
+        assert_eq!(shared.register_link(a, tx.clone(), false), 1);
+        assert_eq!(shared.register_link(a, tx.clone(), false), 2);
+        assert_eq!(shared.register_link(a, tx.clone(), false), 3);
+        // A different device starts its own sequence at 1.
+        assert_eq!(shared.register_link(b, tx, false), 1);
+    }
+
+    #[test]
+    fn teardown_if_current_tears_down_only_at_the_current_generation() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x22);
+        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let gen = shared.register_link(peer, tx, true);
+        shared.mark_capability_proven(peer);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        // A stale generation (there is none newer here, but simulate a mismatch)
+        // is a no-op: nothing is cleared.
+        assert!(!shared.teardown_if_current(
+            peer,
+            gen + 1,
+            LinkTeardown::Offline(OfflineReason::LinkDropped)
+        ));
+        assert!(shared.is_provisional(peer));
+        assert!(shared.is_capability_proven(peer));
+        assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Connected));
+
+        // The current generation tears everything down.
+        assert!(shared.teardown_if_current(
+            peer,
+            gen,
+            LinkTeardown::Offline(OfflineReason::LinkDropped)
+        ));
+        assert!(!shared.is_provisional(peer));
+        assert!(!shared.is_capability_proven(peer));
+        assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Offline));
+    }
+
+    #[test]
+    fn superseded_provisional_link_teardown_preserves_the_successors_gate() {
+        // The #126 leak, reduced to its invariant: an unproven provisional dialer
+        // double-connects (conn1 → gen1, conn2 → gen2), then conn1 closes. conn1's
+        // teardown must NOT clear the provisional mark (nor drop conn2's writer, nor
+        // flip conn2 Offline) — otherwise the pump would serve the still-connected
+        // conn2 un-gated.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x23);
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let gen1 = shared.register_link(peer, tx1, true);
+        shared.table.set(peer, PeerConnState::Connected, None);
+        // conn2 supersedes conn1: fresh generation, its own writer.
+        let gen2 = shared.register_link(peer, tx2, true);
+        shared.table.set(peer, PeerConnState::Connected, None);
+        assert!(gen2 > gen1);
+
+        // conn1 (the superseded link) closes.
+        assert!(!shared.teardown_if_current(
+            peer,
+            gen1,
+            LinkTeardown::Offline(OfflineReason::LinkDropped)
+        ));
+
+        // The gate for the still-live conn2 is intact.
+        assert!(
+            shared.is_provisional(peer),
+            "superseded conn1 close must leave conn2's provisional mark set"
+        );
+        assert_eq!(
+            shared.table.state_of(peer),
+            Some(PeerConnState::Connected),
+            "superseded conn1 close must not flip the live conn2 Offline"
+        );
+        // conn2's writer still delivers; conn1's is gone.
+        shared.route(&dummy_outgoing(peer));
+        assert!(
+            rx2.try_recv().is_ok(),
+            "conn2's writer must survive conn1's close"
+        );
+        assert!(
+            rx1.try_recv().is_err(),
+            "conn1's writer was replaced, not the live one"
+        );
+
+        // When conn2 itself finally closes at its own generation, the gate clears.
+        assert!(shared.teardown_if_current(
+            peer,
+            gen2,
+            LinkTeardown::Offline(OfflineReason::LinkDropped)
+        ));
+        assert!(!shared.is_provisional(peer));
+        assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Offline));
+    }
+
+    #[test]
+    fn concurrent_supersede_and_teardown_never_clears_a_live_gate() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Real threads racing the exact #126 interleaving: a superseded link's
+        // close (thread A) against a successor link's registration (thread B). For
+        // every interleaving the live successor must remain provisional — if the
+        // CAS were not atomic under one lock, A could clear the mark B just set.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x25);
+        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut current = shared.register_link(peer, tx.clone(), true);
+
+        for _ in 0..500 {
+            let barrier = Arc::new(Barrier::new(2));
+            let old_gen = current;
+
+            let a = {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    shared.teardown_if_current(
+                        peer,
+                        old_gen,
+                        LinkTeardown::Offline(OfflineReason::LinkDropped),
+                    );
+                })
+            };
+            let b = {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    shared.register_link(peer, tx, true)
+                })
+            };
+
+            a.join().expect("teardown thread");
+            let new_gen = b.join().expect("register thread");
+
+            assert!(
+                shared.is_provisional(peer),
+                "a superseded link's concurrent close cleared the live successor's gate"
+            );
+            assert!(
+                new_gen > old_gen,
+                "the successor must get a fresh generation"
+            );
+            current = new_gen;
+        }
+    }
+
+    #[test]
+    fn teardown_if_current_unauthorized_exit_sets_unauthorized() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x24);
+        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
+        let gen = shared.register_link(peer, tx, false);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        assert!(shared.teardown_if_current(peer, gen, LinkTeardown::Unauthorized));
+        assert_eq!(
+            shared.table.state_of(peer),
+            Some(PeerConnState::Unauthorized)
         );
     }
 
