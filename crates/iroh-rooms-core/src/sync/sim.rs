@@ -53,6 +53,12 @@ pub struct SimNet {
     links: BTreeMap<PeerId, BTreeSet<PeerId>>,
     queue: VecDeque<Envelope>,
     clock_ms: u64,
+    /// Frames dropped at delivery for exceeding the wire frame cap — mirrors the
+    /// net writer's oversized-frame drop (issue #113), so a sync message the
+    /// real transport could never deliver also never delivers in Gate-D
+    /// simulation. Exposed via [`dropped_oversized`](Self::dropped_oversized)
+    /// for regression assertions.
+    dropped_oversized: u64,
 }
 
 impl SimNet {
@@ -65,6 +71,7 @@ impl SimNet {
             links: BTreeMap::new(),
             queue: VecDeque::new(),
             clock_ms: 0,
+            dropped_oversized: 0,
         }
     }
 
@@ -235,6 +242,12 @@ impl SimNet {
 
     /// Deliver one queued frame (if its link is still up), enqueuing the
     /// receiver's response. Returns `false` when the queue is empty.
+    ///
+    /// A frame whose encoded body exceeds the wire cap is dropped here — at
+    /// delivery, exactly where the net writer drops it — so the sim cannot
+    /// deliver a message the real transport never could (issue #113). Checking
+    /// at dequeue (not enqueue) keeps `shuffle` permutations and `restart`'s
+    /// queue filtering byte-identical to the un-enforced harness.
     pub fn step(&mut self) -> bool {
         let Some(env) = self.queue.pop_front() else {
             return false;
@@ -244,11 +257,21 @@ impl SimNet {
             // reconnect). Still counts as a step.
             return true;
         }
+        if env.out.msg.encode().len() > super::message::MAX_FRAME_BYTES {
+            self.dropped_oversized += 1;
+            return true;
+        }
         if self.engines.contains_key(&env.to) {
             let outs = self.engine_mut(env.to).on_message(env.from, env.out.msg);
             self.enqueue(env.to, outs);
         }
         true
+    }
+
+    /// Frames dropped at delivery for exceeding the wire frame cap (issue #113).
+    #[must_use]
+    pub fn dropped_oversized(&self) -> u64 {
+        self.dropped_oversized
     }
 
     /// Deterministically permute the in-flight queue with a seeded PRNG

@@ -1099,6 +1099,70 @@ fn room_event_ids_returns_full_validated_set() {
     );
 }
 
+// Issue #113: recent_event_ids is the recent-lamport slab of the WantMembership
+// ancestry claim — descending canonical order, causally-placed rows only.
+#[test]
+fn recent_event_ids_returns_placed_rows_newest_first() {
+    let (id, dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&id, &dev);
+    let m1 = message(&id, &dev, room, vec![g.event_id], "one", T0 + 1);
+    let m2 = message(&id, &dev, room, vec![m1.event_id], "two", T0 + 2);
+    // m3's parent m2 is withheld below: NULL lamport, must never be claimed.
+    let m3 = message(&id, &dev, room, vec![m2.event_id], "three", T0 + 3);
+    let mut store = EventStore::open_in_memory().unwrap();
+    store
+        .insert_all(&[g.clone(), m1.clone(), m3.clone()])
+        .unwrap();
+
+    let recent = store.recent_event_ids(&room, 10, 0).unwrap();
+    assert_eq!(
+        recent,
+        vec![m1.event_id, g.event_id],
+        "descending (lamport, event_id); the unplaced row is excluded"
+    );
+
+    // The limit truncates from the top (most recent first); the offset pages
+    // downward (the claim's rotating window, #113).
+    assert_eq!(
+        store.recent_event_ids(&room, 1, 0).unwrap(),
+        vec![m1.event_id]
+    );
+    assert_eq!(
+        store.recent_event_ids(&room, 1, 1).unwrap(),
+        vec![g.event_id]
+    );
+    assert!(
+        store.recent_event_ids(&room, 1, 2).unwrap().is_empty(),
+        "an offset past the placed set returns an empty page, no wrap"
+    );
+
+    // The unplaced row is invisible to the claim's head list too.
+    assert_eq!(
+        store.placed_heads(&room).unwrap(),
+        vec![m1.event_id],
+        "m3 heads the DAG but is unplaced; m1 is the placed frontier"
+    );
+    assert_eq!(store.placed_count(&room).unwrap(), 2);
+
+    // Healing the hole places m3 (insert-time propagation) and it leads the slab.
+    store.insert(&m2).unwrap();
+    assert_eq!(
+        store.recent_event_ids(&room, 2, 0).unwrap(),
+        vec![m3.event_id, m2.event_id],
+        "a healed descendant re-qualifies with its recomputed lamport"
+    );
+    assert_eq!(store.placed_heads(&room).unwrap(), vec![m3.event_id]);
+    assert_eq!(store.placed_count(&room).unwrap(), 4);
+
+    assert!(
+        store
+            .recent_event_ids(&RoomId::from_bytes([0x99; 32]), 4, 0)
+            .unwrap()
+            .is_empty(),
+        "an unknown room must return an empty slab"
+    );
+}
+
 // ── issue #85: busy_timeout + IMMEDIATE writes for concurrent writers ─────────
 //
 // Bantaba opens two `EventStore` connections onto one file (RPC writes + a sync

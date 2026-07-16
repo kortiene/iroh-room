@@ -253,8 +253,16 @@ Window = { max_count: u32, since_ms: Option<u64> }                         // co
 WireBytes = bstr                                                           // == WireEvent.to_bytes()
 ```
 
-- `have` lists let the responder send only the delta (server-side set difference); it is an
-  optimization, never a trust input — the requester re-validates every returned frame.
+- `have` lists let the responder send only the delta; they are an optimization, never a trust
+  input — the requester re-validates every returned frame. For `WantRecentChat` the subtraction is
+  an exact set difference over the listed ids. For `WantMembership` each entry is an **ancestry
+  claim** (issue #113): it asserts the requester holds that event *and its entire stored ancestry*,
+  and the responder subtracts the claimed id plus every stored ancestor of it. A bounded claim
+  (§6.3) therefore covers an arbitrarily large held set, so the request frame no longer grows with
+  room history (an exhaustive id list crossed the 1 MiB frame cap near ~30k held events). The
+  expansion is trust-safe in both directions: a claimed id the responder does not hold subtracts
+  nothing (over-serving idempotent duplicates — the safe direction), and a **false** claim
+  withholds events only from the claimant itself, never from a third party.
 - `max_count` is the only **trustworthy** bound (canonical order). `since_ms` filters on advisory
   `created_at` and MUST NOT be relied on for completeness or security (spike §2.3 / Event Protocol
   §2). Default `max_count` and the responder's hard cap are §4.4 constants.
@@ -282,6 +290,7 @@ Named constants with safe defaults (all tunable; chosen for ≤5-peer MVP rooms)
 | `RESPONSE_MAX_FRAMES` | 512 | Cap frames per `Events` response; requester re-asks for the rest. |
 | `CHAT_WINDOW_DEFAULT` | 200 | Default `Window.max_count` when a peer asks without one. |
 | `CHAT_WINDOW_MAX` | 1000 | Responder's hard cap on `max_count` (PRD §10.7 "maximum events per sync"). |
+| `MEMBERSHIP_HAVE_MAX_IDS` | 512 | Cap ids in a `WantMembership` ancestry claim (placed heads + recent-lamport slab + rotating window, issue #113); ~17 KiB on the wire regardless of room size. `validate()` also rejects values large enough to overflow a frame themselves. |
 
 The engine MUST `log()` whenever a bound drops/evicts/caps something — silent truncation reads as
 "covered everything" when it did not (a Gate-D NO-GO condition is an *unbounded* park/backfill).
@@ -465,7 +474,13 @@ On a new authenticated peer link (both directions symmetric):
 
 1. Send `AdminTip { tip: store.admin_chain_tip(room) }` and `Heads { heads: store.heads(room) }`.
 2. On receiving the peer's `AdminTip`/`Heads`, run the **detector** (D6) and compute what to pull:
-   - `WantMembership { have: <local membership-sub-DAG ids> }` — **always** (never windowed).
+   - `WantMembership { have: <bounded ancestry claim> }` — **always** (never windowed). The claim
+     samples the held set within `MEMBERSHIP_HAVE_MAX_IDS` total (issue #113): placed DAG heads
+     (≤ half the budget, so a pathologically wide DAG cannot starve the rest), the most recent
+     causally-placed ids, and a per-tick **rotating window** over everything older — the sweep
+     claims every placed id within at most `placed-events` ticks, so no store state can pin the
+     responder's coverage at ∅ indefinitely. Only rows with a derived lamport qualify (a `NULL`
+     lamport means the ancestry is locally incomplete and must keep being re-served).
    - `WantRecentChat { window: config.default_window, have: <local recent chat ids> }` — bounded.
    - `WantEvents { ids }` for any specific missing parents already known from the park.
 3. Drain `Events` responses through `ingest_frame` (6.1); the `Buffered` path (6.2) issues further
@@ -479,12 +494,29 @@ On a new authenticated peer link (both directions symmetric):
 - `WantMembership { have }` ⇒ compute the **authorization-class** set (4.1: union of `by_type` over
   the five membership types + `by_sender(admin_identity)`), close it over stored `prev_events`
   ancestry (the **causal closure** — a membership event authored after chat cites chat heads as
-  structural parents, and the fold cannot classify it without them), subtract `have`, return as
-  `Events` (causal order, truncated at `RESPONSE_MAX_FRAMES`). **Never** apply a window. This is
-  the §0 hard invariant. The requester's `have` claims **every id it holds** (not just its own
-  closure): a truncated response is a causally-closed prefix that fold-accepts in full, so each
-  round's `have` shrinks the next delta — bootstrap over any closure size converges in
-  `ceil(closure/cap)` rounds, and a converged mesh quiesces (empty responses).
+  structural parents, and the fold cannot classify it without them), subtract everything the
+  `have` **ancestry claims** cover — each claimed id held locally plus every stored ancestor of it
+  (4.2 / issue #113) — and return as `Events` (causal order, truncated at `RESPONSE_MAX_FRAMES`,
+  causally-unplaced `NULL`-lamport rows skipped). **Never** apply a window. This is the §0 hard
+  invariant. Soundness: an honest claim's ancestry is byte-identical on both sides (content-hashed
+  ids; the requester only claims rows with a derived lamport, which the store computes only when
+  the full ancestry is present), so covered ⊆ requester-held — the responder can over-serve but
+  never under-serve. Progress (#111): a truncated response is a causally-closed prefix that
+  fold-accepts in full; its tips become heads the requester claims next round — and being
+  responder-served they are responder-known — so each round's delta shrinks by the cap: bootstrap
+  over any closure size converges in `ceil(closure/cap)` rounds. Quiescence: a claim containing
+  every responder head covers the responder's whole held set (fast-path empty response). The
+  recent-lamport slab keeps claims anchored when a requester's own newest events are
+  responder-unknown (a returning member). When even the slab is responder-unknown (an exclusive
+  suffix larger than the whole claim budget), rounds degrade to duplicate re-serves until the
+  claim's rotating window (6.3) sweeps into responder-known territory — bounded by `placed` ticks,
+  after which the pull progresses again; an adversarially **wide** shared region can stretch this
+  (the deferred Meyer range reconciliation is the full answer — a §2 non-goal, tracked under #102).
+- `Events` responses are **byte-budgeted** (issue #113): a serve whose frames would exceed the
+  1 MiB `MAX_FRAME_BYTES` wire cap is split into consecutive `Events` messages, each under the
+  cap, order preserved (an unchunked over-cap body would be dropped whole at the net writer and
+  re-served identically forever). `RESPONSE_MAX_FRAMES` still caps total frames per serve, so the
+  anti-amplification bound is unchanged.
 - `WantRecentChat { window, have }` ⇒ take `room_tail(room, min(window.max_count, CHAT_WINDOW_MAX))`,
   keep **chat-class** events, optionally filter `created_at >= since_ms` (advisory), subtract `have`,
   return as `Events` (chunked). Count is the trustworthy bound (canonical order); time is advisory.
