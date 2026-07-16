@@ -7,6 +7,49 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+## 0.1.0-rc.3 - 2026-07-16
+
+- Gated the join-bootstrap membership closure on a **capability proof** (issue
+  #112, `iroh-rooms-core` / `iroh-rooms-net` / `iroh-rooms-cli`): since #111
+  `WantMembership` serves the causal closure of the authorization class, which
+  can carry chat that entered the membership ancestry — and while a join window
+  (`room tail --accept-joins`) was open, any provisionally-admitted unknown
+  device could send `WantMembership` and read that chat with no invite. A
+  provisional peer must now present the new
+  `ProveCapability { room_id, invite_id, capability_secret }` message; the
+  responder recomputes the invite `capability_hash` against an on-log
+  `member.invited` and serves the closure only after a valid proof. This is a
+  bootstrap **privacy** gate only — the convergent `gate_join` remains the
+  unchanged authorization authority on the actual join. The join CLI,
+  `Node::spawn_join_bootstrap`, and the SDK examples (PR #120) present the
+  proof automatically before the bootstrap pull, so genuine invitees join
+  unchanged; the deterministic engine treats a forwarded or replayed proof as
+  a no-op. Tracked residuals: outbound live fan-out to a still-connected
+  unproven provisional dialer is not yet gated — history no longer leaks, but
+  chat published while the join window is open and the dialer stays connected
+  does (issue #121) — and proof outcomes surface only through the tracing
+  audit hooks, not the CLI's `audit.ndjson` (issue #122). **Upgrade note: an
+  rc.2 joiner never sends the proof, so an rc.3 admin serves it no provisional
+  bootstrap and its `room join` times out — joiners must run rc.3 against an
+  rc.3 admin.**
+- Healed deep pure-chat gaps for a returning member (issue #114,
+  `iroh-rooms-core`): a member returning across a >64-deep linear pure-chat
+  gap accepted no new chat. Three stacked defects: the backfill chase
+  re-requested parents that were already parked in flight (burning the
+  per-author token budget on no-ops while the one gap-advancing request
+  deterministically lost the token race), the tick retry re-derived missing
+  parents from the `events` table (empty for a parked frame — a silent no-op),
+  and a legitimate >64-deep single-author chain overflowed the depth and
+  per-author park caps (evicting the middle of the chain made its still-parked
+  children re-request the evicted parents — eviction thrash). Backfill now
+  skips parents already in flight, `retry_park` drives from each parked
+  frame's recorded `missing` set, and `max_parked_per_author` /
+  `max_backfill_depth` are raised 64 → 1024 (per-author park equals the total
+  park so one author's chain cascades in a single pass with unchanged maximum
+  memory; the depth bound stays finite, so a phantom-parent chase is still
+  dropped at a hard bound — the Gate-D bounded-backfill requirement holds,
+  widened). Gaps deeper than the cap still degrade gracefully: bounded chase,
+  membership always converges.
 - Removed the membership-sync room-size ceiling (issue #113, `iroh-rooms-core`
   / `iroh-rooms-net`): the `WantMembership` requester claimed **every held
   event id** in `have` (required by #111's progress invariant), so at ~30k held

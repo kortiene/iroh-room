@@ -74,7 +74,7 @@ Local storage is plaintext for this beta. Use trusted local machines only.
 
 ## How To Participate
 
-1. Read [`docs/releases/v0.1.0-rc.2-release-notes.md`](docs/releases/v0.1.0-rc.2-release-notes.md).
+1. Read [`docs/releases/v0.1.0-rc.3-release-notes.md`](docs/releases/v0.1.0-rc.3-release-notes.md).
 2. Run one recipe from [`docs/community/demo-recipes.md`](docs/community/demo-recipes.md).
 3. File feedback with the cohort feedback issue template.
 4. If the workflow worked, share what you used it for.
@@ -102,4 +102,4 @@ If those happen, the project has a real community seed.
 - [First cohort plan](docs/community/first-cohort.md)
 - [Demo recipes](docs/community/demo-recipes.md)
 - [Outreach guide](docs/community/outreach.md)
-- [Production Beta sign-off](docs/releases/v0.1.0-rc.2-production-beta-signoff.md)
+- [Production Beta sign-off](docs/releases/v0.1.0-rc.3-production-beta-signoff.md)

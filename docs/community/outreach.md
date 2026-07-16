@@ -108,7 +108,7 @@ unredacted audit logs.
 Use this only after several manual attempts succeed.
 
 ```text
-Iroh Rooms v0.1.0-rc.2 is open for a small controlled beta.
+Iroh Rooms v0.1.0-rc.3 is open for a small controlled beta.
 
 It is for technical builders who want private local-first collaboration:
 create a room, invite a peer, share a verified file, or expose localhost to a
