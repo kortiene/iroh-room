@@ -6,8 +6,10 @@
 //! that touches it, translating async I/O events into the engine's synchronous
 //! entry points and routing the [`Outgoing`]s it returns —
 //!
-//! * a [`ConnEvent`] reaching `Connected` → `engine.on_connect` (handshake);
-//!   leaving `Connected` → `engine.on_disconnect`,
+//! * a [`ConnEvent`] reaching `Connected` → `engine.on_connect` (handshake) —
+//!   deferred for an unproven provisional peer until its capability proof
+//!   verifies or its join lands (issue #121); leaving `Connected` →
+//!   `engine.on_disconnect`,
 //! * an inbound frame → `engine.ingest_frame`,
 //! * a periodic tick → `engine.on_tick` (anti-entropy re-pull),
 //! * a [`Cmd`] (publish / query / shutdown) from a [`Node`] handle.
@@ -1119,6 +1121,15 @@ async fn pump(
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Outbound gate (issue #121): provisional peers whose engine handshake is
+    // deferred because they have not yet proven invite possession. A peer in this
+    // set never enters the engine's fan-out set, so `store_and_fanout` pushes
+    // nothing to it and `on_tick` never advertises the admin tip / heads to it.
+    // The deferred `on_connect` runs when its capability proof verifies (below)
+    // or when its accepted join upgrades it to a member
+    // ([`maybe_upgrade_provisional`]); the entry is dropped on disconnect.
+    let mut deferred_handshakes: BTreeSet<PeerId> = BTreeSet::new();
+
     // Establish the initial dial set + admission view from the opening snapshot so a
     // managed session starts dialing its active members immediately (not after the
     // first fold change).
@@ -1175,6 +1186,15 @@ async fn pump(
                                         if ok {
                                             shared.mark_capability_proven(d);
                                             shared.audit.bootstrap_capability_proven(d);
+                                            // Deferred handshake (issue #121): if this
+                                            // peer reached `Connected` before its proof
+                                            // verified, run the engine handshake now —
+                                            // only from this point may it receive
+                                            // fan-out and advertisements.
+                                            if deferred_handshakes.remove(&inbound.peer) {
+                                                let outs = engine.on_connect(inbound.peer);
+                                                route_all(&shared, outs);
+                                            }
                                         } else {
                                             shared.audit.bootstrap_capability_rejected(d);
                                         }
@@ -1232,7 +1252,12 @@ async fn pump(
                                 // Upgrade-on-learn: if that frame was the join the
                                 // fold accepted, the peer is now an Active member —
                                 // lift the restriction and record its identity.
-                                maybe_upgrade_provisional(&engine, &shared, inbound.peer);
+                                maybe_upgrade_provisional(
+                                    &mut engine,
+                                    &shared,
+                                    inbound.peer,
+                                    &mut deferred_handshakes,
+                                );
                             }
                             // An inbound message may have advanced membership (a join
                             // landed, a member was removed): reconcile against it.
@@ -1249,7 +1274,13 @@ async fn pump(
             event = conn_rx.recv() => {
                 match event {
                     Ok(event) => {
-                        handle_conn_event(&mut engine, &shared, event, bootstrap_proof.as_ref());
+                        handle_conn_event(
+                            &mut engine,
+                            &shared,
+                            event,
+                            bootstrap_proof.as_ref(),
+                            &mut deferred_handshakes,
+                        );
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(lagged = n, "pump: conn-event stream lagged");
@@ -1359,11 +1390,24 @@ fn drain_room_events(engine: &mut SyncEngine, tx: &broadcast::Sender<StoredEvent
 }
 
 /// Translate a connection-state transition into the engine's link entry points.
+///
+/// For an **unproven provisional** peer the `Connected` handshake is deferred
+/// (issue #121): `engine.on_connect` would insert it into the fan-out set, so every
+/// event accepted while it stays connected — including live chat published during
+/// an open `--accept-joins` window — would be pushed to it, and every tick would
+/// advertise the admin tip and heads to it. The peer is parked in `deferred`
+/// instead; the handshake runs when its capability proof verifies (the pump's
+/// `ProveCapability` arm) or when its accepted join promotes it to a member
+/// ([`maybe_upgrade_provisional`]). The proof may be processed *before* this
+/// `Connected` transition (the pump's inbound and conn-event channels are not
+/// ordered relative to each other): then the proven mark is already set and the
+/// handshake runs here, immediately.
 fn handle_conn_event(
     engine: &mut SyncEngine,
     shared: &Arc<Shared>,
     event: ConnEvent,
     bootstrap_proof: Option<&BootstrapProof>,
+    deferred: &mut BTreeSet<PeerId>,
 ) {
     let peer = peer_id(event.device);
     match event.to {
@@ -1382,12 +1426,20 @@ fn handle_conn_event(
                     },
                 });
             }
-            let outs = engine.on_connect(peer);
-            route_all(shared, outs);
+            if shared.is_provisional(event.device) && !shared.is_capability_proven(event.device) {
+                deferred.insert(peer);
+            } else {
+                let outs = engine.on_connect(peer);
+                route_all(shared, outs);
+            }
         }
         PeerConnState::Offline | PeerConnState::Unauthorized => {
+            // A deferred handshake dies with the link (a re-connect re-proves).
+            deferred.remove(&peer);
             // Only a transition *away from* a live link is a real disconnect; a
             // first-sight Offline/Unauthorized (we never connected) is a no-op.
+            // (`on_disconnect` is a plain set-remove, so it is safe for a peer
+            // whose handshake was still deferred.)
             if event.from == PeerConnState::Connected {
                 engine.on_disconnect(peer);
             }
@@ -1461,7 +1513,12 @@ fn sync_message_kind(msg: &SyncMessage) -> &'static str {
 /// is accepted by the fold, its device is bound to a now-Active identity. Lift the
 /// provisional restriction and record the learned identity so subsequent traffic is
 /// served as a normal member. A no-op until the join lands.
-fn maybe_upgrade_provisional(engine: &SyncEngine, shared: &Arc<Shared>, peer: PeerId) {
+fn maybe_upgrade_provisional(
+    engine: &mut SyncEngine,
+    shared: &Arc<Shared>,
+    peer: PeerId,
+    deferred: &mut BTreeSet<PeerId>,
+) {
     let snapshot = engine.snapshot();
     let device_key = DeviceKey::from_bytes(*peer.as_bytes());
     let Some(identity) = snapshot.identity_of_device(&device_key) else {
@@ -1475,12 +1532,19 @@ fn maybe_upgrade_provisional(engine: &SyncEngine, shared: &Arc<Shared>, peer: Pe
     };
     shared.clear_provisional(device);
     // Record the now-known identity on the live Connected entry (it was admitted
-    // without one). The peer is already in the engine's fan-out set from its
-    // `on_connect`, so no re-handshake is needed.
+    // without one).
     shared
         .table
         .set(device, PeerConnState::Connected, Some(*identity));
     shared.audit.bootstrap_upgraded(device, identity);
+    // If the peer's handshake was deferred (issue #121: its join was accepted
+    // without a verified capability proof — e.g. a device that already held the
+    // membership DAG pushed a valid `member.joined` directly), run it now so the
+    // new member enters the fan-out set.
+    if deferred.remove(&peer) {
+        let outs = engine.on_connect(peer);
+        route_all(shared, outs);
+    }
 }
 
 /// Advisory wall-clock ms for `on_tick` (the engine treats it as advisory only).
