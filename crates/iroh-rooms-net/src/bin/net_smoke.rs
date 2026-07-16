@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     };
 
     match cmd {
-        Some("listen") => run_listen(mode).await,
+        Some("listen") => Box::pin(run_listen(mode)).await,
         Some("dial") => {
             let id_str = args
                 .get(1)
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
             let addr = flag_value(&args, "--addr")
                 .map(|s| SocketAddr::from_str(&s).context("invalid --addr"))
                 .transpose()?;
-            run_dial(mode, host_id, addr, reject).await
+            Box::pin(run_dial(mode, host_id, addr, reject)).await
         }
         _ => {
             eprintln!(

@@ -315,8 +315,20 @@ async fn room_events_two_node_out_of_order() {
     let (room, baseline, invite_bob_id, alice, bob) = build_baseline();
 
     let roster = || allowlist(&[&alice, &bob]);
-    let alice_node = spawn_loopback_node(alice.iroh_secret(), roster(), room, &baseline).await;
-    let bob_node = spawn_loopback_node(bob.iroh_secret(), roster(), room, &baseline).await;
+    let alice_node = Box::pin(spawn_loopback_node(
+        alice.iroh_secret(),
+        roster(),
+        room,
+        &baseline,
+    ))
+    .await;
+    let bob_node = Box::pin(spawn_loopback_node(
+        bob.iroh_secret(),
+        roster(),
+        room,
+        &baseline,
+    ))
+    .await;
 
     // Subscribe before anything carol-related exists, so no live-tap events are
     // missed. No `.await` intervenes before this call, so the freshly spawned
@@ -439,7 +451,13 @@ async fn room_events_lagging_subscriber_observes_lagged_then_recovers() {
     let (room, baseline, invite_bob_id, alice, bob) = build_baseline();
 
     let roster = || allowlist(&[&alice, &bob]);
-    let alice_node = spawn_loopback_node(alice.iroh_secret(), roster(), room, &baseline).await;
+    let alice_node = Box::pin(spawn_loopback_node(
+        alice.iroh_secret(),
+        roster(),
+        room,
+        &baseline,
+    ))
+    .await;
     let bob_node =
         spawn_loopback_node_with_capacity(bob.iroh_secret(), roster(), room, &baseline, 2).await;
 

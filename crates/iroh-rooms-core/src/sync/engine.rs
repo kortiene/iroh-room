@@ -15,7 +15,9 @@
 //! frame runs the exact landed path —
 //! [`validate_wire_bytes`](crate::event::validate_wire_bytes) →
 //! [`RoomMembership::ingest`] — and only fold-`Accepted` events are persisted
-//! (spec D5), so the `events` table stays equal to the convergent validated set.
+//! (spec D5), so the `events` table stays equal to the convergent validated set
+//! (an insert the store fails is retried on tick until it lands or its bounded
+//! budget surfaces a CRITICAL `store_degraded` decision, issue #119).
 //! The engine adds: backfill (pull), anti-amplification gating, fan-out, and the
 //! admin-tip / fail-closed completeness layer.
 
@@ -99,20 +101,24 @@ pub enum Completeness {
 pub enum Severity {
     /// Advisory: catch-up will resolve it.
     Warning,
-    /// Non-recoverable safety event (admin equivocation).
+    /// Non-recoverable safety event (admin equivocation, a degraded local
+    /// store).
     Critical,
 }
 
 /// A first-class trust event surfaced for the audit surface (spec §9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustDecision {
-    /// Stable code: `equivocation` (admin fork) or `admin_view_suspect`.
+    /// Stable code: `equivocation` (admin fork), `admin_view_suspect`, or
+    /// `store_degraded` (an accepted event could not be persisted, issue #119).
     pub code: &'static str,
-    /// Severity (CRITICAL on an admin fork).
+    /// Severity (CRITICAL on an admin fork or a degraded store).
     pub severity: Severity,
-    /// The `admin_seq` the decision concerns.
+    /// The `admin_seq` the decision concerns (`0` for decisions that concern no
+    /// admin event, e.g. `store_degraded`).
     pub admin_seq: u64,
-    /// The event ids involved (both branch tips for a fork).
+    /// The event ids involved (both branch tips for a fork; the unpersistable
+    /// event for `store_degraded`).
     pub event_ids: Vec<EventId>,
 }
 
@@ -169,6 +175,32 @@ pub struct SyncCounters {
     /// Per-author backfill token buckets restored on `open` (the amplification
     /// budget is not reset by the restart; spec §1.3 / R4).
     pub tokens_restored: u64,
+
+    // -- store-degradation evidence (issue #119) --------------------------------
+    /// `store.insert` failures on a fold-accepted event (first attempts and
+    /// retries alike). Non-zero means the fold and the store disagreed at least
+    /// transiently this session.
+    pub store_insert_failed: u64,
+    /// Fold-accepted events abandoned by the insert-retry path (budget
+    /// exhausted, or the retry queue was full on arrival). Each one also
+    /// records a CRITICAL `store_degraded` [`TrustDecision`].
+    pub store_retry_dropped: u64,
+}
+
+/// One fold-accepted event whose `store.insert` failed, held in memory for
+/// bounded per-tick retry (issue #119). The fold already committed the accept —
+/// descendants will fold-accept and persist above the missing row — so the event
+/// must not be dropped on the floor: retrying from here heals the hole locally
+/// (the store's insert-time lamport propagation re-places the descendants),
+/// without waiting for a peer to re-serve it (#118).
+struct StoreRetry {
+    event: ValidatedEvent,
+    /// The peer the event arrived from (`None` for a local publish), so a
+    /// late-succeeding insert still fans out to everyone but the sender.
+    from: Option<PeerId>,
+    /// Failed insert attempts so far, bounded by
+    /// [`store_retry_attempts`](SyncConfig::store_retry_attempts).
+    attempts: u32,
 }
 
 /// One parked orphan frame, held in memory pending backfill (spec D5/D7).
@@ -232,6 +264,12 @@ pub struct SyncEngine {
 
     /// In-memory orphan park (spec D5/D7), keyed by event id.
     park: BTreeMap<EventId, Parked>,
+    /// Fold-accepted events whose `store.insert` failed, awaiting bounded
+    /// per-tick retry (issue #119), keyed by event id. Session-only on purpose:
+    /// persisting it to the same failing store is circular, and a restart
+    /// re-folds from `events` — clearing the fold/store divergence this queue
+    /// exists to repair.
+    store_retry: BTreeMap<EventId, StoreRetry>,
     /// Restored parked frames still owed a one-shot `WantEvents` re-issue on the
     /// first `on_connect`/`on_tick` after `open` (spec §6.3 — buffering **and
     /// retry** survive a restart). Ongoing retry thereafter is the anti-entropy
@@ -338,6 +376,7 @@ impl SyncEngine {
             fold,
             peers: BTreeSet::new(),
             park: BTreeMap::new(),
+            store_retry: BTreeMap::new(),
             restored_backfill: BTreeSet::new(),
             park_seq: 0,
             backfill_depth: BTreeMap::new(),
@@ -386,6 +425,13 @@ impl SyncEngine {
     /// (spec D9 / AC5). **Not** part of the public surface (spec §7).
     pub(crate) fn into_store(self) -> EventStore {
         self.store
+    }
+
+    /// Test-only mutable access to the owned store, so the #119 tests can arm
+    /// the store's deterministic insert fault injection mid-scenario.
+    #[cfg(test)]
+    pub(crate) fn store_mut(&mut self) -> &mut EventStore {
+        &mut self.store
     }
 
     // ------------------------------------------------------------------
@@ -515,6 +561,9 @@ impl SyncEngine {
         self.claim_rotation = self.claim_rotation.wrapping_add(1);
         self.refill_tokens();
         self.expire_suspect_tip();
+        // Retry failed inserts first (issue #119): a healed hole re-places its
+        // stored descendants, so this tick's `have` claims can already cover them.
+        self.retry_store(&mut out);
         self.retry_park(&mut out);
         // A restart may have left parked frames owed their one-shot by-id backfill;
         // the first tick after `open` re-issues it if no `on_connect` did (spec §6.3).
@@ -762,6 +811,15 @@ impl SyncEngine {
         self.park.len()
     }
 
+    /// The number of fold-accepted events awaiting a store-insert retry
+    /// (issue #119; test/observability helper). Non-zero means the local store
+    /// is currently failing writes and the engine is holding the affected
+    /// events for its bounded per-tick retry.
+    #[must_use]
+    pub fn store_retry_len(&self) -> usize {
+        self.store_retry.len()
+    }
+
     /// The number of events tracked by the underlying membership fold — accepted,
     /// buffered, or rejected (test/observability helper). Non-member junk dropped
     /// at the §6.2 pre-gate never reaches the fold, so a non-member flood leaves
@@ -830,20 +888,51 @@ impl SyncEngine {
 
     /// Persist an accepted event, update admin state, and fan it out. Does **not**
     /// wake the park (the caller drives that loop to avoid recursion).
+    ///
+    /// The fold has already committed the accept when this runs, so a failed
+    /// insert must not silently drop the event — the fold and the store would
+    /// disagree for the rest of the session, and descendants (whose readiness
+    /// checks the fold) would persist above a permanently missing row (issue
+    /// #119). The event is queued for bounded per-tick retry instead
+    /// ([`retry_store`](Self::retry_store)); fan-out, counters, and the push
+    /// feed are deferred until the insert actually lands, so nothing is
+    /// announced that this node cannot serve.
     fn store_and_fanout(
         &mut self,
         ev: &ValidatedEvent,
         from: Option<PeerId>,
         out: &mut Vec<Outgoing>,
     ) {
-        let id = ev.event_id;
         let outcome = match self.store.insert(ev) {
             Ok(o) => o,
             Err(e) => {
+                self.counters.store_insert_failed += 1;
                 self.log(&format!("store insert failed: {e}"));
+                self.enqueue_store_retry(ev, from);
                 return;
             }
         };
+        // A successful insert supersedes any pending retry for this id (a peer
+        // may have re-served an event whose first insert failed, issue #119).
+        self.store_retry.remove(&ev.event_id);
+        self.apply_insert_outcome(outcome, ev, from, out);
+    }
+
+    /// Apply the bookkeeping for a **successful** `store.insert`: counters,
+    /// cache invalidation, admin fork-detection state, the push-subscription
+    /// feed, advisory flags, fan-out, and the completeness recompute. Shared by
+    /// the direct path ([`store_and_fanout`](Self::store_and_fanout)) and the
+    /// deferred insert-retry path ([`retry_store`](Self::retry_store), issue
+    /// #119), so a late-landing event gets exactly the treatment an immediate
+    /// one does.
+    fn apply_insert_outcome(
+        &mut self,
+        outcome: InsertOutcome,
+        ev: &ValidatedEvent,
+        from: Option<PeerId>,
+        out: &mut Vec<Outgoing>,
+    ) {
+        let id = ev.event_id;
         match outcome {
             InsertOutcome::Duplicate => {
                 self.counters.duplicates += 1;
@@ -893,6 +982,87 @@ impl SyncEngine {
                 }
             }
         }
+    }
+
+    /// Queue a fold-accepted event whose insert failed for per-tick retry
+    /// (issue #119). A re-see of an already-queued id keeps the existing entry
+    /// (and its attempt count): duplicate deliveries are not extra retries.
+    /// Beyond [`max_store_retry_total`](SyncConfig::max_store_retry_total) the
+    /// event is abandoned immediately — logged, counted, and surfaced as a
+    /// CRITICAL `store_degraded` decision (no silent truncation, spec §4.4).
+    fn enqueue_store_retry(&mut self, ev: &ValidatedEvent, from: Option<PeerId>) {
+        let id = ev.event_id;
+        if self.store_retry.contains_key(&id) {
+            return;
+        }
+        if self.store_retry.len() >= self.config.max_store_retry_total {
+            self.counters.store_retry_dropped += 1;
+            self.log("store retry dropped: store_retry_total");
+            self.record_store_degraded(id);
+            return;
+        }
+        self.store_retry.insert(
+            id,
+            StoreRetry {
+                event: ev.clone(),
+                from,
+                attempts: 0,
+            },
+        );
+    }
+
+    /// Retry every queued failed insert (issue #119, one attempt per event per
+    /// tick). A success runs the full deferred-accept bookkeeping — the event
+    /// is counted, fed to subscribers, and fanned out only now, and the store's
+    /// insert-time lamport propagation re-places any descendants stored above
+    /// the hole. Exhausting the attempt budget abandons the event with a
+    /// CRITICAL `store_degraded` decision; the fold keeps it Accepted (the
+    /// verdict is ancestor-stable and cannot be rolled back), so the fold/store
+    /// divergence persists until a peer re-serves the event (#118) or a restart
+    /// re-folds from `events`.
+    fn retry_store(&mut self, out: &mut Vec<Outgoing>) {
+        for id in self.store_retry.keys().copied().collect::<Vec<_>>() {
+            let Some((ev, from)) = self.store_retry.get(&id).map(|r| (r.event.clone(), r.from))
+            else {
+                continue;
+            };
+            match self.store.insert(&ev) {
+                Ok(outcome) => {
+                    self.store_retry.remove(&id);
+                    self.apply_insert_outcome(outcome, &ev, from, out);
+                }
+                Err(e) => {
+                    self.counters.store_insert_failed += 1;
+                    self.log(&format!("store insert retry failed: {e}"));
+                    let exhausted = self.store_retry.get_mut(&id).map_or(true, |entry| {
+                        entry.attempts += 1;
+                        entry.attempts >= self.config.store_retry_attempts
+                    });
+                    if exhausted {
+                        self.store_retry.remove(&id);
+                        self.counters.store_retry_dropped += 1;
+                        self.log("store retry dropped: store_retry_attempts");
+                        self.record_store_degraded(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Surface a CRITICAL `store_degraded` [`TrustDecision`] (issue #119): a
+    /// fold-accepted event could not be persisted and its retry budget is gone.
+    /// The operator-facing meaning is "this node's store is dropping writes" —
+    /// the fold counts and fans out state the store cannot serve, until a peer
+    /// re-serve (#118) or a restart re-fold clears the divergence. Persisting
+    /// the decision may itself fail on the degraded store; `record_trust` logs
+    /// that and keeps the in-memory decision either way.
+    fn record_store_degraded(&mut self, id: EventId) {
+        self.record_trust(TrustDecision {
+            code: "store_degraded",
+            severity: Severity::Critical,
+            admin_seq: 0,
+            event_ids: vec![id],
+        });
     }
 
     /// Promote any parked frames the fold has since reclassified as accepted, and
@@ -2050,6 +2220,7 @@ fn trust_row_to_decision(tr: &TrustRow) -> Result<TrustDecision, StoreError> {
     let code = match tr.code.as_str() {
         "equivocation" => "equivocation",
         "admin_view_suspect" => "admin_view_suspect",
+        "store_degraded" => "store_degraded",
         other => {
             return Err(StoreError::integrity(format!(
                 "unknown stored trust code {other:?}"

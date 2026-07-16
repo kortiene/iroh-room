@@ -110,6 +110,13 @@ impl Default for StoreOptions {
 /// (spec §10, multi-connection pooling is future work).
 pub struct EventStore {
     conn: Connection,
+    /// Test-only deterministic fault injection: the number of upcoming
+    /// [`insert`](Self::insert) calls that fail with an injected error before
+    /// touching the database (issue #119 — the engine's insert-failure recovery
+    /// is untestable against real `SQLite` without nondeterministic disk-full
+    /// tricks). Compiled out of non-test builds.
+    #[cfg(test)]
+    fail_next_inserts: u32,
 }
 
 impl EventStore {
@@ -159,7 +166,19 @@ impl EventStore {
         // opt-out. `Duration::ZERO` clears the handler (`sqlite3_busy_timeout(db, 0)`).
         conn.busy_timeout(opts.busy_timeout.unwrap_or(Duration::ZERO))?;
         schema::migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            #[cfg(test)]
+            fail_next_inserts: 0,
+        })
+    }
+
+    /// Test-only: make the next `n` [`insert`](Self::insert) calls fail with an
+    /// injected [`StoreError`] without touching the database — the deterministic
+    /// stand-in for a disk-full / I/O fault (issue #119).
+    #[cfg(test)]
+    pub(crate) fn fail_next_inserts(&mut self, n: u32) {
+        self.fail_next_inserts = n;
     }
 
     /// Begin a write transaction that grabs the write lock up front
@@ -187,6 +206,11 @@ impl EventStore {
     /// [`StoreError::Integrity`] if `BLAKE3(wire.signed) != ev.event_id` (a caller
     /// passed a mismatched id/bytes pair); [`StoreError::Sqlite`] on a DB error.
     pub fn insert(&mut self, ev: &ValidatedEvent) -> Result<InsertOutcome, StoreError> {
+        #[cfg(test)]
+        if self.fail_next_inserts > 0 {
+            self.fail_next_inserts -= 1;
+            return Err(StoreError::integrity("injected insert fault (test)"));
+        }
         let tx = self.begin_write()?;
         let outcome = insert_in_tx(&tx, ev)?;
         tx.commit()?;
