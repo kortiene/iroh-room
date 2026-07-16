@@ -30,6 +30,8 @@
 
 pub mod config;
 pub mod engine;
+#[cfg(test)]
+mod engine_tests;
 pub mod message;
 pub mod sim;
 pub mod transport;

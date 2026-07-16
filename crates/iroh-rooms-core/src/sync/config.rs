@@ -52,6 +52,19 @@ pub struct SyncConfig {
     /// ticks. Values large enough to overflow a wire frame themselves
     /// (~30k ids) are rejected by [`validate`](Self::validate).
     pub membership_have_max_ids: usize,
+    /// Insert retries (one per [`on_tick`](super::SyncEngine::on_tick)) for a
+    /// fold-accepted event whose `store.insert` failed (issue #119 — the fold
+    /// holds the event Accepted, so dropping it silently would leave the store
+    /// and the fold disagreeing for the whole session). When the budget is
+    /// exhausted the event is dropped from the retry queue and a CRITICAL
+    /// `store_degraded` [`TrustDecision`](super::TrustDecision) is recorded;
+    /// peer re-serves remain the healing backstop (#118).
+    pub store_retry_attempts: u32,
+    /// Cap on fold-accepted events held in memory awaiting insert retry
+    /// (issue #119). An arrival beyond the cap is not queued: it is dropped
+    /// straight to the CRITICAL `store_degraded` decision, so a store outage
+    /// under event flood cannot grow memory unboundedly (Gate-D R4).
+    pub max_store_retry_total: usize,
 }
 
 impl Default for SyncConfig {
@@ -85,6 +98,14 @@ impl Default for SyncConfig {
             // deep enough that a node must hold >512 events no peer has seen
             // before any claim coverage degrades (issue #113).
             membership_have_max_ids: 512,
+            // Long enough to ride out a transient store fault (a busy_timeout
+            // burst, a briefly-full disk) at the MVP's ~1 tick/s cadence, short
+            // enough that a genuinely dead store surfaces its CRITICAL
+            // `store_degraded` decision within seconds (issue #119).
+            store_retry_attempts: 16,
+            // Mirrors `max_parked_total`: the same "bounded in-memory frame
+            // buffer" shape, sized for the MVP room target (issue #119).
+            max_store_retry_total: 1024,
         }
     }
 }
@@ -119,6 +140,11 @@ impl SyncConfig {
             // #113 removes, reintroduced by configuration. 16 384 ids ≈ 557 KiB,
             // comfortably under the cap.
             return Err("membership_have_cap_oversized");
+        }
+        if self.store_retry_attempts == 0 || self.max_store_retry_total == 0 {
+            // Zero would silently disable the #119 insert-failure recovery and
+            // reopen the permanent-store-hole path.
+            return Err("store_retry_zero");
         }
         Ok(())
     }
@@ -175,6 +201,20 @@ mod tests {
             ..SyncConfig::default()
         };
         assert_eq!(max_ok.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_zero_store_retry_bounds() {
+        let cfg = SyncConfig {
+            store_retry_attempts: 0,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("store_retry_zero"));
+        let cfg = SyncConfig {
+            max_store_retry_total: 0,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("store_retry_zero"));
     }
 
     #[test]

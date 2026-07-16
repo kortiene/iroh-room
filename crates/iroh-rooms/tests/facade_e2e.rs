@@ -269,7 +269,7 @@ async fn two_nodes_converge_to_active_through_the_facade_alone() {
     let joiner = Principal::new(0x10);
     let setup = build_admin_room(&admin, joiner.identity());
 
-    let (admin_node, joiner_node) = converge(&admin, &joiner, &setup).await;
+    let (admin_node, joiner_node) = Box::pin(converge(&admin, &joiner, &setup)).await;
 
     assert!(
         wait_active(&admin_node, &joiner.identity(), WAIT).await,
@@ -306,7 +306,7 @@ async fn message_propagates_through_the_facade_after_convergence() {
     let joiner = Principal::new(0x20);
     let setup = build_admin_room(&admin, joiner.identity());
 
-    let (admin_node, joiner_node) = converge(&admin, &joiner, &setup).await;
+    let (admin_node, joiner_node) = Box::pin(converge(&admin, &joiner, &setup)).await;
     assert!(
         wait_active(&admin_node, &joiner.identity(), WAIT).await,
         "the room must converge before the message round trip"
@@ -371,7 +371,7 @@ async fn room_events_delivers_published_message_through_the_facade() {
     let joiner = Principal::new(0x30);
     let setup = build_admin_room(&admin, joiner.identity());
 
-    let (admin_node, joiner_node) = converge(&admin, &joiner, &setup).await;
+    let (admin_node, joiner_node) = Box::pin(converge(&admin, &joiner, &setup)).await;
     assert!(
         wait_active(&admin_node, &joiner.identity(), WAIT).await,
         "the room must converge before the push round trip"
