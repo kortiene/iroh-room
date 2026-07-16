@@ -259,6 +259,16 @@ impl AuditSink for LocalAudit {
         self.stderr.bootstrap_blocked(device, kind);
     }
 
+    fn bootstrap_capability_proven(&self, device: EndpointId) {
+        self.record_peer("join.bootstrap.capability_proven", device);
+        self.stderr.bootstrap_capability_proven(device);
+    }
+
+    fn bootstrap_capability_rejected(&self, device: EndpointId) {
+        self.record_peer("join.bootstrap.capability_rejected", device);
+        self.stderr.bootstrap_capability_rejected(device);
+    }
+
     fn blob_serve_accepted(&self, peer: EndpointId, hash: [u8; 32]) {
         self.persistent.record(
             "blob.serve.accepted",
@@ -328,6 +338,22 @@ impl AuditSink for StderrAudit {
         );
     }
 
+    fn bootstrap_capability_proven(&self, device: EndpointId) {
+        // An expected step of a genuine join handshake (issue #112): informational,
+        // like the tracing sink's INFO line.
+        eprintln!("note: peer {device} proved invite possession; serving the membership closure");
+    }
+
+    fn bootstrap_capability_rejected(&self, device: EndpointId) {
+        // Someone probed the join window with a bad or replayed invite secret —
+        // exactly the event the local audit trail exists for (issue #122). Same
+        // `warning[<code>]:` shape as the connection-reject line.
+        eprintln!(
+            "warning[capability_rejected]: peer {device} presented an invalid capability \
+             proof; staying gated"
+        );
+    }
+
     fn blob_serve_accepted(&self, peer: EndpointId, hash: [u8; 32]) {
         // `blob.serve.accepted` is the stable, greppable audit line (IR-0204 §7).
         eprintln!(
@@ -374,6 +400,8 @@ mod tests {
         sink.event_rejected(device(1), 3);
         sink.deauthorized(device(1));
         sink.event_flagged(device(1), "clock_skew");
+        sink.bootstrap_capability_proven(device(1));
+        sink.bootstrap_capability_rejected(device(1));
         sink.blob_serve_accepted(device(1), [0x22; 32]);
         sink.blob_serve_rejected(device(1), BlobDenyCause::NotActive, Some([0x22; 32]));
         sink.blob_serve_rejected(device(1), BlobDenyCause::PushDenied, None);
@@ -439,5 +467,38 @@ mod tests {
         );
         assert!(content.contains("\"hash_prefix\":\"44444444\""));
         assert!(!content.contains("identity.secret"));
+    }
+
+    // The #122 line contract: a capability-proof accept or reject on the join
+    // bootstrap must land in audit.ndjson (the shipped binary installs no
+    // tracing subscriber, so this sink is the only durable record), carrying
+    // the public peer id and never any part of the proof itself.
+    #[test]
+    fn local_audit_persists_capability_proof_outcomes() {
+        let home = tempdir().unwrap();
+        let persistent = PersistentAudit::open(home.path()).unwrap();
+        let sink = LocalAudit::new(persistent);
+
+        sink.bootstrap_capability_proven(device(1));
+        sink.bootstrap_capability_rejected(device(2));
+
+        let content = std::fs::read_to_string(home.path().join(AUDIT_LOG_FILE)).unwrap();
+        let lines = content
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "join.bootstrap.capability_proven");
+        assert_eq!(lines[0]["peer"], device(1).to_string());
+        assert_eq!(lines[1]["event"], "join.bootstrap.capability_rejected");
+        assert_eq!(lines[1]["peer"], device(2).to_string());
+        for line in &lines {
+            assert!(line["ts_ms"].as_u64().is_some());
+            // The proof is (invite_id, capability_secret); neither may ever be
+            // written, in any spelling.
+            assert!(line.get("invite_id").is_none());
+            assert!(line.get("capability_secret").is_none());
+            assert!(line.get("secret").is_none());
+        }
     }
 }
