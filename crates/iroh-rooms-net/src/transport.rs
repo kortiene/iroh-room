@@ -108,9 +108,10 @@ pub struct Shared {
     /// Provisional devices that have **proven invite possession** (issue #112): a
     /// join-bootstrap dialer whose [`ProveCapability`](iroh_rooms_core::sync::SyncMessage::ProveCapability)
     /// matched an on-log invite. Only these are served the never-windowed membership
-    /// **closure** (which since #111 can carry chat ancestry); an unproven provisional
-    /// peer is not. Cleared with the provisional mark (on upgrade-on-learn or
-    /// disconnect).
+    /// **closure** (which since #111 can carry chat ancestry) or entered into the
+    /// engine's fan-out set (issue #121 — an unproven peer's `on_connect` is
+    /// deferred, so it receives no live push and no tip/head advertisements).
+    /// Cleared with the provisional mark (on upgrade-on-learn or disconnect).
     capability_proven: Mutex<HashSet<EndpointId>>,
     /// The single inbound sink feeding the engine driver.
     pub(crate) inbound_tx: mpsc::UnboundedSender<Inbound>,
