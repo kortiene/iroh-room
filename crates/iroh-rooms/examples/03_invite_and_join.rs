@@ -25,7 +25,8 @@ use std::time::Duration;
 use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::session::{
-    AllowlistAdmission, EndpointAddr, EndpointId, NetConfig, Node, SecretKey, DEFAULT_TICK,
+    AllowlistAdmission, BootstrapProof, EndpointAddr, EndpointId, NetConfig, Node, SecretKey,
+    DEFAULT_TICK,
 };
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::store::EventStore;
@@ -70,13 +71,21 @@ async fn main() -> anyhow::Result<()> {
     let engine = SyncEngine::open(store, ticket.room_id, SyncConfig::default())
         .map_err(|e| anyhow::anyhow!("could not open sync engine: {e}"))?;
     let secret_key = SecretKey::from_bytes(&joiner_device.to_seed());
-    let node = Node::spawn(
+    // Present a capability proof on connect (issue #112): a provisional dialer
+    // is served the membership bootstrap only after proving it holds the
+    // ticket's invite — a plain `Node::spawn` would pull nothing here.
+    let node = Node::spawn_join_bootstrap(
         secret_key,
         Arc::new(admission),
         Arc::new(iroh_rooms::experimental::session::TracingAudit),
         engine,
         NetConfig::default(),
         DEFAULT_TICK,
+        BootstrapProof {
+            room_id: ticket.room_id,
+            invite_id: ticket.invite_id,
+            capability_secret: ticket.capability_secret,
+        },
     )
     .await?;
 

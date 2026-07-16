@@ -51,8 +51,8 @@ use iroh_rooms::events::{
 use iroh_rooms::experimental::blob::BlobStore;
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::session::{
-    AllowlistAdmission, EndpointAddr, EndpointId, NetConfig, NetMode, Node, PeerConnState,
-    SecretKey, TracingAudit, DEFAULT_TICK,
+    AllowlistAdmission, BootstrapProof, EndpointAddr, EndpointId, NetConfig, NetMode, Node,
+    PeerConnState, SecretKey, TracingAudit, DEFAULT_TICK,
 };
 #[cfg(feature = "experimental")]
 use iroh_rooms::experimental::store::EventStore;
@@ -662,13 +662,23 @@ async fn cmd_join(args: JoinArgs) -> anyhow::Result<()> {
         },
         ..NetConfig::default()
     };
-    let node = Node::spawn(
+    // Present a capability proof on connect (issue #112): the admin serves the
+    // never-windowed membership closure to a provisional dialer only after it
+    // proves it holds this invite, so `wait_for_invited` below would time out
+    // on a plain `Node::spawn`. The secret carried here is the same one the
+    // join places on the log a moment later.
+    let node = Node::spawn_join_bootstrap(
         SecretKey::from_bytes(&device.to_seed()),
         Arc::new(admission),
         Arc::new(TracingAudit),
         engine,
         net_cfg,
         DEFAULT_TICK,
+        BootstrapProof {
+            room_id: ticket.room_id,
+            invite_id: ticket.invite_id,
+            capability_secret: ticket.capability_secret,
+        },
     )
     .await
     .context("could not bring up the network node")?;
