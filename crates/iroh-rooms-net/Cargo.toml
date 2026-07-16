@@ -5,7 +5,7 @@
 # sans-IO `SyncEngine`. See `NOTES.md` for the spike findings (Gate-A status).
 [package]
 name = "iroh-rooms-net"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

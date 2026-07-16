@@ -124,10 +124,14 @@ mkdir -p "$DIST_DIR"
 rm -f "$ARCHIVE" "$ARCHIVE.sha256"
 tar -C "$STAGE_ROOT" -czf "$ARCHIVE" "$STAGE_NAME"
 
+# The checksum line must carry the bare archive name, not the build-tree path:
+# a downloader runs `shasum -c` next to the downloaded files, where a
+# `target/release-artifacts/` prefix can never resolve (the release-notes
+# verification command depends on this).
 if command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$ARCHIVE")") > "$ARCHIVE.sha256"
 elif command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+  (cd "$DIST_DIR" && sha256sum "$(basename "$ARCHIVE")") > "$ARCHIVE.sha256"
 else
   echo "error: need shasum or sha256sum to write artifact checksum" >&2
   exit 1
