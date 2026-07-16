@@ -17,7 +17,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use crate::admission::AdmissionDecision;
 use crate::peer::register_connection;
 use crate::state::{OfflineReason, PeerConnState};
-use crate::transport::Shared;
+use crate::transport::{LinkTeardown, Shared};
 
 /// Application close code used when admission rejects a remote endpoint. A stable
 /// code lets the *dialing* side distinguish a deliberate `Unauthorized` rejection
@@ -66,20 +66,32 @@ impl ProtocolHandler for EventProtocolHandler {
                 self.shared.audit.accepted(device, &identity);
                 // Only now — for an admitted member — do we accept the stream.
                 let (send, recv) = conn.accept_bi().await?;
-                register_connection(self.shared.clone(), device, conn.clone(), send, recv);
+                let generation = register_connection(
+                    self.shared.clone(),
+                    device,
+                    conn.clone(),
+                    send,
+                    recv,
+                    false,
+                );
                 self.shared
                     .table
                     .set(device, PeerConnState::Connected, Some(identity));
                 self.shared.audit.connected(device);
 
                 // The accept future owns the connection: keep it (and its streams)
-                // alive until it closes, then surface the disconnect.
+                // alive until it closes, then surface the disconnect — but only if
+                // this link is still the device's current generation (issue #126):
+                // a crossed re-connect must not be unregistered or flipped Offline
+                // by our late close.
                 conn.closed().await;
-                self.shared.unregister(device);
-                self.shared
-                    .table
-                    .set_offline(device, OfflineReason::LinkDropped, None);
-                self.shared.audit.disconnected(device);
+                if self.shared.teardown_if_current(
+                    device,
+                    generation,
+                    LinkTeardown::Offline(OfflineReason::LinkDropped),
+                ) {
+                    self.shared.audit.disconnected(device);
+                }
                 Ok(())
             }
             AdmissionDecision::AdmitProvisional => {
@@ -94,20 +106,35 @@ impl ProtocolHandler for EventProtocolHandler {
                 // disconnect.
                 self.shared.audit.bootstrap_admitted(device);
                 let (send, recv) = conn.accept_bi().await?;
-                self.shared.mark_provisional(device);
-                register_connection(self.shared.clone(), device, conn.clone(), send, recv);
+                // Register provisional atomically with the generation stamp so a
+                // superseded link's teardown cannot clear this mark (issue #126);
+                // the mark is visible before the peer flips to `Connected`, so the
+                // engine driver serves it membership events only from the very
+                // first inbound frame.
+                let generation = register_connection(
+                    self.shared.clone(),
+                    device,
+                    conn.clone(),
+                    send,
+                    recv,
+                    true,
+                );
                 self.shared
                     .table
                     .set(device, PeerConnState::Connected, None);
                 self.shared.audit.connected(device);
 
+                // Guarded teardown (issue #126): a double-connecting unproven dialer
+                // that closes this link must not clear the provisional/proven marks
+                // of a successor link — the join-bootstrap gate bypass this closes.
                 conn.closed().await;
-                self.shared.clear_provisional(device);
-                self.shared.unregister(device);
-                self.shared
-                    .table
-                    .set_offline(device, OfflineReason::LinkDropped, None);
-                self.shared.audit.disconnected(device);
+                if self.shared.teardown_if_current(
+                    device,
+                    generation,
+                    LinkTeardown::Offline(OfflineReason::LinkDropped),
+                ) {
+                    self.shared.audit.disconnected(device);
+                }
                 Ok(())
             }
         }
