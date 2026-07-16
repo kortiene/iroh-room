@@ -451,11 +451,22 @@ async fn spawn_joiner_node(
 }
 
 /// Spawn a joiner node that presents **no** capability proof (a plain
-/// [`Node::spawn`]) — used to model an uninvited dialer for the issue #112
-/// security regression. It still admits the admin so the dial itself succeeds.
-async fn spawn_bare_joiner_node(joiner: &Principal, admin: &Principal, room: RoomId) -> Node {
+/// [`Node::spawn`]) — used to model an uninvited dialer for the issue #112/#121
+/// security regressions. It still admits the admin so the dial itself succeeds.
+/// `log` pre-seeds its store: empty for a dialer that knows only the room id, or
+/// a copy of the room log for a worst-case attacker holding stale history
+/// out-of-band (so any leaked live frame folds cleanly and shows in its store).
+async fn spawn_bare_joiner_node(
+    joiner: &Principal,
+    admin: &Principal,
+    room: RoomId,
+    log: &[Vec<u8>],
+) -> Node {
     let store = EventStore::open_in_memory().expect("in-memory joiner store");
-    let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
+    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
+    for ev in log {
+        engine.publish(ev).expect("seed bare joiner event");
+    }
     let admission = AllowlistAdmission::new()
         .bind_device(admin.endpoint_id(), admin.identity())
         .set_active(admin.identity());
@@ -1045,7 +1056,7 @@ async fn uninvited_provisional_dialer_gets_no_membership_closure() {
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
 
     // The attacker dials with NO capability proof.
-    let attacker_node = spawn_bare_joiner_node(&attacker, &admin, setup.room_id).await;
+    let attacker_node = spawn_bare_joiner_node(&attacker, &admin, setup.room_id, &[]).await;
     attacker_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
     // It must never pull the closure — not even genesis.
@@ -1074,6 +1085,97 @@ async fn uninvited_provisional_dialer_gets_no_membership_closure() {
     );
 
     admin_node.shutdown().await.expect("shutdown admin");
+    attacker_node.shutdown().await.expect("shutdown attacker");
+}
+
+/// Issue #121 (the #112 residual): an **uninvited** dialer admitted provisionally
+/// while the `--accept-joins` window is open must receive no **live fan-out**
+/// either — before this fix, a provisional accept reaching `Connected` ran
+/// `engine.on_connect`, inserting the unproven dialer into the engine's peer set,
+/// so `store_and_fanout` pushed every newly accepted event (and every tick
+/// advertised the admin tip + heads) to it. The attacker here is worst-case: it
+/// already holds a stale out-of-band copy of the room log, so any leaked live
+/// push would fold cleanly, making `wait_until_contains` on its store a precise
+/// leak oracle (an empty-store attacker's engine would drop the pushed frame at
+/// the signer pre-check, masking the wire-level disclosure).
+///
+/// A genuine invitee that proved possession is connected alongside as the
+/// positive control: it must receive the same live publish — which also pins
+/// that the deferred handshake actually runs once the capability proof verifies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uninvited_provisional_dialer_receives_no_live_fanout() {
+    let admin = Principal::new(0x01);
+    let resident = Principal::new(0x30);
+    let joiner = Principal::new(0x10); // genuine invitee; INV_ID is minted for it
+    let attacker = Principal::new(0x40); // knows room + admin + stale log, holds no invite
+
+    let setup = build_admin_room_with_history(&admin, &resident, joiner.identity(), 5);
+    let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
+
+    // The attacker dials with NO capability proof and stays connected through
+    // the whole open window.
+    let attacker_node = spawn_bare_joiner_node(&attacker, &admin, setup.room_id, &setup.log).await;
+    attacker_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    admin_node
+        .wait_for_state(attacker.endpoint_id(), PeerConnState::Connected, WAIT)
+        .await
+        .expect("attacker admitted provisionally (window open)");
+
+    // The genuine invitee connects with its proof and completes the closure pull
+    // (it does NOT publish a join — it stays a proven provisional peer). Waiting
+    // for the closure tip guarantees the whole causally-ordered response landed.
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
+    joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    joiner_node
+        .wait_until_contains(setup.invite_dag_id, WAIT)
+        .await
+        .expect("proven joiner pulled the membership closure");
+
+    // Let the admin's pump settle the joiner's deferred handshake (the proof and
+    // the Connected transition arrive on unordered channels) before publishing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Live chat published while both dialers are connected and the window is open.
+    let live_chat = SignedEvent {
+        schema_version: 1,
+        room_id: setup.room_id,
+        sender_id: admin.identity(),
+        device_id: admin.device_key(),
+        event_type: EventType::MessageText,
+        created_at: T0 + 100,
+        prev_events: vec![setup.invite_dag_id],
+        content: Content::MessageText(MessageText {
+            body: "live message during the open join window".to_owned(),
+            format: None,
+            in_reply_to: None,
+            mentions: None,
+        }),
+    };
+    let live_chat_id = live_chat.event_id();
+    admin_node
+        .publish(wire(&live_chat, &admin.dev))
+        .await
+        .expect("admin publishes live chat");
+
+    // Positive control: the proven invitee receives the live push (fan-out ran,
+    // and the deferred handshake completed on proof verification).
+    joiner_node
+        .wait_until_contains(live_chat_id, WAIT)
+        .await
+        .expect("issue #121: a proven provisional peer still receives live fan-out");
+
+    // The unproven attacker must never see it: its handshake stayed deferred, so
+    // it never entered the fan-out set — nothing is pushed or advertised to it.
+    assert!(
+        attacker_node
+            .wait_until_contains(live_chat_id, REFUSAL_WAIT)
+            .await
+            .is_err(),
+        "issue #121: an unproven provisional dialer must receive no live fan-out"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    joiner_node.shutdown().await.expect("shutdown joiner");
     attacker_node.shutdown().await.expect("shutdown attacker");
 }
 
