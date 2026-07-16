@@ -97,6 +97,14 @@ pub trait AuditSink: Send + Sync + 'static {
     /// connection is served the membership sub-DAG only (`kind` is the stable
     /// sync-message kind that was refused). Default: no-op.
     fn bootstrap_blocked(&self, _device: EndpointId, _kind: &'static str) {}
+    /// A provisional join-bootstrap peer proved invite possession (issue #112): its
+    /// `ProveCapability` matched an on-log invite, so it may now pull the membership
+    /// closure. Default: no-op.
+    fn bootstrap_capability_proven(&self, _device: EndpointId) {}
+    /// A provisional join-bootstrap peer's `ProveCapability` did **not** match any
+    /// on-log invite (issue #112): it stays gated out of the membership closure.
+    /// Default: no-op.
+    fn bootstrap_capability_rejected(&self, _device: EndpointId) {}
 
     /// A gated blob fetch was served: `peer` requested `hash` over the blobs ALPN
     /// and the two-gate ACL allowed it (IR-0204 spec §7 `blob.serve.accepted`).
@@ -219,6 +227,28 @@ impl AuditSink for TracingAudit {
             kind,
             peer = %device,
             "dropped a non-membership request from a provisional join-bootstrap peer"
+        );
+    }
+
+    fn bootstrap_capability_proven(&self, device: EndpointId) {
+        // `join.bootstrap.capability_proven` — the dialer proved invite possession
+        // (issue #112); it may now pull the membership closure. INFO: an expected
+        // step of a genuine join handshake.
+        tracing::info!(
+            reason = "join.bootstrap.capability_proven",
+            peer = %device,
+            "provisional peer proved invite possession; serving the membership closure"
+        );
+    }
+
+    fn bootstrap_capability_rejected(&self, device: EndpointId) {
+        // `join.bootstrap.capability_rejected` — a provisional peer's proof matched
+        // no on-log invite (issue #112). WARN: a dialer with no invite tried to earn
+        // the membership closure; it stays gated out.
+        tracing::warn!(
+            reason = "join.bootstrap.capability_rejected",
+            peer = %device,
+            "provisional peer presented an invalid capability proof; staying gated"
         );
     }
 

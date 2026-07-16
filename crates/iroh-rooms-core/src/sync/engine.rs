@@ -433,6 +433,12 @@ impl SyncEngine {
             SyncMessage::NotFound { ids, .. } => {
                 self.log(&format!("peer lacks {} requested ids", ids.len()));
             }
+            // A join-bootstrap capability proof (issue #112) is a transport-layer
+            // concern: the network adapter verifies it (via `capability_proof_matches`)
+            // and gates the provisional membership-closure serve on it, before this
+            // point. The deterministic engine treats it as a no-op so a forwarded or
+            // replayed proof never affects the validated set or convergence.
+            SyncMessage::ProveCapability { .. } => {}
         }
         out
     }
@@ -581,6 +587,40 @@ impl SyncEngine {
             }
         }
         Ok(hashes)
+    }
+
+    /// Whether `secret` proves possession of an on-log invite `invite_id` in this
+    /// room: the recomputed capability hash matches an accepted `member.invited`
+    /// (issue #112 — the join-bootstrap capability proof). The network adapter
+    /// calls this to gate the never-windowed membership **closure** serve to a
+    /// *provisional* join-bootstrap peer: since PR #111 that closure can carry chat
+    /// that entered the membership ancestry, and an uninvited dialer must not pull
+    /// it. A dialer that holds a minted invite secret can; a stranger cannot.
+    ///
+    /// This is a bootstrap **privacy** gate, not an authorization one — it does not
+    /// check expiry, consumption, role, or the dialer's identity (an invite that was
+    /// once minted still proves "was invited", which is the bar for *seeing* room
+    /// history). The convergent authorization authority remains `gate_join`, run on
+    /// the actual join by every peer, and is unchanged.
+    #[must_use]
+    pub fn capability_proof_matches(
+        &self,
+        invite_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+        secret: &[u8; crate::event::constants::SHORT_ID_LEN],
+    ) -> bool {
+        let expected = crate::event::content::capability_hash(&self.room_id, invite_id, secret);
+        let Ok(invites) = self.store.by_type(&self.room_id, EventType::MemberInvited) else {
+            return false;
+        };
+        invites.iter().any(|se| {
+            crate::event::signed::SignedEvent::decode(&se.wire.signed)
+                .ok()
+                .and_then(|ev| match ev.content {
+                    Content::MemberInvited(inv) => Some(inv),
+                    _ => None,
+                })
+                .is_some_and(|inv| inv.invite_id == *invite_id && inv.capability_hash == expected)
+        })
     }
 
     /// The admin-completeness verdict the access planes consult (spec D6).

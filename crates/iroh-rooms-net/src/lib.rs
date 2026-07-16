@@ -70,7 +70,7 @@ pub use diag::{classify_remote_info, PathType};
 pub use frame::{FrameError, MAX_FRAME_BYTES};
 pub use handler::EventProtocolHandler;
 pub use manager::PeerManager;
-pub use node::{BlobServeConfig, Node, DEFAULT_TICK};
+pub use node::{BlobServeConfig, BootstrapProof, Node, DEFAULT_TICK};
 pub use pipe::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,
     PipeSessionInfo, TracingPipeAudit, PIPE_ALPN,

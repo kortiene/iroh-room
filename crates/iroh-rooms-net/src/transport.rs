@@ -105,6 +105,13 @@ pub struct Shared {
     /// reads this to restrict service (membership-only) and clears it on
     /// upgrade-on-learn; the accept handler clears it on disconnect.
     provisional: Mutex<HashSet<EndpointId>>,
+    /// Provisional devices that have **proven invite possession** (issue #112): a
+    /// join-bootstrap dialer whose [`ProveCapability`](iroh_rooms_core::sync::SyncMessage::ProveCapability)
+    /// matched an on-log invite. Only these are served the never-windowed membership
+    /// **closure** (which since #111 can carry chat ancestry); an unproven provisional
+    /// peer is not. Cleared with the provisional mark (on upgrade-on-learn or
+    /// disconnect).
+    capability_proven: Mutex<HashSet<EndpointId>>,
     /// The single inbound sink feeding the engine driver.
     pub(crate) inbound_tx: mpsc::UnboundedSender<Inbound>,
 }
@@ -185,9 +192,14 @@ impl Shared {
     }
 
     /// Clear a device's provisional mark — on upgrade-on-learn (its join was
-    /// accepted, so it is now a full member) or on disconnect.
+    /// accepted, so it is now a full member) or on disconnect. Also drops any
+    /// capability-proven mark, so a re-connect must re-prove (issue #112).
     pub(crate) fn clear_provisional(&self, device: EndpointId) {
         self.provisional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
+        self.capability_proven
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&device);
@@ -198,6 +210,25 @@ impl Shared {
     #[must_use]
     pub(crate) fn is_provisional(&self, device: EndpointId) -> bool {
         self.provisional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&device)
+    }
+
+    /// Record that a provisional `device` has proven invite possession (issue
+    /// #112): its [`ProveCapability`](iroh_rooms_core::sync::SyncMessage::ProveCapability)
+    /// matched an on-log invite, so it may now pull the membership closure.
+    pub(crate) fn mark_capability_proven(&self, device: EndpointId) {
+        self.capability_proven
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(device);
+    }
+
+    /// Whether a provisional `device` has proven invite possession (issue #112).
+    #[must_use]
+    pub(crate) fn is_capability_proven(&self, device: EndpointId) -> bool {
+        self.capability_proven
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&device)
@@ -274,6 +305,7 @@ impl NetTransport {
             outbound: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
+            capability_proven: Mutex::new(HashSet::new()),
             inbound_tx,
         });
 
@@ -491,6 +523,7 @@ mod tests {
             outbound: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
+            capability_proven: Mutex::new(HashSet::new()),
             inbound_tx,
         });
         (shared, inbound_rx)

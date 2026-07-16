@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
+use iroh_rooms_core::event::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
 use iroh_rooms_core::event::content::{Content, PipeOpened};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
@@ -164,6 +164,34 @@ impl RoomReconciler {
     }
 }
 
+/// The join-bootstrap **capability proof** a dialing invitee presents on connect
+/// (issue #112): the invite it holds and the secret proving possession. The pump
+/// sends it as a [`SyncMessage::ProveCapability`] to every peer it connects to, and
+/// the join-hosting admin verifies it before serving the never-windowed membership
+/// closure. Held only for the short bootstrap session; the secret carried here is
+/// the same one the join later places on the log, so this leaks nothing new.
+///
+/// `Debug` is hand-redacted — the `capability_secret` must never reach a log.
+#[derive(Clone)]
+pub struct BootstrapProof {
+    /// Room the proof is scoped to.
+    pub room_id: RoomId,
+    /// The invite id the dialer holds (`member.invited.invite_id`).
+    pub invite_id: [u8; SHORT_ID_LEN],
+    /// The capability secret proving possession of that invite.
+    pub capability_secret: [u8; SHORT_ID_LEN],
+}
+
+impl core::fmt::Debug for BootstrapProof {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BootstrapProof")
+            .field("room_id", &self.room_id)
+            .field("invite_id", &hex::encode(self.invite_id))
+            .field("capability_secret", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A running event-transport node: a [`NetTransport`] carrier + an engine pump.
 ///
 /// The node also drives the **Live Pipe Plane** (IR-0010): its `Router` serves the
@@ -216,7 +244,43 @@ impl Node {
         cfg: NetConfig,
         tick: Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(secret, admission, audit, engine, cfg, tick, None, None).await
+        Self::spawn_inner(
+            secret, admission, audit, engine, cfg, tick, None, None, None,
+        )
+        .await
+    }
+
+    /// Like [`Node::spawn`] but the node presents a join-bootstrap **capability
+    /// proof** (issue #112) to every peer it connects to: the invitee proves it
+    /// holds the ticket's invite before the join-hosting admin will serve it the
+    /// never-windowed membership closure (which since #111 can carry chat ancestry).
+    /// The join CLI uses this so an uninvited dialer that merely knows the room id
+    /// and admin address cannot pull room history during the `--accept-joins` window.
+    ///
+    /// # Errors
+    /// Returns an error if the endpoint fails to bind.
+    #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
+    pub async fn spawn_join_bootstrap(
+        secret: SecretKey,
+        admission: Arc<dyn Admission>,
+        audit: Arc<dyn AuditSink>,
+        engine: SyncEngine,
+        cfg: NetConfig,
+        tick: Duration,
+        proof: BootstrapProof,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            secret,
+            admission,
+            audit,
+            engine,
+            cfg,
+            tick,
+            None,
+            None,
+            Some(proof),
+        )
+        .await
     }
 
     /// Like [`Node::spawn`] but with a caller-supplied Live-Pipe-Plane audit sink
@@ -248,6 +312,7 @@ impl Node {
             tick,
             None,
             Some(pipe_audit),
+            None,
         )
         .await
     }
@@ -301,6 +366,7 @@ impl Node {
                 blob,
             }),
             None,
+            None,
         )
         .await
     }
@@ -315,6 +381,7 @@ impl Node {
         tick: Duration,
         room: Option<RoomConfig>,
         pipe_audit: Option<Arc<dyn PipeAuditSink>>,
+        bootstrap_proof: Option<BootstrapProof>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         // A dedicated channel for the Pipe plane's reads against the single-owner
@@ -416,6 +483,7 @@ impl Node {
             tick,
             room_reconciler,
             room_event_tx.clone(),
+            bootstrap_proof,
         ));
 
         // The teardown-on-learn watcher (spec §4.5/D5): re-evaluates every live pipe
@@ -1035,7 +1103,7 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
 /// on each tick it reconciles the [`PeerManager`] dial set and refreshes the live
 /// admission cell against the current snapshot (spec §4.3 — snapshot-diff on the
 /// existing tick, so no new membership-change event plumbing is introduced).
-#[allow(clippy::too_many_arguments)] // one wiring seam; each channel/handle is distinct
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one wiring seam; each channel/handle is distinct
 async fn pump(
     mut engine: SyncEngine,
     mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
@@ -1046,6 +1114,7 @@ async fn pump(
     tick: Duration,
     mut room: Option<RoomReconciler>,
     room_event_tx: broadcast::Sender<StoredEvent>,
+    bootstrap_proof: Option<BootstrapProof>,
 ) {
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1082,16 +1151,54 @@ async fn pump(
                 match SyncMessage::decode(&inbound.bytes) {
                     Ok(msg) => {
                         // Join-bootstrap restriction (IR-0104, Approach A): a
-                        // *provisional* peer is served the membership sub-DAG only.
-                        // Drop any request that would serve it chat/files/arbitrary
-                        // events; allow membership pulls and its `member.joined` push.
+                        // *provisional* peer is served the membership sub-DAG only,
+                        // and — since #111 lets that closure carry chat ancestry —
+                        // only once it has proven invite possession (issue #112).
                         let device = endpoint_of(inbound.peer);
                         let provisional = device.is_some_and(|d| shared.is_provisional(d));
-                        if provisional && !provisional_allows(&msg) {
-                            if let Some(d) = device {
-                                shared.audit.bootstrap_blocked(d, sync_message_kind(&msg));
+                        let serve = if provisional {
+                            match &msg {
+                                // The capability proof is a transport handshake step:
+                                // verify it, flip the proven mark, and never forward it
+                                // to the deterministic engine (issue #112).
+                                SyncMessage::ProveCapability {
+                                    room_id,
+                                    invite_id,
+                                    capability_secret,
+                                } => {
+                                    if let Some(d) = device {
+                                        let ok = room_id == engine.room_id()
+                                            && engine.capability_proof_matches(
+                                                invite_id,
+                                                capability_secret,
+                                            );
+                                        if ok {
+                                            shared.mark_capability_proven(d);
+                                            shared.audit.bootstrap_capability_proven(d);
+                                        } else {
+                                            shared.audit.bootstrap_capability_rejected(d);
+                                        }
+                                    }
+                                    false
+                                }
+                                other => {
+                                    let proven = device
+                                        .is_some_and(|d| shared.is_capability_proven(d));
+                                    let allowed = provisional_allows(other, proven);
+                                    if !allowed {
+                                        if let Some(d) = device {
+                                            shared
+                                                .audit
+                                                .bootstrap_blocked(d, sync_message_kind(other));
+                                        }
+                                    }
+                                    allowed
+                                }
                             }
                         } else {
+                            true
+                        };
+                        if serve {
                             // AC3 observability (spec §D8): surface an engine reject
                             // of this inbound frame through the AuditSink so it is
                             // visible without a tracing subscriber. The reject count
@@ -1141,7 +1248,9 @@ async fn pump(
             }
             event = conn_rx.recv() => {
                 match event {
-                    Ok(event) => handle_conn_event(&mut engine, &shared, event),
+                    Ok(event) => {
+                        handle_conn_event(&mut engine, &shared, event, bootstrap_proof.as_ref());
+                    }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(lagged = n, "pump: conn-event stream lagged");
                     }
@@ -1250,10 +1359,29 @@ fn drain_room_events(engine: &mut SyncEngine, tx: &broadcast::Sender<StoredEvent
 }
 
 /// Translate a connection-state transition into the engine's link entry points.
-fn handle_conn_event(engine: &mut SyncEngine, shared: &Arc<Shared>, event: ConnEvent) {
+fn handle_conn_event(
+    engine: &mut SyncEngine,
+    shared: &Arc<Shared>,
+    event: ConnEvent,
+    bootstrap_proof: Option<&BootstrapProof>,
+) {
     let peer = peer_id(event.device);
     match event.to {
         PeerConnState::Connected => {
+            // A dialing invitee presents its capability proof (issue #112) *before*
+            // the engine's `on_connect` pull, so the admin marks it proven before it
+            // processes the `WantMembership` that follows — frames are ordered per
+            // link, so the closure serve is never blocked for a genuine joiner.
+            if let Some(proof) = bootstrap_proof {
+                shared.route(&Outgoing {
+                    peer,
+                    msg: SyncMessage::ProveCapability {
+                        room_id: proof.room_id,
+                        invite_id: proof.invite_id,
+                        capability_secret: proof.capability_secret,
+                    },
+                });
+            }
             let outs = engine.on_connect(peer);
             route_all(shared, outs);
         }
@@ -1283,25 +1411,35 @@ fn endpoint_of(peer: PeerId) -> Option<EndpointId> {
 }
 
 /// Whether a provisional join-bootstrap peer (IR-0104, Approach A) may be served
-/// `msg`. It may pull the never-windowed membership sub-DAG ([`WantMembership`]) and
-/// push its `member.joined` ([`Events`], which the fold judges), plus the harmless
-/// tip/head/not-found advertisements. It may **not** pull chat or arbitrary events
-/// ([`WantRecentChat`] / [`WantEvents`]) — those would serve room content to a
-/// not-yet-member, the privacy regression the spec scopes out.
+/// `msg`, given whether it has proven invite possession (`capability_proven`, issue
+/// #112).
+///
+/// It may push its `member.joined` ([`Events`], which the fold judges) and the
+/// harmless tip/head/not-found advertisements at any time. It may pull the
+/// never-windowed membership sub-DAG ([`WantMembership`]) **only after proving
+/// capability** — since PR #111 that closure can carry the chat that entered the
+/// membership ancestry, so an *unproven* dialer must not receive it. It may **never**
+/// pull chat or arbitrary events ([`WantRecentChat`] / [`WantEvents`]) — those would
+/// serve room content to a not-yet-member, the privacy regression the spec scopes
+/// out. [`ProveCapability`] is intercepted before this gate and never reaches it.
 ///
 /// [`WantMembership`]: SyncMessage::WantMembership
 /// [`Events`]: SyncMessage::Events
 /// [`WantRecentChat`]: SyncMessage::WantRecentChat
 /// [`WantEvents`]: SyncMessage::WantEvents
-fn provisional_allows(msg: &SyncMessage) -> bool {
-    matches!(
-        msg,
-        SyncMessage::WantMembership { .. }
-            | SyncMessage::Events { .. }
-            | SyncMessage::AdminTip { .. }
-            | SyncMessage::Heads { .. }
-            | SyncMessage::NotFound { .. }
-    )
+/// [`ProveCapability`]: SyncMessage::ProveCapability
+fn provisional_allows(msg: &SyncMessage, capability_proven: bool) -> bool {
+    match msg {
+        // The membership closure is served only to a capability-proven peer (#112).
+        SyncMessage::WantMembership { .. } => capability_proven,
+        // The join push and the harmless advertisements are always allowed.
+        SyncMessage::Events { .. }
+        | SyncMessage::AdminTip { .. }
+        | SyncMessage::Heads { .. }
+        | SyncMessage::NotFound { .. } => true,
+        // Chat/arbitrary pulls, and any other kind, are refused.
+        _ => false,
+    }
 }
 
 /// A stable, greppable kind string for the `join.bootstrap.blocked` audit line.
