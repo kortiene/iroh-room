@@ -1,0 +1,107 @@
+name: release
+
+# Builds the Production Beta CLI archive + checksum for every supported platform
+# triple and attaches them to the tag's release.
+#
+# This exists because `scripts/build-release-artifacts.sh` names its archive
+# after the *rustc host triple*, so a release cut by hand only ever ships the
+# one platform the release owner happened to build on. v0.1.0-rc.1 shipped
+# macOS-only; rc.2 and rc.3 shipped Linux-only while their notes still promised
+# `x86_64-apple-darwin`. A native runner per triple removes the manual step.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build release artifacts for (e.g. v0.1.0-rc.3)."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  artifacts:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing must not suppress the others' artifacts; a partial
+      # release is still better than none, and the gap is visible in the run.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The build script derives the archive name from the rustc host triple, so
+      # a runner image whose arch drifts would publish an archive labelled for a
+      # platform it cannot run on.
+      - name: Assert runner host triple
+        run: |
+          host="$(rustc -vV | awk '/^host: / { print $2 }')"
+          if [[ "$host" != "${{ matrix.target }}" ]]; then
+            echo "::error::runner host triple is $host, expected ${{ matrix.target }}"
+            exit 1
+          fi
+
+      # The script derives the version from crates/iroh-rooms-cli/Cargo.toml, not
+      # from the tag. If a release tag is cut off a commit that predates the
+      # version bump, the artifacts get the wrong version in their name.
+      - name: Assert tag matches crate version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="$(awk -F ' *= *' '
+            /^\[package\]/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && $1 == "version" { gsub(/"/, "", $2); print $2; exit }
+          ' crates/iroh-rooms-cli/Cargo.toml)"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "::error::tag $tag does not match crate version $version"
+            exit 1
+          fi
+
+      - name: Build release artifact
+        run: scripts/build-release-artifacts.sh
+
+      - name: Record build host in the run log
+        run: |
+          rustc --version
+          cat target/release-artifacts/*.tar.gz.sha256
+
+      # Keep the artifacts reachable even when the tag has no release yet, so a
+      # tag pushed ahead of its notes is not a lost build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iroh-rooms-${{ matrix.target }}
+          path: |
+            target/release-artifacts/*.tar.gz
+            target/release-artifacts/*.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              target/release-artifacts/*.tar.gz \
+              target/release-artifacts/*.tar.gz.sha256 \
+              --clobber
+          else
+            echo "::notice::no release exists for $tag; artifacts are attached to this run only"
+          fi
