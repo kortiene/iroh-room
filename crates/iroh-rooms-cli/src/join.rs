@@ -49,7 +49,7 @@ use iroh_rooms_core::membership::Ingest;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_core::ticket::{RoomInviteTicket, TicketError};
-use iroh_rooms_net::{AllowlistAdmission, NetConfig, Node, DEFAULT_TICK};
+use iroh_rooms_net::{AllowlistAdmission, BootstrapProof, NetConfig, Node, DEFAULT_TICK};
 use zeroize::Zeroizing;
 
 use crate::error::{CodedResultExt, ErrorCode};
@@ -166,13 +166,23 @@ pub async fn join(
         ..NetConfig::default()
     };
     let audit_sink = audit::sink(home)?;
-    let node = Node::spawn(
+    // Present a capability proof on connect (issue #112): the admin serves the
+    // membership closure only once we prove we hold this invite, so a dialer with no
+    // invite cannot pull room history during the `--accept-joins` window. The secret
+    // here is the same one the join places on the log a moment later.
+    let proof = BootstrapProof {
+        room_id,
+        invite_id: via_invite_id,
+        capability_secret: *capability_secret,
+    };
+    let node = Node::spawn_join_bootstrap(
         secret_key,
         Arc::new(admission),
         audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,
+        proof,
     )
     .await
     .context("could not bring up the network node")?;

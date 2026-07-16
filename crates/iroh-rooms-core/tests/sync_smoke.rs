@@ -1661,3 +1661,40 @@ fn take_ingested_never_emits_a_dropped_frame() {
         "a dropped frame must never appear on the ingest feed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #112 — the join-bootstrap capability-proof verifier
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capability_proof_matches_only_a_held_invite_secret() {
+    // build_log mints bob's invite with invite_id [0x01; 16] + secret [0x41; 16].
+    let built = build_log(0, false);
+    let store = EventStore::open_in_memory().expect("store");
+    let mut engine = SyncEngine::open(store, built.room, SyncConfig::default()).expect("engine");
+    engine.publish(&built.events[0]).expect("genesis");
+    engine.publish(&built.events[1]).expect("invite");
+
+    let inv_bob_id = [0x01u8; 16];
+    let inv_bob_secret = [0x41u8; 16];
+
+    assert!(
+        engine.capability_proof_matches(&inv_bob_id, &inv_bob_secret),
+        "the correct secret for a held invite must prove possession"
+    );
+    assert!(
+        !engine.capability_proof_matches(&inv_bob_id, &[0xFFu8; 16]),
+        "a wrong secret must not prove possession"
+    );
+    assert!(
+        !engine.capability_proof_matches(&[0x09u8; 16], &inv_bob_secret),
+        "an unknown invite id must not prove possession"
+    );
+    // A fresh engine that holds no invite proves nothing.
+    let empty_store = EventStore::open_in_memory().expect("store");
+    let empty = SyncEngine::open(empty_store, built.room, SyncConfig::default()).expect("engine");
+    assert!(
+        !empty.capability_proof_matches(&inv_bob_id, &inv_bob_secret),
+        "an engine with no on-log invite proves nothing"
+    );
+}

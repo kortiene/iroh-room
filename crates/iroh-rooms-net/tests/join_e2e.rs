@@ -68,8 +68,8 @@ use iroh_rooms_core::event::wire::WireEvent;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{
-    AllowlistAdmission, JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState,
-    TracingAudit, DEFAULT_TICK,
+    AllowlistAdmission, BootstrapProof, JoinBootstrapAdmission, NetConfig, NetMode, Node,
+    PeerConnState, TracingAudit, DEFAULT_TICK,
 };
 
 // ── fixed test fixtures ───────────────────────────────────────────────────────
@@ -410,13 +410,52 @@ async fn spawn_admin_node_dynamic(
     .expect("spawn admin node (dynamic admission)")
 }
 
-/// Spawn a joiner node with an empty store.
-/// Uses an [`AllowlistAdmission`] that admits the admin (so the outbound dial
-/// succeeds and the sub-DAG pull from the admin can proceed).
-async fn spawn_joiner_node(joiner: &Principal, admin: &Principal, room: RoomId) -> Node {
+/// Spawn a joiner node with an empty store that presents a join-bootstrap
+/// capability proof on connect (issue #112) for `invite_id` + `secret`. Uses an
+/// [`AllowlistAdmission`] that admits the admin (so the outbound dial succeeds and
+/// the sub-DAG pull from the admin can proceed). A genuine invitee passes the
+/// invite it holds; the admin serves it the membership closure only once the proof
+/// matches an on-log invite.
+async fn spawn_joiner_node(
+    joiner: &Principal,
+    admin: &Principal,
+    room: RoomId,
+    invite_id: [u8; 16],
+    secret: [u8; 16],
+) -> Node {
     let store = EventStore::open_in_memory().expect("in-memory joiner store");
     let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
     // Joiner must admit the admin so the dial_loop's authorization check passes.
+    let admission = AllowlistAdmission::new()
+        .bind_device(admin.endpoint_id(), admin.identity())
+        .set_active(admin.identity());
+    let cfg = NetConfig {
+        mode: NetMode::Loopback,
+        ..NetConfig::default()
+    };
+    Node::spawn_join_bootstrap(
+        joiner.iroh_secret(),
+        Arc::new(admission),
+        Arc::new(TracingAudit),
+        engine,
+        cfg,
+        DEFAULT_TICK,
+        BootstrapProof {
+            room_id: room,
+            invite_id,
+            capability_secret: secret,
+        },
+    )
+    .await
+    .expect("spawn joiner node")
+}
+
+/// Spawn a joiner node that presents **no** capability proof (a plain
+/// [`Node::spawn`]) — used to model an uninvited dialer for the issue #112
+/// security regression. It still admits the admin so the dial itself succeeds.
+async fn spawn_bare_joiner_node(joiner: &Principal, admin: &Principal, room: RoomId) -> Node {
+    let store = EventStore::open_in_memory().expect("in-memory joiner store");
+    let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
     let admission = AllowlistAdmission::new()
         .bind_device(admin.endpoint_id(), admin.identity())
         .set_active(admin.identity());
@@ -433,7 +472,7 @@ async fn spawn_joiner_node(joiner: &Principal, admin: &Principal, room: RoomId) 
         DEFAULT_TICK,
     )
     .await
-    .expect("spawn joiner node")
+    .expect("spawn bare joiner node")
 }
 
 // ── wait helper ───────────────────────────────────────────────────────────────
@@ -491,7 +530,7 @@ async fn valid_join_both_peers_show_joiner_active() {
     let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
 
     // Joiner dials Admin; Admin admits it provisionally (first-time device +
     // open invite window → `AdmitProvisional`). The engine on both sides calls
@@ -574,7 +613,7 @@ async fn join_succeeds_after_conversation_has_started() {
     let setup = build_admin_room_with_history(&admin, &resident, joiner.identity(), 70);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
 
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
@@ -636,7 +675,7 @@ async fn bad_capability_secret_join_not_accepted() {
     let setup = build_admin_room(&admin, joiner.identity(), "member", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
 
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
@@ -709,7 +748,7 @@ async fn agent_bad_capability_secret_join_not_accepted() {
     let setup = build_admin_room(&admin, joiner.identity(), "agent", None);
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
 
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
@@ -787,7 +826,7 @@ async fn expired_invite_join_not_accepted() {
     let setup = build_admin_room(&admin, joiner.identity(), "member", Some(T0 + 1));
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
 
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
@@ -858,7 +897,7 @@ async fn agent_expired_invite_join_not_accepted() {
     let setup = build_admin_room(&admin, joiner.identity(), "agent", Some(T0 + 1));
 
     let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
 
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
@@ -951,7 +990,7 @@ async fn provisional_peer_does_not_receive_chat_events() {
 
     // Joiner connects (provisionally) but does NOT publish a join — so it stays
     // at most Invited and the provisional restriction is never lifted.
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
 
     // Wait for the membership pull to complete (genesis + invite reach the joiner).
@@ -985,6 +1024,59 @@ async fn provisional_peer_does_not_receive_chat_events() {
     joiner_node.shutdown().await.expect("shutdown joiner");
 }
 
+/// Issue #112 (security regression): an **uninvited** dialer that knows only the
+/// room id and the admin's address is admitted provisionally while the
+/// `--accept-joins` window is open, but — because it presents no capability proof —
+/// the admin serves it **nothing**. In particular it does not receive the member
+/// chat that entered the membership ancestry (the #111 causally-closed
+/// `WantMembership`), which before this fix rode along to any provisional dialer.
+/// A genuine invitee that proves possession still bootstraps
+/// (`join_succeeds_after_conversation_has_started`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uninvited_provisional_dialer_gets_no_membership_closure() {
+    let admin = Principal::new(0x01);
+    let resident = Principal::new(0x30);
+    let joiner = Principal::new(0x10); // the (absent) genuine invitee INV_ID is for
+    let attacker = Principal::new(0x40); // knows the room + admin, holds no invite
+
+    // A room whose joiner-invite descends from resident chat, so the membership
+    // closure carries that chat (the #111 scenario the #112 gate must contain).
+    let setup = build_admin_room_with_history(&admin, &resident, joiner.identity(), 5);
+    let admin_node = spawn_admin_node(&admin, setup.room_id, &setup.log).await;
+
+    // The attacker dials with NO capability proof.
+    let attacker_node = spawn_bare_joiner_node(&attacker, &admin, setup.room_id).await;
+    attacker_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+
+    // It must never pull the closure — not even genesis.
+    assert!(
+        attacker_node
+            .wait_until_contains(setup.genesis_event_id, REFUSAL_WAIT)
+            .await
+            .is_err(),
+        "issue #112: an unproven provisional dialer must not pull the membership closure"
+    );
+
+    // Settle any in-flight frames, then assert its store holds nothing at all — in
+    // particular no leaked `MessageText` chat from the admin's history.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let tail = attacker_node
+        .room_tail(200)
+        .await
+        .expect("attacker room_tail");
+    assert!(
+        tail.is_empty(),
+        "issue #112: an unproven provisional dialer must receive no events; got {} (chat: {})",
+        tail.len(),
+        tail.iter()
+            .filter(|e| e.event_type == EventType::MessageText)
+            .count()
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    attacker_node.shutdown().await.expect("shutdown attacker");
+}
+
 // ── Issue #88 — JoinBootstrapAdmission::new_dynamic (no-respawn window flip) ─
 
 /// Issue #88's acceptance sketch, end-to-end: a resident host built with
@@ -1014,7 +1106,8 @@ async fn dynamic_accept_joins_flips_join_window_without_respawn_or_conn_churn() 
 
     // A resident member connects once, before any flip, and stays connected for
     // the whole test — the peer whose admin-side `ConnEvent` stream must stay quiet.
-    let resident_node = spawn_joiner_node(&resident, &admin, setup.room_id).await;
+    let resident_node =
+        spawn_joiner_node(&resident, &admin, setup.room_id, INV_ID, INV_SECRET).await;
     let mut conn_events = admin_node.conn_events();
     resident_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
     admin_node
@@ -1023,7 +1116,7 @@ async fn dynamic_accept_joins_flips_join_window_without_respawn_or_conn_churn() 
         .expect("resident member connects and is admitted (Active, independent of the window)");
 
     // ── Window closed: a fresh joiner's bootstrap dial is refused ───────────
-    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id).await;
+    let joiner_node = spawn_joiner_node(&joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
     joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
     assert!(
         joiner_node
@@ -1080,7 +1173,8 @@ async fn dynamic_accept_joins_flips_join_window_without_respawn_or_conn_churn() 
     // ── Redeem: close the window again WITHOUT respawning ───────────────────
     window.store(false, Ordering::Relaxed);
 
-    let second_joiner_node = spawn_joiner_node(&second_joiner, &admin, setup.room_id).await;
+    let second_joiner_node =
+        spawn_joiner_node(&second_joiner, &admin, setup.room_id, INV_ID, INV_SECRET).await;
     second_joiner_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
     assert!(
         second_joiner_node

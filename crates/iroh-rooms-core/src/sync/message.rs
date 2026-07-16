@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use crate::event::cbor::{self, CborValue};
-use crate::event::constants::DIGEST_LEN;
+use crate::event::constants::{DIGEST_LEN, SHORT_ID_LEN};
 use crate::event::ids::{EventId, RoomId};
 
 /// A transport peer address: the remote device id (`device_id` == iroh
@@ -131,6 +131,27 @@ pub enum SyncMessage {
         /// Ids the responder lacks.
         ids: Vec<EventId>,
     },
+    /// A join-bootstrap **capability proof** (issue #112): a provisionally-admitted
+    /// dialer proves it holds an invite by presenting the invite's `invite_id` and
+    /// its `capability_secret`. The responder recomputes the invite
+    /// `capability_hash` and matches it against an on-log `member.invited` before it
+    /// will serve the never-windowed membership **closure** — which, since #111, can
+    /// carry the chat that entered the membership ancestry. An uninvited dialer
+    /// cannot produce a matching secret, so it never earns the closure.
+    ///
+    /// This is a bootstrap **privacy** gate only; the convergent `gate_join`
+    /// authorization authority is unchanged and still runs on the actual join. The
+    /// secret carried here is the same one the join later places on the log, and it
+    /// travels only over the authenticated transport link to the admin who minted
+    /// it — so it reveals nothing the responder does not already hold.
+    ProveCapability {
+        /// Room scope.
+        room_id: RoomId,
+        /// The invite the dialer claims (`member.invited.invite_id`).
+        invite_id: [u8; SHORT_ID_LEN],
+        /// The capability secret proving possession of that invite.
+        capability_secret: [u8; SHORT_ID_LEN],
+    },
 }
 
 /// A frame the engine wants sent to a peer. The engine performs no I/O; it
@@ -178,7 +199,8 @@ impl SyncMessage {
             | Self::WantMembership { room_id, .. }
             | Self::WantRecentChat { room_id, .. }
             | Self::Events { room_id, .. }
-            | Self::NotFound { room_id, .. } => room_id,
+            | Self::NotFound { room_id, .. }
+            | Self::ProveCapability { room_id, .. } => room_id,
         }
     }
 
@@ -235,6 +257,19 @@ impl SyncMessage {
                 room_field(room_id),
                 ("ids".to_owned(), id_array(ids)),
             ],
+            Self::ProveCapability {
+                room_id,
+                invite_id,
+                capability_secret,
+            } => vec![
+                tag("prove_capability"),
+                room_field(room_id),
+                ("invite_id".to_owned(), CborValue::Bytes(invite_id.to_vec())),
+                (
+                    "secret".to_owned(),
+                    CborValue::Bytes(capability_secret.to_vec()),
+                ),
+            ],
         };
         cbor::encode(&CborValue::Map(entries))
     }
@@ -288,6 +323,11 @@ impl SyncMessage {
             "not_found" => Self::NotFound {
                 room_id,
                 ids: read_id_array(field(entries, "ids"))?,
+            },
+            "prove_capability" => Self::ProveCapability {
+                room_id,
+                invite_id: read_short_id(field(entries, "invite_id"))?,
+                capability_secret: read_short_id(field(entries, "secret"))?,
             },
             _ => return Err(MessageError::BadShape),
         };
@@ -351,6 +391,13 @@ fn read_digest(value: &CborValue) -> Option<[u8; DIGEST_LEN]> {
 
 fn read_room(value: &CborValue) -> Option<RoomId> {
     read_digest(value).map(RoomId::from_bytes)
+}
+
+fn read_short_id(value: Option<&CborValue>) -> Result<[u8; SHORT_ID_LEN], MessageError> {
+    value
+        .and_then(CborValue::as_bytes)
+        .and_then(|b| <[u8; SHORT_ID_LEN]>::try_from(b).ok())
+        .ok_or(MessageError::BadShape)
 }
 
 fn read_id_array(value: Option<&CborValue>) -> Result<Vec<EventId>, MessageError> {
@@ -477,6 +524,11 @@ mod tests {
         round_trip(&SyncMessage::NotFound {
             room_id: room(),
             ids: vec![id(9)],
+        });
+        round_trip(&SyncMessage::ProveCapability {
+            room_id: room(),
+            invite_id: [0x3c; SHORT_ID_LEN],
+            capability_secret: [0x5e; SHORT_ID_LEN],
         });
     }
 

@@ -39,8 +39,9 @@ use iroh_rooms::events::{
 };
 use iroh_rooms::experimental::blob::{BlobImport, BlobStore, FetchOutcome};
 use iroh_rooms::experimental::session::{
-    AdmissionView, AllowlistAdmission, BlobServeConfig, EndpointId, JoinBootstrapAdmission,
-    NetConfig, NetMode, Node, SecretKey, SnapshotAdmission, TracingAudit, DEFAULT_TICK,
+    AdmissionView, AllowlistAdmission, BlobServeConfig, BootstrapProof, EndpointId,
+    JoinBootstrapAdmission, NetConfig, NetMode, Node, SecretKey, SnapshotAdmission, TracingAudit,
+    DEFAULT_TICK,
 };
 use iroh_rooms::experimental::store::EventStore;
 use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
@@ -177,13 +178,18 @@ async fn spawn_joiner_node(joiner: &Principal, admin: &Principal, room_id: RoomI
         mode: NetMode::Loopback,
         ..NetConfig::default()
     };
-    Node::spawn(
+    Node::spawn_join_bootstrap(
         joiner.iroh_secret(),
         Arc::new(admission),
         Arc::new(TracingAudit),
         engine,
         cfg,
         DEFAULT_TICK,
+        BootstrapProof {
+            room_id,
+            invite_id: INV_ID,
+            capability_secret: INV_SECRET,
+        },
     )
     .await
     .expect("spawn joiner node through the facade")
