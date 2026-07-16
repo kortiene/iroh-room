@@ -63,12 +63,24 @@ scripts/production-readiness.sh
 `scripts/production-readiness.sh --offline-only` is allowed during iteration but
 cannot produce a production-ready verdict.
 
-Build release artifacts only after the gates pass:
+Build release artifacts only after the gates pass. Pushing the release tag runs
+the `release` workflow, which builds and attaches every supported triple:
 
 ```bash
-scripts/build-release-artifacts.sh --version <VERSION>
+git push origin v<VERSION>
 ```
 
+To (re)build artifacts for a tag that already exists — for example after fixing
+a release that shipped an incomplete artifact set:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v<VERSION>
+```
+
+`scripts/build-release-artifacts.sh --version <VERSION>` is the same build run
+locally, but it only ever produces the *rustc host triple*. Use it for local
+dry-runs and smoke tests, not as the source of published artifacts: a release
+cut by hand ships only the platform its release owner happened to build on.
 Use `--allow-dirty` only for local dry-runs, never for signed-off Production
 Beta artifacts.
 
@@ -92,8 +104,8 @@ Rust toolchain:
 - `scripts/verify.sh`: <PASS/FAIL, paste summary>
 - `scripts/release-readiness.sh`: <PASS/FAIL, paste `release-readiness: ...`>
 - `scripts/production-readiness.sh`: <PASS/FAIL, paste `production-readiness: ...`>
-- `scripts/build-release-artifacts.sh --version <VERSION>`:
-  <PASS/FAIL, paste artifact path and SHA-256>
+- `release` workflow run for `v<VERSION>`:
+  <PASS/FAIL, paste run URL, then one artifact name + SHA-256 per supported triple>
 
 ## Manual P0 Sign-Offs
 
@@ -152,11 +164,15 @@ Production Beta artifacts must be:
 - Built from a recorded commit SHA.
 - Checksummed.
 - Distributed with install and uninstall instructions.
+- Built for every triple the release notes list as supported, and listed in the
+  notes for every triple actually attached to the release. `install-uninstall.md`
+  only supports triples the notes name with a checksum, so an unannounced
+  artifact is an unsupported one.
 
-Recommended checksum command:
+The `release` workflow builds and checksums each triple on a native runner and
+attaches both files to the tag's release. Verify a downloaded artifact with:
 
 ```bash
-scripts/build-release-artifacts.sh --version <VERSION>
 shasum -a 256 -c <artifact>.sha256
 ```
 
