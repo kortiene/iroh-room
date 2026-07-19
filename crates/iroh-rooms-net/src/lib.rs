@@ -73,7 +73,10 @@ pub use manager::PeerManager;
 pub use node::{BlobServeConfig, BootstrapProof, Node, DEFAULT_TICK};
 pub use pipe::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,
-    PipeSessionInfo, TracingPipeAudit, PIPE_ALPN,
+    PipeSessionInfo, TracingPipeAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
 };
 pub use state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
-pub use transport::{Inbound, NetConfig, NetMode, NetTransport, Shared, RELAY_ONLY_TEST_BUILD};
+pub use transport::{
+    Inbound, NetConfig, NetMode, NetTransport, Shared, MAX_CONCURRENT_BIDI_STREAMS,
+    RELAY_ONLY_TEST_BUILD,
+};

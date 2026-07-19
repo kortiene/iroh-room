@@ -37,7 +37,7 @@ mod handler;
 
 pub use alpn::{PIPE_ALPN, PIPE_REJECT_CODE, PIPE_TEARDOWN_CODE};
 pub use audit::{PipeAuditSink, PipeDenyCause, TracingPipeAudit};
-pub use connector::{PipeForwarder, PipeOutcome};
+pub use connector::{PipeForwarder, PipeOutcome, PIPE_MAX_CONCURRENT_FORWARDS};
 pub use error::PipeError;
 pub use gate::PipeGateVerdict;
 pub use hello::PipeHello;

@@ -24,6 +24,7 @@ use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::pipe::is_loopback_target;
 use iroh_rooms_net::{
     NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome, DEFAULT_TICK,
+    PIPE_MAX_CONCURRENT_FORWARDS,
 };
 use serde_json::json;
 
@@ -329,6 +330,7 @@ pub async fn connect(
                 Some(PipeOutcome::Forwarded) => println!("[pipe] connection forwarding"),
                 Some(PipeOutcome::Denied) => eprintln!("[pipe] denied by the owner (not authorized / closed)"),
                 Some(PipeOutcome::OwnerClosed) => eprintln!("[pipe] owner closed the connection"),
+                Some(PipeOutcome::Saturated) => eprintln!("[pipe] refused: this connector is at its {PIPE_MAX_CONCURRENT_FORWARDS}-connection budget; retry when one finishes"),
                 Some(PipeOutcome::Error(e)) => eprintln!("[pipe] error: {e}"),
                 None => break,
             },
