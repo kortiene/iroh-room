@@ -109,16 +109,24 @@ pub enum Severity {
 /// A first-class trust event surfaced for the audit surface (spec §9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustDecision {
-    /// Stable code: `equivocation` (admin fork), `admin_view_suspect`, or
-    /// `store_degraded` (an accepted event could not be persisted, issue #119).
+    /// Stable code: `equivocation` (admin fork), `admin_view_suspect`,
+    /// `store_degraded` (an accepted event could not be persisted, issue #119),
+    /// `backfill_depth_exceeded` (a chain gap deeper than `max_backfill_depth`
+    /// was dropped as a phantom parent — permanently unrecoverable, fix 2),
+    /// `park_overflow` (a parked frame was cap-evicted and may be lost, fix 2),
+    /// or `admin_tip_expired` (an unconfirmed admin tip expired, failing the
+    /// removal-sensitive access gate OPEN, fix 2).
     pub code: &'static str,
-    /// Severity (CRITICAL on an admin fork or a degraded store).
+    /// Severity (CRITICAL on an admin fork, a degraded store, a permanent event
+    /// loss, or a fail-open tip expiry).
     pub severity: Severity,
-    /// The `admin_seq` the decision concerns (`0` for decisions that concern no
-    /// admin event, e.g. `store_degraded`).
+    /// The `admin_seq` the decision concerns (the expired tip's seq for
+    /// `admin_tip_expired`; `0` for decisions that concern no admin event, e.g.
+    /// `store_degraded` / `backfill_depth_exceeded` / `park_overflow`).
     pub admin_seq: u64,
     /// The event ids involved (both branch tips for a fork; the unpersistable
-    /// event for `store_degraded`).
+    /// event for `store_degraded`; the lost event for `backfill_depth_exceeded`
+    /// and `park_overflow`; the abandoned tip for `admin_tip_expired`).
     pub event_ids: Vec<EventId>,
 }
 
@@ -185,6 +193,15 @@ pub struct SyncCounters {
     /// exhausted, or the retry queue was full on arrival). Each one also
     /// records a CRITICAL `store_degraded` [`TrustDecision`].
     pub store_retry_dropped: u64,
+
+    // -- silent-loss / fail-open evidence (fix 2) -------------------------------
+    /// Unconfirmed admin tips expired by the attempt budget
+    /// ([`max_unconfirmed_tip_attempts`](SyncConfig::max_unconfirmed_tip_attempts)).
+    /// Each expiry *fails the removal-sensitive access gate open* on a tip that
+    /// could never be confirmed; non-zero means at least one such fail-open
+    /// happened this session, and the first one also records a CRITICAL
+    /// `admin_tip_expired` [`TrustDecision`].
+    pub suspect_tip_expired: u64,
 }
 
 /// One fold-accepted event whose `store.insert` failed, held in memory for
@@ -1111,10 +1128,29 @@ impl SyncEngine {
         let depth = self.backfill_depth.get(&id).copied().unwrap_or(0);
 
         // Gate 2/5: phantom-parent depth bound (structural proxy for an
-        // implausible derived lamport).
+        // implausible derived lamport). A real chain gap deeper than this is
+        // dropped here and is permanently unrecoverable by this node through the
+        // backfill path (spec §4.4), so surface it the way #119 surfaces
+        // `store_degraded`: count every drop and record a CRITICAL
+        // `backfill_depth_exceeded` decision. This is a hot path (one call per
+        // buffered frame, floodable by fabricated deep chains), so the CRITICAL
+        // record is latched to the *first* drop of the session — the counter
+        // carries the ongoing volume — rather than storming the audit sink with a
+        // per-event decision (its own denial of service).
         if depth > self.config.max_backfill_depth {
+            if self.counters.phantom_depth_dropped == 0 {
+                self.record_trust(TrustDecision {
+                    code: "backfill_depth_exceeded",
+                    severity: Severity::Critical,
+                    admin_seq: 0,
+                    event_ids: vec![id],
+                });
+            }
             self.counters.phantom_depth_dropped += 1;
-            self.log("reject.phantom_parent_depth");
+            self.log(&format!(
+                "reject.phantom_parent_depth id={id} author={} depth={depth}",
+                ev.event.sender_id
+            ));
             return;
         }
 
@@ -1258,14 +1294,31 @@ impl SyncEngine {
     }
 
     /// Evict one parked frame (cap overflow): drop it from memory and the
-    /// persisted park, count and log it.
+    /// persisted park, count and log it. A frame evicted here and not later
+    /// re-served is permanently lost (spec §4.4), so — mirroring the #119
+    /// `store_degraded` path — record a CRITICAL `park_overflow` decision naming
+    /// the victim. Eviction is a hot, floodable path, so the CRITICAL record is
+    /// latched to the *first* eviction of the session (the `park_evicted` counter
+    /// carries the volume) rather than one decision per evicted frame.
     fn evict_parked(&mut self, id: EventId, reason: &str) {
+        let author = self.park.get(&id).map(|p| p.author);
         self.park.remove(&id);
         self.backfill_depth.remove(&id);
         self.restored_backfill.remove(&id);
         self.persist_delete_parked(id);
+        if self.counters.park_evicted == 0 {
+            self.record_trust(TrustDecision {
+                code: "park_overflow",
+                severity: Severity::Critical,
+                admin_seq: 0,
+                event_ids: vec![id],
+            });
+        }
         self.counters.park_evicted += 1;
-        self.log(reason);
+        match author {
+            Some(a) => self.log(&format!("{reason} id={id} author={a}")),
+            None => self.log(&format!("{reason} id={id}")),
+        }
     }
 
     /// The oldest parked id (optionally restricted to one author), by arrival seq
@@ -1729,6 +1782,25 @@ impl SyncEngine {
         if susp.attempts == 0 {
             self.suspect_tip = None;
             self.persist_sync_state();
+            // Expiring the suspicion FAILS OPEN the removal-sensitive access gate:
+            // the node stops failing closed on a tip it could never confirm, so a
+            // removal it never saw could leave a removed member trusted as active.
+            // Unlike the advisory admin-view-suspect warning, this transition
+            // weakens a security property, so record it as CRITICAL
+            // `admin_tip_expired` naming the abandoned tip. Expiry is tick-rate
+            // bounded and needs a fresh fabricated tip each time (not a hot path),
+            // but to stay consistent with the other fix-2 bounds — and to blunt a
+            // rotating-tip attacker — the CRITICAL record is latched to the first
+            // expiry of the session while the counter tracks every one.
+            if self.counters.suspect_tip_expired == 0 {
+                self.record_trust(TrustDecision {
+                    code: "admin_tip_expired",
+                    severity: Severity::Critical,
+                    admin_seq: susp.seq,
+                    event_ids: vec![susp.id],
+                });
+            }
+            self.counters.suspect_tip_expired += 1;
             self.log("unconfirmed admin tip expired: admin_tip_unconfirmed");
             if let Err(e) = self.recompute_completeness() {
                 self.log(&format!("completeness recompute failed: {e}"));
@@ -2221,6 +2293,9 @@ fn trust_row_to_decision(tr: &TrustRow) -> Result<TrustDecision, StoreError> {
         "equivocation" => "equivocation",
         "admin_view_suspect" => "admin_view_suspect",
         "store_degraded" => "store_degraded",
+        "backfill_depth_exceeded" => "backfill_depth_exceeded",
+        "park_overflow" => "park_overflow",
+        "admin_tip_expired" => "admin_tip_expired",
         other => {
             return Err(StoreError::integrity(format!(
                 "unknown stored trust code {other:?}"

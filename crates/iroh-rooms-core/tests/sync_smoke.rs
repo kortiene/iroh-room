@@ -459,6 +459,103 @@ fn stale_admin_tip_fails_closed_then_recovers() {
 }
 
 // ---------------------------------------------------------------------------
+// Security — an unconfirmable admin tip expires and FAILS OPEN, loudly (fix 2)
+// ---------------------------------------------------------------------------
+
+// A fabricated higher admin tip that can never be backfilled is expired by the
+// attempt budget so it cannot pin the node fail-closed forever (spec §13). That
+// expiry *fails the removal-sensitive gate open* — a security-relevant
+// transition — so it must not be silent: it surfaces a CRITICAL
+// `admin_tip_expired` decision plus a counter, mirroring how #119 surfaces
+// store_degraded.
+#[test]
+fn stale_admin_tip_expiry_fails_open_and_records_critical() {
+    let built = build_log(0, true);
+    // A tiny attempt budget so the fabricated tip reaches expiry in a few ticks
+    // (the default value is unchanged; only this test drives a small bound).
+    let cfg = SyncConfig {
+        max_unconfirmed_tip_attempts: 2,
+        ..SyncConfig::default()
+    };
+    let store = EventStore::open_in_memory().expect("store");
+    let mut engine = SyncEngine::open(store, built.room, cfg).expect("engine");
+
+    // Seed everything except the removal: the node holds carol as an active
+    // member and believes its admin view is complete.
+    for f in &built.events[..built.events.len() - 1] {
+        engine.publish(f).expect("seed prefix");
+    }
+    assert_eq!(engine.completeness(), Completeness::Complete);
+    assert!(engine.snapshot().is_active(&built.carol.identity()));
+
+    // A peer advertises a higher admin tip whose event can never be backfilled
+    // (a fabricated id this node will never hold).
+    let fake_tip = EventId::from_bytes([0x77; 32]);
+    let fake_seq = 999;
+    let _ = engine.on_message(
+        NODE_A,
+        SyncMessage::AdminTip {
+            room_id: built.room,
+            tip: Some((fake_tip, fake_seq)),
+        },
+    );
+
+    // While the tip is suspect the node fails CLOSED on carol (correct posture).
+    assert_eq!(engine.completeness(), Completeness::AdminViewSuspect);
+    assert!(
+        engine
+            .fail_closed_subjects()
+            .contains(&built.carol.identity()),
+        "carol is fail-closed while the tip is unconfirmed"
+    );
+    assert_eq!(engine.counters().suspect_tip_expired, 0);
+    assert!(
+        !engine
+            .trust_decisions()
+            .iter()
+            .any(|d| d.code == "admin_tip_expired"),
+        "no fail-open recorded before the budget is spent"
+    );
+
+    // Tick the attempt budget down: 2 -> 1 -> 0 -> expire on the third tick. The
+    // injected `now_ms` is advisory only (never gates the expiry), so the exact
+    // values do not matter, only that three ticks elapse.
+    for t in (T0 + 1..).take(3) {
+        let _ = engine.on_tick(t);
+    }
+
+    // The fail-OPEN is now loud: the suspicion cleared (carol is trusted again
+    // despite the removal we never confirmed), and the transition is surfaced.
+    assert_eq!(
+        engine.completeness(),
+        Completeness::Complete,
+        "the attempt budget expired the unconfirmed suspicion"
+    );
+    assert!(
+        !engine
+            .fail_closed_subjects()
+            .contains(&built.carol.identity()),
+        "expiry fails OPEN: carol is trusted again despite the unconfirmed removal"
+    );
+    assert_eq!(engine.counters().suspect_tip_expired, 1);
+    let decisions = engine.trust_decisions();
+    assert!(
+        decisions.iter().any(|d| d.code == "admin_tip_expired"
+            && d.severity == Severity::Critical
+            && d.admin_seq == fake_seq
+            && d.event_ids == vec![fake_tip]),
+        "the fail-open must surface a CRITICAL admin_tip_expired naming the tip; got {decisions:?}"
+    );
+    assert!(
+        engine
+            .logs()
+            .iter()
+            .any(|l| l.contains("admin_tip_unconfirmed")),
+        "the expiry must be logged"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test plan — shuffled delivery converges deterministically across seeds
 // ---------------------------------------------------------------------------
 
@@ -1114,6 +1211,18 @@ fn global_park_cap_evicts_oldest_across_authors() {
         engine.logs().iter().any(|l| l.contains("max_parked_total")),
         "global cap eviction must be logged as max_parked_total"
     );
+
+    // fix 2: an evicted-and-never-re-served frame is permanently lost, so the
+    // overflow is surfaced (not a silent drop) — a CRITICAL `park_overflow`
+    // decision names the evicted event.
+    let inv_carol_id = frame_event_id(&built.events[3]);
+    let decisions = engine.trust_decisions();
+    assert!(
+        decisions.iter().any(|d| d.code == "park_overflow"
+            && d.severity == Severity::Critical
+            && d.event_ids == vec![inv_carol_id]),
+        "the max_parked_total eviction must surface a CRITICAL decision; got {decisions:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1269,18 @@ fn phantom_depth_drop_gates_backfill_chain() {
             .iter()
             .any(|l| l.contains("phantom_parent_depth")),
         "phantom depth drop must be logged"
+    );
+
+    // fix 2: the drop is a *permanent* loss (unrecoverable through backfill), so
+    // it is not silent — a CRITICAL `backfill_depth_exceeded` decision names the
+    // lost event, exactly as #119 surfaces store_degraded.
+    let inv_carol_id = frame_event_id(&built.events[3]);
+    let decisions = engine.trust_decisions();
+    assert!(
+        decisions.iter().any(|d| d.code == "backfill_depth_exceeded"
+            && d.severity == Severity::Critical
+            && d.event_ids == vec![inv_carol_id]),
+        "the phantom-depth drop must surface a CRITICAL decision; got {decisions:?}"
     );
 }
 
