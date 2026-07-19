@@ -5,6 +5,15 @@
 //! A Gate-D **NO-GO** condition is an *unbounded* orphan park or backfill, so the
 //! engine enforces all of these and logs whenever one drops, evicts, or caps
 //! something (spec §4.4 final paragraph / §9).
+//!
+//! These are anti-amplification bounds, **not** a room-size limit: nothing here
+//! (or anywhere else in code) enforces or warns on the declared ≤5-peer ceiling
+//! (ADR-1, `PHASE-0-SPIKE.md`). Above it these defaults do not degrade
+//! gracefully — at N=25 delivery was measured to stop entirely (idle
+//! `frames_sent=0`, `accepted=0`, 661 MB inbound backlog) while every
+//! connectivity signal read healthy. Staying under the ceiling is the
+//! operator's responsibility, documented in `README.md` and the PRD success
+//! metrics.
 
 /// Anti-amplification configuration for the sync engine (spec §4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

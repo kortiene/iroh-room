@@ -190,11 +190,22 @@ not discovered by a user:
   is still dropped wherever no explicit CLI sink is installed.
 - **Small-room, single-immutable-admin, TCP-only-pipe, loopback-only-bind**
   scope (PRD §7, §18.4).
-- **File-size cap divergence to confirm.** Code enforces
-  `MAX_SHARED_FILE_BYTES` = **100 MiB** (`104_857_600` bytes,
-  `crates/iroh-rooms-core/src/event/constants.rs`); PRD §17.1's metric target
-  is **25 MB**. Record the shipped cap on each build and flag the divergence
-  rather than silently accepting it.
+- **File-size cap reconciled.** Code enforces `MAX_SHARED_FILE_BYTES` =
+  **100 MiB** (`104_857_600` bytes,
+  `crates/iroh-rooms-core/src/event/constants.rs`), checked at share, at
+  `file.shared` validation, and at fetch buffering. The PRD success metrics
+  (PRD §18.6, PRD.v0.3 §17.1.9) previously read **25 MB**, a target that was
+  never enforced; they now document the shipped 100 MiB cap, so this is no
+  longer a per-build divergence to flag. The 100 MiB cap is not free and the
+  PRD records the measured cost: a 100 MiB fetch was measured at ~134.6 MB
+  consumer RSS (the collector allocates the next power of two) and ~2.004x
+  disk amplification (payload written to the out path *and* re-imported into
+  the blob store, with no GC or delete path in non-test code). A
+  `cargo test -p iroh-rooms-core` guard pins the constant so the docs and the
+  code cannot silently drift apart again. Note the test-only
+  `IROH_ROOMS_MAX_SHARE_BYTES` override (`crates/iroh-rooms-cli/src/file.rs`)
+  is not a user-facing knob: it is absent from `--help` and the size error
+  still names the effective cap.
 
 ## Security warnings
 

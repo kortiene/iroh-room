@@ -99,7 +99,9 @@ The supported binary artifact for this candidate is `x86_64-apple-darwin`. Build
 Read these before trusting Iroh Rooms with real work:
 
 - **No central application server**: peers sync directly through the iroh transport
+- **Small rooms only (≤5 members)**: the transport is a full QUIC mesh sized for the declared ≤5-peer ceiling (ADR-1, `PHASE-0-SPIKE.md`). Nothing in code enforces or warns on room size, so it is on the operator to stay under it. Above the ceiling the failure mode is silent: at N=25 the system was measured to stop delivering messages entirely (idle `frames_sent=0`, `accepted=0`, a 661 MB inbound backlog) while every connectivity signal still read healthy. Do not run rooms larger than 5 participants.
 - **No guaranteed offline delivery**: a peer may need to be online and serving for another peer to fetch data
+- **Files up to 100 MiB, and the cap is not free**: the enforced share cap is `MAX_SHARED_FILE_BYTES` = 100 MiB. A 100 MiB fetch was measured at ~134.6 MB consumer RSS (the collector allocates the next power of two) and ~2.004x disk use (the payload is written to the out path and re-imported into the blob store), and there is no GC or delete path in non-test code
 - **Plaintext local storage**: beta storage is scoped to trusted local machines
 - **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
 - **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
