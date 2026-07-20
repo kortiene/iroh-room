@@ -232,6 +232,17 @@ impl AuditSink for LocalAudit {
         self.stderr.event_flagged(device, code);
     }
 
+    fn transport_queue_saturated(&self, device: EndpointId, queue: &'static str) {
+        self.persistent.record(
+            "transport.queue.saturated",
+            json!({
+                "peer": device.to_string(),
+                "queue": queue,
+            }),
+        );
+        self.stderr.transport_queue_saturated(device, queue);
+    }
+
     fn bootstrap_admitted(&self, device: EndpointId) {
         self.record_peer("join.bootstrap.admitted", device);
         self.stderr.bootstrap_admitted(device);
@@ -327,6 +338,10 @@ impl AuditSink for StderrAudit {
 
     fn deauthorized(&self, device: EndpointId) {
         eprintln!("note: peer {device} was removed from the room mid-session");
+    }
+
+    fn transport_queue_saturated(&self, device: EndpointId, queue: &'static str) {
+        eprintln!("warning[transport_queue_saturated]: {queue} queue saturated for peer {device}");
     }
 
     fn event_flagged(&self, device: EndpointId, code: &'static str) {

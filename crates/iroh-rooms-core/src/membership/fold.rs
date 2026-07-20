@@ -21,7 +21,7 @@ use crate::event::reject::{Flag, MembershipOracle, RejectReason};
 use crate::event::signed::SignedEvent;
 use crate::event::validate::ValidatedEvent;
 
-use super::model::{Member, MembershipSnapshot, Role, Status};
+use super::model::{Member, MembershipSnapshot, Role, Status, MAX_ACTIVE_MEMBERS};
 
 /// The per-event verdict the fold assigns once the event is causally complete.
 #[derive(Clone, Debug)]
@@ -488,6 +488,10 @@ impl RoomMembership {
             return Err(RejectReason::ExpiredInvite);
         }
 
+        if !view.is_active(&subject) && view.active_member_count() >= MAX_ACTIVE_MEMBERS {
+            return Err(RejectReason::RoomFull);
+        }
+
         Ok(())
     }
 
@@ -645,6 +649,7 @@ impl RoomMembership {
             subjects.remove(&a);
         }
 
+        let mut active_ranks = BTreeMap::new();
         for subject in subjects {
             let touch = self.touch_events(scope, subject);
             if touch.is_empty() {
@@ -652,6 +657,11 @@ impl RoomMembership {
             }
             let heads = self.causal_heads(&touch);
             let status = self.status_from_heads(&heads);
+            if status == Status::Active {
+                if let Some(rank) = self.activation_event(&touch, &heads) {
+                    active_ranks.insert(subject, rank);
+                }
+            }
             let role = self.resolve_role(&touch, &heads);
             let device = self.resolve_device(&touch, &heads);
             members.insert(
@@ -667,6 +677,8 @@ impl RoomMembership {
                 by_device.insert(d, subject);
             }
         }
+
+        Self::cap_active_members(admin, &mut members, &active_ranks);
 
         MembershipSnapshot::new(self.room_id, admin, members, by_device)
     }
@@ -756,6 +768,41 @@ impl RoomMembership {
             })
             .min_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)))
             .map(|(role, _)| role)
+    }
+
+    fn activation_event(&self, touch: &[EventId], heads: &[EventId]) -> Option<EventId> {
+        heads
+            .iter()
+            .chain(touch.iter())
+            .filter_map(|id| {
+                let node = self.nodes.get(id)?;
+                matches!(node.event.event.content, Content::MemberJoined(_)).then_some(*id)
+            })
+            .min()
+    }
+
+    fn cap_active_members(
+        admin: Option<IdentityKey>,
+        members: &mut BTreeMap<IdentityKey, Member>,
+        active_ranks: &BTreeMap<IdentityKey, EventId>,
+    ) {
+        let slots = MAX_ACTIVE_MEMBERS.saturating_sub(usize::from(admin.is_some()));
+        let mut admitted: BTreeSet<IdentityKey> = active_ranks
+            .iter()
+            .map(|(identity, rank)| (*rank, *identity))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(slots)
+            .map(|(_, identity)| identity)
+            .collect();
+        if let Some(admin) = admin {
+            admitted.insert(admin);
+        }
+        for member in members.values_mut() {
+            if member.status == Status::Active && !admitted.contains(&member.identity) {
+                member.status = Status::Invited;
+            }
+        }
     }
 
     /// The device bound to the subject: from the lowest-id `member.joined` head

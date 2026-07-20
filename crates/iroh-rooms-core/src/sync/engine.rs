@@ -346,6 +346,9 @@ pub struct SyncEngine {
     /// session state like the caches: a restart resets the sweep phase, never
     /// its guarantees (the window position is coverage-only, not trust).
     claim_rotation: u64,
+    /// Whether the next tick should emit full anti-entropy pulls even if no local
+    /// sync activity has happened since the previous tick.
+    force_next_tick_pull: bool,
 }
 
 /// How much of the responder's held set a `WantMembership` `have` ancestry
@@ -410,6 +413,7 @@ impl SyncEngine {
             closure_cache: None,
             covered_cache: BTreeMap::new(),
             claim_rotation: 0,
+            force_next_tick_pull: true,
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -493,6 +497,7 @@ impl SyncEngine {
     /// never-windowed membership sub-DAG and the bounded recent chat window.
     pub fn on_connect(&mut self, peer: PeerId) -> Vec<Outgoing> {
         self.peers.insert(peer);
+        self.force_next_tick_pull = true;
         let mut out = vec![
             to(peer, self.admin_tip_msg()),
             to(peer, self.heads_msg()),
@@ -525,11 +530,13 @@ impl SyncEngine {
     /// for retry on reconnect (spec §6.3 / A4).
     pub fn on_disconnect(&mut self, peer: PeerId) {
         self.peers.remove(&peer);
+        self.force_next_tick_pull = true;
     }
 
     /// Handle one inbound control/data message (§6.4 responder + the detector).
     pub fn on_message(&mut self, from: PeerId, msg: SyncMessage) -> Vec<Outgoing> {
         let mut out = Vec::new();
+        self.force_next_tick_pull = true;
         if msg.room_id() != &self.room_id {
             self.log("dropped frame for foreign room");
             return out;
@@ -585,30 +592,43 @@ impl SyncEngine {
         // A restart may have left parked frames owed their one-shot by-id backfill;
         // the first tick after `open` re-issues it if no `on_connect` did (spec §6.3).
         self.retry_restored_park(&mut out);
-        let membership_have = self.membership_have();
-        let chat_have = self.chat_have();
+        let emit_pulls = self.force_next_tick_pull || self.has_pending_sync_work();
+        self.force_next_tick_pull = false;
+        let membership_have = emit_pulls.then(|| self.membership_have());
+        let chat_have = emit_pulls.then(|| self.chat_have());
         for peer in self.peers.iter().copied().collect::<Vec<_>>() {
             out.push(to(peer, self.admin_tip_msg()));
-            out.push(to(
-                peer,
-                SyncMessage::WantMembership {
-                    room_id: self.room_id,
-                    have: membership_have.clone(),
-                },
-            ));
-            out.push(to(
-                peer,
-                SyncMessage::WantRecentChat {
-                    room_id: self.room_id,
-                    window: Window {
-                        max_count: self.config.chat_window_default,
-                        since_ms: None,
+            if let Some(have) = &membership_have {
+                out.push(to(
+                    peer,
+                    SyncMessage::WantMembership {
+                        room_id: self.room_id,
+                        have: have.clone(),
                     },
-                    have: chat_have.clone(),
-                },
-            ));
+                ));
+            }
+            if let Some(have) = &chat_have {
+                out.push(to(
+                    peer,
+                    SyncMessage::WantRecentChat {
+                        room_id: self.room_id,
+                        window: Window {
+                            max_count: self.config.chat_window_default,
+                            since_ms: None,
+                        },
+                        have: have.clone(),
+                    },
+                ));
+            }
         }
         out
+    }
+
+    fn has_pending_sync_work(&self) -> bool {
+        !self.park.is_empty()
+            || !self.store_retry.is_empty()
+            || !self.restored_backfill.is_empty()
+            || self.suspect_tip.is_some()
     }
 
     // ------------------------------------------------------------------
@@ -920,6 +940,7 @@ impl SyncEngine {
         from: Option<PeerId>,
         out: &mut Vec<Outgoing>,
     ) {
+        self.force_next_tick_pull = true;
         let outcome = match self.store.insert(ev) {
             Ok(o) => o,
             Err(e) => {

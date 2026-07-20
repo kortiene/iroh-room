@@ -1115,6 +1115,7 @@ fn reject_reason_code_strings_match_spec() {
         RejectReason::NotGenesisDescended.code(),
         "not_genesis_descended"
     );
+    assert_eq!(RejectReason::RoomFull.code(), "room_full");
 }
 
 #[test]

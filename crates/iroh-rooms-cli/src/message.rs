@@ -708,6 +708,8 @@ async fn print_diagnostics(node: &Node) {
     );
 
     let entries: HashMap<EndpointId, PeerEntry> = node.peer_entries().into_iter().collect();
+    let queue_depths: HashMap<EndpointId, usize> =
+        node.outbound_queue_depths().into_iter().collect();
     let (mut direct, mut relay, mut mixed) = (0u32, 0u32, 0u32);
     let (mut connected, mut offline, mut unauthorized) = (0u32, 0u32, 0u32);
     for (device, path_type, relay_url) in node.peer_paths().await {
@@ -717,10 +719,11 @@ async fn print_diagnostics(node: &Node) {
             .map_or_else(|| "unknown".to_owned(), |id| short_id(&id));
         let state_label = entry.map_or("unknown", |e| e.state.label());
         eprintln!(
-            "diag: peer {identity} device={} state={state_label} path={} relay={}",
+            "diag: peer {identity} device={} state={state_label} path={} relay={} outbound_depth={}",
             short_device(&device),
             path_type.label(),
             relay_url.as_deref().unwrap_or("none"),
+            queue_depths.get(&device).copied().unwrap_or(0),
         );
         match path_type {
             PathType::Direct => direct += 1,

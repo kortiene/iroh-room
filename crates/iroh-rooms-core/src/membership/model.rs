@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use crate::event::ids::RoomId;
 use crate::event::keys::{DeviceKey, IdentityKey};
 
+pub const MAX_ACTIVE_MEMBERS: usize = 5;
+
 /// A subject's current membership status (spike §3.4).
 ///
 /// Ordered so the **Removed-dominates** rule is a `max`:
@@ -155,6 +157,12 @@ impl MembershipSnapshot {
     /// Iterate the currently-`Active` members in deterministic identity order.
     pub fn active_members(&self) -> impl Iterator<Item = &Member> {
         self.members.values().filter(|m| m.status == Status::Active)
+    }
+
+    /// Count currently-`Active` members.
+    #[must_use]
+    pub fn active_member_count(&self) -> usize {
+        self.active_members().count()
     }
 
     /// Iterate every known member (any status) in deterministic identity order.

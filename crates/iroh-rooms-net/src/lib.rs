@@ -77,6 +77,6 @@ pub use pipe::{
 };
 pub use state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
 pub use transport::{
-    Inbound, NetConfig, NetMode, NetTransport, Shared, MAX_CONCURRENT_BIDI_STREAMS,
+    Inbound, NetConfig, NetMode, NetTransport, OutboundQueue, Shared, MAX_CONCURRENT_BIDI_STREAMS,
     RELAY_ONLY_TEST_BUILD,
 };

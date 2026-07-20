@@ -515,7 +515,7 @@ a removal, `pipe.closed`, or expiry. Exposure is bounded by *removal-event reach
 
 The exact `.code()` spellings — do not invent variants:
 
-### Rejections (14 — event dropped, never persisted or re-broadcast)
+### Rejections (15 — event dropped, never persisted or re-broadcast)
 
 | Code | Meaning | Layer |
 |---|---|---|
@@ -533,6 +533,7 @@ The exact `.code()` spellings — do not invent variants:
 | `insufficient_role` | `sender_id`'s role does not permit `event_type` | deferred (membership) |
 | `expired_invite` | A cited invite was consumed (sticky departure) or its `expires_at` passed | deferred (membership) |
 | `bad_capability` | A join's `capability_secret` did not reproduce the invite's hash, or no such invite exists in the ancestor view | deferred (membership) |
+| `room_full` | Accepting a join would exceed the supported active-member ceiling | deferred (membership) |
 
 ### Ignored (not an error)
 

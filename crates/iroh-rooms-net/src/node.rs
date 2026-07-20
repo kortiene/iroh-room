@@ -558,6 +558,11 @@ impl Node {
         self.transport.peer_entries()
     }
 
+    #[must_use]
+    pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
+        self.transport.outbound_queue_depths()
+    }
+
     /// Subscribe to the live [`ConnEvent`] transition stream.
     #[must_use]
     pub fn conn_events(&self) -> broadcast::Receiver<ConnEvent> {
@@ -1108,7 +1113,7 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one wiring seam; each channel/handle is distinct
 async fn pump(
     mut engine: SyncEngine,
-    mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
+    mut inbound_rx: mpsc::Receiver<Inbound>,
     mut conn_rx: broadcast::Receiver<ConnEvent>,
     shared: Arc<Shared>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,

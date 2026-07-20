@@ -64,7 +64,7 @@ Read this before writing code; the point of the issue is *completeness and trace
 so start by cataloguing what is already covered and avoid duplicating it.
 
 ### Already implemented (dependency #6 and siblings)
-- `crates/iroh-rooms-core/src/event/reject.rs` — `RejectReason` (14 variants) and `Flag`
+- `crates/iroh-rooms-core/src/event/reject.rs` — `RejectReason` (15 variants) and `Flag`
   (3 variants: `ClockSkew`, `Equivocation`, `FromRemovedMember`), each with a `.code()`
   string. `MembershipOracle` trait lives here too.
 - `crates/iroh-rooms-core/src/event/validate.rs` — `validate_wire_bytes(...)` (stateless
@@ -78,7 +78,7 @@ so start by cataloguing what is already covered and avoid duplicating it.
   non-canonical cases, `too_many_parents`, unknown schema/type, content-validation
   rejections, clock-skew advisory (threshold tests), and `reject_reason_code_strings_match_spec`
   / `flag_code_strings_match_spec` (**note: the reason-code test currently asserts only 9 of
-  the 14 variants** — the five stateful ones are unasserted; the new gate closes this).
+  the 15 variants** — the stateful ones are unasserted; the new gate closes this).
 - Duplicate idempotency: `tests/store_e2e.rs` (`file_backed_duplicate_across_reopen_is_ignored`)
   and `tests/membership_store_e2e.rs` (dup insert stats) via `InsertOutcome::Duplicate`.
 - Stateful behaviour (fold, ordering, equivocation, access gates): scattered across
@@ -293,7 +293,7 @@ The spike marks two tiers of golden values. The fixtures module **must** treat t
 8. **`taxonomy.rs` — coverage matrix + gate (§4.4).** Implement `COVERAGE`, `DEFERRED`
    (empty), the exhaustive-match enumerators for `RejectReason` and `Flag`, and
    `every_reason_and_flag_is_covered_or_deferred`. Add `reason_and_flag_code_strings_match_spec`
-   asserting **all 14** reason codes and **all 3** flag codes (closes the 9-of-14 gap noted
+   asserting **all 15** reason codes and **all 3** flag codes (closes the original partial-code gap noted
    in §3).
 9. **Traceability doc comment** in `conformance/mod.rs`: the full §1–§20 → test-fn table and
    the §8 code → vector map (mirror of §6/§7 below).
@@ -337,7 +337,7 @@ The spike marks two tiers of golden values. The fixtures module **must** treat t
 
 ## 7. Taxonomy coverage matrix (§8) — every outcome mapped
 
-**Rejections (14):**
+**Rejections (15):**
 
 | Code | Covered by |
 |---|---|
@@ -353,6 +353,7 @@ The spike marks two tiers of golden values. The fixtures module **must** treat t
 | `invalid_content` | serialization (ported content-bounds cases: body-too-long, bad enum, pct>100, empty admins, …) |
 | `expired_invite` | §15, §19 |
 | `bad_capability` | §15 |
+| `room_full` | membership (`join_rejected_when_room_is_full`) |
 | `too_many_parents` | serialization (ported: `too_many_parents_is_rejected`, >20) |
 | `not_genesis_descended` | serialization (ported: empty/floating `prev_events`) |
 

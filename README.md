@@ -131,7 +131,7 @@ The `next: <action>` line is additive. It does not replace the machine-readable 
 | `0` | Success | command completed, including best-effort sends that reach zero peers | none |
 | `1` | Internal | unexpected or uncoded failure | `internal` |
 | `2` | Usage | bad input, missing local state, or unreadable local files | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
-| `3` | Auth | membership, role, capability, identity, or peer authorization denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `wrong_identity`, `peer_unauthorized` |
+| `3` | Auth | membership, role, capability, identity, room-capacity, or peer authorization denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `room_full`, `wrong_identity`, `peer_unauthorized` |
 | `4` | Integrity | signature, event id, encoding, schema, content, room binding, or hash verification failure | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch` |
 | `5` | Ticket | invite ticket decoding failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
 | `6` | Connectivity | peer reachability or blob availability failure | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
@@ -154,6 +154,7 @@ Per-code reference:
 | `insufficient_role` | Auth | `3` | role does not permit the operation | ask the admin to invite you with the intended role |
 | `expired_invite` | Auth | `3` | invite expired or was consumed | ask the admin for a fresh `room invite` |
 | `bad_capability` | Auth | `3` | invite capability secret does not match | ask the admin to re-issue the invite |
+| `room_full` | Auth | `3` | joining would exceed the supported active-member ceiling | remove a member before inviting another |
 | `wrong_identity` | Auth | `3` | local identity does not match the ticket binding | run `identity show`, then ask the admin to re-issue the invite for that identity |
 | `peer_unauthorized` | Auth | `3` | reachable peer refused this caller | ask the admin to confirm membership has synced |
 | `bad_signature` | Integrity | `4` | event signature failed verification | structural rejection, not user-fixable |
@@ -176,7 +177,7 @@ Per-code reference:
 | `peer_offline` | Connectivity | `6` | authorized peer is not reachable right now | ask the peer to come online |
 | `blob_unavailable` | Connectivity | `6` | no reachable provider currently serves the requested blob | ask a peer that holds it to run `room tail <ROOM_ID>`, then retry `file fetch` |
 
-Verbose network diagnostics are opt-in. `room members <ROOM_ID> --status --verbose` and `room tail <ROOM_ID> --verbose` append stderr-only `diag:` lines with this node's dialable addresses, `relay=...`, and per-peer path classifications such as `path=direct`, `path=relay`, `path=mixed`, or `path=none`. These diagnostics help explain reachability; they grant no trust and do not expose private key material.
+Verbose network diagnostics are opt-in. `room members <ROOM_ID> --status --verbose` and `room tail <ROOM_ID> --verbose` append stderr-only `diag:` lines with this node's dialable addresses, `relay=...`, per-peer path classifications such as `path=direct`, `path=relay`, `path=mixed`, or `path=none`, and `outbound_depth=<N>` queue-depth counters. These diagnostics help explain reachability; they grant no trust and do not expose private key material.
 
 ## How it works
 
