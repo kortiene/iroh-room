@@ -25,7 +25,7 @@ use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidatedEvent, Vali
 use iroh_rooms_core::event::wire::WireEvent;
 use iroh_rooms_core::membership::{
     blob_serve_allowed, pipe_connect_allowed, BlobDecision, DenyReason, Ingest, MembershipSnapshot,
-    PipeDecision, Role, RoomMembership, Status,
+    PipeDecision, Role, RoomMembership, Status, MAX_ACTIVE_MEMBERS,
 };
 
 // --------------------------------------------------------------------------
@@ -513,6 +513,75 @@ fn join_requires_valid_capability() {
         T0 + 8,
     );
     assert_rejected(&m.ingest(mismatch), &RejectReason::InsufficientRole);
+}
+
+#[test]
+fn join_rejected_when_room_is_full() {
+    let alice = Principal::new(0x01);
+    let (gen_ev, room) = genesis(&alice);
+    let mut m = RoomMembership::new(room);
+    assert_accepted(&m.ingest(gen_ev.clone()));
+
+    let mut prev = gen_ev.event_id;
+    for i in 0..(MAX_ACTIVE_MEMBERS - 1) {
+        let member = Principal::new(0x10 + u8::try_from(i).expect("small fixture index"));
+        let invite_id = [0x10 + u8::try_from(i).expect("small fixture index"); 16];
+        let secret = [0x40 + u8::try_from(i).expect("small fixture index"); 16];
+        let inv = invite(
+            &alice,
+            room,
+            &[prev],
+            invite_id,
+            secret,
+            member.identity(),
+            "member",
+            None,
+            T0 + 1 + u64::try_from(i).expect("small fixture index") * 2,
+        );
+        assert_accepted(&m.ingest(inv.clone()));
+        let jn = join(
+            &member,
+            room,
+            &[inv.event_id],
+            invite_id,
+            secret,
+            "member",
+            T0 + 2 + u64::try_from(i).expect("small fixture index") * 2,
+        );
+        assert_accepted(&m.ingest(jn.clone()));
+        prev = jn.event_id;
+    }
+    assert_eq!(m.snapshot().active_member_count(), MAX_ACTIVE_MEMBERS);
+
+    let extra = Principal::new(0x40);
+    let extra_invite_id = [0xee; 16];
+    let extra_secret = [0x99; 16];
+    let inv = invite(
+        &alice,
+        room,
+        &[prev],
+        extra_invite_id,
+        extra_secret,
+        extra.identity(),
+        "member",
+        None,
+        T0 + 100,
+    );
+    assert_accepted(&m.ingest(inv.clone()));
+    let rejected = join(
+        &extra,
+        room,
+        &[inv.event_id],
+        extra_invite_id,
+        extra_secret,
+        "member",
+        T0 + 101,
+    );
+    assert_rejected(&m.ingest(rejected), &RejectReason::RoomFull);
+    assert_eq!(
+        m.snapshot().status(&extra.identity()),
+        Some(Status::Invited)
+    );
 }
 
 // --------------------------------------------------------------------------

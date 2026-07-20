@@ -17,7 +17,7 @@
 //! land silently reviewed:
 //!
 //! 1. [`ALL_REASON_CODES`] / [`ALL_FLAG_CODES`] pin the taxonomy **counts**
-//!    (14 + 3); adding a variant without extending these lists makes their
+//!    (15 + 3); adding a variant without extending these lists makes their
 //!    consistency check with the constructed variants fail.
 //! 2. [`reason_and_flag_code_strings_match_spec`] pins every `.code()` string
 //!    (closing the 9-of-14 gap the old `golden_vectors.rs` test left open).
@@ -31,7 +31,7 @@ use iroh_rooms_core::event::reject::{Flag, RejectReason};
 
 /// One row per §8 outcome → the vector (or ported test) that exercises it.
 const COVERAGE: &[(&str, &str)] = &[
-    // Rejections (14).
+    // Rejections (15).
     (
         "unknown_schema_version",
         "serialization::unknown_schema_version_is_rejected",
@@ -62,6 +62,7 @@ const COVERAGE: &[(&str, &str)] = &[
         "bad_capability",
         "§15 vector_15_bad_capability_and_expired_invite",
     ),
+    ("room_full", "membership::join_rejected_when_room_is_full"),
     (
         "too_many_parents",
         "serialization::too_many_parents_is_rejected",
@@ -104,6 +105,7 @@ const ALL_REASONS: &[RejectReason] = &[
     RejectReason::InvalidContent,
     RejectReason::ExpiredInvite,
     RejectReason::BadCapability,
+    RejectReason::RoomFull,
     RejectReason::TooManyParents,
     RejectReason::NotGenesisDescended,
 ];
@@ -139,8 +141,8 @@ fn every_reason_and_flag_is_covered_or_deferred() {
     // added here, which then trips the coverage check below unless also mapped).
     assert_eq!(
         ALL_REASONS.len(),
-        14,
-        "the §8 rejection taxonomy has exactly 14 reasons"
+        15,
+        "the §8 rejection taxonomy has exactly 15 reasons"
     );
     assert_eq!(
         ALL_FLAGS.len(),
@@ -179,12 +181,12 @@ fn every_reason_and_flag_is_covered_or_deferred() {
 }
 
 // ---------------------------------------------------------------------------
-// Pin every §8 code string (closes the 9-of-14 gap in golden_vectors.rs).
+// Pin every §8 code string.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn reason_and_flag_code_strings_match_spec() {
-    // All 14 rejection codes.
+    // All 15 rejection codes.
     assert_eq!(
         RejectReason::UnknownSchemaVersion.code(),
         "unknown_schema_version"
@@ -203,6 +205,7 @@ fn reason_and_flag_code_strings_match_spec() {
     assert_eq!(RejectReason::InvalidContent.code(), "invalid_content");
     assert_eq!(RejectReason::ExpiredInvite.code(), "expired_invite");
     assert_eq!(RejectReason::BadCapability.code(), "bad_capability");
+    assert_eq!(RejectReason::RoomFull.code(), "room_full");
     assert_eq!(RejectReason::TooManyParents.code(), "too_many_parents");
     assert_eq!(
         RejectReason::NotGenesisDescended.code(),

@@ -34,7 +34,7 @@ pub enum ErrorCode {
     /// A protocol §8 rejection (reuses [`RejectReason::code`] verbatim). Covers
     /// `bad_signature` (invalid-signature, AC1) and `not_a_member` /
     /// `unbound_device` / `insufficient_role` / `expired_invite` / `bad_capability`
-    /// (unauthorized-sender / invalid-ticket, AC1/AC3), plus the structural/encoding
+    /// / `room_full` (unauthorized-sender / invalid-ticket, AC1/AC3), plus the structural/encoding
     /// rejects.
     Reject(RejectReason),
     /// A ticket decode failure (reuses [`TicketError::code`] verbatim; AC3).
@@ -229,6 +229,9 @@ fn reject_next_action(r: &RejectReason) -> Option<&'static str> {
         RejectReason::BadCapability => {
             Some("ask the admin to re-issue the invite for your identity id")
         }
+        RejectReason::RoomFull => {
+            Some("this room is at the supported 5-member ceiling; remove a member before inviting another")
+        }
         RejectReason::InsufficientRole => {
             Some("ask the admin to invite you with the intended role")
         }
@@ -297,7 +300,8 @@ fn reject_category(reason: &RejectReason) -> ErrorCategory {
         | RejectReason::UnboundDevice
         | RejectReason::InsufficientRole
         | RejectReason::ExpiredInvite
-        | RejectReason::BadCapability => ErrorCategory::Auth,
+        | RejectReason::BadCapability
+        | RejectReason::RoomFull => ErrorCategory::Auth,
         _ => ErrorCategory::Integrity,
     }
 }
@@ -453,6 +457,7 @@ mod tests {
             RejectReason::InsufficientRole,
             RejectReason::ExpiredInvite,
             RejectReason::BadCapability,
+            RejectReason::RoomFull,
         ] {
             assert_eq!(
                 ErrorCode::from(reason.clone()).code(),
@@ -496,6 +501,7 @@ mod tests {
             RejectReason::InsufficientRole,
             RejectReason::ExpiredInvite,
             RejectReason::BadCapability,
+            RejectReason::RoomFull,
         ] {
             assert_eq!(ErrorCode::Reject(auth).category(), ErrorCategory::Auth);
         }
@@ -705,6 +711,7 @@ mod tests {
             RejectReason::InsufficientRole,
             RejectReason::NotAMember,
             RejectReason::UnboundDevice,
+            RejectReason::RoomFull,
         ] {
             let action = ErrorCode::Reject(reason.clone()).next_action();
             assert!(

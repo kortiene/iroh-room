@@ -59,11 +59,11 @@ surfaced through one consistent CLI contract. Inventory of the taxonomies to uni
 
 ### 2.1 Core (`crates/iroh-rooms-core`)
 
-- **`event::reject::RejectReason`** — the §8 protocol rejection taxonomy. 14 variants,
+- **`event::reject::RejectReason`** — the §8 protocol rejection taxonomy. 15 variants,
   each with a stable `.code()` (`bad_signature`, `id_mismatch`, `non_canonical_encoding`,
   `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`,
   `not_genesis_descended`, `room_id_mismatch`, `unbound_device`, `not_a_member`,
-  `insufficient_role`, `expired_invite`, `bad_capability`). `#[non_exhaustive]`,
+  `insufficient_role`, `expired_invite`, `bad_capability`, `room_full`). `#[non_exhaustive]`,
   implements `Display`/`Error`. **Coverage is conformance-gated** (README: the
   taxonomy-completeness gate fails if a variant lands without a vector). This is the
   authoritative source for the *invalid signature* vs *unauthorized sender* split

@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -99,6 +100,10 @@ pub struct NetConfig {
     /// Ring capacity of the `Node::room_events` broadcast (issue #83). Lossy on
     /// lag exactly like `conn_event_capacity`; a slow subscriber gets `Lagged`.
     pub room_event_capacity: usize,
+    /// Bounded raw-frame backlog from peer reader tasks into the engine pump.
+    pub inbound_frame_capacity: usize,
+    /// Bounded per-peer raw-frame backlog from the engine pump to peer writers.
+    pub outbound_frame_capacity: usize,
 }
 
 impl Default for NetConfig {
@@ -107,6 +112,8 @@ impl Default for NetConfig {
             mode: NetMode::Loopback,
             conn_event_capacity: 256,
             room_event_capacity: 256,
+            inbound_frame_capacity: 256,
+            outbound_frame_capacity: 256,
         }
     }
 }
@@ -124,6 +131,23 @@ pub struct Inbound {
 /// Shared transport state: the identity/authorizer/audit + the per-peer routing
 /// tables + the inbound sink. Cloned (as `Arc<Shared>`) into the accept handler
 /// and every connection task so they observe one consistent view.
+#[derive(Clone)]
+pub struct OutboundQueue {
+    pub(crate) tx: mpsc::Sender<Vec<u8>>,
+    pub(crate) depth: Arc<AtomicUsize>,
+}
+
+impl OutboundQueue {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>, depth: Arc<AtomicUsize>) -> Self {
+        Self { tx, depth }
+    }
+
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
+}
+
 pub struct Shared {
     /// This node's authenticated identity (`endpoint.id() == device_id`).
     pub(crate) me: EndpointId,
@@ -134,7 +158,9 @@ pub struct Shared {
     /// The observable per-peer connection-state table (§4.5).
     pub(crate) table: PeerTable,
     /// Per-peer outbound frame queues (one writer task each).
-    outbound: Mutex<HashMap<EndpointId, mpsc::UnboundedSender<Vec<u8>>>>,
+    outbound: Mutex<HashMap<EndpointId, OutboundQueue>>,
+    /// Configured per-peer outbound queue capacity.
+    outbound_frame_capacity: usize,
     /// Live connection handles (so a local disconnect can close a specific link).
     connections: Mutex<HashMap<EndpointId, Connection>>,
     /// Devices admitted **provisionally** for the join bootstrap (IR-0104,
@@ -162,8 +188,8 @@ pub struct Shared {
     /// long-superseded link's teardown clobber a same-numbered successor); one
     /// `u64` per distinct device seen, bounded like the other per-device tables.
     generations: Mutex<HashMap<EndpointId, u64>>,
-    /// The single inbound sink feeding the engine driver.
-    pub(crate) inbound_tx: mpsc::UnboundedSender<Inbound>,
+    /// The bounded inbound sink feeding the engine driver.
+    pub(crate) inbound_tx: mpsc::Sender<Inbound>,
 }
 
 /// The terminal peer-table state a guarded teardown writes (issue #126).
@@ -178,11 +204,11 @@ pub(crate) enum LinkTeardown {
 impl Shared {
     /// Register a peer's outbound frame queue (replaces any prior queue for the
     /// device — last writer wins on a double-connect, spec OQ-4).
-    pub(crate) fn register_outbound(&self, device: EndpointId, tx: mpsc::UnboundedSender<Vec<u8>>) {
+    pub(crate) fn register_outbound(&self, device: EndpointId, queue: OutboundQueue) {
         self.outbound
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(device, tx);
+            .insert(device, queue);
     }
 
     /// Record a live connection handle for the device.
@@ -219,23 +245,35 @@ impl Shared {
         }
     }
 
-    /// Route one engine [`Outgoing`] to its peer's writer queue. Non-blocking;
-    /// **dropped** if the peer has no live writer (offline / unauthorized) — never
-    /// buffered to a non-member, and the engine re-pulls on reconnect (spec §6 /
-    /// the [`SyncTransport`] contract).
+    /// Route one engine [`Outgoing`] to its peer's bounded writer queue. Non-blocking;
+    /// **dropped** if the peer has no live writer (offline / unauthorized), and the
+    /// live link is closed if the queue is full so reconnect/backfill becomes the
+    /// recovery path (spec §6 / the [`SyncTransport`] contract).
     pub(crate) fn route(&self, out: &Outgoing) {
         let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
             tracing::warn!("route: outgoing peer id is not a valid endpoint id; dropping");
             return;
         };
         let body = out.msg.encode();
-        let guard = self
+        let queue = self
             .outbound
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(tx) = guard.get(&device) {
-            // Unbounded, non-blocking: a send error only means the writer is gone.
-            let _ = tx.send(body);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device)
+            .cloned();
+        if let Some(queue) = queue {
+            queue.depth.fetch_add(1, Ordering::Relaxed);
+            match queue.tx.try_send(body) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    queue.depth.fetch_sub(1, Ordering::Relaxed);
+                    self.audit.transport_queue_saturated(device, "outbound");
+                    self.close_connection(device);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    queue.depth.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
         }
         // No live writer ⇒ peer offline ⇒ drop (engine re-pulls on reconnect).
     }
@@ -255,7 +293,7 @@ impl Shared {
     pub(crate) fn register_link(
         &self,
         device: EndpointId,
-        tx: mpsc::UnboundedSender<Vec<u8>>,
+        queue: OutboundQueue,
         provisional: bool,
     ) -> u64 {
         let mut generations = self
@@ -274,7 +312,7 @@ impl Shared {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(device);
         }
-        self.register_outbound(device, tx);
+        self.register_outbound(device, queue);
         generation
     }
 
@@ -394,6 +432,19 @@ impl Shared {
             .map(peer_id)
             .collect()
     }
+
+    pub(crate) const fn outbound_frame_capacity(&self) -> usize {
+        self.outbound_frame_capacity
+    }
+
+    pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
+        self.outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(device, queue)| (*device, queue.depth()))
+            .collect()
+    }
 }
 
 /// The full-mesh direct-QUIC event-transport adapter.
@@ -401,7 +452,7 @@ pub struct NetTransport {
     shared: Arc<Shared>,
     endpoint: Endpoint,
     router: Router,
-    inbound_rx: Option<mpsc::UnboundedReceiver<Inbound>>,
+    inbound_rx: Option<mpsc::Receiver<Inbound>>,
     dial_tasks: Mutex<Vec<JoinHandle<()>>>,
     mode: NetMode,
 }
@@ -451,13 +502,14 @@ impl NetTransport {
         };
 
         let me = endpoint.id();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::channel(cfg.inbound_frame_capacity.max(1));
         let shared = Arc::new(Shared {
             me,
             admission,
             audit,
             table: PeerTable::new(cfg.conn_event_capacity),
             outbound: Mutex::new(HashMap::new()),
+            outbound_frame_capacity: cfg.outbound_frame_capacity.max(1),
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
@@ -558,6 +610,11 @@ impl NetTransport {
         self.shared.table.entries()
     }
 
+    #[must_use]
+    pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
+        self.shared.outbound_queue_depths()
+    }
+
     /// The current state of one device, if known.
     #[must_use]
     pub fn peer_state(&self, device: EndpointId) -> Option<PeerConnState> {
@@ -587,7 +644,7 @@ impl NetTransport {
 
     /// Take the inbound raw-frame receiver (once). The engine driver owns it and
     /// feeds each frame to `SyncEngine::ingest_frame`.
-    pub fn take_inbound(&mut self) -> Option<mpsc::UnboundedReceiver<Inbound>> {
+    pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Inbound>> {
         self.inbound_rx.take()
     }
 
@@ -653,7 +710,9 @@ fn loopback_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inbound, LinkTeardown, NetConfig, NetMode, Shared, RELAY_ONLY_TEST_BUILD};
+    use super::{
+        Inbound, LinkTeardown, NetConfig, NetMode, OutboundQueue, Shared, RELAY_ONLY_TEST_BUILD,
+    };
     use crate::admission::AllowlistAdmission;
     use crate::audit::TracingAudit;
     use crate::state::{OfflineReason, PeerConnState, PeerTable};
@@ -661,6 +720,7 @@ mod tests {
     use iroh_rooms_core::event::ids::RoomId;
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
@@ -669,14 +729,15 @@ mod tests {
     }
 
     /// Construct a `Shared` with no connections or queues registered.
-    fn make_shared() -> (Arc<Shared>, mpsc::UnboundedReceiver<Inbound>) {
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    fn make_shared() -> (Arc<Shared>, mpsc::Receiver<Inbound>) {
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
         let shared = Arc::new(Shared {
             me: device(0x01),
             admission: Arc::new(AllowlistAdmission::new()),
             audit: Arc::new(TracingAudit),
             table: PeerTable::new(8),
             outbound: Mutex::new(HashMap::new()),
+            outbound_frame_capacity: 256,
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
@@ -684,6 +745,11 @@ mod tests {
             inbound_tx,
         });
         (shared, inbound_rx)
+    }
+
+    fn outbound_pair(capacity: usize) -> (OutboundQueue, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (OutboundQueue::new(tx, Arc::new(AtomicUsize::new(0))), rx)
     }
 
     fn dummy_outgoing(peer: EndpointId) -> Outgoing {
@@ -714,6 +780,12 @@ mod tests {
     }
 
     #[test]
+    fn net_config_default_frame_queue_capacities_are_256() {
+        assert_eq!(NetConfig::default().inbound_frame_capacity, 256);
+        assert_eq!(NetConfig::default().outbound_frame_capacity, 256);
+    }
+
+    #[test]
     fn relay_only_diagnostic_constant_matches_the_compile_time_feature() {
         assert_eq!(RELAY_ONLY_TEST_BUILD, cfg!(feature = "relay-only-test"));
     }
@@ -741,8 +813,8 @@ mod tests {
     fn route_delivers_encoded_frame_to_registered_peer() {
         let (shared, _rx) = make_shared();
         let peer = device(0x03);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        shared.register_outbound(peer, tx);
+        let (queue, mut rx) = outbound_pair(1);
+        shared.register_outbound(peer, queue);
 
         let out = dummy_outgoing(peer);
         let expected = out.msg.encode();
@@ -754,14 +826,28 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    #[test]
+    fn route_closes_peer_when_outbound_queue_is_full() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x05);
+        let (queue, _rx) = outbound_pair(1);
+        shared.register_outbound(peer, queue);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        shared.route(&dummy_outgoing(peer));
+        shared.route(&dummy_outgoing(peer));
+
+        assert_eq!(shared.outbound_queue_depths(), vec![(peer, 1)]);
+    }
+
     // --- Shared::unregister removes the outbound queue ---
 
     #[test]
     fn route_drops_frame_after_unregister() {
         let (shared, _rx) = make_shared();
         let peer = device(0x04);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        shared.register_outbound(peer, tx);
+        let (queue, mut rx) = outbound_pair(1);
+        shared.register_outbound(peer, queue);
         shared.unregister(peer);
 
         shared.route(&dummy_outgoing(peer));
@@ -778,24 +864,20 @@ mod tests {
         let (shared, _rx) = make_shared();
         let a = device(0x20);
         let b = device(0x21);
-        let (tx, _rx1) = mpsc::unbounded_channel::<Vec<u8>>();
-
         // Each successive link on the same device gets a strictly greater stamp,
         // so a superseded link can always be distinguished from its successor.
-        assert_eq!(shared.register_link(a, tx.clone(), false), 1);
-        assert_eq!(shared.register_link(a, tx.clone(), false), 2);
-        assert_eq!(shared.register_link(a, tx.clone(), false), 3);
+        assert_eq!(shared.register_link(a, outbound_pair(1).0, false), 1);
+        assert_eq!(shared.register_link(a, outbound_pair(1).0, false), 2);
+        assert_eq!(shared.register_link(a, outbound_pair(1).0, false), 3);
         // A different device starts its own sequence at 1.
-        assert_eq!(shared.register_link(b, tx, false), 1);
+        assert_eq!(shared.register_link(b, outbound_pair(1).0, false), 1);
     }
 
     #[test]
     fn teardown_if_current_tears_down_only_at_the_current_generation() {
         let (shared, _rx) = make_shared();
         let peer = device(0x22);
-        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        let gen = shared.register_link(peer, tx, true);
+        let gen = shared.register_link(peer, outbound_pair(1).0, true);
         shared.mark_capability_proven(peer);
         shared.table.set(peer, PeerConnState::Connected, None);
 
@@ -830,13 +912,13 @@ mod tests {
         // conn2 un-gated.
         let (shared, _rx) = make_shared();
         let peer = device(0x23);
-        let (tx1, mut rx1) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (tx2, mut rx2) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_queue1, mut rx1) = outbound_pair(1);
+        let (queue2, mut rx2) = outbound_pair(1);
 
-        let gen1 = shared.register_link(peer, tx1, true);
+        let gen1 = shared.register_link(peer, outbound_pair(1).0, true);
         shared.table.set(peer, PeerConnState::Connected, None);
         // conn2 supersedes conn1: fresh generation, its own writer.
-        let gen2 = shared.register_link(peer, tx2, true);
+        let gen2 = shared.register_link(peer, queue2, true);
         shared.table.set(peer, PeerConnState::Connected, None);
         assert!(gen2 > gen1);
 
@@ -889,8 +971,7 @@ mod tests {
         // CAS were not atomic under one lock, A could clear the mark B just set.
         let (shared, _rx) = make_shared();
         let peer = device(0x25);
-        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
-        let mut current = shared.register_link(peer, tx.clone(), true);
+        let mut current = shared.register_link(peer, outbound_pair(1).0, true);
 
         for _ in 0..500 {
             let barrier = Arc::new(Barrier::new(2));
@@ -911,10 +992,9 @@ mod tests {
             let b = {
                 let shared = shared.clone();
                 let barrier = barrier.clone();
-                let tx = tx.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    shared.register_link(peer, tx, true)
+                    shared.register_link(peer, outbound_pair(1).0, true)
                 })
             };
 
@@ -937,8 +1017,7 @@ mod tests {
     fn teardown_if_current_unauthorized_exit_sets_unauthorized() {
         let (shared, _rx) = make_shared();
         let peer = device(0x24);
-        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
-        let gen = shared.register_link(peer, tx, false);
+        let gen = shared.register_link(peer, outbound_pair(1).0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         assert!(shared.teardown_if_current(peer, gen, LinkTeardown::Unauthorized));
@@ -955,10 +1034,8 @@ mod tests {
         // first turns that close into a no-op, so `Deauthorized` is not overwritten.
         let (shared, _rx) = make_shared();
         let peer = device(0x26);
-        let (tx, _rx0) = mpsc::unbounded_channel::<Vec<u8>>();
-
         // An inbound accept link is live at generation `gen`.
-        let gen = shared.register_link(peer, tx, false);
+        let gen = shared.register_link(peer, outbound_pair(1).0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         // Manager deauthorize: invalidate the generation, then force the terminal

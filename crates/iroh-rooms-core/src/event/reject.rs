@@ -58,6 +58,9 @@ pub enum RejectReason {
     /// A join's `capability_secret` did not reproduce the invite's hash, or no
     /// such invite exists in the ancestor view. **(deferred.)**
     BadCapability,
+    /// Accepting a join would exceed the supported active-member ceiling.
+    /// **(deferred.)**
+    RoomFull,
 }
 
 impl RejectReason {
@@ -80,6 +83,7 @@ impl RejectReason {
             Self::InsufficientRole => "insufficient_role",
             Self::ExpiredInvite => "expired_invite",
             Self::BadCapability => "bad_capability",
+            Self::RoomFull => "room_full",
         }
     }
 }

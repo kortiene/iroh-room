@@ -55,7 +55,7 @@ const VECTOR_SOURCES: &[&str] = &[
     include_str!("advisory.rs"),
 ];
 
-/// Every `RejectReason` (14), hand-mirrored because the enum is
+/// Every `RejectReason` (15), hand-mirrored because the enum is
 /// `#[non_exhaustive]` and an external test crate cannot reflect it. The count is
 /// pinned below, so a new variant forces an update here — which then trips the
 /// doc-coverage assert unless the doc is updated too. Mirrors `taxonomy.rs`.
@@ -74,6 +74,7 @@ const ALL_REASONS: &[RejectReason] = &[
     RejectReason::InsufficientRole,
     RejectReason::ExpiredInvite,
     RejectReason::BadCapability,
+    RejectReason::RoomFull,
 ];
 
 /// Every `Flag` (3).
@@ -120,8 +121,8 @@ fn every_reason_and_flag_code_is_documented() {
     // both this module and the doc's reason-code tables need review.
     assert_eq!(
         ALL_REASONS.len(),
-        14,
-        "the reason taxonomy has exactly 14 variants"
+        15,
+        "the reason taxonomy has exactly 15 variants"
     );
     assert_eq!(
         ALL_FLAGS.len(),
@@ -136,9 +137,9 @@ fn every_reason_and_flag_code_is_documented() {
         );
     }
 
-    // The doc states the rejection count inline ("### Rejections (14 — ...)"); pin
-    // it to the actual number of variants so a 15th reason cannot land with a stale
-    // "(14" in the doc.
+    // The doc states the rejection count inline ("### Rejections (15 — ...)"); pin
+    // it to the actual number of variants so a new reason cannot land with a stale
+    // count in the doc.
     assert!(
         DOC.contains(&format!("Rejections ({}", ALL_REASONS.len())),
         "docs/protocol.md must state the rejection count as {}",

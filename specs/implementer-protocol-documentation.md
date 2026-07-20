@@ -247,10 +247,10 @@ these; do not omit any listed fact and do not add un-sourced claims.
 
 ### 9. Rejection / flag reason codes  *(spike §8; code `event/reject.rs`)*
 - A single table with the **exact `.code()` spellings** (do not invent):
-  - **Rejections (14, event dropped):** `unknown_schema_version`, `unknown_event_type`,
+  - **Rejections (15, event dropped):** `unknown_schema_version`, `unknown_event_type`,
     `non_canonical_encoding`, `id_mismatch`, `bad_signature`, `unbound_device`, `not_a_member`,
     `insufficient_role`, `room_id_mismatch`, `invalid_content`, `expired_invite`,
-    `bad_capability`, `too_many_parents`, `not_genesis_descended`.
+    `bad_capability`, `room_full`, `too_many_parents`, `not_genesis_descended`.
   - **Ignored (not an error):** `duplicate`.
   - **Advisory flags (event still accepted, ordered, persisted):** `clock_skew`,
     `equivocation`, `from_removed_member`.

@@ -106,6 +106,9 @@ pub trait AuditSink: Send + Sync + 'static {
     /// Default: no-op.
     fn bootstrap_capability_rejected(&self, _device: EndpointId) {}
 
+    /// A transport queue hit its configured capacity. Default: no-op.
+    fn transport_queue_saturated(&self, _device: EndpointId, _queue: &'static str) {}
+
     /// A gated blob fetch was served: `peer` requested `hash` over the blobs ALPN
     /// and the two-gate ACL allowed it (IR-0204 spec §7 `blob.serve.accepted`).
     /// Default: no-op, so existing sinks need not change.
@@ -197,6 +200,15 @@ impl AuditSink for TracingAudit {
             code,
             peer = %device,
             "accepted inbound event carried an advisory flag"
+        );
+    }
+
+    fn transport_queue_saturated(&self, device: EndpointId, queue: &'static str) {
+        tracing::warn!(
+            reason = "transport.queue.saturated",
+            queue,
+            peer = %device,
+            "bounded transport queue saturated; dropping frame and closing the peer link"
         );
     }
 

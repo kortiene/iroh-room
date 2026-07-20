@@ -23,7 +23,7 @@ use crate::alpn::EVENT_ALPN;
 use crate::frame::{read_frame, write_frame};
 use crate::handler::REJECT_CODE;
 use crate::state::{OfflineReason, PeerConnState};
-use crate::transport::{Inbound, LinkTeardown, Shared};
+use crate::transport::{Inbound, LinkTeardown, OutboundQueue, Shared};
 
 /// Bridge an iroh [`EndpointId`] (device key) to the engine's [`PeerId`] — both
 /// are the same raw 32 `device_id` bytes (Membership §1).
@@ -50,11 +50,13 @@ pub(crate) fn register_connection(
     recv: RecvStream,
     provisional: bool,
 ) -> u64 {
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let generation = shared.register_link(device, tx, provisional);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(shared.outbound_frame_capacity());
+    let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let generation =
+        shared.register_link(device, OutboundQueue::new(tx, depth.clone()), provisional);
     shared.register_connection(device, conn);
 
-    tokio::spawn(writer_task(send, rx));
+    tokio::spawn(writer_task(send, rx, depth));
     tokio::spawn(reader_task(shared, device, recv));
     generation
 }
@@ -62,8 +64,13 @@ pub(crate) fn register_connection(
 /// Drain the per-peer outbound frame queue, writing each body as a length-prefixed
 /// frame. Ends when the queue's sender is dropped (peer unregistered) or a write
 /// fails (link down).
-async fn writer_task(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_task(
+    mut send: SendStream,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+) {
     while let Some(body) = rx.recv().await {
+        depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(err) = write_frame(&mut send, &body).await {
             // A locally-queued body over MAX_FRAME_BYTES (e.g. a huge sync
             // message in a very large room) is a per-message failure, not a link
@@ -90,12 +97,18 @@ async fn reader_task(shared: Arc<Shared>, device: EndpointId, mut recv: RecvStre
     let peer = peer_id(device);
     loop {
         match read_frame(&mut recv).await {
-            Ok(Some(bytes)) => {
-                if shared.inbound_tx.send(Inbound { peer, bytes }).is_err() {
+            Ok(Some(bytes)) => match shared.inbound_tx.try_send(Inbound { peer, bytes }) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    shared.audit.transport_queue_saturated(device, "inbound");
+                    shared.close_connection(device);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
                     // The driver/engine is gone; nothing left to feed.
                     break;
                 }
-            }
+            },
             Ok(None) => break, // clean EOF at a frame boundary
             Err(err) => {
                 tracing::debug!(%err, peer = %device, "reader: frame error; ending");
