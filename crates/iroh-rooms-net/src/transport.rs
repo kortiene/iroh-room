@@ -379,6 +379,78 @@ impl Shared {
         true
     }
 
+    /// Try to record `device`'s state as [`Connecting`](PeerConnState::Connecting),
+    /// but only if **no live link is currently registered for it** (issue #136).
+    ///
+    /// The dial loop calls this at the top of each iteration so a stale-address
+    /// redial does not stomp a [`Connected`](PeerConnState::Connected) entry a
+    /// newer inbound accept established while this loop was backing off. After a
+    /// peer rebinds (new UDP port, same device key) the remote's stale-address
+    /// dial loop keeps dialing the dead address; without this guard every
+    /// iteration's `Connecting` set would briefly flip a demonstrably-live flow's
+    /// state away from `Connected`. Returns whether the state was recorded, so the
+    /// caller can reason about ownership (though it currently makes no decisions
+    /// on the return value — the next dial attempt is correct either way).
+    ///
+    /// "Live link" is read from the per-device outbound-queue map, which is
+    /// populated by [`register_link`](Self::register_link) (under the generations
+    /// lock) for both inbound accepts and outbound dials, and cleared by
+    /// [`unregister`](Self::unregister) on teardown — so an entry there means a
+    /// link has registered its writer and can carry data. The check-and-set runs
+    /// under the generations lock (the same critical section
+    /// [`register_link`](Self::register_link) takes), so a concurrent link
+    /// registration fully serializes against this: it cannot slip its queue
+    /// installation between our observation and our table write.
+    pub(crate) fn set_connecting_if_no_link(&self, device: EndpointId) -> bool {
+        let _guard = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&device)
+        {
+            return false;
+        }
+        self.table.set(device, PeerConnState::Connecting, None);
+        true
+    }
+
+    /// Try to move `device` to [`Offline`](PeerConnState::Offline) carrying
+    /// `reason`, but only if **no live link is currently registered for it**
+    /// (issue #136). Returns whether the offline was recorded, so the caller can
+    /// gate its disconnect audit on actually owning the state transition.
+    ///
+    /// The dial loop's failed-connect path uses this so a stale-address dial does
+    /// not overwrite a live link's `Connected` state: after a peer rebinds, the
+    /// remote's stale-address dial loop redials the dead address and fails on
+    /// every backoff tick; without this guard each failure would stomp the table
+    /// entry of a device whose newer inbound link is alive and carrying data —
+    /// the post-rebind lifecycle defect tracked in #136. The provisional-backoff
+    /// and stream-open-failure arms use it for the same reason.
+    ///
+    /// Like [`set_connecting_if_no_link`](Self::set_connecting_if_no_link), the
+    /// check-and-set runs under the generations lock so a concurrent
+    /// [`register_link`](Self::register_link) serializes against it.
+    pub(crate) fn set_offline_if_no_link(&self, device: EndpointId, reason: OfflineReason) -> bool {
+        let _guard = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&device)
+        {
+            return false;
+        }
+        self.table.set_offline(device, reason, None);
+        true
+    }
+
     /// Clear a device's provisional mark — on upgrade-on-learn (its join was
     /// accepted, so it is now a full member). Also drops any capability-proven
     /// mark, so a re-connect must re-prove (issue #112). Disconnect teardown goes
@@ -1062,6 +1134,199 @@ mod tests {
             .map(|(_, e)| e.offline_reason);
         assert_eq!(reason, Some(OfflineReason::Deauthorized));
         assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Offline));
+    }
+
+    // --- Issue #136: live-link guard on the dial loop's stomp paths ------------
+
+    #[test]
+    fn set_offline_if_no_link_records_offline_when_no_link_registered() {
+        // The benign case: no live link exists, so the dial loop's failed-connect
+        // path freely records Offline{Unreachable} — the pre-#136 behavior, still
+        // correct for a genuinely unreachable peer.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x30);
+        assert!(
+            shared.set_offline_if_no_link(peer, OfflineReason::Unreachable),
+            "no live link registered → must record Offline"
+        );
+        assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Offline));
+        let reason = shared
+            .table
+            .entries()
+            .into_iter()
+            .find(|(d, _)| *d == peer)
+            .map(|(_, e)| e.offline_reason);
+        assert_eq!(reason, Some(OfflineReason::Unreachable));
+    }
+
+    #[test]
+    fn set_offline_if_no_link_preserves_live_link_state() {
+        // The #136 defect, reduced: a live link is registered (an inbound accept
+        // established it); the stale-address dial loop's failed-connect path must
+        // NOT stomp its `Connected` state to Offline.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x31);
+        // The inbound accept registers a link (outbound queue + connection
+        // generation) and flips the peer Connected — exactly what
+        // `peer::register_connection` + the accept handler do.
+        let _gen = shared.register_link(peer, outbound_pair(1).0, false);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        assert!(
+            !shared.set_offline_if_no_link(peer, OfflineReason::Unreachable),
+            "a live link is registered → must NOT record Offline"
+        );
+        assert_eq!(
+            shared.table.state_of(peer),
+            Some(PeerConnState::Connected),
+            "the live link's Connected state must survive the stale dial's stomp"
+        );
+    }
+
+    #[test]
+    fn set_offline_if_no_link_records_offline_after_link_torn_down() {
+        // Once the live link's teardown clears the outbound queue, the guard no
+        // longer protects the peer — a subsequent failed-connect may record
+        // Offline. This is the steady-state contract: the guard tracks liveness,
+        // not history.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x32);
+        let gen = shared.register_link(peer, outbound_pair(1).0, false);
+        shared.table.set(peer, PeerConnState::Connected, None);
+        assert!(shared.teardown_if_current(
+            peer,
+            gen,
+            LinkTeardown::Offline(OfflineReason::LinkDropped)
+        ));
+
+        assert!(
+            shared.set_offline_if_no_link(peer, OfflineReason::Unreachable),
+            "after teardown cleared the live link, the guard must allow Offline"
+        );
+        let reason = shared
+            .table
+            .entries()
+            .into_iter()
+            .find(|(d, _)| *d == peer)
+            .map(|(_, e)| e.offline_reason);
+        assert_eq!(reason, Some(OfflineReason::Unreachable));
+    }
+
+    #[test]
+    fn set_connecting_if_no_link_records_connecting_when_no_link_registered() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x33);
+        assert!(
+            shared.set_connecting_if_no_link(peer),
+            "no live link registered → must record Connecting"
+        );
+        assert_eq!(shared.table.state_of(peer), Some(PeerConnState::Connecting));
+    }
+
+    #[test]
+    fn set_connecting_if_no_link_preserves_live_link_state() {
+        // Symmetric to the Offline guard: the top-of-iteration Connecting set
+        // must not stomp a live link's Connected state. Without this, a
+        // stale-address dial would briefly flip the peer Connecting on every
+        // backoff tick even though an inbound link is carrying data.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x34);
+        let _gen = shared.register_link(peer, outbound_pair(1).0, false);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        assert!(
+            !shared.set_connecting_if_no_link(peer),
+            "a live link is registered → must NOT record Connecting"
+        );
+        assert_eq!(
+            shared.table.state_of(peer),
+            Some(PeerConnState::Connected),
+            "the live link's Connected state must survive the stale dial's Connecting stomp"
+        );
+    }
+
+    #[test]
+    fn set_offline_if_no_link_preserves_live_link_across_repeated_stoms() {
+        // The observed #136 signature: the stale-address dial loop retries
+        // indefinitely (the never-give-up contract), each failed connect
+        // attempting to stomp. Every iteration must leave the live link's
+        // Connected state intact, not just the first.
+        let (shared, _rx) = make_shared();
+        let peer = device(0x35);
+        let _gen = shared.register_link(peer, outbound_pair(1).0, false);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        for _ in 0..50 {
+            assert!(
+                !shared.set_offline_if_no_link(peer, OfflineReason::Unreachable),
+                "no iteration of the stale dial may stomp a live link"
+            );
+            assert_eq!(
+                shared.table.state_of(peer),
+                Some(PeerConnState::Connected),
+                "Connected must hold across every backoff tick"
+            );
+        }
+    }
+
+    #[test]
+    fn set_offline_if_no_link_and_register_link_serialize_atomically() {
+        // Real threads racing the exact #136 interleaving: a stale-address dial's
+        // failed-connect (thread A) against an inbound accept's register_link
+        // (thread B). For every interleaving, either A's Offline lands BEFORE B
+        // registers (so B then flips it Connected — correct), or A's Offline is
+        // suppressed because B already registered (so the peer stays Connected —
+        // correct). The one outcome that must NEVER happen is A's Offline
+        // overwriting an already-established live link — that is the #136 defect.
+        use std::sync::Barrier;
+        use std::thread;
+
+        let (shared, _rx) = make_shared();
+        let peer = device(0x36);
+
+        for _ in 0..500 {
+            // Clean slate for this round: no live link, peer Offline.
+            shared.unregister(peer);
+            shared.table.set(peer, PeerConnState::Offline, None);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let a = {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    shared.set_offline_if_no_link(peer, OfflineReason::Unreachable);
+                })
+            };
+            let b = {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    // The inbound accept: register the link, then flip Connected.
+                    shared.register_link(peer, outbound_pair(1).0, false);
+                    shared.table.set(peer, PeerConnState::Connected, None);
+                })
+            };
+
+            a.join().expect("set_offline thread");
+            b.join().expect("register_link thread");
+
+            // The invariant: if a live link is registered, the table MUST read
+            // Connected — never Offline. A stale-address stomp landing AFTER the
+            // register would violate this; the generations-lock guard prevents it.
+            let has_link = shared
+                .outbound_queue_depths()
+                .into_iter()
+                .any(|(d, _)| d == peer);
+            if has_link {
+                assert_eq!(
+                    shared.table.state_of(peer),
+                    Some(PeerConnState::Connected),
+                    "a registered live link must never read Offline (#136 invariant)"
+                );
+            }
+        }
     }
 
     // --- Shared::connected_peers ---

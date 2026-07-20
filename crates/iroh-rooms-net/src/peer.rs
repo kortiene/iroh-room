@@ -126,12 +126,26 @@ async fn reader_task(shared: Arc<Shared>, device: EndpointId, mut recv: RecvStre
 /// A dial that reaches a **non-member** (the proven `remote_id()` fails admission)
 /// records `Unauthorized` and stops — there is no point redialing a peer we will
 /// never admit.
+///
+/// The `Connecting`/`Offline` writes on each iteration are **live-link-guarded**
+/// (issue #136): a stale-address dial (e.g. after a peer rebinds to a new UDP port
+/// under the same device key, with no loopback discovery to update the hint) must
+/// not stomp the table entry of a device whose newer inbound link is alive and
+/// carrying data. Only a link that is no longer current is ever flipped away from
+/// `Connected` by this loop; the inbound-accept path independently maintains the
+/// live link's state.
 pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: EndpointAddr) {
     let target = addr.id;
     let mut attempt: u32 = 0;
 
     loop {
-        shared.table.set(target, PeerConnState::Connecting, None);
+        // Guarded (issue #136): only flip to Connecting if no live link is
+        // registered for `target`. After a peer rebinds, this loop may be
+        // dialing a stale address (loopback has no discovery to update it)
+        // while a newer inbound link from the same device is alive and carrying
+        // data; unconditionally setting Connecting here would stomp that link's
+        // `Connected` state on every backoff tick.
+        shared.set_connecting_if_no_link(target);
 
         match endpoint.connect(addr.clone(), EVENT_ALPN).await {
             Ok(conn) => {
@@ -156,9 +170,8 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                             peer = %remote,
                             "dial: remote only provisionally admissible; backing off without establishing"
                         );
-                        shared
-                            .table
-                            .set_offline(remote, OfflineReason::Unreachable, None);
+                        // Guarded (issue #136): do not stomp a live link's state.
+                        shared.set_offline_if_no_link(remote, OfflineReason::Unreachable);
                     }
                     AdmissionDecision::Admit { identity } => {
                         match establish_outbound(&shared, &conn, remote, identity).await {
@@ -205,14 +218,14 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                             Established::Failed => {
                                 // Connected at QUIC but the stream open/handshake failed —
                                 // reachable, but the transport could not carry events.
-                                shared.table.set_offline(
-                                    remote,
-                                    OfflineReason::TransportError,
-                                    None,
-                                );
-                                shared
-                                    .audit
-                                    .offline(remote, OfflineReason::TransportError.label());
+                                // Guarded (issue #136): do not stomp a live link's state.
+                                if shared
+                                    .set_offline_if_no_link(remote, OfflineReason::TransportError)
+                                {
+                                    shared
+                                        .audit
+                                        .offline(remote, OfflineReason::TransportError.label());
+                                }
                             }
                         }
                     }
@@ -222,12 +235,18 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                 // `endpoint.connect()` failed: no path to the peer (the common
                 // "peer is offline / unreachable" case).
                 tracing::debug!(%err, peer = %target, "dial: connect failed");
-                shared
-                    .table
-                    .set_offline(target, OfflineReason::Unreachable, None);
-                shared
-                    .audit
-                    .offline(target, OfflineReason::Unreachable.label());
+                // Guarded (issue #136): only record Unreachable if no live link
+                // is registered for `target`. After a peer rebinds (new UDP port,
+                // same device key) this loop may be dialing a stale address
+                // (loopback has no discovery to update it) while a newer inbound
+                // link from the same device is alive and carrying data; stomping
+                // it to `Offline{Unreachable}` on every backoff tick would
+                // overwrite a demonstrably-live connection's state for minutes.
+                if shared.set_offline_if_no_link(target, OfflineReason::Unreachable) {
+                    shared
+                        .audit
+                        .offline(target, OfflineReason::Unreachable.label());
+                }
             }
         }
 
