@@ -34,6 +34,19 @@ Both decisions were adversarially verified against the actual mid-2026 stack (ir
 > were measured at N=2..5 on deterministic loopback and confirm the
 > recommendation; none were disproven. Findings and the measured comparison
 > table are in `crates/spike-transport/NOTES.md`.
+>
+> **Ceiling is a documented contract, not an enforced one (measured):** the
+> ≤5-peer / ≤10-link bound below is the declared operating band, but nothing in
+> code enforces or warns on room size — `gate_join` checks capability, key
+> binding, role, and expiry but never size, and the peer reconciler dials every
+> active member unconditionally. Above the ceiling the mesh does not fail
+> loudly: at N=25 delivery was measured to stop entirely (idle `frames_sent=0`,
+> `accepted=0`, 661 MB inbound backlog; under load 22 published events produced
+> `accepted=0` room-wide, the entry node holding 55,222 unprocessed frames)
+> while every connectivity signal read healthy. A clean band up to N=25 was seen
+> *only* with an experimental convergence gate that is not in mainline, and even
+> then only below ~0.2 events/s room-wide. Enforcing a hard limit in code is a
+> product decision, deliberately left out of this transport ADR.
 
 - **Scope:** Room Event Plane transport for ≤5-person private rooms (PRD v0.3 §9.1, §17.1.13).
 - **Related:** ADR-2 (event log + sync).

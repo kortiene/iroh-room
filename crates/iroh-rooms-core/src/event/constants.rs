@@ -84,3 +84,20 @@ pub const DIGEST_LEN: usize = 32;
 /// Length in bytes of the short opaque identifiers used in content schemas
 /// (`invite_id`, `capability_secret`, `pipe_id`, `file_id`, artifact ids).
 pub const SHORT_ID_LEN: usize = 16;
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_SHARED_FILE_BYTES;
+
+    /// Doc/code guard: the shipped file-share cap is exactly 100 MiB. The PRD
+    /// success metrics (PRD §18.6, PRD.v0.3 §17.1.9) and `RELEASE-READINESS.md`
+    /// document this number verbatim; an earlier "25 MB" target that was never
+    /// enforced diverged from the constant unnoticed. If this value ever
+    /// changes, those docs must change with it — this assertion makes the drift
+    /// loud instead of silent.
+    #[test]
+    fn shared_file_cap_is_100_mib() {
+        assert_eq!(MAX_SHARED_FILE_BYTES, 100 * 1024 * 1024);
+        assert_eq!(MAX_SHARED_FILE_BYTES, 104_857_600);
+    }
+}

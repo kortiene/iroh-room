@@ -5,6 +5,15 @@
 //! A Gate-D **NO-GO** condition is an *unbounded* orphan park or backfill, so the
 //! engine enforces all of these and logs whenever one drops, evicts, or caps
 //! something (spec §4.4 final paragraph / §9).
+//!
+//! These are anti-amplification bounds, **not** a room-size limit: nothing here
+//! (or anywhere else in code) enforces or warns on the declared ≤5-peer ceiling
+//! (ADR-1, `PHASE-0-SPIKE.md`). Above it these defaults do not degrade
+//! gracefully — at N=25 delivery was measured to stop entirely (idle
+//! `frames_sent=0`, `accepted=0`, 661 MB inbound backlog) while every
+//! connectivity signal read healthy. Staying under the ceiling is the
+//! operator's responsibility, documented in `README.md` and the PRD success
+//! metrics.
 
 /// Anti-amplification configuration for the sync engine (spec §4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,7 +21,14 @@ pub struct SyncConfig {
     /// Cap on parked (causally-incomplete) frames **per author key**; oldest is
     /// evicted on overflow (`MAX_PARKED_PER_AUTHOR`).
     pub max_parked_per_author: usize,
-    /// Global cap on the orphan park across all authors (`MAX_PARKED_TOTAL`).
+    /// Global cap on the orphan park across all authors (`MAX_PARKED_TOTAL`);
+    /// oldest-first eviction on overflow. **Not an ordinary tuning knob:** a
+    /// frame evicted here and never re-served is *permanently lost* — raising the
+    /// bound moves that cliff, it does not remove it. Overflow is surfaced (never
+    /// a silent drop): the first eviction each session records a CRITICAL
+    /// `park_overflow` [`TrustDecision`](super::TrustDecision) naming the lost
+    /// event, and every eviction bumps
+    /// [`park_evicted`](super::SyncCounters::park_evicted).
     pub max_parked_total: usize,
     /// Max ids in a single `WantEvents`; larger needs are chunked
     /// (`MAX_BACKFILL_FANOUT_IDS`).
@@ -23,7 +39,14 @@ pub struct SyncConfig {
     /// Tokens refilled into each author bucket per [`on_tick`](super::SyncEngine::on_tick).
     pub backfill_refill_per_tick: u32,
     /// Max consecutive missing-parent levels chased before a chain is treated as
-    /// a phantom and dropped (`MAX_BACKFILL_DEPTH`).
+    /// a phantom and dropped (`MAX_BACKFILL_DEPTH`). **Not an ordinary tuning
+    /// knob:** a *real* chain gap deeper than this is dropped as a phantom parent
+    /// and is thereafter *permanently unrecoverable* by this node through the
+    /// backfill path — raising the bound moves that cliff, it does not remove it.
+    /// The drop is surfaced (never silent): the first one each session records a
+    /// CRITICAL `backfill_depth_exceeded`
+    /// [`TrustDecision`](super::TrustDecision) naming the lost event, and every
+    /// drop bumps [`phantom_depth_dropped`](super::SyncCounters::phantom_depth_dropped).
     pub max_backfill_depth: usize,
     /// Cap on frames in one `Events` response; the requester re-asks for the rest
     /// (`RESPONSE_MAX_FRAMES`).
@@ -38,6 +61,14 @@ pub struct SyncConfig {
     /// can never be backfilled — from pinning a node fail-closed forever. A real
     /// tip is reconciled (and the suspicion cleared) well within this budget by the
     /// never-windowed membership pull, so only a fabricated tip reaches expiry.
+    /// **Not an ordinary tuning knob:** expiry *fails the removal-sensitive access
+    /// gate open* — the node stops failing closed on a tip it could not confirm,
+    /// so a removal it never saw could leave a removed member trusted as active.
+    /// That is a security-relevant transition, surfaced accordingly (never
+    /// silent): the first expiry each session records a CRITICAL
+    /// `admin_tip_expired` [`TrustDecision`](super::TrustDecision) naming the
+    /// abandoned tip, and every expiry bumps
+    /// [`suspect_tip_expired`](super::SyncCounters::suspect_tip_expired).
     pub max_unconfirmed_tip_attempts: u32,
     /// Cap on ids in a `WantMembership` `have` **ancestry claim** (#113): the
     /// requester claims a bounded sample of its held set — placed DAG heads, the

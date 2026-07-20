@@ -701,11 +701,24 @@ MVP is successful if:
 3. Message signatures are validated.
 4. Local history survives restart.
 5. Recent history sync works after reconnect.
-6. Files up to 25 MB can be shared and fetched.
+6. Files up to 100 MiB can be shared and fetched. (The enforced cap is
+   `MAX_SHARED_FILE_BYTES` = 104_857_600 bytes / 100 MiB, checked at share, at
+   `file.shared` validation, and at fetch buffering; an earlier "25 MB" target
+   was never enforced and is corrected here. The cap is not free: a 100 MiB
+   fetch was measured at ~134.6 MB consumer RSS because the collector allocates
+   the next power of two, and disk use is ~2.004x the fetched bytes because the
+   payload is written to the out path and re-imported into the blob store, with
+   no GC or delete path in non-test code.)
 7. Interrupted file fetch can resume or restart cleanly.
 8. A live TCP pipe can expose a local dev server to another peer.
 9. An agent can join and post status.
-10. A room with 5 participants remains usable.
+10. A room with 5 participants remains usable. This is the declared ceiling
+    (ADR-1, `PHASE-0-SPIKE.md`): the full-mesh QUIC transport is sized for
+    ≤5 peers / ≤10 links, and nothing in code enforces or warns above it.
+    Measured reality above the ceiling: at N=25 the system does not deliver
+    messages at all (idle `frames_sent=0`, `accepted=0`, 661 MB inbound
+    backlog; under load 22 published events produced `accepted=0` room-wide),
+    so behavior above 5 participants must not be assumed sensible.
 11. The system runs without a central application server.
 
 ## 19. Product Success Metrics

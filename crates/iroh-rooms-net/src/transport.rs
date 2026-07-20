@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{presets, Connection, VarInt};
+use iroh::endpoint::{presets, Connection, QuicTransportConfig, VarInt};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_rooms_core::sync::{Outgoing, PeerId, SyncTransport};
@@ -34,6 +34,44 @@ use crate::state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable
 /// Normal application close code for a locally-initiated disconnect (distinct from
 /// [`crate::handler::REJECT_CODE`], which means "unauthorized").
 const LOCAL_CLOSE_CODE: VarInt = VarInt::from_u32(0);
+
+/// How many bidirectional QUIC streams a remote endpoint may have open toward us on
+/// one connection, set **explicitly** on the endpoint's `QuicTransportConfig` instead
+/// of inherited from quinn's default.
+///
+/// Until now no `TransportConfig` existed anywhere in this workspace, so quinn's
+/// default of 100 applied by accident. That default was the first ceiling the Live
+/// Pipe Plane hit, and it hit it invisibly: a scale run on real hardware (25 nodes,
+/// real QUIC) drove 150 concurrent forwarded connections through one connector;
+/// exactly 100 succeeded (`echo_accepts=100`, `owner_sessions=100`) and the other 50
+/// parked indefinitely inside `open_bi()` — no error, no timeout, and no
+/// [`PipeOutcome`](crate::pipe::PipeOutcome) of any variant. FD peak in that run was
+/// 518 for 100 live sessions, so FD exhaustion cannot bind before this limit does.
+///
+/// The value is deliberately set **above** the connector's forwarding budget
+/// ([`PIPE_MAX_CONCURRENT_FORWARDS`](crate::pipe::PIPE_MAX_CONCURRENT_FORWARDS) = 100,
+/// which stays at the measured number). The 28-stream headroom is not slack, it is
+/// required for correctness of the guard: quinn issues stream credit in batches, so
+/// with the two numbers equal a peer sitting at the limit gets **no** new credit when
+/// a single stream retires, and the next `open_bi()` blocks even though the connector's
+/// own accounting says a slot is free. Measured on the P12 loopback fixture: with the
+/// limit equal to the budget, readmission after retiring one forward never happened
+/// inside 90 s (every attempt hit the connector's open deadline); with this headroom it
+/// happens in ~1 ms. Headroom keeps the connector's own budget — the one that refuses
+/// visibly — the binding constraint, which is the whole point.
+///
+/// This is also the bound on `PipeProtocolHandler::accept`'s per-stream task spawn:
+/// `accept_bi()` cannot yield more than this many live streams per connection, so the
+/// owner-side spawn is capped by the same setting rather than being unbounded.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
+
+/// The explicit [`QuicTransportConfig`] every endpoint binds with — see
+/// [`MAX_CONCURRENT_BIDI_STREAMS`]. Every other QUIC parameter keeps its default.
+fn transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(VarInt::from_u32(MAX_CONCURRENT_BIDI_STREAMS))
+        .build()
+}
 
 /// Which iroh stack the endpoint binds (spec §4.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,11 +430,14 @@ impl NetTransport {
             NetMode::Loopback => Endpoint::builder(presets::Minimal)
                 .secret_key(secret)
                 .relay_mode(RelayMode::Disabled)
+                .transport_config(transport_config())
                 .bind()
                 .await
                 .context("bind loopback endpoint")?,
             NetMode::RealNetwork => {
-                let builder = Endpoint::builder(presets::N0).secret_key(secret);
+                let builder = Endpoint::builder(presets::N0)
+                    .secret_key(secret)
+                    .transport_config(transport_config());
                 // Compile-time diagnostic seam only. Both endpoints in a
                 // controlled verification run use a separately built binary,
                 // suppressing direct UDP transports so all room, blob, and

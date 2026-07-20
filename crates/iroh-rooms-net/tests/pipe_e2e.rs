@@ -16,6 +16,7 @@
 //! | P5 | Admin removes Bob; the owner tears the active session down within ≤1 tick | AC5 |
 //! | P6 | An expired pipe is denied `expired` (the one wall-clock consultation) | §5 |
 //! | P11 | Two pipes exposed; per-pipe session count/info distinguish the connected pipe from the idle one, and closing one pipe decrements only its count | issue #86 |
+//! | P12 | The connector's stream budget saturates: forward #`N+1` is refused with a visible `PipeOutcome::Saturated` and an immediately-closed local socket, never accepted-then-starved | scale guardrails |
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,7 +37,7 @@ use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::pipe::PipeHello;
 use iroh_rooms_net::{
     AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, PipeAuditSink, PipeDenyCause,
-    PipeOutcome, TracingAudit, PIPE_ALPN,
+    PipeOutcome, TracingAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1385,6 +1386,150 @@ async fn p11_per_pipe_session_attribution() {
 
     fwd_a.shutdown();
     fwd_b.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+}
+
+// ---------------------------------------------------------------------------
+// P12 — the connector's concurrent-forward budget saturates visibly
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p12_over_budget_forward_is_refused_not_starved() {
+    // The scale run drove 150 concurrent forwards through one connector: 100 got
+    // streams and 50 parked forever inside `open_bi()` — no error, no timeout, no
+    // outcome, and no `PipeHello`, so the owner could not observe the overload even
+    // in principle. This test reproduces the boundary (`PIPE_MAX_CONCURRENT_FORWARDS`
+    // live forwards, then one more) and pins the new contract: the excess connection
+    // is refused with a typed outcome and its local socket is closed at once. Every
+    // await is `WAIT`-bounded, so a regression to the old parking behaviour fails the
+    // test instead of hanging CI.
+    let (room, log, alice, bob, _carol) = build_room();
+    let (echo, echo_count) = spawn_echo_server().await;
+
+    let alice_node = spawn_node(alice.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), allowlist(&[&alice, &bob]), room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+
+    let pipe_id = alice_node
+        .pipe_expose(
+            &alice.id,
+            &alice.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[bob.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("expose pipe");
+    wait_pipe_opened(&bob_node, pipe_id).await;
+
+    let mut forwarder = bob_node
+        .pipe_connect(loopback_addr(&alice_node), pipe_id, 0)
+        .await
+        .expect("bob connects pipe");
+    let local = forwarder.local_addr();
+
+    // Fill the budget exactly. Each client is held open (never dropped) so its permit
+    // — and its QUIC stream — stays live; awaiting the `Forwarded` outcome after each
+    // connect makes the fill deterministic rather than racing the accept loop.
+    let mut clients = Vec::with_capacity(PIPE_MAX_CONCURRENT_FORWARDS);
+    for i in 0..PIPE_MAX_CONCURRENT_FORWARDS {
+        let client = tokio::time::timeout(WAIT, TcpStream::connect(local))
+            .await
+            .unwrap_or_else(|_| panic!("connect client {i} within budget"))
+            .unwrap_or_else(|e| panic!("connect client {i}: {e}"));
+        let outcome = tokio::time::timeout(WAIT, forwarder.next_outcome())
+            .await
+            .unwrap_or_else(|_| panic!("client {i} produced no outcome"));
+        assert_eq!(
+            outcome,
+            Some(PipeOutcome::Forwarded),
+            "client {i} is within the budget and must forward"
+        );
+        clients.push(client);
+    }
+    wait_sessions(&alice_node, PIPE_MAX_CONCURRENT_FORWARDS).await;
+
+    // One more than the budget: the connection past the limit.
+    let mut excess = tokio::time::timeout(WAIT, TcpStream::connect(local))
+        .await
+        .expect("local listener still accepts")
+        .expect("connect the over-budget client");
+
+    // 1. It is reported. Before this fix there was no outcome of any variant here.
+    let outcome = tokio::time::timeout(WAIT, forwarder.next_outcome())
+        .await
+        .expect("the over-budget forward must surface an outcome, not park");
+    assert_eq!(
+        outcome,
+        Some(PipeOutcome::Saturated),
+        "saturation must be its own outcome, distinguishable from a gate denial"
+    );
+
+    // 2. Its local socket is closed immediately — the client learns it will not be
+    // served instead of holding an accepted connection that never carries a byte.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(WAIT, excess.read(&mut buf))
+        .await
+        .expect("the refused local socket must close, not hang")
+        .expect("read the refused local socket");
+    assert_eq!(n, 0, "a refused connection must see EOF, never be starved");
+
+    // 3. Nothing reached the owner for it: the echo server saw exactly the forwards
+    // that were admitted, so the refusal cost no owner-side resources.
+    assert_eq!(
+        echo_count.load(Ordering::SeqCst),
+        PIPE_MAX_CONCURRENT_FORWARDS,
+        "the over-budget connection must not reach the owner's target"
+    );
+    assert_eq!(
+        alice_node.live_pipe_sessions(),
+        PIPE_MAX_CONCURRENT_FORWARDS
+    );
+
+    // 4. The budget is a live count, not a fuse: retiring one forward frees a permit
+    // and a later connection forwards normally again. This is also what pins the
+    // headroom between `PIPE_MAX_CONCURRENT_FORWARDS` and `MAX_CONCURRENT_BIDI_STREAMS`
+    // — with the two equal, quinn's batched stream credit means the readmitted forward
+    // gets a permit but no stream, and this step never completes. The connector's
+    // permit is released when its own splice future returns, which is not synchronised
+    // with the owner's session bookkeeping, so retry inside the bound rather than
+    // assuming the slot is free the instant the owner's count drops.
+    drop(clients.pop().expect("one client to retire"));
+    wait_sessions(&alice_node, PIPE_MAX_CONCURRENT_FORWARDS - 1).await;
+    let mut retry = tokio::time::timeout(WAIT, async {
+        loop {
+            let mut client = TcpStream::connect(local)
+                .await
+                .expect("connect retry client");
+            match forwarder.next_outcome().await {
+                Some(PipeOutcome::Forwarded) => return client,
+                Some(PipeOutcome::Saturated) => {
+                    // The freed permit has not landed yet; close and try again.
+                    client.shutdown().await.ok();
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                other => panic!("unexpected outcome while awaiting readmission: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a freed permit must admit a later connection");
+    let echoed = tokio::time::timeout(WAIT, async {
+        retry.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        retry.read_exact(&mut buf).await.expect("read echo");
+        buf
+    })
+    .await
+    .expect("retry round-trip within budget");
+    assert_eq!(&echoed, b"ping", "the readmitted connection must forward");
+
+    forwarder.shutdown();
     alice_node.shutdown().await.expect("shutdown alice");
     bob_node.shutdown().await.expect("shutdown bob");
 }
