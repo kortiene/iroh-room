@@ -160,7 +160,7 @@ below assume the envelope exposes at least:
 ```
 ContentEventBody = {              // owned by #134 §9 — exact names are OQ-1
   "kind":      tstr,              // registered kind from D1; the §6.4 discriminant
-  "version":   uint,              // per-kind body schema minor version (default 1)
+  "version":   opt uint,          // per-kind body schema minor version; default 1 when absent
   "stream_id": opt bstr[16],      // stream scope; absent ⇒ the room default stream (#134 §17)
   "body":      map                // kind-specific; strict; schemas in D3/D4
 }
@@ -404,7 +404,8 @@ a two-stage check once the envelope is `ContentEventBody`:
 | 5c | `version` is a known minor for this `kind` (default `1`). | `invalid_content` |
 | 5d | Strict-parse `body` per D3/D4 (known keys, required/optional, types, caps, enums). | `invalid_content` |
 | 5e | Cross-field rules against the envelope (`sender_id`): D4.1 `blocked_by == sender_id`, `subject != sender_id`; D4.2 `reported_by == sender_id`; D4.3 `removed_by == sender_id`. (v1 `check_field_rules` pattern.) | `invalid_content` |
-| 5f | `stream_id`/`scope` consistency (D4.1: `scope == room` ⇒ no `stream_id`). | `invalid_content` |
+| 5f | `stream_id`/`scope` bidirectional consistency (D4.1): `scope == room` ⇒ `stream_id` absent; `scope == stream` ⇒ `stream_id` present. Both directions checked. | `invalid_content` |
+| 5g | If the envelope `ContentEventBody.stream_id` (D2) and a moderation body's `stream_id` (D4) are both present, they MUST be identical. A mismatch means the event is ambiguous between the envelope's scope and the body's scope. | `invalid_content` |
 
 **Deferred (stateful) checks — not owned by this spec, listed for completeness:**
 
@@ -517,8 +518,10 @@ The issue also names two Out-of-scope items; this spec respects both:
 
 - **OQ-1 (blocks Phase C, not this spec):** the exact `ContentEventBody` field names and the
   presence/shape of `version` and `stream_id` — owned by #134 §9. This spec assumes D2.
-- **OQ-2:** is `message.edited` in the v2.0 MVP registry, or is it deferred? It is proposed
-  here because it is the natural counterpart to `message.reaction`; #134 §25 decides.
+- **OQ-2 (resolved):** `message.edited` IS in the v2.0 MVP registry. It is the natural
+  counterpart to `message.reaction` and is required for edit semantics in chat streams. A
+  v2.0 event with `kind = "message.edited"` is accepted (not `unknown_content_kind`). The
+  D1 registry entry and D3.3 schema are normative.
 - **OQ-3:** should `moderation.report.category` be open (string with a *recommended* set) or
   closed enum? This spec chooses closed for sortability of intake; revisit if i18n/l10c of
   categories becomes a product requirement.
