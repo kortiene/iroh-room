@@ -8,6 +8,11 @@
     "defaultRoot": ".adw/prompts",
     "runnerRoots": {}
   },
+  "runners": {
+    "opencode": {
+      "authEnv": "SAKANA_API_KEY"
+    }
+  },
   "phases": [
     "classify",
     "plan",
@@ -132,19 +137,19 @@
         "claude": "claude-haiku-4-5",
         "pi": "haiku",
         "codex": "gpt-5.4-mini",
-        "opencode": "anthropic/claude-haiku-4-5"
+        "opencode": "dgx-spark/qwen3.6-35b-a3b"
       },
       "mid": {
         "claude": "claude-sonnet-5",
         "pi": "sonnet",
         "codex": "gpt-5.4",
-        "opencode": "anthropic/claude-sonnet-5"
+        "opencode": "sakana/fugu"
       },
       "capable": {
         "claude": "claude-opus-4-8",
         "pi": "opus",
         "codex": "gpt-5.5",
-        "opencode": "anthropic/claude-opus-4-8"
+        "opencode": "sakana/fugu-ultra"
       }
     }
   },
