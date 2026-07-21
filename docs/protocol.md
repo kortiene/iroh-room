@@ -316,6 +316,18 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 > fields as `invalid_content`. Forward-compatible fields arrive only by bumping
 > `schema_version` — never as a silently-ignored extra key.
 
+> **v2.0 forward design (not shipping).** The `schema_version = 2` content-kind
+> registry (the finer-grained successor of the table above), the stream-scoped
+> moderation events `moderation.block` / `moderation.report` / `moderation.remove`,
+> and the `unknown_content_kind` rejection that extends the "reject, never ignore"
+> rule to the content-kind discriminant are specified in
+> [`specs/content-and-moderation-event-schemas.md`](../specs/content-and-moderation-event-schemas.md)
+> (issue #158, parent #134 §25 #4). It is a **design document only**: under the
+> shipped code every v2.0 event is still rejected `unknown_schema_version` until
+> the P-26 / Decision D-9 schema-evolution ADR
+> (`docs/audits/feature-complete-audit-2026-07-02.md`) lands. No code, wire
+> format, or compatibility promise here changes today.
+
 ### Content schemas (condensed; bounds are the `constants.rs` values, [§9](#9-rejection--flag-reason-codes))
 
 **`room.created`**
@@ -678,6 +690,7 @@ document's §9 table cannot silently fall out of date without CI catching it fir
 
 - [`PHASE-0-SPIKE.md`](../PHASE-0-SPIKE.md) — the full normative source, ADRs, and residual-risk analysis.
 - [`PRD.v0.3.md`](../PRD.v0.3.md) §18.6 (Protocol Ambiguity Risk), §11 (product-level envelope view), §13/§14 (security & availability model).
+- [`specs/content-and-moderation-event-schemas.md`](../specs/content-and-moderation-event-schemas.md) — v2.0 design (not shipping) for the content-kind registry, stream-scoped moderation events, and `unknown_content_kind` rejection; gated on the D-9 schema-evolution ADR (P-26).
 - [`docs/getting-started.md`](getting-started.md) — the runnable end-to-end demo.
 - `crates/iroh-rooms-core/` — the reference implementation.
 - `crates/iroh-rooms-core/tests/conformance/` — the conformance suite.
