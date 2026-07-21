@@ -8,6 +8,52 @@
     "defaultRoot": ".adw/prompts",
     "runnerRoots": {}
   },
+  "runners": {
+    "opencode": {
+      "authEnv": ["SAKANA_API_KEY", "ZAI_API_KEY"],
+      "config": {
+        "enabled_providers": ["sakana", "zai-coding-plan"],
+        "small_model": "sakana/fugu",
+        "provider": {
+          "sakana": {
+            "npm": "@ai-sdk/openai",
+            "name": "Sakana AI",
+            "options": {
+              "apiKey": "{env:SAKANA_API_KEY}",
+              "baseURL": "https://api.sakana.ai/v1",
+              "timeout": 7200000,
+              "chunkTimeout": 7200000
+            },
+            "models": {
+              "fugu": {
+                "name": "Fugu",
+                "reasoning": true,
+                "attachment": true,
+                "tool_call": true,
+                "modalities": { "input": ["text", "image"], "output": ["text"] },
+                "limit": { "context": 1000000, "output": 32768 },
+                "options": { "reasoningEffort": "high" }
+              },
+              "fugu-ultra": {
+                "name": "Fugu Ultra",
+                "reasoning": true,
+                "attachment": true,
+                "tool_call": true,
+                "modalities": { "input": ["text", "image"], "output": ["text"] },
+                "limit": { "context": 1000000, "output": 32768 },
+                "options": { "reasoningEffort": "high" }
+              }
+            }
+          },
+          "zai-coding-plan": {
+            "options": {
+              "apiKey": "{env:ZAI_API_KEY}"
+            }
+          }
+        }
+      }
+    }
+  },
   "phases": [
     "classify",
     "plan",
@@ -132,19 +178,19 @@
         "claude": "claude-haiku-4-5",
         "pi": "haiku",
         "codex": "gpt-5.4-mini",
-        "opencode": "anthropic/claude-haiku-4-5"
+        "opencode": "sakana/fugu"
       },
       "mid": {
         "claude": "claude-sonnet-5",
         "pi": "sonnet",
         "codex": "gpt-5.4",
-        "opencode": "anthropic/claude-sonnet-5"
+        "opencode": "zai-coding-plan/glm-5.2"
       },
       "capable": {
         "claude": "claude-opus-4-8",
         "pi": "opus",
         "codex": "gpt-5.5",
-        "opencode": "anthropic/claude-opus-4-8"
+        "opencode": "sakana/fugu-ultra"
       }
     }
   },
@@ -153,4 +199,3 @@
     "defaultFinalizeGates": ["scripts/verify.sh"]
   }
 }
-
