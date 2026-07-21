@@ -233,7 +233,7 @@ Status uses:
 | T06 | Expired or stale invite reused | High | Expiry, sticky departure, join capability check | Keep user docs and release notes explicit: no native revocation; ask admin for a fresh invite | Controlled |
 | T07 | Removed member keeps blob/pipe capability | Critical | Current-snapshot access gates, owner inactive checks, revocation-on-learn | Exposure is bounded by removal-event reachability; production notes must say this; consider always-on witness later | Partial |
 | T08 | Removed member pollutes timeline after removal | Medium | Advisory `from_removed_member`; capabilities are zero | UI/listing hard segregation not complete; acceptable for beta only if disclosed | Partial |
-| T09 | Repeat malicious identity has no basic blocklist | Medium | Admin can withhold invites or remove members | PRD names basic blocklist; no explicit blocklist surface found. Decide if member removal satisfies scoped beta or implement blocklist | Open |
+| T09 | Repeat malicious identity has no basic blocklist | Medium | Admin can withhold invites or remove members | PRD names basic blocklist; no explicit blocklist surface found. Decide if member removal satisfies scoped beta or implement blocklist. A v2.0 stream-scoped `moderation.block` design now exists in `specs/content-and-moderation-event-schemas.md` (issue #158) as the forward blocklist design, but it is **not implemented** and is gated on the D-9 schema-evolution ADR (P-26); it does not change v1 posture. | Open |
 | T10 | Compromised local account reads room data | Critical | Unix owner-only identity files; local-only storage; ADR-0001 scopes beta to trusted local machines | `rooms.db`, blobs, and `audit.ndjson` are plaintext. GA needs encryption or a narrower deployment claim | Partial |
 | T11 | Local secret key leakage through CLI output | Critical | Secret-free output tests, redaction, `identity show` avoids secret file | Keep regression tests; extend bug template to request redacted logs only | Controlled |
 | T12 | Malicious blob provider serves wrong file | High | Independent BLAKE3 verify; hash mismatch hard stop | Keep tests in release gate | Controlled |
@@ -307,6 +307,13 @@ blocklist.
 Recommendation: for Production Beta, use member removal plus no implicit joins
 as the scoped blocklist only if release notes state there is no global identity
 blocklist or abuse-reporting system.
+
+A v2.0 stream-scoped blocklist design (`moderation.block`, with paired
+`moderation.report` / `moderation.remove`) is specified in
+`specs/content-and-moderation-event-schemas.md` (issue #158) as the forward
+design. It is **not implemented**, is blocked by the D-9 schema-evolution ADR
+(P-26), and does not change the Production Beta posture above; it is cited here
+only so the design input is traceable from this threat.
 
 ### D06 SDK Publication And Stability
 
