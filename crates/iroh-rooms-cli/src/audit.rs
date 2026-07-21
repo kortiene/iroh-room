@@ -28,7 +28,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use iroh_rooms::experimental::session::EndpointId;
+use iroh_rooms_core::event::ids::RoomId;
 use iroh_rooms_core::event::keys::IdentityKey;
+use iroh_rooms_core::membership::ACTIVE_MEMBER_WARNING_THRESHOLD;
 use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
 use serde_json::{json, Value};
 
@@ -302,6 +304,30 @@ impl AuditSink for LocalAudit {
         );
         self.stderr.blob_serve_rejected(peer, cause, hash);
     }
+
+    fn active_member_threshold_reached(
+        &self,
+        room_id: &RoomId,
+        active: usize,
+        max: usize,
+        remaining: usize,
+    ) {
+        // `room.active_members.near_cap` (issue #144): operational metadata only
+        // — room id + numeric counts. No secrets, tickets, bodies, blob bytes,
+        // or local paths may ever be added here (ADR-0003).
+        self.persistent.record(
+            "room.active_members.near_cap",
+            json!({
+                "room": room_id.to_string(),
+                "active": active,
+                "max": max,
+                "remaining": remaining,
+                "threshold": ACTIVE_MEMBER_WARNING_THRESHOLD,
+            }),
+        );
+        self.stderr
+            .active_member_threshold_reached(room_id, active, max, remaining);
+    }
 }
 
 impl AuditSink for StderrAudit {
@@ -386,6 +412,25 @@ impl AuditSink for StderrAudit {
             hash.map_or_else(String::new, |h| format!(" hash={}", short_hash(h)))
         );
     }
+
+    fn active_member_threshold_reached(
+        &self,
+        _room_id: &RoomId,
+        active: usize,
+        max: usize,
+        remaining: usize,
+    ) {
+        // Stable, greppable operator line (issue #144, spec §4 D4). Mirrors the
+        // `room members --status` headroom wording so an operator scanning stderr
+        // sees the same vocabulary. The room id is intentionally omitted from the
+        // stderr line — it is already on the persistent record, and a `room tail`
+        // session is scoped to a single room.
+        let slot = if remaining == 1 { "slot" } else { "slots" };
+        eprintln!(
+            "warning[room_near_capacity]: room has {active}/{max} active members ({remaining} \
+             {slot} remaining)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +465,12 @@ mod tests {
         sink.blob_serve_accepted(device(1), [0x22; 32]);
         sink.blob_serve_rejected(device(1), BlobDenyCause::NotActive, Some([0x22; 32]));
         sink.blob_serve_rejected(device(1), BlobDenyCause::PushDenied, None);
+        sink.active_member_threshold_reached(
+            &iroh_rooms_core::event::ids::RoomId::from_bytes([0x33; 32]),
+            4,
+            5,
+            1,
+        );
     }
 
     #[test]
@@ -466,6 +517,12 @@ mod tests {
         sink.accepted(device(1), &id);
         sink.rejected(device(1), RejectCause::UnknownDevice);
         sink.blob_serve_rejected(device(1), BlobDenyCause::NotReferenced, Some([0x44; 32]));
+        sink.active_member_threshold_reached(
+            &iroh_rooms_core::event::ids::RoomId::from_bytes([0x55; 32]),
+            4,
+            5,
+            1,
+        );
 
         let content = std::fs::read_to_string(home.path().join(AUDIT_LOG_FILE)).unwrap();
         let events = content
@@ -478,9 +535,13 @@ mod tests {
                 Value::String("peer.accepted".to_owned()),
                 Value::String("peer.rejected".to_owned()),
                 Value::String("blob.serve.rejected".to_owned()),
+                Value::String("room.active_members.near_cap".to_owned()),
             ]
         );
         assert!(content.contains("\"hash_prefix\":\"44444444\""));
+        assert!(content.contains("\"active\":4"));
+        assert!(content.contains("\"max\":5"));
+        assert!(content.contains("\"remaining\":1"));
         assert!(!content.contains("identity.secret"));
     }
 

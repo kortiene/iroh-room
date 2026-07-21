@@ -13,6 +13,14 @@ use crate::event::keys::{DeviceKey, IdentityKey};
 
 pub const MAX_ACTIVE_MEMBERS: usize = 5;
 
+/// The soft warning threshold for "approaching the active-member ceiling": one
+/// slot below the hard cap (issue #144). Used by live observers
+/// (`RoomReconciler`, `room members --status`) to surface a near-cap warning
+/// **without** changing authorization or the cap itself. Derived from
+/// [`MAX_ACTIVE_MEMBERS`] so it tracks the protocol invariant rather than being
+/// configured independently.
+pub const ACTIVE_MEMBER_WARNING_THRESHOLD: usize = MAX_ACTIVE_MEMBERS - 1;
+
 /// A subject's current membership status (spike §3.4).
 ///
 /// Ordered so the **Removed-dominates** rule is a `max`:
@@ -165,8 +173,86 @@ impl MembershipSnapshot {
         self.active_members().count()
     }
 
+    /// The hard active-member cap ([`MAX_ACTIVE_MEMBERS`]); the protocol
+    /// invariant the fold enforces with `RejectReason::RoomFull`. Exposed as a
+    /// snapshot method so status/audit callers do not need to import the
+    /// constant separately (issue #144).
+    #[must_use]
+    pub fn active_member_limit(&self) -> usize {
+        MAX_ACTIVE_MEMBERS
+    }
+
+    /// Remaining active-member slots before the room hits [`MAX_ACTIVE_MEMBERS`]
+    /// (issue #144). Saturates to `0` for an over-cap snapshot (defensive: the
+    /// fold should never produce one, but the headroom surface must never
+    /// underflow).
+    #[must_use]
+    pub fn active_member_headroom(&self) -> usize {
+        self.active_member_limit()
+            .saturating_sub(self.active_member_count())
+    }
+
     /// Iterate every known member (any status) in deterministic identity order.
     pub fn members(&self) -> impl Iterator<Item = &Member> {
         self.members.values()
+    }
+}
+
+/// Pure below-to-at/above-threshold crossing detector for the active-member
+/// count (issue #144). Returns `true` only on the transition from strictly
+/// below [`ACTIVE_MEMBER_WARNING_THRESHOLD`] to at/above it; this is what
+/// "one-shot warning per crossing" callers (`RoomReconciler`) consume so a
+/// room that stays at the threshold does not emit a warning on every tick.
+///
+/// * `previous = Some(3), current = 4` → `true` (the canonical 3 → 4 cross)
+/// * `previous = Some(4), current = 4` → `false` (no transition)
+/// * `previous = Some(4), current = 5` → `false` (already at/above; not a cross)
+/// * `previous = Some(3), current = 5` → `true` (concurrent-join jump across)
+/// * `previous = Some(5), current = 3` → `false` (room shrank; not a warning)
+/// * `previous = None`           , any `current` → `false` (no prior observation;
+///   recommended default for `RoomReconciler` startup — see spec §4 D3 / OQ-1)
+#[must_use]
+pub fn active_member_warning_crossed(previous: Option<usize>, current: usize) -> bool {
+    match previous {
+        Some(prev) => {
+            prev < ACTIVE_MEMBER_WARNING_THRESHOLD && current >= ACTIVE_MEMBER_WARNING_THRESHOLD
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        active_member_warning_crossed, ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS,
+    };
+
+    #[test]
+    fn active_member_warning_crossed_is_one_shot_per_below_to_threshold_crossing() {
+        assert_eq!(ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS - 1);
+        assert!(active_member_warning_crossed(
+            Some(ACTIVE_MEMBER_WARNING_THRESHOLD - 1),
+            ACTIVE_MEMBER_WARNING_THRESHOLD
+        ));
+        assert!(active_member_warning_crossed(
+            Some(ACTIVE_MEMBER_WARNING_THRESHOLD - 1),
+            MAX_ACTIVE_MEMBERS
+        ));
+        assert!(!active_member_warning_crossed(
+            Some(ACTIVE_MEMBER_WARNING_THRESHOLD),
+            ACTIVE_MEMBER_WARNING_THRESHOLD
+        ));
+        assert!(!active_member_warning_crossed(
+            Some(ACTIVE_MEMBER_WARNING_THRESHOLD),
+            MAX_ACTIVE_MEMBERS
+        ));
+        assert!(!active_member_warning_crossed(
+            Some(MAX_ACTIVE_MEMBERS),
+            ACTIVE_MEMBER_WARNING_THRESHOLD - 1
+        ));
+        assert!(!active_member_warning_crossed(
+            None,
+            ACTIVE_MEMBER_WARNING_THRESHOLD
+        ));
     }
 }

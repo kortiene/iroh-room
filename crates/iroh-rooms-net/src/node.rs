@@ -33,7 +33,9 @@ use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::SignedEvent;
 use iroh_rooms_core::event::{build_pipe_closed, build_pipe_opened};
-use iroh_rooms_core::membership::MembershipSnapshot;
+use iroh_rooms_core::membership::{
+    active_member_warning_crossed, MembershipSnapshot, MAX_ACTIVE_MEMBERS,
+};
 use iroh_rooms_core::store::StoredEvent;
 use iroh_rooms_core::sync::{Completeness, Outgoing, PeerId, SyncEngine, SyncMessage};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -116,6 +118,18 @@ struct RoomReconciler {
     /// gating this refresh on `last` would starve Gate 2 of newly-shared files
     /// (memory: membership-snapshot equality is vacuous over content events).
     last_referenced: Option<BTreeSet<[u8; 32]>>,
+    /// The local audit sink — the seam for the approach-to-ceiling warning
+    /// (issue #144). Held on the reconciler because it already observes every
+    /// live fold and the warning is independent of the `last` admission-change
+    /// detector (a 4 → 4 stay-at-threshold must not re-warn).
+    audit: Arc<dyn AuditSink>,
+    /// Last observed active-member count — the per-reconciler state that turns
+    /// the threshold check into a one-shot-per-crossing signal instead of
+    /// per-tick spam. `None` until the first `maybe_reconcile` reads a
+    /// snapshot (spec §4 D3 / OQ-1: a node that starts at/above threshold does
+    /// **not** emit an initial warning — `room members --status` is the
+    /// current-state surface for that).
+    last_active_member_count: Option<usize>,
 }
 
 impl RoomReconciler {
@@ -126,6 +140,20 @@ impl RoomReconciler {
     /// fold-mutating pump step and on each tick.
     fn maybe_reconcile(&mut self, engine: &SyncEngine) {
         let snapshot = engine.snapshot();
+        // Approach-to-ceiling warning (issue #144): independent of the admission
+        // fold-change detector below — a stay-at-threshold room must not re-warn
+        // on every tick, but a below-to-at/above transition must warn exactly
+        // once per crossing. Tracked against `last_active_member_count` so the
+        // signal is one-shot per crossing regardless of admission diff cadence.
+        let active = snapshot.active_member_count();
+        if active_member_warning_crossed(self.last_active_member_count, active) {
+            let max = MAX_ACTIVE_MEMBERS;
+            let remaining = max.saturating_sub(active);
+            self.audit
+                .active_member_threshold_reached(snapshot.room_id(), active, max, remaining);
+        }
+        self.last_active_member_count = Some(active);
+
         let view = AdmissionView::from_snapshot(&snapshot, &engine.fail_closed_subjects());
         let membership_changed = self.last.as_ref() != Some(&view);
 
@@ -450,7 +478,10 @@ impl Node {
         // Build the room-scoped manager + admission-refresh reconciler when this is a
         // managed session. The manager is moved (as a clone) into the pump so the
         // single-owner engine drives reconciliation; `Node` keeps a handle to abort
-        // its dial loops on shutdown.
+        // its dial loops on shutdown. `audit` is cloned here (before it is moved
+        // into `NetTransport::bind` further below) so the reconciler can emit the
+        // approach-to-ceiling warning (issue #144) through the same sink the
+        // accept path uses.
         let (peer_manager, room_reconciler) = match room {
             Some(RoomConfig {
                 addr_hints,
@@ -469,6 +500,8 @@ impl Node {
                     last: None,
                     blob_acl_cell,
                     last_referenced: None,
+                    audit: transport.shared().audit.clone(),
+                    last_active_member_count: None,
                 };
                 (Some(manager), Some(reconciler))
             }

@@ -660,6 +660,13 @@ fn print_members_status(
         Some(admin) => println!("admin: {admin}"),
         None => println!("admin: <none>"),
     }
+    println!(
+        "{}",
+        active_capacity_line(
+            snapshot.active_member_count(),
+            snapshot.active_member_limit()
+        )
+    );
     let entries: HashMap<EndpointId, PeerEntry> = node.peer_entries().into_iter().collect();
     for m in snapshot.members() {
         let admin_tag = if snapshot.admin() == Some(&m.identity) {
@@ -677,6 +684,18 @@ fn print_members_status(
         );
     }
     println!("{}", roster_summary(&node.peer_entries()));
+}
+
+/// Render the `active: <active>/<max> (<remaining> slot[s] remaining)` line for
+/// `room members --status` (issue #144). Kept as a pure formatter so unit tests
+/// do not need to capture stdout; the `slot`/`slots` pluralization is the only
+/// piece of natural-language variance. `max` is taken from the caller (the
+/// snapshot's `active_member_limit()`, which returns [`MAX_ACTIVE_MEMBERS`]) so
+/// the helper stays trivially testable without constructing a snapshot.
+fn active_capacity_line(active: usize, max: usize) -> String {
+    let remaining = max.saturating_sub(active);
+    let slot = if remaining == 1 { "slot" } else { "slots" };
+    format!("active: {active}/{max} ({remaining} {slot} remaining)")
 }
 
 /// Render the `--verbose` network-diagnostics block (spec IR-0303 §5.3): the local
@@ -1236,8 +1255,8 @@ pub(crate) fn render_endpoint_addr(addr: &EndpointAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_event_id, parse_peer, parse_timeout, render_endpoint_addr, validate_body,
-        validate_format,
+        active_capacity_line, parse_event_id, parse_peer, parse_timeout, render_endpoint_addr,
+        validate_body, validate_format,
     };
     use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
     use iroh_rooms_core::event::constants::MAX_MESSAGE_BODY_BYTES;
@@ -1285,6 +1304,29 @@ mod tests {
     fn format_unknown_is_rejected() {
         assert!(validate_format(Some("html")).is_err());
         assert!(validate_format(Some("Plain")).is_err()); // case-sensitive
+    }
+
+    // ── active_capacity_line ──────────────────────────────────────────────────
+
+    #[test]
+    fn active_capacity_line_shows_limit_and_one_remaining_slot() {
+        assert_eq!(active_capacity_line(4, 5), "active: 4/5 (1 slot remaining)");
+    }
+
+    #[test]
+    fn active_capacity_line_pluralizes_and_saturates_remaining_slots() {
+        assert_eq!(
+            active_capacity_line(3, 5),
+            "active: 3/5 (2 slots remaining)"
+        );
+        assert_eq!(
+            active_capacity_line(5, 5),
+            "active: 5/5 (0 slots remaining)"
+        );
+        assert_eq!(
+            active_capacity_line(6, 5),
+            "active: 6/5 (0 slots remaining)"
+        );
     }
 
     // ── parse_event_id ────────────────────────────────────────────────────────

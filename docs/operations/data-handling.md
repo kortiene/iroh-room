@@ -75,7 +75,9 @@ Current behavior:
 
 - It records event names such as `peer.rejected`, `event.rejected`,
   `join.bootstrap.admitted`, `blob.serve.rejected`, `pipe.connect.rejected`,
-  and `pipe.torndown`.
+  `pipe.torndown`, and `room.active_members.near_cap` (the one-shot
+  approach-to-ceiling warning emitted when a live observer sees the active-member
+  count reach `MAX_ACTIVE_MEMBERS - 1`; issue #144).
 - It may include public identity IDs, endpoint IDs, pipe IDs, reason codes,
   counts, and shortened blob hash prefixes.
 - It does not record identity secret seeds, device secret seeds, invite

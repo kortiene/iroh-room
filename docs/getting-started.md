@@ -1093,6 +1093,7 @@ never renders as reachable):
 $ iroh-rooms room members <ROOM_ID> --status --verbose
 room: blake3:…
 admin: …
+active: 2/5 (3 slots remaining)
 member: … role=admin status=active conn=self
 member: … role=member status=active conn=connected
 peers: 1 connected, 0 offline, 0 unauthorized
@@ -1100,6 +1101,15 @@ diag: local id=<endpoint_id> direct=192.168.1.20:45001 relay=none
 diag: peer 9a0211bd device=7f3a2c1b state=connected path=direct relay=none
 diag: transport connected=1 (direct=1 relay=0 mixed=0) offline=0 unauthorized=0
 ```
+
+The `active: <n>/5 (<k> slots remaining)` line (issue #144) surfaces the current
+active-member count against the hard `MAX_ACTIVE_MEMBERS = 5` cap; the cap itself
+is enforced as a `RejectReason::RoomFull` reject on the 6th active join and is
+not configurable. A live `room tail` / managed session that observes the count
+cross from below 4 to at/above 4 also emits a one-shot
+`warning[room_near_capacity]:` stderr line and a `room.active_members.near_cap`
+audit record (see `docs/operations/data-handling.md`); `room members --status`
+is the on-demand current-state view of the same headroom.
 
 The `diag:` lines never contain a private key, a ticket secret, or a message payload — only
 public identifiers (an `EndpointId`/`IdentityKey`), connection-state labels, IP socket

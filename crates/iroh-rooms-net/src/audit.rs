@@ -8,6 +8,7 @@
 //! sink); the default [`TracingAudit`] emits structured `tracing` events.
 
 use iroh::EndpointId;
+use iroh_rooms_core::event::ids::RoomId;
 use iroh_rooms_core::event::keys::IdentityKey;
 
 use crate::admission::RejectCause;
@@ -123,6 +124,28 @@ pub trait AuditSink: Send + Sync + 'static {
         _peer: EndpointId,
         _cause: BlobDenyCause,
         _hash: Option<[u8; 32]>,
+    ) {
+    }
+
+    /// The room approached its active-member ceiling (issue #144): a live
+    /// observer (`RoomReconciler`) saw the active count cross from strictly
+    /// below `ACTIVE_MEMBER_WARNING_THRESHOLD` to at/above it. Pure
+    /// observability — never changes authorization, the hard
+    /// `RejectReason::RoomFull` cap, or the signed event log.
+    ///
+    /// - `active` is the current active-member count.
+    /// - `max` is the hard cap (`MAX_ACTIVE_MEMBERS`, currently `5`).
+    /// - `remaining` is `max.saturating_sub(active)` (the headroom left).
+    ///
+    /// Stable reason code: `room.active_members.near_cap`. Emitters must keep
+    /// this secret-free (room id + numeric counts only). Default: no-op, so
+    /// existing sinks need not change.
+    fn active_member_threshold_reached(
+        &self,
+        _room_id: &RoomId,
+        _active: usize,
+        _max: usize,
+        _remaining: usize,
     ) {
     }
 }
@@ -283,6 +306,27 @@ impl AuditSink for TracingAudit {
             peer = %peer,
             hash = hash.map(hex::encode),
             "rejected a blob-plane connect or request"
+        );
+    }
+
+    fn active_member_threshold_reached(
+        &self,
+        room_id: &RoomId,
+        active: usize,
+        max: usize,
+        remaining: usize,
+    ) {
+        // `room.active_members.near_cap` is the stable, greppable audit line for
+        // the approach-to-ceiling warning (issue #144). WARN: an operator-relevant
+        // signal that the next join may fail with `RejectReason::RoomFull`.
+        tracing::warn!(
+            reason = "room.active_members.near_cap",
+            room = %room_id,
+            active,
+            max,
+            remaining,
+            threshold = iroh_rooms_core::membership::ACTIVE_MEMBER_WARNING_THRESHOLD,
+            "room is approaching the active-member ceiling"
         );
     }
 }
