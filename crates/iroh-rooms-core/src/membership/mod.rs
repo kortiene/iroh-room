@@ -42,4 +42,7 @@ pub use access::{
     blob_serve_allowed, pipe_connect_allowed, BlobDecision, DenyReason, PipeDecision,
 };
 pub use fold::{AncestorView, Ingest, RoomMembership};
-pub use model::{Member, MembershipSnapshot, Role, Status, MAX_ACTIVE_MEMBERS};
+pub use model::{
+    active_member_warning_crossed, Member, MembershipSnapshot, Role, Status,
+    ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS,
+};

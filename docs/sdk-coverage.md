@@ -51,6 +51,19 @@ dependency, so `derive_room_id` was added to `iroh_rooms::room` (it is exactly
 as pure/deterministic as the already-listed `capability_hash`; see
 `crates/iroh-rooms/src/room.rs`).
 
+**Drift note (issue #144).** `crates/iroh-rooms-cli/src/audit.rs` now imports
+`ACTIVE_MEMBER_WARNING_THRESHOLD` directly from `iroh_rooms_core::membership`,
+and `crates/iroh-rooms-net` uses `active_member_warning_crossed` from the same
+module. Neither symbol is re-exported through the `iroh-rooms` façade today, so
+the "façade is a strict superset of the CLI's needs" claim above is currently
+violated by these two observability-only symbols. The façade re-exports the
+`MembershipSnapshot` type itself (including its new `active_member_limit` /
+`active_member_headroom` methods), so the headroom surface IS reachable through
+`iroh_rooms::room`; only the threshold constant and the crossing detector are
+core-only. Resolving this drift is a one-line `pub use` in
+`crates/iroh-rooms/src/room.rs` and is tracked here rather than fixed in the
+issue #144 docs pass to keep that pass docs-only.
+
 ## Experimental tier (`iroh_rooms::experimental::*`)
 
 | `net`/`core` symbol | Façade path | Used by |
