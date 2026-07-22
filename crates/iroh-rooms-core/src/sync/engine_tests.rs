@@ -611,6 +611,84 @@ fn disabled_dedup_cache_uses_store_duplicate_path() {
     assert_eq!(engine.store_mut().write_tx_count(), 1);
 }
 
+// A failed parent insert can leave a persisted descendant with a NULL lamport.
+// On restart that descendant is absent from `room_tail` and therefore from the
+// rebuilt fold. Its id must not be seeded into the early cache: a peer replay is
+// what restores it to the in-memory fold after the parent hole heals.
+#[test]
+fn restart_dedup_seed_excludes_causally_unplaced_rows() {
+    let cfg = SyncConfig::default();
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let parent = make_message(
+        &admin_id,
+        &admin_dev,
+        room,
+        genesis_id,
+        "missing parent",
+        T0 + 1,
+    );
+    let parent_id = frame_id(&parent, room);
+    let child = make_message(
+        &admin_id,
+        &admin_dev,
+        room,
+        parent_id,
+        "stored child",
+        T0 + 2,
+    );
+
+    engine.store_mut().fail_next_inserts(1);
+    engine.publish(&parent).expect("fold accepts parent");
+    engine.publish(&child).expect("fold accepts child");
+    assert_eq!(
+        engine.store_retry_len(),
+        1,
+        "the parent is still a store hole"
+    );
+    assert_eq!(
+        engine.room_tail(100).expect("tail").len(),
+        1,
+        "the NULL-lamport child is not causally placed"
+    );
+
+    let store = engine.into_store();
+    let mut reopened = SyncEngine::open(store, room, cfg).expect("reopen");
+    assert_eq!(
+        reopened.fold_tracked_len(),
+        1,
+        "only genesis was restored from the causal room tail"
+    );
+    let early_before = reopened.counters().early_duplicates;
+    let duplicates_before = reopened.counters().duplicates;
+
+    reopened.ingest_frame(NODE_A, &parent);
+    assert_eq!(
+        reopened.fold_tracked_len(),
+        2,
+        "the parent replay heals the hole"
+    );
+    reopened.ingest_frame(NODE_A, &child);
+
+    assert_eq!(
+        reopened.counters().early_duplicates,
+        early_before,
+        "an event omitted from the rebuilt fold must not be dropped early"
+    );
+    assert_eq!(
+        reopened.counters().duplicates,
+        duplicates_before + 1,
+        "the stored child reaches the full fold + idempotent store path"
+    );
+    assert_eq!(
+        reopened.fold_tracked_len(),
+        3,
+        "the child replay restores the event to the membership fold"
+    );
+    assert_eq!(reopened.room_tail(100).expect("tail").len(), 3);
+}
+
 // T4 — N consecutive accepted events in one Events message commit in
 // ⌈N/batch⌉ transactions, not N (issue #143 batching acceptance).
 #[test]
@@ -668,7 +746,8 @@ fn consecutive_accepted_events_commit_in_ceil_n_over_batch_transactions() {
 
 // T7 — A failed batch defers every side effect (no fan-out, no feed, no
 // accept count) and enqueues each affected event on the #119 retry queue; the
-// retry path on the next tick recovers with the full deferred bookkeeping.
+// retry path preserves parent-before-child order, blocks the child behind a
+// still-failing parent, then recovers with the full deferred bookkeeping.
 #[test]
 fn failed_batch_defers_side_effects_and_recovers_on_tick() {
     let cfg = SyncConfig {
@@ -683,9 +762,24 @@ fn failed_batch_defers_side_effects_and_recovers_on_tick() {
     let admin_id = sk(1);
     let admin_dev = sk(2);
     let m1 = make_message(&admin_id, &admin_dev, room, genesis_id, "one", T0 + 1);
-    let m2 = make_message(&admin_id, &admin_dev, room, genesis_id, "two", T0 + 2);
     let m1_id = frame_id(&m1, room);
-    let m2_id = frame_id(&m2, room);
+    // Make m2 a child whose id sorts *before* its parent. The old retry loop's
+    // BTreeMap iteration would therefore announce m2 first; enqueue-order retry
+    // must still land and announce the causal parent first.
+    let (m2, m2_id) = (0u64..256)
+        .find_map(|i| {
+            let frame = make_message(
+                &admin_id,
+                &admin_dev,
+                room,
+                m1_id,
+                &format!("child-{i}"),
+                T0 + 2,
+            );
+            let id = frame_id(&frame, room);
+            (id < m1_id).then_some((frame, id))
+        })
+        .expect("find a child id that sorts before its parent");
 
     // Inject one transaction-level failure for the next batch commit. With
     // batch size 4, the two events accumulate into a single flush that fails.
@@ -722,10 +816,27 @@ fn failed_batch_defers_side_effects_and_recovers_on_tick() {
         "the batch failure must be logged distinctly"
     );
 
-    // Clear the fault; the tick's retry_store lands both events with their
-    // deferred post-commit bookkeeping. Each event fans out to every peer
-    // except its original sender (NODE_A), so NODE_B sees both.
-    let out = engine.on_tick(T0 + 3);
+    // Fail the first retry too. Enqueue-order processing tries m1 first and
+    // stops the pass, so m2 cannot land or be announced above the parent hole.
+    // The old bytewise-id loop tried m2 first (its id is deliberately lower),
+    // then continued to land and announce m1 in this tick.
+    engine.store_mut().fail_next_inserts(1);
+    let blocked = engine.on_tick(T0 + 3);
+    assert!(
+        events_frames(&blocked).is_empty(),
+        "a failed parent retry blocks every later descendant"
+    );
+    assert!(
+        engine.take_ingested().is_empty(),
+        "the blocked retry pass has no feed side effects"
+    );
+    assert_eq!(engine.store_retry_len(), 2);
+    assert_eq!(engine.room_tail(100).expect("tail").len(), 1);
+
+    // The next tick lands both events with their deferred post-commit
+    // bookkeeping. Each event fans out to every peer except its original
+    // sender (NODE_A), so NODE_B sees both in causal/input order.
+    let out = engine.on_tick(T0 + 4);
     let fanned_to_b: Vec<EventId> = out
         .iter()
         .filter(|o| o.peer == NODE_B)
@@ -736,7 +847,11 @@ fn failed_batch_defers_side_effects_and_recovers_on_tick() {
         .flatten()
         .map(|f| frame_id(&f, room))
         .collect();
-    assert!(fanned_to_b.contains(&m1_id) && fanned_to_b.contains(&m2_id));
+    assert_eq!(
+        fanned_to_b,
+        vec![m1_id, m2_id],
+        "retry fan-out preserves parent-before-child enqueue order"
+    );
     assert_eq!(engine.store_retry_len(), 0);
     assert_eq!(engine.counters().accepted, 3, "genesis + m1 + m2");
     let fed: Vec<EventId> = engine
@@ -744,18 +859,10 @@ fn failed_batch_defers_side_effects_and_recovers_on_tick() {
         .into_iter()
         .map(|se| se.event_id)
         .collect();
-    // The #119 per-event retry path iterates `store_retry` in BTreeMap
-    // (bytewise EventId) order, not the original batch input order (spec D9:
-    // "Keep retry insertion per-event initially"). Set-membership +
-    // exactly-once is what holds here; strict input-order is the live batch
-    // path's contract, pinned separately by `batch_preserves_fanout_and_feed_order`.
-    let mut fed_sorted = fed.clone();
-    fed_sorted.sort();
-    let mut expected_sorted = vec![m1_id, m2_id];
-    expected_sorted.sort();
     assert_eq!(
-        fed_sorted, expected_sorted,
-        "feed gets both events exactly once"
+        fed,
+        vec![m1_id, m2_id],
+        "retry feed preserves parent-before-child enqueue order"
     );
     assert_eq!(engine.room_tail(100).expect("tail").len(), 3);
 }

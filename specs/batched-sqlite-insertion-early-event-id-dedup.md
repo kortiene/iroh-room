@@ -134,7 +134,7 @@ Populate the cache only when one of these happens:
 
 - `apply_insert_outcome(InsertOutcome::Inserted, ...)` runs after a successful store commit;
 - `apply_insert_outcome(InsertOutcome::Duplicate, ...)` runs after the store proves the id was already persisted but the hot cache missed;
-- `SyncEngine::open` optionally seeds the cache from already persisted room ids, bounded by the configured cache capacity.
+- `SyncEngine::open` seeds the cache only from the causally placed events used to rebuild the membership fold, bounded by the configured cache capacity.
 
 Do **not** cache fold-accepted events whose store insert failed and entered #119 retry. A peer re-serve must remain able to heal or supersede a pending retry, as pinned by `peer_reserve_clears_pending_retry_exactly_once` in `sync/engine_tests.rs`.
 
@@ -284,9 +284,11 @@ Because `insert_all_outcomes` runs inside one SQLite transaction, a failure mean
 
 This preserves #119’s core invariant: the fold may have accepted the event, but the node must not announce or serve it until the store lands it.
 
-### D9 — Keep retry insertion per-event initially
+### D9 — Keep retry insertion per-event and enqueue-ordered
 
 Do not batch `retry_store` in the first implementation unless the main batching work is already stable. The existing retry loop is correct, tested, and bounded. It can continue calling `self.store.insert(&ev)` one queued event per id per tick.
+
+The retry loop must iterate in original enqueue order, not the retry map's bytewise `EventId` order. It must stop the current pass after a failed attempt so a later descendant cannot land, feed, or fan out while an earlier parent remains a store hole.
 
 A future optimization may batch retry attempts, but only if it preserves these existing tests:
 
@@ -324,10 +326,9 @@ File: `crates/iroh-rooms-core/src/sync/engine.rs`
    - `new(cap: usize) -> Self`
    - `contains(&self, id: &EventId) -> bool`
    - `insert(&mut self, id: EventId)`
-   - `len(&self) -> usize` for tests if useful
 4. Add a `dedup_cache: EventIdDedupCache` field to `SyncEngine`.
 5. Initialize it in `SyncEngine::open` from config.
-6. Optionally seed it from `store.room_event_ids(&room_id)?`, bounded by capacity. If seeded from a `BTreeSet`, the order is deterministic but not recency-based; that is acceptable because the cache is a performance guardrail, not correctness state.
+6. Seed it from the canonical `room_tail` events actually passed to `RoomMembership::from_events`, bounded by capacity. Never seed from all `room_event_ids`: the store can temporarily contain a NULL-lamport descendant above a failed parent insert, and that event is not present in the rebuilt fold after restart.
 
 ### Step 3 — Add early duplicate counters
 
@@ -618,9 +619,9 @@ Full code rollback is low risk because there is no schema migration or wire-form
 ## 12. Open questions
 
 1. Should `early_duplicates` also increment the existing `duplicates` counter for a total duplicate count, or should the two counters remain separate?
-2. Should the cache be seeded on `SyncEngine::open` from persisted event ids, or should it start empty and only cover events seen during the current process lifetime?
+2. Should the cache be seeded on `SyncEngine::open`, or start empty? The implementation seeds only ids in the causally placed set used to rebuild the fold.
 3. Should `store_insert_batches` be a production counter, or is test-only transaction counting enough for the acceptance criterion?
-4. Should `retry_store` be batched in a follow-up issue after this change lands, or intentionally remain per-event for simplicity?
+4. Should enqueue-ordered `retry_store` be batched in a follow-up issue, or intentionally remain per-event for simplicity?
 5. What maximum batch size should config validation permit: 512 to match `response_max_frames`, 1024 to match park/retry caps, or no explicit upper bound?
 
 ---

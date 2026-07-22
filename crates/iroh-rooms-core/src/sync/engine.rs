@@ -235,6 +235,10 @@ struct StoreRetry {
     /// Failed insert attempts so far, bounded by
     /// [`store_retry_attempts`](SyncConfig::store_retry_attempts).
     attempts: u32,
+    /// Original enqueue order. Retry delivery must not fall back to the
+    /// `BTreeMap`'s bytewise event-id order: a later entry may be a descendant
+    /// of an earlier one and must not be announced before its parent lands.
+    seq: u64,
 }
 
 /// One parked orphan frame, held in memory pending backfill (spec D5/D7).
@@ -323,12 +327,6 @@ impl EventIdDedupCache {
         }
         self.order.push_back(id);
     }
-
-    /// Number of cached ids (test/observability helper; also used by the
-    /// open-time seeding loop to respect the cap when iterating a `BTreeSet`).
-    fn len(&self) -> usize {
-        self.set.len()
-    }
 }
 
 /// A buffered run of fold-accepted events awaiting a single batched
@@ -397,6 +395,9 @@ pub struct SyncEngine {
     /// re-folds from `events` — clearing the fold/store divergence this queue
     /// exists to repair.
     store_retry: BTreeMap<EventId, StoreRetry>,
+    /// Monotonic enqueue counter used to preserve causal/input order while
+    /// retrying failed store writes.
+    store_retry_seq: u64,
     /// Restored parked frames still owed a one-shot `WantEvents` re-issue on the
     /// first `on_connect`/`on_tick` after `open` (spec §6.3 — buffering **and
     /// retry** survive a restart). Ongoing retry thereafter is the anti-entropy
@@ -508,23 +509,21 @@ impl SyncEngine {
                 .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
             validated.push(ev);
         }
+        // Only ids in this causally-placed set are safe for early dedup. The
+        // events table can also contain fold-accepted descendants with a NULL
+        // lamport while an earlier failed insert is still a hole; those rows
+        // were excluded by `room_tail` and therefore are not restored below.
+        let restored_ids = validated.iter().map(|ev| ev.event_id).collect::<Vec<_>>();
         let fold = RoomMembership::from_events(room_id, validated);
 
-        // Seed the early dedup cache (issue #143) from the persisted room ids.
+        // Seed the early dedup cache (issue #143) from exactly the events used
+        // to rebuild the membership fold.
         // A restart re-covers the recent window without paying store duplicate
-        // paths on a flood of immediate replays. The seed order is bytewise from
-        // the `BTreeSet` (not recency-based) — acceptable, this is a performance
-        // guardrail, not correctness state.
+        // paths on a flood of immediate replays. Inserting canonical room-tail
+        // order also leaves the most recent `cap` restored ids in the FIFO cache.
         let mut dedup_cache = EventIdDedupCache::new(config.early_event_id_dedup_cache_entries);
-        if dedup_cache.cap > 0 {
-            if let Ok(ids) = store.room_event_ids(&room_id) {
-                for id in ids {
-                    dedup_cache.insert(id);
-                    if dedup_cache.len() >= dedup_cache.cap {
-                        break;
-                    }
-                }
-            }
+        for id in restored_ids {
+            dedup_cache.insert(id);
         }
 
         let mut engine = Self {
@@ -535,6 +534,7 @@ impl SyncEngine {
             peers: BTreeSet::new(),
             park: BTreeMap::new(),
             store_retry: BTreeMap::new(),
+            store_retry_seq: 0,
             restored_backfill: BTreeSet::new(),
             park_seq: 0,
             backfill_depth: BTreeMap::new(),
@@ -1306,27 +1306,37 @@ impl SyncEngine {
             self.record_store_degraded(id);
             return;
         }
+        let seq = self.store_retry_seq;
+        self.store_retry_seq = self.store_retry_seq.saturating_add(1);
         self.store_retry.insert(
             id,
             StoreRetry {
                 event: ev.clone(),
                 from,
                 attempts: 0,
+                seq,
             },
         );
     }
 
-    /// Retry every queued failed insert (issue #119, one attempt per event per
-    /// tick). A success runs the full deferred-accept bookkeeping — the event
-    /// is counted, fed to subscribers, and fanned out only now, and the store's
-    /// insert-time lamport propagation re-places any descendants stored above
-    /// the hole. Exhausting the attempt budget abandons the event with a
+    /// Retry queued failed inserts in original enqueue order (issue #119, one
+    /// attempt per event per tick). A failure stops the pass, preventing a
+    /// later descendant from landing or being announced while its earlier
+    /// parent is still missing. A success runs the full deferred-accept
+    /// bookkeeping — the event is counted, fed to subscribers, and fanned out
+    /// only now. Exhausting the attempt budget abandons the event with a
     /// CRITICAL `store_degraded` decision; the fold keeps it Accepted (the
     /// verdict is ancestor-stable and cannot be rolled back), so the fold/store
     /// divergence persists until a peer re-serves the event (#118) or a restart
     /// re-folds from `events`.
     fn retry_store(&mut self, out: &mut Vec<Outgoing>) {
-        for id in self.store_retry.keys().copied().collect::<Vec<_>>() {
+        let mut queued = self
+            .store_retry
+            .iter()
+            .map(|(id, retry)| (retry.seq, *id))
+            .collect::<Vec<_>>();
+        queued.sort_unstable();
+        for (_, id) in queued {
             let Some((ev, from)) = self.store_retry.get(&id).map(|r| (r.event.clone(), r.from))
             else {
                 continue;
@@ -1349,6 +1359,10 @@ impl SyncEngine {
                         self.log("store retry dropped: store_retry_attempts");
                         self.record_store_degraded(id);
                     }
+                    // Preserve head-of-line ordering even when the store only
+                    // fails partway through a retry pass. A later queued event
+                    // may be a descendant of this one.
+                    break;
                 }
             }
         }
