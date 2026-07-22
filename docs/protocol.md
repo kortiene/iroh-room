@@ -495,6 +495,24 @@ bound `device`, and the access predicates `blob_serve_allowed` / `pipe_connect_a
 (`membership/access.rs`) consult the **current** snapshot, not the ancestor view —
 [§8](#8-connect-time-authorization-blob--pipe) explains why that split matters.
 
+> **Implementation note (issue #142):** the sync engine serves that current
+> snapshot from an in-memory cache, not a fresh `RoomMembership::snapshot()` fold
+> on every read. `RoomMembership` exposes a monotonic
+> `membership_projection_generation` that advances only when a
+> membership-affecting event (`room.created`, `member.invited`,
+> `member.joined`, `member.left`, `member.removed`) newly accepts — content
+> events, duplicates, rejections, and still-buffered frames never advance it.
+> The engine refreshes its cached `MembershipSnapshot` immediately after every
+> `fold.ingest` iff that generation changed (so a membership event early in a
+> multi-frame `Events` loop is visible to later frames in the same batch),
+> rebuilt once from the fold on `SyncEngine::open`. This is a local-only
+> performance guardrail: it changes no wire, signature, membership-fold, or
+> access-predicate rule, and `RoomMembership` remains the correctness authority.
+> The runtime refreshes are observable via
+> `SyncCounters::membership_projection_recomputes` (the startup rebuild is
+> intentionally not counted, so the counter can prove a content-only publish
+> leaves it unchanged).
+
 ---
 
 ## 8. Connect-time authorization (blob & pipe)

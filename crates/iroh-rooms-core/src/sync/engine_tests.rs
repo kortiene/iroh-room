@@ -14,15 +14,19 @@
 //! integration tests compile the lib without it.
 
 use crate::event::binding::DeviceBinding;
-use crate::event::content::{Content, EventType, MessageText, RoomCreated};
-use crate::event::ids::{EventId, RoomId};
-use crate::event::keys::SigningKey;
+use crate::event::content::{
+    capability_hash, Content, EventType, FileShared, MemberInvited, MemberJoined, MemberRemoved,
+    MessageText, RoomCreated,
+};
+use crate::event::ids::{EventId, HashRef, RoomId};
+use crate::event::keys::{IdentityKey, SigningKey};
 use crate::event::signed::{self, SignedEvent};
 use crate::event::validate::{validate_wire_bytes, ValidationContext};
 use crate::event::wire::WireEvent;
+use crate::membership::{Role, Status};
 use crate::store::EventStore;
 
-use super::engine::{Severity, SyncEngine};
+use super::engine::{Completeness, Severity, SyncEngine};
 use super::message::{Outgoing, PeerId, SyncMessage};
 use super::SyncConfig;
 
@@ -45,6 +49,22 @@ fn frame_id(bytes: &[u8], room: RoomId) -> EventId {
     validate_wire_bytes(bytes, &ValidationContext::for_room(room))
         .expect("test frame must be stateless-valid")
         .event_id
+}
+
+fn assert_counter_unchanged(engine: &SyncEngine, before: u64) {
+    assert_eq!(
+        engine.counters().membership_projection_recomputes,
+        before,
+        "content events must not refresh the cached membership projection"
+    );
+}
+
+fn assert_counter_increased_by(engine: &SyncEngine, before: u64, delta: u64) {
+    assert_eq!(
+        engine.counters().membership_projection_recomputes,
+        before + delta,
+        "cached membership projection recompute counter changed by an unexpected amount"
+    );
 }
 
 /// A genesis frame for a fresh room whose admin is `sk(1)`/`sk(2)`.
@@ -71,10 +91,10 @@ fn make_genesis(admin_id: &SigningKey, admin_dev: &SigningKey) -> (Vec<u8>, Room
     (seal(&ev, admin_dev), room)
 }
 
-/// An admin-authored `message.text` frame citing `prev`.
+/// A `message.text` frame citing `prev`.
 fn make_message(
-    admin_id: &SigningKey,
-    admin_dev: &SigningKey,
+    sender_id: &SigningKey,
+    sender_dev: &SigningKey,
     room: RoomId,
     prev: EventId,
     body: &str,
@@ -83,8 +103,8 @@ fn make_message(
     let ev = SignedEvent {
         schema_version: 1,
         room_id: room,
-        sender_id: admin_id.identity_key(),
-        device_id: admin_dev.device_key(),
+        sender_id: sender_id.identity_key(),
+        device_id: sender_dev.device_key(),
         event_type: EventType::MessageText,
         created_at: t,
         prev_events: vec![prev],
@@ -93,6 +113,124 @@ fn make_message(
             format: None,
             in_reply_to: None,
             mentions: None,
+        }),
+    };
+    seal(&ev, sender_dev)
+}
+
+fn make_file_shared(
+    sender_id: &SigningKey,
+    sender_dev: &SigningKey,
+    room: RoomId,
+    prev: EventId,
+    blob_hash: HashRef,
+    t: u64,
+) -> Vec<u8> {
+    let ev = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: sender_id.identity_key(),
+        device_id: sender_dev.device_key(),
+        event_type: EventType::FileShared,
+        created_at: t,
+        prev_events: vec![prev],
+        content: Content::FileShared(FileShared {
+            file_id: [0xf1; 16],
+            name: "cached-projection.bin".to_owned(),
+            mime_type: "application/octet-stream".to_owned(),
+            size_bytes: 1,
+            blob_hash,
+            blob_format: None,
+            providers: None,
+        }),
+    };
+    seal(&ev, sender_dev)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_invite(
+    admin_id: &SigningKey,
+    admin_dev: &SigningKey,
+    room: RoomId,
+    prev: EventId,
+    invitee: IdentityKey,
+    invite_id: [u8; 16],
+    secret: [u8; 16],
+    role: &str,
+    t: u64,
+) -> Vec<u8> {
+    let ev = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: admin_id.identity_key(),
+        device_id: admin_dev.device_key(),
+        event_type: EventType::MemberInvited,
+        created_at: t,
+        prev_events: vec![prev],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id,
+            capability_hash: capability_hash(&room, &invite_id, &secret),
+            role: role.to_owned(),
+            invitee_key: invitee,
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    seal(&ev, admin_dev)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_join(
+    member_id: &SigningKey,
+    member_dev: &SigningKey,
+    room: RoomId,
+    prev: EventId,
+    invite_id: [u8; 16],
+    secret: [u8; 16],
+    role: &str,
+    t: u64,
+) -> Vec<u8> {
+    let binding = DeviceBinding::create(&room, member_id, member_dev.device_key());
+    let ev = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: member_id.identity_key(),
+        device_id: member_dev.device_key(),
+        event_type: EventType::MemberJoined,
+        created_at: t,
+        prev_events: vec![prev],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: invite_id,
+            capability_secret: secret,
+            role: role.to_owned(),
+            device_binding: binding,
+            display_name: None,
+        }),
+    };
+    seal(&ev, member_dev)
+}
+
+fn make_remove(
+    admin_id: &SigningKey,
+    admin_dev: &SigningKey,
+    room: RoomId,
+    prev: EventId,
+    target: IdentityKey,
+    t: u64,
+) -> Vec<u8> {
+    let ev = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: admin_id.identity_key(),
+        device_id: admin_dev.device_key(),
+        event_type: EventType::MemberRemoved,
+        created_at: t,
+        prev_events: vec![prev],
+        content: Content::MemberRemoved(MemberRemoved {
+            member_id: target,
+            removed_by: admin_id.identity_key(),
+            reason: None,
+            device_binding: None,
         }),
     };
     seal(&ev, admin_dev)
@@ -119,6 +257,362 @@ fn events_frames(out: &[Outgoing]) -> Vec<Vec<u8>> {
         })
         .flatten()
         .collect()
+}
+
+#[test]
+fn content_message_publish_does_not_refresh_membership_projection() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let before = engine.counters().membership_projection_recomputes;
+
+    let msg = make_message(&sk(1), &sk(2), room, genesis_id, "content", T0 + 1);
+    engine.publish(&msg).expect("publish message");
+
+    assert_counter_unchanged(&engine, before);
+    assert_eq!(engine.snapshot().active_member_count(), 1);
+    assert_eq!(engine.snapshot().admin(), Some(&sk(1).identity_key()));
+}
+
+#[test]
+fn file_shared_publish_updates_hashes_without_refreshing_membership_projection() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let before = engine.counters().membership_projection_recomputes;
+    let blob_hash = HashRef::from_bytes([0x42; 32]);
+
+    let share = make_file_shared(&sk(1), &sk(2), room, genesis_id, blob_hash, T0 + 1);
+    engine.publish(&share).expect("publish file.shared");
+
+    assert_counter_unchanged(&engine, before);
+    assert!(engine
+        .file_shared_hashes()
+        .expect("hashes")
+        .contains(blob_hash.as_bytes()));
+    assert_eq!(engine.snapshot().active_member_count(), 1);
+}
+
+#[test]
+fn member_joined_refreshes_cached_projection_and_updates_member_state() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let member_id = sk(0x10);
+    let member_dev = sk(0x11);
+    let invite_id = [0x10; 16];
+    let secret = [0x20; 16];
+    let before = engine.counters().membership_projection_recomputes;
+
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        invite_id,
+        secret,
+        "agent",
+        T0 + 1,
+    );
+    engine.publish(&invite).expect("publish invite");
+    assert_counter_increased_by(&engine, before, 1);
+
+    let invite_event_id = frame_id(&invite, room);
+    let join = make_join(
+        &member_id,
+        &member_dev,
+        room,
+        invite_event_id,
+        invite_id,
+        secret,
+        "agent",
+        T0 + 2,
+    );
+    engine.publish(&join).expect("publish join");
+    assert_counter_increased_by(&engine, before, 2);
+
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot.status(&member_id.identity_key()),
+        Some(Status::Active)
+    );
+    assert_eq!(snapshot.role(&member_id.identity_key()), Some(Role::Agent));
+    assert_eq!(
+        snapshot
+            .member(&member_id.identity_key())
+            .and_then(|m| m.device),
+        Some(member_dev.device_key())
+    );
+    assert_eq!(snapshot.active_member_count(), 2);
+}
+
+#[test]
+fn member_removed_refreshes_cached_projection_and_removes_active_access() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let member_id = sk(0x12);
+    let member_dev = sk(0x13);
+    let invite_id = [0x12; 16];
+    let secret = [0x22; 16];
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        invite_id,
+        secret,
+        "member",
+        T0 + 1,
+    );
+    engine.publish(&invite).expect("publish invite");
+    let invite_event_id = frame_id(&invite, room);
+    let join = make_join(
+        &member_id,
+        &member_dev,
+        room,
+        invite_event_id,
+        invite_id,
+        secret,
+        "member",
+        T0 + 2,
+    );
+    engine.publish(&join).expect("publish join");
+    let before_remove = engine.counters().membership_projection_recomputes;
+
+    let join_event_id = frame_id(&join, room);
+    let remove = make_remove(
+        &sk(1),
+        &sk(2),
+        room,
+        join_event_id,
+        member_id.identity_key(),
+        T0 + 3,
+    );
+    engine.publish(&remove).expect("publish remove");
+
+    assert_counter_increased_by(&engine, before_remove, 1);
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot.status(&member_id.identity_key()),
+        Some(Status::Removed)
+    );
+    assert!(!snapshot.is_active(&member_id.identity_key()));
+    assert!(!snapshot
+        .active_members()
+        .any(|m| m.device == Some(member_dev.device_key())));
+    assert_eq!(snapshot.active_member_count(), 1);
+}
+
+#[test]
+fn content_after_join_in_same_events_message_uses_refreshed_projection() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let member_id = sk(0x14);
+    let member_dev = sk(0x15);
+    let invite_id = [0x14; 16];
+    let secret = [0x24; 16];
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        invite_id,
+        secret,
+        "member",
+        T0 + 1,
+    );
+    engine.publish(&invite).expect("publish invite");
+    let _ = engine.take_ingested();
+    let before = engine.counters().membership_projection_recomputes;
+
+    let join = make_join(
+        &member_id,
+        &member_dev,
+        room,
+        frame_id(&invite, room),
+        invite_id,
+        secret,
+        "member",
+        T0 + 2,
+    );
+    let join_id = frame_id(&join, room);
+    let msg = make_message(&member_id, &member_dev, room, join_id, "same batch", T0 + 3);
+    engine.on_message(
+        NODE_A,
+        SyncMessage::Events {
+            room_id: room,
+            frames: vec![join, msg.clone()],
+        },
+    );
+
+    assert_counter_increased_by(&engine, before, 1);
+    assert!(engine
+        .take_ingested()
+        .iter()
+        .any(|se| se.event_id == frame_id(&msg, room)));
+    assert!(!engine
+        .logs()
+        .iter()
+        .any(|line| line.contains("anti_amplification_signer")
+            || line.contains("reject.not_a_member")));
+}
+
+#[test]
+fn buffered_membership_acceptance_refreshes_cached_projection() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let member_id = sk(0x16);
+    let member_dev = sk(0x17);
+    let invite_id = [0x16; 16];
+    let secret = [0x26; 16];
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        invite_id,
+        secret,
+        "member",
+        T0 + 1,
+    );
+    let join = make_join(
+        &member_id,
+        &member_dev,
+        room,
+        frame_id(&invite, room),
+        invite_id,
+        secret,
+        "member",
+        T0 + 2,
+    );
+    let before = engine.counters().membership_projection_recomputes;
+
+    engine.ingest_frame(NODE_A, &join);
+    assert_counter_unchanged(&engine, before);
+    assert_eq!(engine.counters().parked, 1);
+
+    engine.ingest_frame(NODE_A, &invite);
+
+    assert_counter_increased_by(&engine, before, 1);
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot.status(&member_id.identity_key()),
+        Some(Status::Active)
+    );
+    assert_eq!(snapshot.active_member_count(), 2);
+}
+
+#[test]
+fn duplicate_membership_event_does_not_refresh_cached_projection() {
+    let cfg = SyncConfig {
+        early_event_id_dedup_cache_entries: 0,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let member_id = sk(0x18);
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        [0x18; 16],
+        [0x28; 16],
+        "member",
+        T0 + 1,
+    );
+    engine.publish(&invite).expect("publish invite");
+    let before_duplicate = engine.counters().membership_projection_recomputes;
+
+    engine.ingest_frame(NODE_A, &invite);
+
+    assert_counter_unchanged(&engine, before_duplicate);
+}
+
+#[test]
+fn store_retry_success_does_not_refresh_membership_projection_again() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let member_id = sk(0x19);
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        [0x19; 16],
+        [0x29; 16],
+        "member",
+        T0 + 1,
+    );
+    let before = engine.counters().membership_projection_recomputes;
+    engine.store_mut().fail_next_inserts(1);
+
+    engine.publish(&invite).expect("publish invite");
+
+    assert_counter_increased_by(&engine, before, 1);
+    assert_eq!(engine.store_retry_len(), 1);
+    let after_failed_publish = engine.counters().membership_projection_recomputes;
+
+    engine.on_tick(T0 + 2);
+
+    assert_counter_unchanged(&engine, after_failed_publish);
+    assert_eq!(engine.store_retry_len(), 0);
+}
+
+#[test]
+fn reopened_engine_uses_cached_projection_from_store_without_runtime_recompute() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let member_id = sk(0x1a);
+    let member_dev = sk(0x1b);
+    let invite_id = [0x1a; 16];
+    let secret = [0x2a; 16];
+    let invite = make_invite(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        invite_id,
+        secret,
+        "member",
+        T0 + 1,
+    );
+    engine.publish(&invite).expect("publish invite");
+    let join = make_join(
+        &member_id,
+        &member_dev,
+        room,
+        frame_id(&invite, room),
+        invite_id,
+        secret,
+        "member",
+        T0 + 2,
+    );
+    engine.publish(&join).expect("publish join");
+
+    let store = engine.into_store();
+    let reopened = SyncEngine::open(store, room, SyncConfig::default()).expect("reopen");
+
+    assert_eq!(reopened.counters().membership_projection_recomputes, 0);
+    assert_eq!(
+        reopened.snapshot().status(&member_id.identity_key()),
+        Some(Status::Active)
+    );
+}
+
+#[test]
+fn cached_snapshot_remains_available_when_completeness_changes_without_membership() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let msg = make_message(&sk(1), &sk(2), room, genesis_id, "admin tip", T0 + 1);
+    let msg_id = frame_id(&msg, room);
+    let before = engine.counters().membership_projection_recomputes;
+
+    engine.on_message(
+        NODE_A,
+        SyncMessage::AdminTip {
+            room_id: room,
+            tip: Some((msg_id, 1)),
+        },
+    );
+
+    assert_eq!(engine.completeness(), Completeness::AdminViewSuspect);
+    assert_counter_unchanged(&engine, before);
+    assert_eq!(engine.snapshot().active_member_count(), 1);
 }
 
 // A failed insert defers — never drops — the accepted event: nothing is fanned

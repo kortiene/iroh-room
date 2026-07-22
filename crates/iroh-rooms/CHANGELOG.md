@@ -7,6 +7,30 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Cached the membership projection at the sync engine (issue #142,
+  `iroh-rooms-core`): an in-memory performance optimization with no wire,
+  signature, validation, authorization, or `SQLite` schema change. `RoomMembership`
+  remains the correctness authority; `SyncEngine` now memoizes the current
+  `MembershipSnapshot` and refreshes it only when the fold's new
+  `membership_projection_generation` advances — i.e. only when a
+  membership-affecting event (`room.created`, `member.invited`,
+  `member.joined`, `member.left`, `member.removed`) newly accepts. Content
+  publishes (`message.text`, `file.shared`, …), duplicates, rejections, and
+  still-buffered frames never bump it, so a busy content stream no longer pays a
+  fold recompute on every `SyncEngine::snapshot()` / reconciler / digest /
+  anti-amplification signer read. The cache is rebuilt once from the fold during
+  `SyncEngine::open` (startup rebuild is intentionally **not** counted), follows
+  the fold rather than the store to preserve the existing #119 fold/store
+  divergence semantics, and refreshes immediately after every `fold.ingest` so a
+  membership event early in a multi-frame `Events` loop is visible to later
+  frames in the same batch. The re-exported `SyncCounters` gains one additive
+  field — `membership_projection_recomputes: u64` — counting only runtime cache
+  refreshes caused by a fold membership-generation change after `open`, so
+  diagnostics/tests can prove a content-only publish leaves it unchanged. The
+  fail-closed / admin-completeness overlay remains independent of the membership
+  cache, and `BlobAclView` referenced-hash refresh on `file.shared` is unchanged.
+  No behavioral change to admission, `PeerManager::reconcile`, or any access
+  verdict.
 - Made the approach to the active-member ceiling observable (issue #144,
   `iroh-rooms-core` / `iroh-rooms-net` / `iroh-rooms-cli`): the hard
   `MAX_ACTIVE_MEMBERS = 5` cap and its `RejectReason::RoomFull` reject are

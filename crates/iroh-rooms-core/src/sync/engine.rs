@@ -219,6 +219,19 @@ pub struct SyncCounters {
     /// happened this session, and the first one also records a CRITICAL
     /// `admin_tip_expired` [`TrustDecision`].
     pub suspect_tip_expired: u64,
+
+    // -- cached membership projection (issue #142) ------------------------------
+    /// Refreshes of the engine's cached [`MembershipSnapshot`] caused by a fold
+    /// membership-generation change after [`SyncEngine::open`] initialization
+    /// (issue #142 — cached membership projection). Each accepted
+    /// membership-affecting event (`room.created`, `member.invited`,
+    /// `member.joined`, `member.left`, `member.removed`) bumps this by exactly
+    /// one; content events (`message.text`, `file.shared`, …), duplicates,
+    /// rejections, and still-buffered events never do. The startup cache build
+    /// is intentionally **not** counted, so acceptance tests can baseline at
+    /// zero right after `open` and assert a content-only publish leaves this
+    /// counter unchanged.
+    pub membership_projection_recomputes: u64,
 }
 
 /// One fold-accepted event whose `store.insert` failed, held in memory for
@@ -360,6 +373,33 @@ impl PendingStoreBatch {
     }
 }
 
+/// The engine-level cache of the convergent [`MembershipSnapshot`] derived from
+/// the [`RoomMembership`] fold (issue #142 — cached membership projection).
+///
+/// `RoomMembership` remains the correctness authority: the cache holds only a
+/// clone of the fold output plus the generation it was built from. The engine
+/// refreshes the cache via [`refresh_membership_projection_if_needed`](SyncEngine::refresh_membership_projection_if_needed)
+/// only when the fold's `membership_projection_generation` advances — i.e. only
+/// when an accepted event actually changed membership — so a busy content
+/// stream no longer pays a fold recompute on every [`SyncEngine::snapshot`] /
+/// reconciler pass.
+///
+/// Startup (during [`SyncEngine::open`]) builds the cache once from the
+/// re-folded state **without** bumping `membership_projection_recomputes`:
+/// startup rebuild is expected and would muddy the counter's
+/// "runtime recompute caused by content vs membership activity" signal that
+/// the acceptance tests assert on.
+///
+/// Held inside [`SyncEngine`] as a [`Box`] so the ~120-byte [`MembershipSnapshot`]
+/// does not grow `SyncEngine`'s inline footprint — that struct is moved around
+/// the net pump / CLI push path, and an extra 128 bytes was enough to push a
+/// CLI `async fn` future across clippy's `large_futures` threshold. The heap
+/// indirection is one deref per read, negligible next to the fold it avoids.
+struct MembershipProjectionCache {
+    snapshot: MembershipSnapshot,
+    fold_generation: u64,
+}
+
 /// Maximum retained log lines (bounded, in-memory; spec §9 / R4).
 const MAX_LOG_LINES: usize = 256;
 
@@ -383,6 +423,16 @@ pub struct SyncEngine {
     config: SyncConfig,
     store: EventStore,
     fold: RoomMembership,
+    /// Cached projection of `fold.snapshot()` keyed by the fold's
+    /// `membership_projection_generation` (issue #142). Refreshed by
+    /// [`refresh_membership_projection_if_needed`](Self::refresh_membership_projection_if_needed)
+    /// only when a membership-affecting event newly accepts; the engine read
+    /// paths ([`snapshot`](Self::snapshot), [`digest`](Self::digest),
+    /// [`signer_plausible`](Self::signer_plausible), admission reconcile, …)
+    /// clone this value rather than re-folding on every call. Boxed to keep
+    /// `SyncEngine`'s inline size off clippy's `large_futures` threshold (see
+    /// [`MembershipProjectionCache`]).
+    membership_projection: Box<MembershipProjectionCache>,
 
     /// Currently-connected peers (deterministic fan-out order via `BTreeSet`).
     peers: BTreeSet<PeerId>,
@@ -516,6 +566,16 @@ impl SyncEngine {
         let restored_ids = validated.iter().map(|ev| ev.event_id).collect::<Vec<_>>();
         let fold = RoomMembership::from_events(room_id, validated);
 
+        // Build the engine-level projection cache once, from the same fold the
+        // engine will keep using (issue #142). This is the *only* production
+        // call to `fold.snapshot()` outside the cache-refresh helper, so the
+        // counter starts at zero and subsequent runtime refreshes are
+        // attributable purely to membership activity — never to startup rebuild.
+        let membership_projection = Box::new(MembershipProjectionCache {
+            snapshot: fold.snapshot(),
+            fold_generation: fold.membership_projection_generation(),
+        });
+
         // Seed the early dedup cache (issue #143) from exactly the events used
         // to rebuild the membership fold.
         // A restart re-covers the recent window without paying store duplicate
@@ -531,6 +591,7 @@ impl SyncEngine {
             config,
             store,
             fold,
+            membership_projection,
             peers: BTreeSet::new(),
             park: BTreeMap::new(),
             store_retry: BTreeMap::new(),
@@ -789,9 +850,44 @@ impl SyncEngine {
     // ------------------------------------------------------------------
 
     /// The current convergent membership snapshot.
+    ///
+    /// Returns the engine's cached projection (issue #142): the same
+    /// [`MembershipSnapshot`] value `fold.snapshot()` would produce, but cloned
+    /// from an in-memory cache that is refreshed only when the fold's
+    /// membership-projection generation advances. Content-only publishes
+    /// (`message.text`, `file.shared`, …) therefore no longer pay a fold
+    /// recompute per call; the cache always reflects every accepted
+    /// membership-affecting event because
+    /// [`refresh_membership_projection_if_needed`](Self::refresh_membership_projection_if_needed)
+    /// runs immediately after every `fold.ingest`.
     #[must_use]
     pub fn snapshot(&self) -> MembershipSnapshot {
-        self.fold.snapshot()
+        self.membership_projection.snapshot.clone()
+    }
+
+    /// Refresh the cached projection iff the fold's membership-projection
+    /// generation has advanced since the last refresh (issue #142).
+    ///
+    /// Called immediately after every `self.fold.ingest(...)` so the cache
+    /// always reflects every accepted membership-affecting event — including
+    /// cascaded acceptance of previously-buffered children inside one ingest.
+    /// Returns without re-folding when the generation is unchanged (the common
+    /// case: a content-only publish, a duplicate, a rejection, or a
+    /// still-buffered frame).
+    ///
+    /// The cache follows the fold, not the store: a fold-accepted membership
+    /// event whose `SQLite` insert later enters retry still refreshes the cache
+    /// here, preserving the existing #119 fold/store divergence semantics. A
+    /// queued store retry that eventually succeeds does **not** call this helper
+    /// (it does not ingest into the fold), so it never bumps the counter.
+    fn refresh_membership_projection_if_needed(&mut self) {
+        let generation = self.fold.membership_projection_generation();
+        if generation == self.membership_projection.fold_generation {
+            return;
+        }
+        self.membership_projection.snapshot = self.fold.snapshot();
+        self.membership_projection.fold_generation = generation;
+        self.counters.membership_projection_recomputes += 1;
     }
 
     /// The most-recent `limit` causally-placed events in canonical
@@ -942,7 +1038,7 @@ impl SyncEngine {
         Ok(SyncDigest {
             event_ids: self.store.room_event_ids(&self.room_id)?,
             admin_tip: self.store.admin_chain_tip(&self.room_id)?,
-            snapshot: self.fold.snapshot(),
+            snapshot: self.membership_projection.snapshot.clone(),
         })
     }
 
@@ -1073,7 +1169,16 @@ impl SyncEngine {
             self.log("dropped frame pre-fold: anti_amplification_signer");
             return;
         }
-        match self.fold.ingest(ev.clone()) {
+        let ingest = self.fold.ingest(ev.clone());
+        // Refresh the cached projection immediately, before any branch can read
+        // a snapshot. A membership event early in a multi-frame `Events` loop
+        // may make a later frame's signer plausible or alter admission state;
+        // deferring refresh to the entry-point boundary would judge that later
+        // frame against a stale cache (issue #142 D5). No-op when the fold's
+        // membership generation is unchanged (content event, duplicate,
+        // rejection, still-buffered frame).
+        self.refresh_membership_projection_if_needed();
+        match ingest {
             crate::membership::Ingest::Accepted { .. } => {
                 // The chase for this id (if any) is over; clearing the depth entry
                 // keeps the map bounded and lets a once-depth-dropped id be
@@ -1391,7 +1496,13 @@ impl SyncEngine {
             let mut changed = false;
             for id in self.park.keys().copied().collect::<Vec<_>>() {
                 let ev = self.park[&id].event.clone();
-                match self.fold.ingest(ev.clone()) {
+                let ingest = self.fold.ingest(ev.clone());
+                // A parked membership event cascading to Accepted here is the
+                // "buffered-then-accepted" case from issue #142 D5: refresh the
+                // cache immediately so any subsequent read sees the new state.
+                // No-op for content promotions / non-accepted verdicts.
+                self.refresh_membership_projection_if_needed();
+                match ingest {
                     crate::membership::Ingest::Accepted { .. } => {
                         self.park.remove(&id);
                         self.backfill_depth.remove(&id);
@@ -1529,7 +1640,7 @@ impl SyncEngine {
         if matches!(ev.event.content, Content::MemberJoined(_)) {
             return true;
         }
-        let snap = self.fold.snapshot();
+        let snap = &self.membership_projection.snapshot;
         let sender = &ev.event.sender_id;
         snap.admin() == Some(sender) || snap.member(sender).is_some()
     }
@@ -1901,7 +2012,7 @@ impl SyncEngine {
                 ids.insert(se.event_id);
             }
         }
-        if let Some(admin) = self.fold.snapshot().admin() {
+        if let Some(admin) = self.membership_projection.snapshot.admin() {
             for se in self.store.by_sender(&self.room_id, admin)? {
                 ids.insert(se.event_id);
             }
@@ -2220,7 +2331,7 @@ impl SyncEngine {
         // (the conservative, safe fail-closed set; spec D6 / §10).
         self.fail_closed.clear();
         if self.completeness != Completeness::Complete {
-            let snap = self.fold.snapshot();
+            let snap = &self.membership_projection.snapshot;
             let admin = snap.admin().copied();
             for member in snap.members() {
                 if Some(member.identity) != admin && member.status != Status::Removed {
@@ -2444,7 +2555,7 @@ impl SyncEngine {
     /// admin chain only (spec §9 restart determinism). Advertised tips are not yet
     /// known here and are never persisted, so nothing unverified is seeded.
     fn seed_admin_state(&mut self) -> Result<(), StoreError> {
-        if let Some(admin) = self.fold.snapshot().admin() {
+        if let Some(admin) = self.membership_projection.snapshot.admin() {
             for se in self.store.by_sender(&self.room_id, admin)? {
                 if let Some(seq) = se.admin_seq {
                     self.note_admin_id(seq, se.event_id);

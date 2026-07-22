@@ -99,6 +99,14 @@ pub struct RoomMembership {
     /// Accepted structural heads per author, used for equivocation without
     /// retaining full transitive ancestor sets on every node.
     sender_heads: BTreeMap<IdentityKey, BTreeSet<EventId>>,
+    /// Monotonic generation bumped only when a node transitions `Pending →
+    /// Accepted` and [`affects_membership`](Self::affects_membership) holds for
+    /// its content (issue #142 — cached membership projection). Content events,
+    /// duplicates, rejections, and still-buffered events never bump it, so an
+    /// engine-level cache can skip recomputing the projection on busy content
+    /// streams. Saturating because this is invalidation/instrumentation state
+    /// that must not wrap in a long-running process.
+    membership_projection_generation: u64,
 }
 
 impl RoomMembership {
@@ -110,6 +118,7 @@ impl RoomMembership {
             nodes: BTreeMap::new(),
             children: BTreeMap::new(),
             sender_heads: BTreeMap::new(),
+            membership_projection_generation: 0,
         }
     }
 
@@ -126,6 +135,22 @@ impl RoomMembership {
     #[must_use]
     pub fn tracked_event_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Monotonic generation that bumps only when an event newly transitions to
+    /// `Accepted` *and* affects the membership projection — i.e. one of
+    /// `room.created`, `member.invited`, `member.joined`, `member.left`, or
+    /// `member.removed` (issue #142 — cached membership projection). Content
+    /// events, duplicates, rejections, and still-buffered events never bump it.
+    ///
+    /// The engine compares this value before/after each [`ingest`](Self::ingest)
+    /// to decide whether its cached [`MembershipSnapshot`] needs a refresh,
+    /// avoiding a fold recompute on every content-only publish. Comparing the
+    /// generation — not the current event's type — is what captures cascaded
+    /// acceptance of previously buffered children inside one ingest cascade.
+    #[must_use]
+    pub fn membership_projection_generation(&self) -> u64 {
+        self.membership_projection_generation
     }
 
     /// Fold a whole set in one call (used by tests and the store adapter). Order
@@ -275,6 +300,20 @@ impl RoomMembership {
         }
         if accepted {
             self.record_sender_head(id);
+            // Bump the projection generation iff this accept changes membership
+            // (issue #142). Lives here — at the commit of the final verdict —
+            // not in `ingest`, so a cascade that flips a previously-buffered
+            // child to Accepted inside one `ingest` call bumps the generation
+            // too: the engine's cache refresh compares before/after, so this is
+            // what makes buffered-then-accepted membership events observable.
+            let affects = self
+                .nodes
+                .get(&id)
+                .is_some_and(|n| Self::affects_membership(&n.event.event.content));
+            if affects {
+                self.membership_projection_generation =
+                    self.membership_projection_generation.saturating_add(1);
+            }
         }
         true
     }
