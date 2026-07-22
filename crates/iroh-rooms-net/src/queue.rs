@@ -160,6 +160,10 @@ pub(crate) fn classify_inbound_bytes(bytes: &[u8]) -> QueueFamily {
 /// Why a `try_push` rejected a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PushError {
+    /// Empty bodies are not valid encoded [`SyncMessage`] frames. Reject them
+    /// instead of admitting a zero-byte queue entry that bypasses both byte
+    /// budgets.
+    Empty,
     /// The relevant byte cap (per-peer and/or per-stream) has insufficient
     /// headroom. The caller preserves the existing recovery shape: audit
     /// `transport.queue.saturated` and close the peer link (spec §7).
@@ -274,6 +278,9 @@ impl BytePriorityQueue {
         body: Vec<u8>,
         family: QueueFamily,
     ) -> Result<(), PushError> {
+        if body.is_empty() {
+            return Err(PushError::Empty);
+        }
         let bytes = body.len();
         let mut state = self
             .state
@@ -481,6 +488,19 @@ mod tests {
         let popped = rx.try_recv().expect("one frame is queued");
         assert_eq!(popped.bytes, 10);
         assert_eq!(tx.depth_bytes(), 50);
+    }
+
+    #[test]
+    fn empty_body_is_rejected_without_consuming_budget() {
+        let (tx, mut rx) = BytePriorityQueue::channel(1024, 1024);
+        let p = peer(0x02);
+
+        assert_eq!(
+            tx.try_push(p, Vec::new(), QueueFamily::BlobHints),
+            Err(PushError::Empty)
+        );
+        assert_eq!(tx.depth_bytes(), 0);
+        assert!(rx.try_recv().is_none());
     }
 
     // --- Exact per-peer cap -------------------------------------------------

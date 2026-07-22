@@ -101,6 +101,9 @@ async fn reader_task(shared: Arc<Shared>, device: EndpointId, mut recv: RecvStre
         match read_frame(&mut recv).await {
             Ok(Some(bytes)) => match shared.try_enqueue_inbound(peer, bytes) {
                 Ok(()) => {}
+                Err(PushError::Empty) => {
+                    tracing::debug!(peer = %device, "reader: rejecting empty frame");
+                }
                 Err(PushError::Saturated) => {
                     shared.audit.transport_queue_saturated(device, "inbound");
                     shared.close_connection(device);

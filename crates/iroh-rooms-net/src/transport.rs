@@ -399,7 +399,7 @@ impl Shared {
                 // `PushError::Closed` ⇒ peer's writer is gone; the prior
                 // `mpsc::Closed` path was likewise a silent drop, so collapse
                 // the two no-op arms (clippy::match_same_arms).
-                Ok(()) | Err(PushError::Closed) => {}
+                Ok(()) | Err(PushError::Closed | PushError::Empty) => {}
                 Err(PushError::Saturated) => {
                     self.audit.transport_queue_saturated(device, "outbound");
                     self.close_connection(device);
@@ -416,6 +416,7 @@ impl Shared {
     /// bounded) so the engine pump can decode again and log the drop as before
     /// (spec §5 step 2 / §6.1.6).
     ///
+    /// `Empty` ⇒ the reader drops the malformed frame and continues;
     /// `Saturated` ⇒ the reader audits `transport.queue.saturated` with queue
     /// `inbound` and closes the link; `Closed` ⇒ the pump is gone and the
     /// reader exits silently. Same shape as the prior `mpsc::try_send` arms.

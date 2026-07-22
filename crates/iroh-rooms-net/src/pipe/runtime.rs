@@ -60,7 +60,7 @@ impl PipeQuery {
     /// query channel is saturated (fail-closed: the caller denies on `None`).
     pub async fn snapshot(&self) -> Option<MembershipSnapshot> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(PipeQueryMsg::Snapshot(reply)).await.is_err() {
+        if self.tx.try_send(PipeQueryMsg::Snapshot(reply)).is_err() {
             return None;
         }
         rx.await.ok()
@@ -72,8 +72,7 @@ impl PipeQuery {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
-            .send(PipeQueryMsg::Opened(pipe_id, reply))
-            .await
+            .try_send(PipeQueryMsg::Opened(pipe_id, reply))
             .is_err()
         {
             return None;
@@ -88,8 +87,7 @@ impl PipeQuery {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
-            .send(PipeQueryMsg::IsClosed(pipe_id, reply))
-            .await
+            .try_send(PipeQueryMsg::IsClosed(pipe_id, reply))
             .is_err()
         {
             return true;
@@ -108,6 +106,14 @@ mod tests {
     /// send a single query) never saturate it, while still exercising the
     /// bounded-`Sender` shape introduced in #141.
     const TEST_CHANNEL_CAPACITY: usize = 8;
+
+    fn saturated_query() -> (PipeQuery, mpsc::Receiver<PipeQueryMsg>) {
+        let (tx, rx) = mpsc::channel::<PipeQueryMsg>(1);
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        tx.try_send(PipeQueryMsg::Snapshot(reply))
+            .expect("fixture fills the query channel");
+        (PipeQuery::new(tx), rx)
+    }
 
     // ── fail-closed when the pump (mpsc receiver) is gone ──────────────────────
 
@@ -142,6 +148,39 @@ mod tests {
             q.pipe_is_closed([0x01; 16]).await,
             "fail-closed: treat-as-closed when pump gone"
         );
+    }
+
+    // ── fail-closed immediately when the bounded channel is full ─────────────
+
+    #[tokio::test]
+    async fn snapshot_is_none_when_query_channel_is_full() {
+        let (q, _rx) = saturated_query();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), q.snapshot())
+            .await
+            .expect("snapshot must not wait for query-channel capacity");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipe_opened_is_none_when_query_channel_is_full() {
+        let (q, _rx) = saturated_query();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), q.pipe_opened([0x01; 16]))
+                .await
+                .expect("pipe_opened must not wait for query-channel capacity");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn is_closed_is_true_when_query_channel_is_full() {
+        let (q, _rx) = saturated_query();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            q.pipe_is_closed([0x01; 16]),
+        )
+        .await
+        .expect("pipe_is_closed must not wait for query-channel capacity");
+        assert!(result);
     }
 
     // ── fail-closed when the pump receives but drops the oneshot sender ─────────
