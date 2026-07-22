@@ -51,6 +51,8 @@
 //! asserts a pre-connected resident member's admin-side `ConnEvent` stream carries
 //! only its initial admit — no churn attributable to either flip.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -344,33 +346,45 @@ fn build_admin_room_with_history(
 }
 
 // ── node-spawning helpers ─────────────────────────────────────────────────────
+//
+// Each helper returns `Pin<Box<dyn Future<Output = Node> + Send + '_>>` so the
+// ~16 KB state machine of `Node::spawn`/`spawn_join_bootstrap` is heap-allocated
+// once instead of being inlined into every caller (clippy `large_futures` —
+// every test here builds 1–3 nodes).
 
 /// Spawn an admin node pre-seeded with `log` (genesis + invite).
 /// Uses [`JoinBootstrapAdmission`] with `accept_joins=true` so a first-time
 /// joiner whose device is unknown is admitted provisionally.
-async fn spawn_admin_node(admin: &Principal, room: RoomId, log: &[Vec<u8>]) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory admin store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("admin engine");
-    for ev in log {
-        engine.publish(ev).expect("seed admin event");
-    }
-    // An empty inner AllowlistAdmission: the joiner's device is not yet bound (it
-    // is unknown → provisionally admitted while `accept_joins` is true).
-    let admission = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        admin.iroh_secret(),
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn admin node")
+fn spawn_admin_node<'a>(
+    admin: &'a Principal,
+    room: RoomId,
+    log: &'a [Vec<u8>],
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory admin store");
+        let mut engine =
+            SyncEngine::open(store, room, SyncConfig::default()).expect("admin engine");
+        for ev in log {
+            engine.publish(ev).expect("seed admin event");
+        }
+        // An empty inner AllowlistAdmission: the joiner's device is not yet bound (it
+        // is unknown → provisionally admitted while `accept_joins` is true).
+        let admission = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            admin.iroh_secret(),
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn admin node")
+    })
 }
 
 /// Spawn an admin node pre-seeded with `log`, using
@@ -378,36 +392,39 @@ async fn spawn_admin_node(admin: &Principal, room: RoomId, log: &[Vec<u8>]) -> N
 /// `accept_joins` bool. The inner `AllowlistAdmission` already knows `resident`
 /// as an Active member, so `resident`'s admit verdict never depends on
 /// `window`; only a genuinely unknown device's outcome tracks the live flag.
-async fn spawn_admin_node_dynamic(
-    admin: &Principal,
-    resident: &Principal,
+fn spawn_admin_node_dynamic<'a>(
+    admin: &'a Principal,
+    resident: &'a Principal,
     room: RoomId,
-    log: &[Vec<u8>],
+    log: &'a [Vec<u8>],
     window: Arc<AtomicBool>,
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory admin store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("admin engine");
-    for ev in log {
-        engine.publish(ev).expect("seed admin event");
-    }
-    let inner = AllowlistAdmission::new()
-        .bind_device(resident.endpoint_id(), resident.identity())
-        .set_active(resident.identity());
-    let admission = JoinBootstrapAdmission::new_dynamic(inner, window);
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        admin.iroh_secret(),
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn admin node (dynamic admission)")
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory admin store");
+        let mut engine =
+            SyncEngine::open(store, room, SyncConfig::default()).expect("admin engine");
+        for ev in log {
+            engine.publish(ev).expect("seed admin event");
+        }
+        let inner = AllowlistAdmission::new()
+            .bind_device(resident.endpoint_id(), resident.identity())
+            .set_active(resident.identity());
+        let admission = JoinBootstrapAdmission::new_dynamic(inner, window);
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            admin.iroh_secret(),
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn admin node (dynamic admission)")
+    })
 }
 
 /// Spawn a joiner node with an empty store that presents a join-bootstrap
@@ -416,38 +433,40 @@ async fn spawn_admin_node_dynamic(
 /// the sub-DAG pull from the admin can proceed). A genuine invitee passes the
 /// invite it holds; the admin serves it the membership closure only once the proof
 /// matches an on-log invite.
-async fn spawn_joiner_node(
-    joiner: &Principal,
-    admin: &Principal,
+fn spawn_joiner_node<'a>(
+    joiner: &'a Principal,
+    admin: &'a Principal,
     room: RoomId,
     invite_id: [u8; 16],
     secret: [u8; 16],
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory joiner store");
-    let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
-    // Joiner must admit the admin so the dial_loop's authorization check passes.
-    let admission = AllowlistAdmission::new()
-        .bind_device(admin.endpoint_id(), admin.identity())
-        .set_active(admin.identity());
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn_join_bootstrap(
-        joiner.iroh_secret(),
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-        BootstrapProof {
-            room_id: room,
-            invite_id,
-            capability_secret: secret,
-        },
-    )
-    .await
-    .expect("spawn joiner node")
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory joiner store");
+        let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
+        // Joiner must admit the admin so the dial_loop's authorization check passes.
+        let admission = AllowlistAdmission::new()
+            .bind_device(admin.endpoint_id(), admin.identity())
+            .set_active(admin.identity());
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn_join_bootstrap(
+            joiner.iroh_secret(),
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+            BootstrapProof {
+                room_id: room,
+                invite_id,
+                capability_secret: secret,
+            },
+        )
+        .await
+        .expect("spawn joiner node")
+    })
 }
 
 /// Spawn a joiner node that presents **no** capability proof (a plain
@@ -456,34 +475,37 @@ async fn spawn_joiner_node(
 /// `log` pre-seeds its store: empty for a dialer that knows only the room id, or
 /// a copy of the room log for a worst-case attacker holding stale history
 /// out-of-band (so any leaked live frame folds cleanly and shows in its store).
-async fn spawn_bare_joiner_node(
-    joiner: &Principal,
-    admin: &Principal,
+fn spawn_bare_joiner_node<'a>(
+    joiner: &'a Principal,
+    admin: &'a Principal,
     room: RoomId,
-    log: &[Vec<u8>],
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory joiner store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
-    for ev in log {
-        engine.publish(ev).expect("seed bare joiner event");
-    }
-    let admission = AllowlistAdmission::new()
-        .bind_device(admin.endpoint_id(), admin.identity())
-        .set_active(admin.identity());
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        joiner.iroh_secret(),
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn bare joiner node")
+    log: &'a [Vec<u8>],
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory joiner store");
+        let mut engine =
+            SyncEngine::open(store, room, SyncConfig::default()).expect("joiner engine");
+        for ev in log {
+            engine.publish(ev).expect("seed bare joiner event");
+        }
+        let admission = AllowlistAdmission::new()
+            .bind_device(admin.endpoint_id(), admin.identity())
+            .set_active(admin.identity());
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            joiner.iroh_secret(),
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn bare joiner node")
+    })
 }
 
 // ── wait helper ───────────────────────────────────────────────────────────────

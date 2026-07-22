@@ -30,6 +30,8 @@
 
 #![cfg(feature = "experimental")]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -144,55 +146,72 @@ fn build_admin_room(admin: &Principal, joiner_identity: IdentityKey) -> RoomSetu
 /// Spawn an admin `Node` pre-seeded with `log`, admitting first-time joiners
 /// provisionally (mirrors `iroh-rooms-net/tests/join_e2e.rs::spawn_admin_node`,
 /// but wired entirely from `experimental::{session, store, sync}` re-exports).
-async fn spawn_admin_node(admin: &Principal, room_id: RoomId, log: &[Vec<u8>]) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory admin store");
-    let mut engine = SyncEngine::open(store, room_id, SyncConfig::default()).expect("admin engine");
-    for ev in log {
-        engine.publish(ev).expect("seed admin event");
-    }
-    let admission = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        admin.iroh_secret(),
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn admin node through the facade")
+///
+/// Returns a boxed future so `Node::spawn`'s ~16 KB state machine is not inlined
+/// into each caller (clippy `large_futures`).
+fn spawn_admin_node<'a>(
+    admin: &'a Principal,
+    room_id: RoomId,
+    log: &'a [Vec<u8>],
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory admin store");
+        let mut engine =
+            SyncEngine::open(store, room_id, SyncConfig::default()).expect("admin engine");
+        for ev in log {
+            engine.publish(ev).expect("seed admin event");
+        }
+        let admission = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            admin.iroh_secret(),
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn admin node through the facade")
+    })
 }
 
 /// Spawn a joiner `Node` with an empty store that admits (only) the admin.
-async fn spawn_joiner_node(joiner: &Principal, admin: &Principal, room_id: RoomId) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory joiner store");
-    let engine = SyncEngine::open(store, room_id, SyncConfig::default()).expect("joiner engine");
-    let admission = AllowlistAdmission::new()
-        .bind_device(admin.endpoint_id(), admin.identity())
-        .set_active(admin.identity());
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn_join_bootstrap(
-        joiner.iroh_secret(),
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-        BootstrapProof {
-            room_id,
-            invite_id: INV_ID,
-            capability_secret: INV_SECRET,
-        },
-    )
-    .await
-    .expect("spawn joiner node through the facade")
+fn spawn_joiner_node<'a>(
+    joiner: &'a Principal,
+    admin: &'a Principal,
+    room_id: RoomId,
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory joiner store");
+        let engine =
+            SyncEngine::open(store, room_id, SyncConfig::default()).expect("joiner engine");
+        let admission = AllowlistAdmission::new()
+            .bind_device(admin.endpoint_id(), admin.identity())
+            .set_active(admin.identity());
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn_join_bootstrap(
+            joiner.iroh_secret(),
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+            BootstrapProof {
+                room_id,
+                invite_id: INV_ID,
+                capability_secret: INV_SECRET,
+            },
+        )
+        .await
+        .expect("spawn joiner node through the facade")
+    })
 }
 
 /// Poll `node.snapshot()` (façade `Node::snapshot`) until `identity` is Active or
@@ -581,61 +600,71 @@ async fn seed_blob(dir: &std::path::Path, name: &str, content: &[u8]) -> [u8; 32
 
 /// Spawn a facade-only **serving** node (`Node::spawn_room` + `BlobServeConfig`),
 /// seeded with `log`, reconciled once so admission/`BlobAclView` are populated.
-async fn spawn_facade_serving_member(
-    actor: &Principal,
+fn spawn_facade_serving_member<'a>(
+    actor: &'a Principal,
     room_id: RoomId,
-    log: &[Vec<u8>],
+    log: &'a [Vec<u8>],
     blobs_dir: std::path::PathBuf,
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room_id, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    let cell = Arc::new(Mutex::new(AdmissionView::empty()));
-    let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
-    let node = Node::spawn_room(
-        actor.iroh_secret(),
-        admission,
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-        Vec::new(),
-        cell,
-        Some(BlobServeConfig { blobs_dir }),
-    )
-    .await
-    .expect("spawn_room with blob serving through the facade");
-    node.reconcile_now()
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine =
+            SyncEngine::open(store, room_id, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cell = Arc::new(Mutex::new(AdmissionView::empty()));
+        let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
+        let node = Node::spawn_room(
+            actor.iroh_secret(),
+            admission,
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+            Vec::new(),
+            cell,
+            Some(BlobServeConfig { blobs_dir }),
+        )
         .await
-        .expect("force admission/BlobAclView to populate before returning");
-    node
+        .expect("spawn_room with blob serving through the facade");
+        node.reconcile_now()
+            .await
+            .expect("force admission/BlobAclView to populate before returning");
+        node
+    })
 }
 
 /// Spawn a facade-only **pure fetcher** node (`Node::spawn`, unmanaged).
-async fn spawn_facade_fetcher(actor: &Principal, room_id: RoomId, log: &[Vec<u8>]) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room_id, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    Node::spawn(
-        actor.iroh_secret(),
-        Arc::new(AllowlistAdmission::new()),
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn fetcher node through the facade")
+fn spawn_facade_fetcher<'a>(
+    actor: &'a Principal,
+    room_id: RoomId,
+    log: &'a [Vec<u8>],
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine =
+            SyncEngine::open(store, room_id, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        Node::spawn(
+            actor.iroh_secret(),
+            Arc::new(AllowlistAdmission::new()),
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn fetcher node through the facade")
+    })
 }
 
 /// The online tier's in-session import claim (issue #84 / IR-0308), driven with

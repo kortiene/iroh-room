@@ -156,6 +156,21 @@ The production-scoped product must provide these guarantees:
 - Unknown schema versions, event types, content keys, bad signatures, and
   malformed data are rejected before storage.
 - Duplicate events are idempotent.
+- A bounded in-memory event-id dedup cache rejects replays of already-persisted
+  ids *before* signature verification or any store work (issue #143 / #134 §22.2).
+  The cache key is recomputed from `wire.signed` (never the advisory `wire.id`),
+  the cache is populated only after the store proves an id is persisted, and the
+  capacity (`SyncConfig::early_event_id_dedup_cache_entries`, default 4096, `0`
+  disables) bounds replay-flood memory. This is a local-only performance
+  guardrail; correctness still rests on the store's primary-key idempotency, and
+  a bad-signature first arrival cannot poison the cache and suppress a later
+  valid copy.
+- Consecutive accepted events are persisted in batched `SQLite` transactions
+  (`SyncConfig::store_insert_batch_size`, default 32; `1` is the supported
+  disable-batching rollback knob). A failed batch is all-or-nothing and every
+  affected event enters the existing bounded #119 retry path with no post-commit
+  side effect applied until the insert lands (issue #143) — the insert-then-fanout
+  ordering and `store_degraded` degradation signal are unchanged.
 - Conformance tests cover the protocol rejection taxonomy.
 
 ### Membership And Authorization

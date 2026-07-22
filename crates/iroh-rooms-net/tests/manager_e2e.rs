@@ -28,6 +28,8 @@
 //!
 //! All tests use `NetMode::Loopback` (no discovery, no relay, deterministic CI).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -253,55 +255,66 @@ fn make_engine(room_id: RoomId, events: &[Vec<u8>]) -> SyncEngine {
 /// The `SnapshotAdmission` cell starts empty; the pump's initial
 /// `maybe_reconcile` populates it from the engine's fold and starts the dial
 /// loops for all Active non-self peers found in `addr_hints`.
-async fn spawn_room_node(
+///
+/// Returns a boxed future so `Node::spawn_room`'s ~16 KB state machine is not
+/// inlined into each caller (clippy `large_futures`).
+fn spawn_room_node(
     actor: &Actor,
     engine: SyncEngine,
     addr_hints: Vec<iroh::EndpointAddr>,
-) -> Node {
-    let cell = Arc::new(Mutex::new(AdmissionView::empty()));
-    let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
-    Node::spawn_room(
-        actor.iroh_secret(),
-        admission,
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-        addr_hints,
-        cell,
-        None,
-    )
-    .await
-    .expect("spawn_room")
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let cell = Arc::new(Mutex::new(AdmissionView::empty()));
+        let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
+        Node::spawn_room(
+            actor.iroh_secret(),
+            admission,
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+            addr_hints,
+            cell,
+            None,
+        )
+        .await
+        .expect("spawn_room")
+    })
 }
 
 /// Spawn an **unmanaged** node with a static `AllowlistAdmission` admitting
 /// `self_actor` and every actor in `peers`.
-async fn spawn_static_node(self_actor: &Actor, engine: SyncEngine, peers: &[&Actor]) -> Node {
-    let mut auth = AllowlistAdmission::new()
-        .bind_device(self_actor.endpoint_id(), self_actor.identity())
-        .set_active(self_actor.identity());
-    for peer in peers {
-        auth = auth
-            .bind_device(peer.endpoint_id(), peer.identity())
-            .set_active(peer.identity());
-    }
-    Node::spawn(
-        self_actor.iroh_secret(),
-        Arc::new(auth),
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn_static")
+fn spawn_static_node<'a>(
+    self_actor: &'a Actor,
+    engine: SyncEngine,
+    peers: &'a [&'a Actor],
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let mut auth = AllowlistAdmission::new()
+            .bind_device(self_actor.endpoint_id(), self_actor.identity())
+            .set_active(self_actor.identity());
+        for peer in peers {
+            auth = auth
+                .bind_device(peer.endpoint_id(), peer.identity())
+                .set_active(peer.identity());
+        }
+        Node::spawn(
+            self_actor.iroh_secret(),
+            Arc::new(auth),
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn_static")
+    })
 }
 
 // ===========================================================================

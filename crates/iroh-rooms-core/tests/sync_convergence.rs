@@ -520,10 +520,20 @@ fn idempotency_1000x_does_not_change_state() {
         accepted_before,
         "no new events accepted on 1000× duplicate delivery"
     );
+    // Issue #143: replays inside the dedup-cache window (default cap 4096 ≫ the
+    // 9-event log here) are now rejected by the in-memory cache *before*
+    // signature verification or any store work, so they surface in
+    // `early_duplicates` rather than the legacy post-store `duplicates` counter.
+    // The combined duplicate count still records exactly n_events × 1000.
     assert_eq!(
-        engine.counters().duplicates,
+        engine.counters().early_duplicates + engine.counters().duplicates,
         n_events * 1000,
-        "exactly n_events × 1000 duplicates recorded"
+        "exactly n_events × 1000 duplicates recorded (early + post-store)"
+    );
+    assert_eq!(
+        engine.counters().early_duplicates,
+        n_events * 1000,
+        "all replays fell in the early dedup cache window"
     );
 }
 

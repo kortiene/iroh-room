@@ -14,6 +14,8 @@
 //! proven over real loopback QUIC in the e2e tier (`blob_e2e.rs` and the headline
 //! `blob_import_live_e2e`), not here.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use iroh_rooms_core::store::EventStore;
@@ -28,25 +30,30 @@ use tempfile::TempDir;
 /// Spawn a minimal loopback [`Node::spawn`] — the **unmanaged** path, which never
 /// opens a blob store, so `blob_store == None` and the import façade must fail
 /// closed. No peers, no dialing: the node just binds one loopback endpoint.
-async fn spawn_non_serving_node() -> Node {
-    let host = Participant::new(0x84);
-    let (room, _genesis_id, _genesis_bytes) = demo::genesis(&host);
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        host.iroh_secret(),
-        Arc::new(demo::allowlist(&[&host])),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn non-serving node")
+///
+/// Returns a boxed future so `Node::spawn`'s ~16 KB state machine is not inlined
+/// into each caller (clippy `large_futures`).
+fn spawn_non_serving_node() -> Pin<Box<dyn Future<Output = Node> + Send>> {
+    Box::pin(async move {
+        let host = Participant::new(0x84);
+        let (room, _genesis_id, _genesis_bytes) = demo::genesis(&host);
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            host.iroh_secret(),
+            Arc::new(demo::allowlist(&[&host])),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn non-serving node")
+    })
 }
 
 /// Spawn a **serving** [`Node::spawn_room`] with a `BlobServeConfig` rooted at
@@ -55,29 +62,34 @@ async fn spawn_non_serving_node() -> Node {
 /// import façade must route through this already-open handle (no second `FsStore`
 /// open, no lock) rather than fail closed. Still fully local: it binds one loopback
 /// endpoint and never dials or accepts a peer connection.
-async fn spawn_serving_node(host: &Participant, blobs_dir: std::path::PathBuf) -> Node {
-    let (room, _genesis_id, genesis_bytes) = demo::genesis(host);
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    engine.publish(&genesis_bytes).expect("seed genesis");
-    let cell = Arc::new(Mutex::new(AdmissionView::empty()));
-    let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
-    Node::spawn_room(
-        host.iroh_secret(),
-        admission,
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-        Vec::new(), // no addr hints: this test never dials the event plane
-        cell,
-        Some(BlobServeConfig { blobs_dir }),
-    )
-    .await
-    .expect("spawn_room with blob serving")
+fn spawn_serving_node(
+    host: &Participant,
+    blobs_dir: std::path::PathBuf,
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let (room, _genesis_id, genesis_bytes) = demo::genesis(host);
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        engine.publish(&genesis_bytes).expect("seed genesis");
+        let cell = Arc::new(Mutex::new(AdmissionView::empty()));
+        let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
+        Node::spawn_room(
+            host.iroh_secret(),
+            admission,
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+            Vec::new(), // no addr hints: this test never dials the event plane
+            cell,
+            Some(BlobServeConfig { blobs_dir }),
+        )
+        .await
+        .expect("spawn_room with blob serving")
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

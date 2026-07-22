@@ -29,6 +29,7 @@ use super::SyncConfig;
 const NONCE: [u8; 16] = [0xAA; 16];
 const T0: u64 = 1_750_000_000_000;
 const NODE_A: PeerId = PeerId::from_bytes([0xA1; 32]);
+const NODE_B: PeerId = PeerId::from_bytes([0xB1; 32]);
 
 fn sk(seed: u8) -> SigningKey {
     SigningKey::from_seed(&[seed; 32])
@@ -174,6 +175,78 @@ fn failed_insert_is_retried_on_tick_and_recovers() {
     assert!(
         engine.trust_decisions().is_empty(),
         "a recovered fault is not a trust decision"
+    );
+}
+
+// A transient SQLITE_BUSY burst that spans several retry ticks (but stays
+// inside the attempt budget) recovers with the full deferred bookkeeping and
+// raises no trust decision (issue #143 acceptance: "the store-retry path still
+// recovers a transient SQLITE_BUSY burst"). The existing recovery tests all
+// land on the very first retry tick; this pins the multi-tick-burst case.
+#[test]
+fn transient_busy_burst_recovers_across_multiple_ticks() {
+    let cfg = SyncConfig {
+        store_retry_attempts: 16,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let _ = engine.on_connect(NODE_A);
+    let _ = engine.take_ingested(); // drain genesis + handshake
+
+    let msg = make_message(&sk(1), &sk(2), room, genesis_id, "bursty", T0 + 1);
+    let msg_id = frame_id(&msg, room);
+
+    // One initial publish failure plus two failed retry ticks: the burst spans
+    // three consecutive insert attempts, all well inside the 16-attempt budget.
+    engine.store_mut().fail_next_inserts(3);
+    let out = engine.publish(&msg).expect("publish is not an error path");
+    assert!(
+        events_frames(&out).is_empty(),
+        "an unstored event must not fan out"
+    );
+    assert_eq!(engine.store_retry_len(), 1, "queued for retry");
+
+    // Tick 1 and tick 2 still hit the busy burst: the event stays queued, no
+    // fan-out, no feed, and — crucially — no premature trust decision.
+    let out = engine.on_tick(T0 + 2);
+    assert!(events_frames(&out).is_empty(), "still busy: no fan-out");
+    assert_eq!(engine.store_retry_len(), 1, "attempt 1: still queued");
+    let out = engine.on_tick(T0 + 3);
+    assert!(events_frames(&out).is_empty(), "still busy: no fan-out");
+    assert_eq!(engine.store_retry_len(), 1, "attempt 2: still queued");
+    assert!(
+        engine.trust_decisions().is_empty(),
+        "a still-recoverable burst is not yet a degradation"
+    );
+    assert_eq!(engine.counters().accepted, 1, "genesis only so far");
+
+    // Tick 3: the burst has cleared (fault budget exhausted), so the retry lands
+    // with the full deferred bookkeeping exactly once.
+    let out = engine.on_tick(T0 + 4);
+    assert!(
+        events_frames(&out)
+            .iter()
+            .any(|f| frame_id(f, room) == msg_id),
+        "the recovered event must fan out to the connected peer"
+    );
+    assert_eq!(engine.store_retry_len(), 0, "the queue drained on recovery");
+    assert_eq!(engine.counters().store_insert_failed, 3, "three busy hits");
+    assert_eq!(
+        engine.counters().store_retry_dropped,
+        0,
+        "nothing abandoned"
+    );
+    assert_eq!(engine.counters().accepted, 2, "genesis + recovered event");
+    let fed: Vec<EventId> = engine
+        .take_ingested()
+        .into_iter()
+        .map(|se| se.event_id)
+        .collect();
+    assert_eq!(fed, vec![msg_id], "the feed gets the event exactly once");
+    assert_eq!(engine.room_tail(100).expect("tail").len(), 2);
+    assert!(
+        engine.trust_decisions().is_empty(),
+        "a recovered burst leaves no CRITICAL store_degraded trail"
     );
 }
 
@@ -344,4 +417,509 @@ fn peer_reserve_clears_pending_retry_exactly_once() {
     let _ = engine.on_tick(T0 + 2);
     assert_eq!(engine.counters().store_retry_dropped, 0);
     assert!(engine.trust_decisions().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #143 — batched SQLite insertion + early event-id dedup
+//
+// These tests pin the three acceptance criteria:
+//   * a replay inside the cache window skips signature verification AND store
+//     work (counted by `early_duplicates`);
+//   * N consecutive accepted events commit in ⌈N/batch⌉ transactions;
+//   * a failed batch defers all post-commit side effects and feeds the existing
+//     #119 retry path.
+// ---------------------------------------------------------------------------
+
+/// Build a `WireEvent` envelope from already-signed bytes and a *raw* signature
+/// — used by T1 to forge a deliberately-bad-sig replay over identical `signed`
+/// bytes (same id) without going through [`crate::event::signed::sign_csb`].
+fn seal_with_sig(signed_bytes: Vec<u8>, sig_bytes: [u8; 64]) -> Vec<u8> {
+    use crate::event::keys::Signature;
+    WireEvent::seal(signed_bytes, Signature::from_bytes(sig_bytes)).to_bytes()
+}
+
+// T1 — A replay inside the cache window skips both signature verification and
+// any store transaction: the `early_duplicates` counter increments, no
+// `reject.bad_signature` line is logged, and the store's write-tx count is
+// unchanged.
+#[test]
+fn early_duplicate_skips_bad_signature_and_store() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let _ = engine.take_ingested(); // drain genesis
+
+    // Build the valid signed bytes of a fresh message, accept+store it, and
+    // confirm it landed in the cache.
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let msg = make_message(&admin_id, &admin_dev, room, genesis_id, "first", T0 + 1);
+    let msg_id = frame_id(&msg, room);
+    let _ = engine.publish(&msg).expect("publish valid msg");
+    let _ = engine.take_ingested();
+    let early_before = engine.counters().early_duplicates;
+    let rejected_before = engine.counters().rejected;
+    engine.store_mut().reset_write_tx_count();
+
+    // Forge a replay: identical `signed` bytes (so identical id), but a
+    // signature that does NOT verify under the admin device key.
+    let signed_bytes = crate::event::signed::SignedEvent::decode(
+        &WireEvent::decode(&msg).expect("decode valid frame").signed,
+    )
+    .expect("decode signed")
+    .to_csb();
+    let bad_sig = [0u8; 64];
+    let replay = seal_with_sig(signed_bytes, bad_sig);
+
+    // Sanity: the replay's id matches the original (same signed bytes).
+    assert_eq!(
+        crate::event::signed::event_id_from_bytes(
+            &WireEvent::decode(&replay).expect("decode replay").signed
+        ),
+        msg_id,
+        "the replay must share the original's id"
+    );
+
+    let _ = engine.ingest_frame(NODE_A, &replay);
+
+    assert_eq!(
+        engine.counters().early_duplicates,
+        early_before + 1,
+        "the replay must hit the early dedup cache"
+    );
+    assert_eq!(
+        engine.counters().rejected,
+        rejected_before,
+        "no reject.bad_signature — sig verification never ran"
+    );
+    assert!(
+        !engine
+            .logs()
+            .iter()
+            .any(|l| l.contains("reject.bad_signature")),
+        "no bad_signature log line — sig verification never ran"
+    );
+    assert_eq!(
+        engine.store_mut().write_tx_count(),
+        0,
+        "the store was not touched"
+    );
+    assert_eq!(
+        engine.room_tail(100).expect("tail").len(),
+        2,
+        "room tail unchanged"
+    );
+}
+
+// T2 — A bad-signature first arrival does NOT poison the dedup cache: the
+// validly-signed copy with the same signed bytes is still accepted.
+#[test]
+fn invalid_first_arrival_cannot_poison_cache() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let _ = engine.take_ingested(); // drain genesis
+
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let valid = make_message(&admin_id, &admin_dev, room, genesis_id, "first", T0 + 1);
+    let signed_bytes = crate::event::signed::SignedEvent::decode(
+        &WireEvent::decode(&valid).expect("decode valid").signed,
+    )
+    .expect("decode signed")
+    .to_csb();
+    // Same signed bytes ⇒ same id, but a deliberately invalid signature.
+    let bad = seal_with_sig(signed_bytes, [0u8; 64]);
+
+    let early_before = engine.counters().early_duplicates;
+    engine.ingest_frame(NODE_A, &bad);
+    assert_eq!(
+        engine.counters().early_duplicates,
+        early_before,
+        "an invalid first arrival must not be cached"
+    );
+    assert!(
+        engine.counters().rejected > 0,
+        "the invalid sig was rejected, not silently dropped"
+    );
+
+    // The validly-signed copy with the same signed bytes must still land.
+    let accepted_before = engine.counters().accepted;
+    engine.publish(&valid).expect("publish valid");
+    assert_eq!(engine.counters().accepted, accepted_before + 1);
+}
+
+// T3 — When the dedup cache cap is small enough to evict the first arrival, a
+// replay falls through to the existing idempotent store path and increments
+// `duplicates` (not `early_duplicates`).
+#[test]
+fn cache_eviction_falls_back_to_store_idempotency() {
+    let cfg = SyncConfig {
+        early_event_id_dedup_cache_entries: 2,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let _ = engine.take_ingested(); // drain genesis
+
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let m1 = make_message(&admin_id, &admin_dev, room, genesis_id, "one", T0 + 1);
+    let m2 = make_message(&admin_id, &admin_dev, room, genesis_id, "two", T0 + 2);
+    let m3 = make_message(&admin_id, &admin_dev, room, genesis_id, "three", T0 + 3);
+    engine.publish(&m1).expect("m1");
+    engine.publish(&m2).expect("m2");
+    engine.publish(&m3).expect("m3");
+    let _ = engine.take_ingested();
+
+    let early_before = engine.counters().early_duplicates;
+    let dups_before = engine.counters().duplicates;
+
+    // m1 has been evicted (cap=2 holds {m2, m3}); its replay must run full
+    // validation and hit the store's idempotent Duplicate arm.
+    engine.ingest_frame(NODE_A, &m1);
+    assert_eq!(
+        engine.counters().early_duplicates,
+        early_before,
+        "evicted id must not hit the early cache"
+    );
+    assert_eq!(
+        engine.counters().duplicates,
+        dups_before + 1,
+        "evicted id falls back to the existing store duplicate path"
+    );
+}
+
+#[test]
+fn disabled_dedup_cache_uses_store_duplicate_path() {
+    let cfg = SyncConfig {
+        early_event_id_dedup_cache_entries: 0,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let _ = engine.take_ingested();
+
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let msg = make_message(&admin_id, &admin_dev, room, genesis_id, "first", T0 + 1);
+    engine.publish(&msg).expect("publish valid msg");
+    let _ = engine.take_ingested();
+
+    let early_before = engine.counters().early_duplicates;
+    let dups_before = engine.counters().duplicates;
+    engine.store_mut().reset_write_tx_count();
+
+    engine.ingest_frame(NODE_A, &msg);
+
+    assert_eq!(engine.counters().early_duplicates, early_before);
+    assert_eq!(engine.counters().duplicates, dups_before + 1);
+    assert_eq!(engine.store_mut().write_tx_count(), 1);
+}
+
+// A failed parent insert can leave a persisted descendant with a NULL lamport.
+// On restart that descendant is absent from `room_tail` and therefore from the
+// rebuilt fold. Its id must not be seeded into the early cache: a peer replay is
+// what restores it to the in-memory fold after the parent hole heals.
+#[test]
+fn restart_dedup_seed_excludes_causally_unplaced_rows() {
+    let cfg = SyncConfig::default();
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let parent = make_message(
+        &admin_id,
+        &admin_dev,
+        room,
+        genesis_id,
+        "missing parent",
+        T0 + 1,
+    );
+    let parent_id = frame_id(&parent, room);
+    let child = make_message(
+        &admin_id,
+        &admin_dev,
+        room,
+        parent_id,
+        "stored child",
+        T0 + 2,
+    );
+
+    engine.store_mut().fail_next_inserts(1);
+    engine.publish(&parent).expect("fold accepts parent");
+    engine.publish(&child).expect("fold accepts child");
+    assert_eq!(
+        engine.store_retry_len(),
+        1,
+        "the parent is still a store hole"
+    );
+    assert_eq!(
+        engine.room_tail(100).expect("tail").len(),
+        1,
+        "the NULL-lamport child is not causally placed"
+    );
+
+    let store = engine.into_store();
+    let mut reopened = SyncEngine::open(store, room, cfg).expect("reopen");
+    assert_eq!(
+        reopened.fold_tracked_len(),
+        1,
+        "only genesis was restored from the causal room tail"
+    );
+    let early_before = reopened.counters().early_duplicates;
+    let duplicates_before = reopened.counters().duplicates;
+
+    reopened.ingest_frame(NODE_A, &parent);
+    assert_eq!(
+        reopened.fold_tracked_len(),
+        2,
+        "the parent replay heals the hole"
+    );
+    reopened.ingest_frame(NODE_A, &child);
+
+    assert_eq!(
+        reopened.counters().early_duplicates,
+        early_before,
+        "an event omitted from the rebuilt fold must not be dropped early"
+    );
+    assert_eq!(
+        reopened.counters().duplicates,
+        duplicates_before + 1,
+        "the stored child reaches the full fold + idempotent store path"
+    );
+    assert_eq!(
+        reopened.fold_tracked_len(),
+        3,
+        "the child replay restores the event to the membership fold"
+    );
+    assert_eq!(reopened.room_tail(100).expect("tail").len(), 3);
+}
+
+// T4 — N consecutive accepted events in one Events message commit in
+// ⌈N/batch⌉ transactions, not N (issue #143 batching acceptance).
+#[test]
+fn consecutive_accepted_events_commit_in_ceil_n_over_batch_transactions() {
+    let cfg = SyncConfig {
+        store_insert_batch_size: 4,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let _ = engine.take_ingested(); // drain genesis
+
+    // Build a linear chain of 10 messages; deliver them in one Events message.
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let mut prev = genesis_id;
+    let mut frames = Vec::with_capacity(10);
+    let mut expected_ids = Vec::with_capacity(10);
+    for i in 1u64..=10 {
+        let f = make_message(&admin_id, &admin_dev, room, prev, &format!("m{i}"), T0 + i);
+        expected_ids.push(frame_id(&f, room));
+        prev = expected_ids[expected_ids.len() - 1];
+        frames.push(f);
+    }
+
+    engine.store_mut().reset_write_tx_count();
+    let out = engine.on_message(
+        NODE_A,
+        SyncMessage::Events {
+            room_id: room,
+            frames,
+        },
+    );
+    // Discard handshake-style side effects; the test only cares about tx count.
+    let _ = out;
+
+    // ceil(10 / 4) = 3 batches → 3 write transactions.
+    assert_eq!(
+        engine.store_mut().write_tx_count(),
+        3,
+        "10 events / batch 4 → 3 transactions, not 10"
+    );
+
+    // All 10 events land and appear in canonical room-tail order.
+    let tail: Vec<EventId> = engine
+        .room_tail(100)
+        .expect("tail")
+        .into_iter()
+        .map(|se| se.event_id)
+        .collect();
+    for id in &expected_ids {
+        assert!(tail.contains(id), "event {id} should be in the tail");
+    }
+    assert_eq!(engine.counters().accepted, 11, "genesis + 10 messages");
+}
+
+// T7 — A failed batch defers every side effect (no fan-out, no feed, no
+// accept count) and enqueues each affected event on the #119 retry queue; the
+// retry path preserves parent-before-child order, blocks the child behind a
+// still-failing parent, then recovers with the full deferred bookkeeping.
+#[test]
+fn failed_batch_defers_side_effects_and_recovers_on_tick() {
+    let cfg = SyncConfig {
+        store_insert_batch_size: 4,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let _ = engine.on_connect(NODE_A);
+    let _ = engine.on_connect(NODE_B);
+    let _ = engine.take_ingested(); // drain genesis + handshake
+
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let m1 = make_message(&admin_id, &admin_dev, room, genesis_id, "one", T0 + 1);
+    let m1_id = frame_id(&m1, room);
+    // Make m2 a child whose id sorts *before* its parent. The old retry loop's
+    // BTreeMap iteration would therefore announce m2 first; enqueue-order retry
+    // must still land and announce the causal parent first.
+    let (m2, m2_id) = (0u64..256)
+        .find_map(|i| {
+            let frame = make_message(
+                &admin_id,
+                &admin_dev,
+                room,
+                m1_id,
+                &format!("child-{i}"),
+                T0 + 2,
+            );
+            let id = frame_id(&frame, room);
+            (id < m1_id).then_some((frame, id))
+        })
+        .expect("find a child id that sorts before its parent");
+
+    // Inject one transaction-level failure for the next batch commit. With
+    // batch size 4, the two events accumulate into a single flush that fails.
+    engine.store_mut().fail_next_inserts(1);
+    let out = engine.on_message(
+        NODE_A,
+        SyncMessage::Events {
+            room_id: room,
+            frames: vec![m1.clone(), m2.clone()],
+        },
+    );
+
+    // No fan-out, no feed, no accept.
+    assert!(
+        events_frames(&out).is_empty(),
+        "an unstored batch must not fan out"
+    );
+    assert!(
+        engine.take_ingested().is_empty(),
+        "an unstored batch must not reach the feed"
+    );
+    assert_eq!(engine.store_retry_len(), 2, "both events queued for retry");
+    assert_eq!(
+        engine.counters().store_insert_failed,
+        2,
+        "failure count = batch size"
+    );
+    assert_eq!(engine.counters().accepted, 1, "genesis only");
+    assert!(
+        engine
+            .logs()
+            .iter()
+            .any(|l| l.contains("store insert failed (batch)")),
+        "the batch failure must be logged distinctly"
+    );
+
+    // Fail the first retry too. Enqueue-order processing tries m1 first and
+    // stops the pass, so m2 cannot land or be announced above the parent hole.
+    // The old bytewise-id loop tried m2 first (its id is deliberately lower),
+    // then continued to land and announce m1 in this tick.
+    engine.store_mut().fail_next_inserts(1);
+    let blocked = engine.on_tick(T0 + 3);
+    assert!(
+        events_frames(&blocked).is_empty(),
+        "a failed parent retry blocks every later descendant"
+    );
+    assert!(
+        engine.take_ingested().is_empty(),
+        "the blocked retry pass has no feed side effects"
+    );
+    assert_eq!(engine.store_retry_len(), 2);
+    assert_eq!(engine.room_tail(100).expect("tail").len(), 1);
+
+    // The next tick lands both events with their deferred post-commit
+    // bookkeeping. Each event fans out to every peer except its original
+    // sender (NODE_A), so NODE_B sees both in causal/input order.
+    let out = engine.on_tick(T0 + 4);
+    let fanned_to_b: Vec<EventId> = out
+        .iter()
+        .filter(|o| o.peer == NODE_B)
+        .filter_map(|o| match &o.msg {
+            SyncMessage::Events { frames, .. } => Some(frames.clone()),
+            _ => None,
+        })
+        .flatten()
+        .map(|f| frame_id(&f, room))
+        .collect();
+    assert_eq!(
+        fanned_to_b,
+        vec![m1_id, m2_id],
+        "retry fan-out preserves parent-before-child enqueue order"
+    );
+    assert_eq!(engine.store_retry_len(), 0);
+    assert_eq!(engine.counters().accepted, 3, "genesis + m1 + m2");
+    let fed: Vec<EventId> = engine
+        .take_ingested()
+        .into_iter()
+        .map(|se| se.event_id)
+        .collect();
+    assert_eq!(
+        fed,
+        vec![m1_id, m2_id],
+        "retry feed preserves parent-before-child enqueue order"
+    );
+    assert_eq!(engine.room_tail(100).expect("tail").len(), 3);
+}
+
+// T5 — A successful batch preserves fanout/feed order: outgoing `Events`
+// frames and `take_ingested()` are both in input order.
+#[test]
+fn batch_preserves_fanout_and_feed_order() {
+    let cfg = SyncConfig {
+        store_insert_batch_size: 8,
+        ..SyncConfig::default()
+    };
+    let (mut engine, room, genesis_id) = seeded_engine(cfg);
+    let _ = engine.on_connect(NODE_A);
+    let _ = engine.on_connect(NODE_B);
+    let _ = engine.take_ingested();
+
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let mut prev = genesis_id;
+    let mut frames = Vec::new();
+    let mut expected_ids = Vec::new();
+    for i in 1u64..=5 {
+        let f = make_message(&admin_id, &admin_dev, room, prev, &format!("m{i}"), T0 + i);
+        let id = frame_id(&f, room);
+        expected_ids.push(id);
+        prev = id;
+        frames.push(f);
+    }
+
+    let out = engine.on_message(
+        NODE_A,
+        SyncMessage::Events {
+            room_id: room,
+            frames,
+        },
+    );
+
+    // The events arrived from NODE_A, so they fan out to NODE_B in input order.
+    let fanned_to_b: Vec<EventId> = out
+        .iter()
+        .filter(|o| o.peer == NODE_B)
+        .filter_map(|o| match &o.msg {
+            SyncMessage::Events { frames, .. } => Some(frames.clone()),
+            _ => None,
+        })
+        .flatten()
+        .map(|f| frame_id(&f, room))
+        .collect();
+    assert_eq!(
+        fanned_to_b, expected_ids,
+        "outgoing Events frames to NODE_B are in input order"
+    );
+    let fed: Vec<EventId> = engine
+        .take_ingested()
+        .into_iter()
+        .map(|se| se.event_id)
+        .collect();
+    assert_eq!(fed, expected_ids, "feed emits in input order");
 }

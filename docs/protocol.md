@@ -280,6 +280,21 @@ completes them over `membership::AncestorView`).
 > reports `non_canonical_encoding` rather than `bad_signature`; every other input's reason code
 > is unaffected by which of the two runs first.
 
+> **Implementation note (issue #143):** the sync engine runs a bounded in-memory event-id dedup
+> cache *between steps 2 and 3* — after the id is recomputed from `wire.signed` (so steps 1–2
+> still reject malformed envelopes and id mismatches first), but before any signature, content,
+> membership, or store work. A cache hit on an id the local node has already durably persisted
+> short-circuits the rest of the pipeline and is recorded in `SyncCounters::early_duplicates`
+> (distinct from the post-store `duplicates` counter, which still covers cache misses, evictions,
+> and the cap-0 rollback case). This is a local-only performance guardrail: it changes no wire,
+> signature, or persistence rule. Correctness still rests on the store's primary-key idempotency
+> (step 11); the cache is seeded only from ids the store has proven persisted, so a bad-signature
+> first arrival cannot poison it and suppress a later valid copy. The capacity
+> (`SyncConfig::early_event_id_dedup_cache_entries`, default 4096) bounds replay-flood memory;
+> `0` disables the early path. The engine also batches consecutive fold-accepted events into one
+> `SQLite` transaction per `SyncConfig::store_insert_batch_size` (default 32), preserving the
+> ordered post-commit side effects and the #119 retry path on a failed batch.
+
 > **Security invariant:** step 8 authorization is judged against the event's **own fixed
 > causal ancestors**, not the receiver's live snapshot — this is what makes verdicts
 > arrival-order-independent. Every honest peer reaches the identical verdict for the same event
@@ -552,6 +567,13 @@ The exact `.code()` spellings — do not invent variants:
 | Code | Meaning |
 |---|---|
 | `duplicate` | `event_id` already stored; the copy is ignored idempotently, state and timeline unchanged |
+
+> **Observability note (issue #143):** `duplicate` is reported by the engine as **two disjoint
+> counters**, not one. `SyncCounters::early_duplicates` counts replays the in-memory event-id
+> cache caught before signature verification or any store work; `SyncCounters::duplicates` counts
+> duplicates the store's primary-key idempotency arm returned after the full validation path
+> (cache miss, eviction, or `SyncConfig::early_event_id_dedup_cache_entries == 0`). Their sum is
+> the total duplicate count. Neither counter is an error and neither changes timeline state.
 
 ### Advisory flags (event still accepted, ordered, and persisted)
 

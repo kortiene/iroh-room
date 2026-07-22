@@ -701,7 +701,7 @@ async fn cmd_join(args: JoinArgs) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     match parse_args()? {
         Command::Identity(args) => cmd_identity(&args.identity_file, args.force),
-        Command::Join(args) => cmd_join(args).await,
+        Command::Join(args) => Box::pin(cmd_join(args)).await,
     }
 }
 

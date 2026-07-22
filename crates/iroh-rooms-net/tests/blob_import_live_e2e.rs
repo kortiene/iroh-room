@@ -16,7 +16,9 @@
 //! is its own compilation unit, so the pattern is duplicated rather than shared.
 //! All tests use `NetMode::Loopback` (no discovery, no relay, deterministic CI).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -273,63 +275,74 @@ fn file_shared_citing(
 /// reconcile after spawn so the `BlobAclView`/admission cell is populated before
 /// the caller relies on it. `addr_hints` lets the caller opt a node into
 /// auto-dialing a peer's event-plane connection (empty = accept-only).
-async fn spawn_serving_member(
-    actor: &Principal,
+///
+/// Returns a boxed future so `Node::spawn_room`'s ~16 KB state machine is not
+/// inlined into each caller (clippy `large_futures`).
+fn spawn_serving_member<'a>(
+    actor: &'a Principal,
     room: RoomId,
-    log: &[Vec<u8>],
+    log: &'a [Vec<u8>],
     blobs_dir: PathBuf,
     addr_hints: Vec<EndpointAddr>,
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    let cell = Arc::new(Mutex::new(AdmissionView::empty()));
-    let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
-    let node = Node::spawn_room(
-        actor.iroh_secret(),
-        admission,
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-        addr_hints,
-        cell,
-        Some(BlobServeConfig { blobs_dir }),
-    )
-    .await
-    .expect("spawn_room with blob serving");
-    node.reconcile_now()
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cell = Arc::new(Mutex::new(AdmissionView::empty()));
+        let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
+        let node = Node::spawn_room(
+            actor.iroh_secret(),
+            admission,
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+            addr_hints,
+            cell,
+            Some(BlobServeConfig { blobs_dir }),
+        )
         .await
-        .expect("force admission/BlobAclView to populate before returning");
-    node
+        .expect("spawn_room with blob serving");
+        node.reconcile_now()
+            .await
+            .expect("force admission/BlobAclView to populate before returning");
+        node
+    })
 }
 
 /// Spawn a **pure fetcher** node (unmanaged, no blob serving): only
 /// `Node::fetch_file` is exercised, so no inbound admission is ever tested.
-async fn spawn_fetcher(actor: &Principal, room: RoomId, log: &[Vec<u8>]) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    Node::spawn(
-        actor.iroh_secret(),
-        Arc::new(AllowlistAdmission::new()),
-        Arc::new(TracingAudit),
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-    )
-    .await
-    .expect("spawn fetcher node")
+fn spawn_fetcher<'a>(
+    actor: &'a Principal,
+    room: RoomId,
+    log: &'a [Vec<u8>],
+) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        Node::spawn(
+            actor.iroh_secret(),
+            Arc::new(AllowlistAdmission::new()),
+            Arc::new(TracingAudit),
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+        )
+        .await
+        .expect("spawn fetcher node")
+    })
 }
 
 // ---------------------------------------------------------------------------

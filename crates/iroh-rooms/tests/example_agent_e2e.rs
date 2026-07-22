@@ -548,7 +548,9 @@ fn agent_status_message_bound_matches_the_wire() {
 
 #[cfg(feature = "experimental")]
 mod online {
+    use std::future::Future;
     use std::io::{BufRead, BufReader, Read};
+    use std::pin::Pin;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -670,28 +672,35 @@ mod online {
     /// Spawn an admin [`Node`] pre-seeded with `fx.log`, using
     /// [`JoinBootstrapAdmission`] so the agent's not-yet-known device is
     /// admitted provisionally — exactly `join_e2e.rs`'s `spawn_admin_node`.
-    async fn spawn_admin_node(fx: &OnlineFixture) -> Node {
-        let store = EventStore::open_in_memory().expect("in-memory admin store");
-        let mut engine =
-            SyncEngine::open(store, fx.room_id, SyncConfig::default()).expect("admin engine");
-        for ev in &fx.log {
-            engine.publish(ev).expect("seed admin event");
-        }
-        let admission = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
-        let cfg = NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        };
-        Node::spawn(
-            fx.admin_device.iroh_secret(),
-            Arc::new(admission),
-            Arc::new(TracingAudit),
-            engine,
-            cfg,
-            DEFAULT_TICK,
-        )
-        .await
-        .expect("spawn admin node")
+    ///
+    /// Returns a boxed future so `Node::spawn`'s ~16 KB state machine is not
+    /// inlined into each caller (clippy `large_futures`).
+    fn spawn_admin_node<'a>(
+        fx: &'a OnlineFixture,
+    ) -> Pin<Box<dyn Future<Output = Node> + Send + 'a>> {
+        Box::pin(async move {
+            let store = EventStore::open_in_memory().expect("in-memory admin store");
+            let mut engine =
+                SyncEngine::open(store, fx.room_id, SyncConfig::default()).expect("admin engine");
+            for ev in &fx.log {
+                engine.publish(ev).expect("seed admin event");
+            }
+            let admission = JoinBootstrapAdmission::new(AllowlistAdmission::new(), true);
+            let cfg = NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            };
+            Node::spawn(
+                fx.admin_device.iroh_secret(),
+                Arc::new(admission),
+                Arc::new(TracingAudit),
+                engine,
+                cfg,
+                DEFAULT_TICK,
+            )
+            .await
+            .expect("spawn admin node")
+        })
     }
 
     /// Render an [`EndpointAddr`] as the `--peer` wire form

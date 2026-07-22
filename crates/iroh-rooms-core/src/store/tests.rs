@@ -623,7 +623,6 @@ fn insert_all_rolls_back_entire_batch_on_error() {
 
     let mut tampered = m.clone();
     tampered.event_id = EventId::from_bytes([0xff; 32]);
-
     let mut store = EventStore::open_in_memory().unwrap();
     // Valid genesis followed by an event with a mismatched event_id.
     let err = store.insert_all(&[g.clone(), tampered]).unwrap_err();
@@ -634,6 +633,70 @@ fn insert_all_rolls_back_entire_batch_on_error() {
     // Transaction must have rolled back; nothing should be stored.
     assert_eq!(store.count(&room).unwrap(), 0);
     assert!(!store.contains(&g.event_id).unwrap());
+}
+
+// Issue #143 — `insert_all_outcomes` returns the per-input outcome in input
+// order, the contract the sync engine needs to apply per-event post-commit side
+// effects after a batched commit.
+#[test]
+fn insert_all_outcomes_returns_per_input_outcomes_in_order() {
+    let (id, dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&id, &dev);
+    let m = message(&id, &dev, room, vec![g.event_id], "hi", T0 + 1);
+
+    let mut store = EventStore::open_in_memory().unwrap();
+    // Seed the genesis so the second batch's first event is a Duplicate.
+    store.insert(&g).unwrap();
+
+    let m2 = message(&id, &dev, room, vec![m.event_id], "bye", T0 + 2);
+    let outcomes = store.insert_all_outcomes(&[g.clone(), m2.clone()]).unwrap();
+    assert_eq!(
+        outcomes,
+        vec![InsertOutcome::Duplicate, InsertOutcome::Inserted],
+        "ordered outcomes: g was already stored (Duplicate), m2 is new (Inserted)"
+    );
+    assert_eq!(store.count(&room).unwrap(), 2);
+}
+
+// Issue #143 — `insert_all_outcomes` opens exactly one write transaction per
+// call (the test-only `write_tx_count` is the batching acceptance oracle for
+// the engine).
+#[test]
+fn insert_all_outcomes_uses_one_transaction_per_batch() {
+    let (id, dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&id, &dev);
+    let m1 = message(&id, &dev, room, vec![g.event_id], "one", T0 + 1);
+    let m2 = message(&id, &dev, room, vec![m1.event_id], "two", T0 + 2);
+    let m3 = message(&id, &dev, room, vec![m2.event_id], "three", T0 + 3);
+
+    let mut store = EventStore::open_in_memory().unwrap();
+    store.reset_write_tx_count();
+    let _ = store
+        .insert_all_outcomes(&[g.clone(), m1.clone(), m2.clone(), m3.clone()])
+        .unwrap();
+    assert_eq!(
+        store.write_tx_count(),
+        1,
+        "one batch → one BEGIN IMMEDIATE transaction"
+    );
+}
+
+// Issue #143 — `insert_all` still returns accurate stats after the refactor to
+// delegate to `insert_all_outcomes` (the API the engine used to call directly).
+#[test]
+fn insert_all_delegates_to_insert_all_outcomes() {
+    let (id, dev) = (sk(1), sk(2));
+    let (g, room) = genesis(&id, &dev);
+    let m = message(&id, &dev, room, vec![g.event_id], "hi", T0 + 1);
+    let mut store = EventStore::open_in_memory().unwrap();
+
+    let stats = store.insert_all(&[g.clone(), m.clone()]).unwrap();
+    assert_eq!(stats.inserted, 2);
+    assert_eq!(stats.duplicate, 0);
+
+    let stats = store.insert_all(&[g, m]).unwrap();
+    assert_eq!(stats.inserted, 0);
+    assert_eq!(stats.duplicate, 2);
 }
 
 // Before a merge event arrives, concurrent forks each appear as a DAG head.

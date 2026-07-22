@@ -110,13 +110,21 @@ impl Default for StoreOptions {
 /// (spec §10, multi-connection pooling is future work).
 pub struct EventStore {
     conn: Connection,
-    /// Test-only deterministic fault injection: the number of upcoming
-    /// [`insert`](Self::insert) calls that fail with an injected error before
-    /// touching the database (issue #119 — the engine's insert-failure recovery
-    /// is untestable against real `SQLite` without nondeterministic disk-full
-    /// tricks). Compiled out of non-test builds.
+    /// Test-only deterministic fault injection (issue #119 / #143): the number
+    /// of upcoming [`insert`](Self::insert) **or**
+    /// [`insert_all_outcomes`](Self::insert_all_outcomes) calls that fail with
+    /// an injected error before touching the database. One fault decrements by
+    /// one regardless of whether the call is a single-event insert or a batch
+    /// (modelling a transaction-level `SQLITE_BUSY` burst, per spec §6 / D6).
+    /// Compiled out of non-test builds.
     #[cfg(test)]
     fail_next_inserts: u32,
+    /// Test-only transaction counter (issue #143): every `begin_write` bumps
+    /// this so the engine's batching tests can assert that N consecutive
+    /// accepted events commit in ⌈N/batch⌉ transactions, not N. Compiled out
+    /// of non-test builds.
+    #[cfg(test)]
+    write_tx_count: u64,
 }
 
 impl EventStore {
@@ -170,15 +178,36 @@ impl EventStore {
             conn,
             #[cfg(test)]
             fail_next_inserts: 0,
+            #[cfg(test)]
+            write_tx_count: 0,
         })
     }
 
-    /// Test-only: make the next `n` [`insert`](Self::insert) calls fail with an
-    /// injected [`StoreError`] without touching the database — the deterministic
-    /// stand-in for a disk-full / I/O fault (issue #119).
+    /// Test-only: make the next `n` [`insert`](Self::insert) **or**
+    /// [`insert_all_outcomes`](Self::insert_all_outcomes) calls fail with an
+    /// injected [`StoreError`] before they touch the database — the
+    /// deterministic stand-in for a disk-full / I/O fault (issue #119) or a
+    /// transaction-level `SQLITE_BUSY` burst against a batched accepted-event
+    /// commit (issue #143). One fault decrements by one regardless of whether
+    /// the call is a single-event insert or a batch (spec §6 / D6).
     #[cfg(test)]
     pub(crate) fn fail_next_inserts(&mut self, n: u32) {
         self.fail_next_inserts = n;
+    }
+
+    /// Test-only: the number of write transactions (`BEGIN IMMEDIATE`) opened
+    /// since store creation or the last [`reset_write_tx_count`](Self::reset_write_tx_count).
+    /// Used by the engine batching tests (issue #143) to assert that N
+    /// consecutive accepted events commit in ⌈N/batch⌉ transactions, not N.
+    #[cfg(test)]
+    pub(crate) fn write_tx_count(&self) -> u64 {
+        self.write_tx_count
+    }
+
+    /// Test-only: zero the write transaction counter.
+    #[cfg(test)]
+    pub(crate) fn reset_write_tx_count(&mut self) {
+        self.write_tx_count = 0;
     }
 
     /// Begin a write transaction that grabs the write lock up front
@@ -188,6 +217,10 @@ impl EventStore {
     /// hit the un-retryable lock-upgrade deadlock a `BEGIN DEFERRED` transaction
     /// can hit under concurrent writers (issue #85).
     fn begin_write(&mut self) -> Result<rusqlite::Transaction<'_>, StoreError> {
+        #[cfg(test)]
+        {
+            self.write_tx_count += 1;
+        }
         Ok(self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
@@ -223,13 +256,51 @@ impl EventStore {
     /// # Errors
     /// As [`EventStore::insert`]; the whole batch rolls back on the first error.
     pub fn insert_all(&mut self, evs: &[ValidatedEvent]) -> Result<InsertStats, StoreError> {
-        let tx = self.begin_write()?;
+        let outcomes = self.insert_all_outcomes(evs)?;
         let mut stats = InsertStats::default();
+        for outcome in outcomes {
+            stats.record(outcome);
+        }
+        Ok(stats)
+    }
+
+    /// Persist many events in a single transaction and return the
+    /// per-input [`InsertOutcome`] in input order (issue #143).
+    ///
+    /// The sync engine cannot use [`EventStore::insert_all`] for batched
+    /// accepted-event commits: [`InsertStats`] loses the per-input outcome the
+    /// ordered post-commit side effects (counters, fan-out, push feed) need.
+    /// This method opens one `BEGIN IMMEDIATE` transaction, calls the existing
+    /// [`insert_in_tx`] for each input in order, and commits once at the end.
+    /// Any error rolls back the whole batch — no event in a failed batch is
+    /// durably stored, matching the all-or-nothing contract the engine's #119
+    /// retry path relies on.
+    ///
+    /// # Errors
+    /// [`StoreError::Integrity`] if a caller passes a mismatched id/bytes pair
+    /// (caught by the existing [`insert_in_tx`] guard), or [`StoreError::Sqlite`]
+    /// on a DB error. A fault armed via
+    /// [`fail_next_inserts`](Self::fail_next_inserts) is surfaced as a
+    /// [`StoreError::Integrity`] before the transaction opens, modelling a
+    /// transaction-level `SQLITE_BUSY` burst.
+    pub fn insert_all_outcomes(
+        &mut self,
+        evs: &[ValidatedEvent],
+    ) -> Result<Vec<InsertOutcome>, StoreError> {
+        #[cfg(test)]
+        if self.fail_next_inserts > 0 {
+            self.fail_next_inserts -= 1;
+            return Err(StoreError::integrity(
+                "injected insert_all_outcomes fault (test)",
+            ));
+        }
+        let tx = self.begin_write()?;
+        let mut outcomes = Vec::with_capacity(evs.len());
         for ev in evs {
-            stats.record(insert_in_tx(&tx, ev)?);
+            outcomes.push(insert_in_tx(&tx, ev)?);
         }
         tx.commit()?;
-        Ok(stats)
+        Ok(outcomes)
     }
 
     // -- point / existence ----------------------------------------------------

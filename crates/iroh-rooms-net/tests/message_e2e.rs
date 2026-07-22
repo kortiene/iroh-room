@@ -27,6 +27,8 @@
 //! Membership is seeded via core event builders to avoid the `room join` CLI
 //! dependency (#19 / OQ-5).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -178,31 +180,37 @@ fn allowlist(members: &[&Principal]) -> AllowlistAdmission {
 }
 
 /// Spawn a loopback [`Node`] seeded with `log` (in causal order) via `publish`.
-async fn spawn_loopback_node(
+///
+/// Returns a boxed future so the ~16 KB `Node::spawn` state machine is
+/// heap-allocated once rather than inlined into each caller (clippy
+/// `large_futures` — every test here calls this at least once).
+fn spawn_loopback_node(
     secret: SecretKey,
     admission: AllowlistAdmission,
     room: RoomId,
     log: &[Vec<u8>],
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        secret,
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        Duration::from_millis(100),
-    )
-    .await
-    .expect("spawn loopback node")
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            secret,
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("spawn loopback node")
+    })
 }
 
 // ---------------------------------------------------------------------------

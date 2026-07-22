@@ -27,6 +27,34 @@ where feasible); the **experimental** tier may change on any release.
   `active_member_warning_crossed` are added to `iroh_rooms_core::membership` but
   are not yet re-exported through this façade (tracked as SDK-coverage drift in
   `docs/sdk-coverage.md`).
+- Added a bounded early event-id dedup cache and batched `SQLite` accepted-event
+  commits to the sync engine (issue #143, `iroh-rooms-core`): two local-only
+  performance guardrails from #134 §22.2. The engine now decodes the outer
+  `WireEvent`, recomputes the id from `wire.signed` (never the advisory
+  `wire.id`), and consults an in-memory FIFO cache of recently persisted ids
+  *before* signature verification or any store work — a replay inside the cache
+  window is a cheap no-op counted by a new `SyncCounters::early_duplicates`
+  counter (distinct from the existing post-store `duplicates` counter, which
+  still covers cache misses, evictions, and the cap-0 rollback case). Consecutive
+  fold-accepted events are then persisted in one `BEGIN IMMEDIATE` transaction
+  per `SyncConfig::store_insert_batch_size` (default 32; `1` is the supported
+  disable-batching knob; `0` is invalid), so `N` consecutive accepted events
+  commit in `⌈N/batch⌉` transactions rather than `N`. The cache is populated
+  only after the store proves an id is persisted, so a bad-signature first
+  arrival cannot poison it and suppress a later valid copy; the capacity
+  (`SyncConfig::early_event_id_dedup_cache_entries`, default 4096; `0` disables)
+  bounds replay-flood memory. The #119 retry path is preserved: a failed batch
+  is all-or-nothing, every affected event enters the bounded retry queue with
+  `store_insert_failed` incremented by the affected count and a distinct
+  `store insert failed (batch)` log line, and no fan-out, push-feed emit, or
+  accept counter runs until the insert lands. Post-commit side effects
+  (`apply_insert_outcome`) remain centralized and are applied in input order on
+  success, so insert-then-fanout ordering is unchanged. The shipped
+  `EventStore::insert_all` stats API now delegates to a new public
+  `EventStore::insert_all_outcomes` that returns the per-input `InsertOutcome`
+  sequence the engine needs. No wire-format, canonical-CBOR, signature,
+  membership, or `SQLite` schema change; the new state is in-memory only and the
+  cache is seeded from persisted room ids on `SyncEngine::open`.
 
 ## 0.1.0-rc.3 - 2026-07-16
 

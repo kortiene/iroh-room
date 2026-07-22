@@ -27,6 +27,8 @@
 //! and need no second node: the warning is a local observer decision over the
 //! engine's own fold, independent of whether any peer link is up.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use iroh::{EndpointId, SecretKey};
@@ -238,29 +240,34 @@ fn make_engine(room_id: RoomId, events: &[Vec<u8>]) -> SyncEngine {
 /// audit sink. No `addr_hint`s are supplied: the warning is a local observer
 /// decision over the engine fold and does not depend on any peer link being up,
 /// so the test stays single-node and deterministic.
-async fn spawn_room_with_audit(
+///
+/// Returns a boxed future: `Node::spawn_room`'s state machine is ~16 KB, which
+/// would otherwise be inlined into every caller and trip clippy `large_futures`.
+fn spawn_room_with_audit(
     actor: &Actor,
     engine: SyncEngine,
     audit: Arc<dyn AuditSink>,
-) -> Node {
-    let cell = Arc::new(Mutex::new(AdmissionView::empty()));
-    let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
-    Node::spawn_room(
-        actor.iroh_secret(),
-        admission,
-        audit,
-        engine,
-        NetConfig {
-            mode: NetMode::Loopback,
-            ..NetConfig::default()
-        },
-        DEFAULT_TICK,
-        vec![],
-        cell,
-        None,
-    )
-    .await
-    .expect("spawn_room")
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let cell = Arc::new(Mutex::new(AdmissionView::empty()));
+        let admission = Arc::new(SnapshotAdmission::new(cell.clone()));
+        Node::spawn_room(
+            actor.iroh_secret(),
+            admission,
+            audit,
+            engine,
+            NetConfig {
+                mode: NetMode::Loopback,
+                ..NetConfig::default()
+            },
+            DEFAULT_TICK,
+            vec![],
+            cell,
+            None,
+        )
+        .await
+        .expect("spawn_room")
+    })
 }
 
 // ---------------------------------------------------------------------------
