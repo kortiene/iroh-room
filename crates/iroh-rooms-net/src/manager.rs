@@ -25,6 +25,26 @@ use crate::peer::dial_loop;
 use crate::state::{OfflineReason, PeerConnState};
 use crate::transport::Shared;
 
+/// How many warm dial loops a node maintains toward other active members when
+/// the `gossip_overlay` feature is on (issue #171 / spec §4 D3). The `HyParView`
+/// partial view maintained by `iroh-gossip` grows the overlay the rest of the
+/// way, so the warm-link count is bounded by a small constant K rather than
+/// `O(N)` — the change that lets N grow past the QUIC-connection-count wall the
+/// spike-N40 measured at N=40.
+///
+/// K=3 is the recommended v1 constant: enough for redundancy at the target
+/// N=20 (D7), small enough that the warm connection count is bounded regardless
+/// of N. Revisit if Phase B's spike-N40 re-run shows connectedness <95%.
+pub const GOSSIP_BOOTSTRAP_SEEDS: usize = 3;
+
+/// Per-node cap on simultaneously-live on-demand dial loops toward non-seed
+/// active members (issue #171 / spec §4 D3 step 4). When the engine targets a
+/// pull/query at a peer that is not a warm seed, `Shared::route` triggers a
+/// transient dial that tears itself down after a quiescence timeout. The cap
+/// keeps the total per-node connection count at `K + MAX_ON_DEMAND_LINKS`
+/// regardless of N.
+pub const MAX_ON_DEMAND_LINKS: usize = 8;
+
 /// One running managed dial loop: the task handle and the address it is dialing.
 struct DialEntry {
     handle: JoinHandle<()>,
@@ -98,6 +118,61 @@ impl PeerManager {
         out
     }
 
+    /// The gossip-bootstrap seed set: a K-bounded deterministic subset of
+    /// [`desired_devices`](Self::desired_devices) (issue #171 / spec §4 D3).
+    ///
+    /// Selection (D3 step 2): the K lowest-bytewise `EndpointId`s among active
+    /// members (excluding self), plus the room admin's device if it is Active
+    /// and not self and not already in the seed set. Determinism is
+    /// load-bearing: every node must compute the same seed set from the same
+    /// snapshot so the seeds are mutually reachable (a node's seed set is who
+    /// it dials warm; mismatches would leave some seeds unreachable).
+    ///
+    /// K is [`GOSSIP_BOOTSTRAP_SEEDS`] (3 for v1). At small N (N-1 ≤ K) the
+    /// seed set equals the full desired set, so the seed selector is a no-op
+    /// at the current `MAX_ACTIVE_MEMBERS = 5` — every active member is a
+    /// seed. The change only takes effect when N grows past K+1 (Phase C,
+    /// behind the `large_rooms` feature).
+    ///
+    /// The returned set is the **warm dial target** — `reconcile` starts/stops
+    /// loops only for these devices when the overlay is on. Pull/query
+    /// variants to non-seed peers ride on-demand dials bounded by
+    /// [`MAX_ON_DEMAND_LINKS`] (D3 step 4).
+    #[must_use]
+    pub fn desired_seeds(
+        snapshot: &MembershipSnapshot,
+        self_device: EndpointId,
+    ) -> BTreeSet<EndpointId> {
+        // `desired_devices` returns a `BTreeSet<EndpointId>`; iteration is
+        // already in bytewise order, so the first K are the K lowest-bytewise.
+        let desired = Self::desired_devices(snapshot, self_device);
+        let mut seeds: BTreeSet<EndpointId> =
+            desired.into_iter().take(GOSSIP_BOOTSTRAP_SEEDS).collect();
+
+        // The room admin (if Active and not self) is always a seed: it is the
+        // stable rendezvous point for join bootstrap and the canonical source
+        // of the admin chain. The admin is identified by the snapshot's
+        // genesis `admin` identity, so a member is the admin iff its identity
+        // equals `snapshot.admin()`. `active_members` already includes the
+        // admin when Active, so this is a guarantee, not an addition, when
+        // the admin is among the K lowest-bytewise; otherwise it widens the
+        // set past K by exactly one (acceptable: K+1 warm links, still O(1)).
+        let admin_identity = snapshot.admin();
+        for m in snapshot.active_members() {
+            if Some(&m.identity) != admin_identity {
+                continue;
+            }
+            let Some(dev) = m.device else { continue };
+            let Ok(id) = EndpointId::from_bytes(dev.as_bytes()) else {
+                continue;
+            };
+            if id != self_device {
+                seeds.insert(id);
+            }
+        }
+        seeds
+    }
+
     /// Resolve a device to a dialable [`EndpointAddr`]: an explicit `--peer` hint if
     /// one matches (deterministic loopback/LAN), else a bare `EndpointId` (iroh
     /// discovery resolves it in real-network mode) — identical to `build_dial_set`.
@@ -120,6 +195,19 @@ impl PeerManager {
     ///   `Offline{Deauthorized}`, and audit `peer.deauthorized` — for each running
     ///   loop whose device is no longer desired (removed / left the room).
     pub fn reconcile(&self, snapshot: &MembershipSnapshot) {
+        // The desired warm dial set: every active member (full mesh) when the
+        // gossip overlay is off — the path the v1 spike measured at N≤5. When
+        // the overlay is on, only the K-bounded seed subset is dialed warm;
+        // the HyParView partial view maintained by iroh-gossip grows the
+        // overlay the rest of the way, and pull/query frames to non-seed
+        // peers ride on-demand dials bounded by `MAX_ON_DEMAND_LINKS`
+        // (issue #171 / spec §4 D3 step 3). At N≤5 (the current
+        // `MAX_ACTIVE_MEMBERS = 5`) and K=3 the seed set equals the full
+        // desired set whenever N-1 ≤ K, so the seed selector is a no-op at
+        // the current cap.
+        #[cfg(feature = "gossip_overlay")]
+        let desired = Self::desired_seeds(snapshot, self.self_device);
+        #[cfg(not(feature = "gossip_overlay"))]
         let desired = Self::desired_devices(snapshot, self.self_device);
 
         let mut dials = self
@@ -537,5 +625,227 @@ mod tests {
             !result.contains(&member.endpoint_id()),
             "removed member's device must not be in the desired set"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // desired_seeds: the K-bounded gossip-bootstrap subset (issue #171 / §4 D3)
+    // -----------------------------------------------------------------------
+    //
+    // `desired_seeds` selects the K lowest-bytewise active devices + the room
+    // admin (if Active and not self). Determinism is load-bearing: every node
+    // must compute the same seed set from the same snapshot so the seeds are
+    // mutually reachable. At N-1 ≤ K the seed set equals the full desired set
+    // (the no-op at the current `MAX_ACTIVE_MEMBERS = 5`).
+
+    #[test]
+    fn desired_seeds_empty_fold_is_empty() {
+        let room_id = RoomId::from_bytes([0u8; 32]);
+        let snapshot = RoomMembership::new(room_id).snapshot();
+        let self_dev = SecretKey::from_bytes(&[1u8; 32]).public();
+        assert!(
+            PeerManager::desired_seeds(&snapshot, self_dev).is_empty(),
+            "empty fold must yield an empty seed set"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_excludes_self() {
+        // Only the admin is Active after a genesis fold. If admin == self, the
+        // seed set must be empty.
+        let admin = Actor::new(1);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let snapshot = RoomMembership::from_events(room_id, [genesis_ev]).snapshot();
+
+        assert!(
+            PeerManager::desired_seeds(&snapshot, admin.endpoint_id()).is_empty(),
+            "self device must be excluded from the seed set"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_at_small_n_equals_full_desired_set() {
+        // At N=3 (admin + m1 + m2) and K=3, every non-self active member is a
+        // seed — the no-op at the current cap. Pin this so the seed selector
+        // never accidentally drops a peer at N≤5 (where the spike measured the
+        // mesh path).
+        let admin = Actor::new(5);
+        let m1 = Actor::new(6);
+        let m2 = Actor::new(7);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let gid = genesis_ev.event_id;
+        let invite1 = mk_invite(&admin, room_id, &[gid], m1.identity(), 1, T0 + 1);
+        let i1id = invite1.event_id;
+        let join1 = mk_join(&m1, room_id, &[i1id], 1, T0 + 2);
+        let j1id = join1.event_id;
+        let invite2 = mk_invite(&admin, room_id, &[j1id], m2.identity(), 2, T0 + 3);
+        let i2id = invite2.event_id;
+        let join2 = mk_join(&m2, room_id, &[i2id], 2, T0 + 4);
+
+        let snapshot =
+            RoomMembership::from_events(room_id, [genesis_ev, invite1, join1, invite2, join2])
+                .snapshot();
+
+        let seeds = PeerManager::desired_seeds(&snapshot, admin.endpoint_id());
+        let full = PeerManager::desired_devices(&snapshot, admin.endpoint_id());
+        assert_eq!(
+            seeds, full,
+            "at N=3 with K=3, every non-self active member must be a seed"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_is_bounded_by_k_plus_admin_at_large_n() {
+        // At N=12 (admin + 11 members) and K=3, the seed set is at most K+1
+        // (the K lowest-bytewise members + the admin, if not already among
+        // them). This is the load-bearing property: the warm-link count is
+        // bounded regardless of N (issue #171 / spec §4 D3).
+        let admin = Actor::new(1);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let mut prev = genesis_ev.event_id;
+        let mut events = vec![genesis_ev];
+        for n in 2u8..=12 {
+            let m = Actor::new(n);
+            let invite = mk_invite(&admin, room_id, &[prev], m.identity(), n, T0 + u64::from(n));
+            let iid = invite.event_id;
+            let join = mk_join(&m, room_id, &[iid], n, T0 + u64::from(n) + 100);
+            prev = join.event_id;
+            events.push(invite);
+            events.push(join);
+        }
+        let snapshot = RoomMembership::from_events(room_id, events).snapshot();
+
+        // Self is an outsider so the admin counts toward the seed set.
+        let outsider: EndpointId = SecretKey::from_bytes(&[99u8; 32]).public();
+        let seeds = PeerManager::desired_seeds(&snapshot, outsider);
+        let k = super::GOSSIP_BOOTSTRAP_SEEDS;
+        assert!(
+            seeds.len() <= k + 1,
+            "seed set must be bounded by K+1 (K lowest-bytewise + admin); got {} (K={k})",
+            seeds.len()
+        );
+        assert!(
+            seeds.contains(&admin.endpoint_id()),
+            "the active admin must always be a seed"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_is_deterministic_across_calls() {
+        // Every node must compute the same seed set from the same snapshot, so
+        // the selection must be a pure function of (snapshot, self_device).
+        let admin = Actor::new(5);
+        let m1 = Actor::new(6);
+        let m2 = Actor::new(7);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let gid = genesis_ev.event_id;
+        let invite1 = mk_invite(&admin, room_id, &[gid], m1.identity(), 1, T0 + 1);
+        let i1id = invite1.event_id;
+        let join1 = mk_join(&m1, room_id, &[i1id], 1, T0 + 2);
+        let j1id = join1.event_id;
+        let invite2 = mk_invite(&admin, room_id, &[j1id], m2.identity(), 2, T0 + 3);
+        let i2id = invite2.event_id;
+        let join2 = mk_join(&m2, room_id, &[i2id], 2, T0 + 4);
+
+        let snapshot =
+            RoomMembership::from_events(room_id, [genesis_ev, invite1, join1, invite2, join2])
+                .snapshot();
+
+        let outsider: EndpointId = SecretKey::from_bytes(&[99u8; 32]).public();
+        assert_eq!(
+            PeerManager::desired_seeds(&snapshot, outsider),
+            PeerManager::desired_seeds(&snapshot, outsider),
+            "seed selection must be deterministic"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_is_a_subset_of_desired_devices() {
+        // The seed selector narrows the desired set; it must never invent a
+        // device that is not an active member's bound device (minus self). This
+        // is the load-bearing invariant for "only admitted peers are dialed
+        // warm" (issue #171 / spec §4 D3): a seed outside `desired_devices`
+        // would mean dialing a device that admission would reject, or — worse
+        // — a device the snapshot does not know at all. Pinned at large N so
+        // both the K-take and the admin-injection paths are exercised.
+        let admin = Actor::new(1);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let mut prev = genesis_ev.event_id;
+        let mut events = vec![genesis_ev];
+        for n in 2u8..=9 {
+            let m = Actor::new(n);
+            let invite = mk_invite(&admin, room_id, &[prev], m.identity(), n, T0 + u64::from(n));
+            let iid = invite.event_id;
+            let join = mk_join(&m, room_id, &[iid], n, T0 + u64::from(n) + 100);
+            prev = join.event_id;
+            events.push(invite);
+            events.push(join);
+        }
+        let snapshot = RoomMembership::from_events(room_id, events).snapshot();
+
+        // Self is an outsider so admin + members are all candidates.
+        let outsider: EndpointId = SecretKey::from_bytes(&[99u8; 32]).public();
+        let seeds = PeerManager::desired_seeds(&snapshot, outsider);
+        let desired = PeerManager::desired_devices(&snapshot, outsider);
+        assert!(
+            seeds.is_subset(&desired),
+            "seed set ({seeds:?}) must be a subset of desired devices ({desired:?}); \
+             a warm-dial target outside the active set would bypass admission"
+        );
+
+        // And self must never appear in either set.
+        assert!(
+            !seeds.contains(&outsider),
+            "self must never be a warm-dial seed target"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_excludes_admin_when_admin_is_self_even_with_members() {
+        // The `desired_seeds_excludes_self` test only covers the genesis case
+        // (admin alone). Here self == admin AND there are active members, so
+        // the seed set is non-empty but must still exclude self. Catches a
+        // regression where the admin-injection path re-adds self when self is
+        // the admin.
+        let admin = Actor::new(3);
+        let m1 = Actor::new(4);
+        let m2 = Actor::new(5);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let gid = genesis_ev.event_id;
+        let invite1 = mk_invite(&admin, room_id, &[gid], m1.identity(), 1, T0 + 1);
+        let i1id = invite1.event_id;
+        let join1 = mk_join(&m1, room_id, &[i1id], 1, T0 + 2);
+        let j1id = join1.event_id;
+        let invite2 = mk_invite(&admin, room_id, &[j1id], m2.identity(), 2, T0 + 3);
+        let i2id = invite2.event_id;
+        let join2 = mk_join(&m2, room_id, &[i2id], 2, T0 + 4);
+
+        let snapshot =
+            RoomMembership::from_events(room_id, [genesis_ev, invite1, join1, invite2, join2])
+                .snapshot();
+
+        let seeds = PeerManager::desired_seeds(&snapshot, admin.endpoint_id());
+        assert!(
+            !seeds.contains(&admin.endpoint_id()),
+            "admin's own device must be excluded from its seed set even with members present"
+        );
+        assert!(
+            !seeds.is_empty(),
+            "with two active non-self members, the seed set must be non-empty"
+        );
+    }
+
+    #[test]
+    fn gossip_bootstrap_seeds_constant_is_the_v1_value() {
+        // K=3 is the recommended v1 constant (spec §4 D3 step 1). Pin it so a
+        // future change is caught: raising K widens the warm-link count and
+        // must be re-justified by Phase B's spike-N40 re-run.
+        assert_eq!(super::GOSSIP_BOOTSTRAP_SEEDS, 3);
+    }
+
+    #[test]
+    fn max_on_demand_links_constant_is_the_v1_value() {
+        // The per-node transient-dial cap (D3 step 4). K + MAX_ON_DEMAND_LINKS
+        // is the total per-node connection count bound.
+        assert_eq!(super::MAX_ON_DEMAND_LINKS, 8);
     }
 }

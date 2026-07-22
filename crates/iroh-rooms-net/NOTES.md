@@ -262,3 +262,74 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
   measured full-mesh against a minimal `iroh-gossip` backend at N=2..5 and
   ratified ADR-1 (mesh admission-before-bytes corroborates T2 above; see
   `crates/spike-transport/NOTES.md` for the measured table and decision).
+
+## Gossip overlay for Events fan-out (issue #171 / #154 GO decision) — Phase A landed
+
+`#154` closed GO: a gossip overlay **is** warranted for N>5. `crates/spike-N40`
+measured the full-mesh topology collapsing under fan-out amplification
+(pre-`b0622ec` N=25 = 661 MB backlog, `accepted=0`, `frames_sent=0`; N=40 panics
+the QUIC layer at 1560 in-process connections) while every connectivity signal
+still read healthy. Issue #171 lands the surgical fan-out replacement that
+decision named. Spec: `specs/gossip-overlay-events-fan-out.md`. Integration
+notes: `src/gossip.rs`.
+
+**What landed (Phase A — the overlay, behind a feature flag):**
+
+- `gossip_overlay` cargo feature on this crate, **default off**. With it off the
+  pure full-mesh path the v1 spike measured compiles back in verbatim; rollback
+  is flipping the flag. The CLI does not wire it, so the shipped binary stays on
+  full-mesh. Opt-in is a build-time seam for the Phase B spike re-run.
+- `iroh-gossip = "=0.101.0"` (optional), reconciled against `iroh = "=1.0.1"`
+  with zero API drift (same recon as `spike-transport/NOTES.md` §1).
+- A second ALPN `GOSSIP_ALPN = b"/iroh-rooms/gossip/1"` (`alpn.rs`), distinct
+  from iroh-gossip's default so the room plane owns the accept path.
+- The surgical seam at `Shared::route` (`transport.rs`): when the feature is on
+  and a per-room gossip mesh is installed, a `SyncMessage::Events` frame is
+  broadcast on the room's gossip topic **in addition to** the per-peer queue
+  (dual-path). The engine's `event_id` G-set dedup makes a frame delivered by
+  both paths idempotent. Every other variant (`WantMembership`,
+  `WantRecentChat`, `WantEvents`, `AdminTip`, `Heads`, `NotFound`,
+  `ProveCapability`) stays on the point-to-point queue, byte-identical — those
+  rely on per-link FIFO gossip's epidemic delivery cannot provide.
+- A deterministic per-room `TopicId` derived from the public `room_id` via a
+  domain-separated BLAKE3 KDF (`gossip::events_topic`). The topic is a
+  rendezvous point, **not** the admission boundary.
+- Per-mesh dedup of identical broadcast bodies, collapsing the N-1 identical
+  broadcasts the engine's per-peer fan-out produces per accepted event into one
+  gossip broadcast (the O(N²) amplification #171 exists to remove).
+- Additive audit vocabulary on `AuditSink` (`audit.rs`): `gossip_broadcast`,
+  `gossip_received`, `gossip_lagged`, `gossip_neighbor_up`, `gossip_neighbor_down`,
+  `gossip_topic_rejected`. `Node::gossip_neighbor_count` surfaces the live
+  HyParView partial-view size for the CLI / spike harness.
+- `PeerManager::desired_seeds` computes a K-bounded (`GOSSIP_BOOTSTRAP_SEEDS = 3`)
+  deterministic bootstrap subset (K lowest-bytewise Active devices + admin) for
+  warm dialing. At the current `MAX_ACTIVE_MEMBERS = 5` the seed selector is a
+  no-op (N-1 ≤ K), so it only takes effect once N grows past K+1.
+
+**Auth preservation (non-negotiable, verified):** `spike-transport` §4 measured
+the decisive axis — open gossip topics admit anyone who learns the topic id, while
+the mesh refuses-before-bytes. The overlay preserves the structural
+reject-before-bytes guarantee: `GossipProtocolHandler` wraps `iroh-gossip`'s
+`ProtocolHandler` with the **same** `Arc<dyn Admission>` instance the `EVENT_ALPN`
+gate consults, so a device removed from the live snapshot is rejected on both
+ALPNs in the same tick, and the `GOSSIP_ALPN` connection closes at `accept()`
+time (`REJECT_CODE`) **before** the inner gossip handler runs — zero gossip bytes
+are ever exchanged with an unadmitted device. Pinned by
+`gossip_alpn_rejects_unadmitted_device_before_delegate` and
+`gossip_alpn_reject_propagates_the_admission_cause` (loopback QUIC), plus a
+loopback delivery test `gossip_overlay_broadcast_delivers_events_to_inbound_sink`.
+
+**What did NOT change (deliberately deferred — see spec D4):**
+
+- `MAX_ACTIVE_MEMBERS` is **still 5**. The cap raise is Phase C, its own
+  feature-flagged (`large_rooms`) change, landing **only after** Phase B re-runs
+  `crates/spike-N40` at N=10/20/40 with the overlay and the acceptance criteria
+  (no cascade at 1 event/s, connectedness >95%, delivery >95%) pass. Do not read
+  the overlay landing as a room-size increase; the declared ≤5-peer ceiling,
+  the hard `RejectReason::RoomFull` reject, and the near-cap warning are
+  unchanged.
+- The engine, the `SyncMessage` wire protocol, encoding/decoding, the membership
+  fold, the admission trait shape, and the pull/query variants are byte-for-byte
+  unchanged. Gossip is live fan-out only; the SQLite store and anti-entropy pulls
+  remain canonical (ADR-2), and late-join history still comes over
+  point-to-point `EVENT_ALPN` links.

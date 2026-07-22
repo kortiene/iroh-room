@@ -525,6 +525,66 @@ impl Node {
             None => (None, None),
         };
 
+        // The per-room gossip mesh (issue #171 / spec §4 D1/D5/Step 2). When
+        // the overlay feature is on AND this is a managed room session, spawn
+        // the mesh for the engine's `room_id`, bootstrapping from the
+        // deterministic seed set the manager computes from the current
+        // membership snapshot (D3). The mesh installs itself into
+        // `Shared.gossip_state.meshes`, so `Shared::route`'s `Events` branch
+        // can find it for broadcast.
+        //
+        // The mesh spawns in a **background task** (issue #171): `GossipMesh::spawn`
+        // awaits `receiver.joined()` under a 5s timeout when bootstrap seeds are
+        // present, and loopback endpoints lack the address discovery the dialer
+        // needs — so the join waits the full timeout. Awaiting it inline blocked
+        // `Node::start` for up to 5s per joining node (~54x slowdown on the e2e
+        // suite under `--features gossip_overlay`). Backgrounding it makes
+        // `Node::start` return immediately: the mesh installs itself once formed,
+        // and `Events` broadcasts issued before then hit `mesh_for == None` and are
+        // silently dropped — the documented fallback (same shape as no-mesh / a peer
+        // with no live writer), recovered by anti-entropy on the next tick.
+        //
+        // Failure to spawn the mesh is **non-fatal**: the events plane falls
+        // back to silent-drop for `Events` (the same shape as a peer with no
+        // live writer), and pull/query variants continue unchanged on the
+        // per-peer queue path. Anti-entropy pulls recover any dropped frame on
+        // the next tick. We log the error rather than failing the whole node
+        // — a partial degradation (events plane down, pulls still working) is
+        // more recoverable than a startup crash.
+        #[cfg(feature = "gossip_overlay")]
+        if peer_manager.is_some() {
+            let room_id = *engine.room_id();
+            let snapshot = engine.snapshot();
+            let bootstrap = PeerManager::desired_seeds(&snapshot, transport.id())
+                .into_iter()
+                .collect();
+            if let Some(actor) = shared.gossip_state.actor().cloned() {
+                let shared_for_mesh = shared.clone();
+                tokio::spawn(async move {
+                    match crate::gossip::GossipMesh::spawn(
+                        shared_for_mesh.clone(),
+                        actor,
+                        room_id,
+                        bootstrap,
+                    )
+                    .await
+                    {
+                        Ok(mesh) => {
+                            shared_for_mesh.gossip_state.install_mesh(room_id, mesh);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                reason = "gossip.mesh.spawn_failed",
+                                room = %room_id,
+                                error = %err,
+                                "could not spawn the room events gossip mesh; Events frames will be silently dropped until the next retry"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
         let pump = tokio::spawn(pump(
             engine,
             inbound_rx,
@@ -611,6 +671,16 @@ impl Node {
     #[must_use]
     pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
         self.transport.outbound_queue_depths()
+    }
+
+    /// The total gossip-neighbor count across every per-room mesh this node has
+    /// subscribed (issue #171 / spec §5.4). Zero when the `gossip_overlay`
+    /// feature is off, no room session is active, or the swarm has not yet
+    /// formed a direct neighbor link. Diagnostic only — meant for the CLI's
+    /// `room members --status` panel and the spike-N40 harness.
+    #[must_use]
+    pub fn gossip_neighbor_count(&self) -> usize {
+        self.transport.gossip_neighbor_count()
     }
 
     /// Subscribe to the live [`ConnEvent`] transition stream.
