@@ -24,7 +24,7 @@ use iroh_rooms_core::event::ids::EventId;
 use iroh_rooms_core::event::signed::event_id_from_bytes;
 use iroh_rooms_net::PeerConnState;
 use spike_n40::cluster::HarnessCluster;
-use spike_n40::metrics::{classify_cascade, cluster_metrics};
+use spike_n40::metrics::{classify_cascade, cluster_metrics, counter_baseline, CascadeWindow};
 use spike_n40::report::{results_md, CascadeVerdict, MatrixRow, ScenarioConfig};
 use spike_n40::rss::process_rss_bytes;
 use spike_n40::workload::Workload;
@@ -283,10 +283,13 @@ async fn n5_mini_rebound_node_catches_missed_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n5_metrics_render_markdown_and_json_without_panic() {
+    let baseline_rss = process_rss_bytes().expect("capture pre-spawn RSS baseline");
     let cluster = spawn().await.expect("spawn N=5 cluster");
-    let baseline_rss = process_rss_bytes().unwrap_or(0);
     let audit_baseline = cluster.audit.snapshot();
-    let metrics = cluster_metrics(&cluster, baseline_rss, &audit_baseline, 1).await;
+    let counters = counter_baseline(&cluster).await.expect("counter baseline");
+    let metrics = cluster_metrics(&cluster, baseline_rss, &audit_baseline, &counters, 1)
+        .await
+        .expect("sample cluster metrics");
 
     // Markdown: render one row and assert it contains the rate cell.
     let config = ScenarioConfig {
@@ -296,7 +299,14 @@ async fn n5_metrics_render_markdown_and_json_without_panic() {
         measure_secs: 1,
         seed_base: SEED_BASE,
     };
-    let cascade = classify_cascade(&metrics, N - 1, 0);
+    let cascade = classify_cascade(
+        &[CascadeWindow {
+            metrics: metrics.clone(),
+            published_events: 0,
+            duration_secs: 1,
+        }],
+        true,
+    );
     let row = MatrixRow {
         config,
         metrics: &metrics,
@@ -336,6 +346,7 @@ async fn n5_disconnect_peer_drops_then_redials_and_delivery_recovers() {
     // RecordingAudit, the mesh returns to full connectedness within a bounded
     // window, the reconnect churn flows through `cluster_metrics`, and a
     // subsequent publish still fans out to the dropped-then-redialed peer.
+    let baseline_rss = process_rss_bytes().expect("capture pre-spawn RSS baseline");
     let cluster = spawn().await.expect("spawn N=5 cluster");
     let target = cluster.nodes[N - 1].endpoint_id;
     let target_identity = cluster.nodes[N - 1].identity;
@@ -362,6 +373,7 @@ async fn n5_disconnect_peer_drops_then_redials_and_delivery_recovers() {
     );
 
     let baseline = cluster.audit.snapshot();
+    let counters = counter_baseline(&cluster).await.expect("counter baseline");
 
     // Locally close node 0's link to the last node. The owning dial/accept
     // task observes the close and records the drop on the shared audit.
@@ -402,8 +414,9 @@ async fn n5_disconnect_peer_drops_then_redials_and_delivery_recovers() {
     // The reconnect churn flows through the metrics pipeline (RecordingAudit
     // deltas → cluster_metrics.reconnects_per_sec), the decision-relevant
     // signal for #154.
-    let baseline_rss = process_rss_bytes().unwrap_or(0);
-    let metrics = cluster_metrics(&cluster, baseline_rss, &baseline, 1).await;
+    let metrics = cluster_metrics(&cluster, baseline_rss, &baseline, &counters, 1)
+        .await
+        .expect("sample reconnect metrics");
     assert!(
         metrics.reconnects_per_sec > 0.0,
         "cluster_metrics must reflect the reconnect churn; got {}",

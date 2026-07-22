@@ -48,7 +48,10 @@ use serde_json::json;
 use spike_n40::cluster::{
     full_mesh_admission, node_seeds, AdminPrincipal, HarnessCluster, HARNESS_TICK,
 };
-use spike_n40::metrics::{classify_cascade, cluster_metrics, run_window};
+use spike_n40::metrics::{
+    classify_cascade, cluster_metrics, counter_baseline, recovered_by_end, run_window,
+    CascadeWindow,
+};
 use spike_n40::report::{
     results_md, CascadeVerdict, ClusterMetrics, MatrixRow, ScenarioConfig, ScenarioKind,
     ScenarioResult,
@@ -66,6 +69,8 @@ const SEED_SWEEP_BASE: u64 = 0x5C40_0200;
 const SEED_REBIND: u64 = 0x5C40_0300;
 const DEFAULT_MATRIX_NODES: &str = "5,10,20,40";
 const DEFAULT_MATRIX_RATES: &str = "idle,0.1,1,5";
+const CASCADE_SAMPLE_SECS: u64 = 5;
+const REBIND_CONVERGENCE_BUDGET: Duration = Duration::from_mins(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -177,144 +182,59 @@ async fn run_matrix(args: &[String]) -> Result<()> {
     let nodes: Vec<usize> = parse_csv_usize(&nodes_arg, "nodes")?;
     let rates: Vec<Option<f64>> = parse_csv_rates(&rates_arg)?;
 
-    let baseline_rss = process_rss_bytes().unwrap_or(0);
-
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut matrix_rows: Vec<MatrixRowOwned> = Vec::new();
 
     for &n in &nodes {
-        // Each N runs in a fresh cluster (spec §6.7) so RSS/backlog from one
-        // row does not contaminate the next.
-        let seed_base = SEED_MATRIX_BASE + (n as u64) * 0x100;
-        let readiness = readiness_timeout(n);
-        let cluster = HarnessCluster::spawn(n, seed_base, readiness)
-            .await
-            .with_context(|| format!("spawn N={n} cluster"))?;
-
-        // Idle window.
-        let idle_audit_baseline = cluster.audit.snapshot();
-        run_window(idle_secs).await;
-        let idle_metrics =
-            cluster_metrics(&cluster, baseline_rss, &idle_audit_baseline, idle_secs).await;
-        let idle_cascade = classify_cascade(&idle_metrics, n.saturating_sub(1), 0);
-        matrix_rows.push(MatrixRowOwned {
-            config: ScenarioConfig {
-                n,
-                rate_events_per_sec: None,
-                warmup_secs: 0,
-                measure_secs: idle_secs,
-                seed_base,
-            },
-            metrics: idle_metrics.clone(),
-            cascade: idle_cascade.clone(),
-            recovered_by_end: true,
-        });
-
-        // Each rate window. The explicit idle window above already produced
-        // the idle matrix row + ScenarioResult.idle field, so a `None` rate
-        // token in `rates` is skipped here to avoid duplicating that row.
-        for rate_opt in &rates {
-            if rate_opt.is_none() {
-                continue;
-            }
-            // Warmup: let the queue settle / dial loops stabilize.
-            run_window(warmup_secs).await;
-            let warm_audit_baseline = cluster.audit.snapshot();
-
-            let published_events;
-            let load_metrics;
-            let cascade;
-            let measure_secs_actual;
-
-            if let Some(rate) = rate_opt {
-                let window_secs = if *rate <= 0.1 {
+        for (row_index, rate_opt) in rates.iter().enumerate() {
+            let measure_secs = rate_opt.map_or(idle_secs, |rate| {
+                if rate <= 0.1 {
                     low_rate_secs
                 } else {
                     load_secs
-                };
-                measure_secs_actual = window_secs;
-                let workload = Workload::build(
-                    cluster.room_id,
-                    &cluster.admin.identity_secret(),
-                    &cluster.admin.device_secret(),
-                    cluster.genesis_id,
-                    ((rate * window_secs as f64).ceil() as usize).max(1),
-                    base_created_at(seed_base),
-                    "n40 load",
-                );
-                published_events = workload.wires.len();
-                publish_at_rate(
-                    &cluster.nodes[0].node,
-                    &workload,
-                    *rate,
-                    Duration::from_secs(window_secs),
-                )
-                .await;
-                load_metrics =
-                    cluster_metrics(&cluster, baseline_rss, &warm_audit_baseline, window_secs)
-                        .await;
-                cascade = classify_cascade(&load_metrics, n.saturating_sub(1), published_events);
+                }
+            });
+            let seed_base = matrix_seed(n, row_index);
+            let kind = if rate_opt.is_some() {
+                ScenarioKind::Load
             } else {
-                measure_secs_actual = idle_secs;
-                run_window(idle_secs).await;
-                load_metrics =
-                    cluster_metrics(&cluster, baseline_rss, &warm_audit_baseline, idle_secs).await;
-                published_events = 0;
-                cascade = classify_cascade(&load_metrics, n.saturating_sub(1), 0);
-            }
+                ScenarioKind::Idle
+            };
+            let row_warmup = if rate_opt.is_some() { warmup_secs } else { 0 };
+            let result = run_one_scenario(n, seed_base, kind, *rate_opt, row_warmup, measure_secs)
+                .await
+                .with_context(|| {
+                    let rate = rate_opt.map_or_else(|| "idle".to_owned(), |r| r.to_string());
+                    format!("run matrix row N={n} rate={rate}")
+                })?;
 
-            let rate_label = rate_opt.map_or_else(|| "idle".to_owned(), |r| format!("{r}"));
-
+            let metrics = if rate_opt.is_some() {
+                result
+                    .load
+                    .clone()
+                    .context("load row missing load metrics")?
+            } else {
+                result
+                    .idle
+                    .clone()
+                    .context("idle row missing idle metrics")?
+            };
+            let recovered = recovered_by_end(&metrics, result.published_events);
             matrix_rows.push(MatrixRowOwned {
-                config: ScenarioConfig {
-                    n,
-                    rate_events_per_sec: *rate_opt,
-                    warmup_secs,
-                    measure_secs: measure_secs_actual,
-                    seed_base,
-                },
-                metrics: load_metrics.clone(),
-                cascade: cascade.clone(),
-                recovered_by_end: !cascade.began,
+                config: result.config.clone(),
+                metrics: metrics.clone(),
+                cascade: result.cascade.clone(),
+                recovered_by_end: recovered,
             });
-
-            results.push(ScenarioResult {
-                kind: if rate_opt.is_some() {
-                    ScenarioKind::Load
-                } else {
-                    ScenarioKind::Idle
-                },
-                config: ScenarioConfig {
-                    n,
-                    rate_events_per_sec: *rate_opt,
-                    warmup_secs,
-                    measure_secs: measure_secs_actual,
-                    seed_base,
-                },
-                idle: Some(idle_metrics.clone()),
-                load: Some(load_metrics),
-                published_events,
-                cascade: cascade.clone(),
-                notes: vec![format!("loopback NetMode::Loopback iroh={IROH_VERSION}")],
-            });
-
-            println!(
+            let rate_label = rate_opt.map_or_else(|| "idle".to_owned(), |r| r.to_string());
+            eprintln!(
                 "[matrix] N={n} rate={rate_label} cascade={} connected={}/{}",
-                if cascade.began { "yes" } else { "no" },
-                matrix_rows
-                    .last()
-                    .unwrap()
-                    .metrics
-                    .total_connected_peer_entries,
-                matrix_rows
-                    .last()
-                    .unwrap()
-                    .metrics
-                    .expected_connected_peer_entries,
+                if result.cascade.began { "yes" } else { "no" },
+                metrics.total_connected_peer_entries,
+                metrics.expected_connected_peer_entries,
             );
+            results.push(result);
         }
-
-        cluster.shutdown().await.context("shutdown cluster")?;
     }
 
     // Render markdown.
@@ -382,6 +302,8 @@ async fn run_sweep(args: &[String]) -> Result<()> {
         .transpose()?
         .unwrap_or(10);
 
+    validate_sweep(start, max, factor)?;
+
     let mut rate = start;
     let mut results: Vec<ScenarioResult> = Vec::new();
     while rate <= max + f64::EPSILON {
@@ -396,7 +318,7 @@ async fn run_sweep(args: &[String]) -> Result<()> {
         )
         .await?;
         let began = r.cascade.began;
-        println!(
+        eprintln!(
             "[sweep] N={n} rate={rate:.3} cascade={}",
             if began { "yes" } else { "no" }
         );
@@ -429,11 +351,16 @@ async fn run_rebind(args: &[String]) -> Result<()> {
         .map(|s| s.parse())
         .transpose()?
         .unwrap_or(0.1);
-    let _json_path = flag_value(args, "--json");
+    let json_path = flag_value(args, "--json");
 
     let result = rebind_scenario(n, missed_events, rate).await?;
     let doc = render_run_document(std::slice::from_ref(&result));
-    println!("{}", serde_json::to_string_pretty(&doc)?);
+    let bytes = serde_json::to_vec_pretty(&doc)?;
+    if let Some(path) = json_path {
+        std::fs::write(&path, bytes).with_context(|| format!("write json to {path}"))?;
+    } else {
+        println!("{}", String::from_utf8(bytes)?);
+    }
     Ok(())
 }
 
@@ -445,6 +372,11 @@ async fn run_rebind(args: &[String]) -> Result<()> {
 ///
 /// Propagates any cluster spawn / publish / shutdown error.
 pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Result<ScenarioResult> {
+    if n < 2 {
+        bail!("rebind requires at least 2 nodes, got {n}");
+    }
+    validate_positive_rate(rate, "rate")?;
+
     let seed_base = SEED_REBIND;
     let readiness = readiness_timeout(n);
     let cluster = HarnessCluster::spawn(n, seed_base, readiness)
@@ -466,7 +398,9 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
     for wire in &baseline_workload.wires {
         cluster.nodes[0].node.publish(wire.to_bytes()).await?;
     }
-    wait_until_all_hold(&cluster, &baseline_ids, Duration::from_mins(1)).await;
+    wait_until_all_hold(&cluster, &baseline_ids, REBIND_CONVERGENCE_BUDGET)
+        .await
+        .context("baseline events did not converge before rebind")?;
 
     // Choose target node N-1 (the rebinding node).
     let target_index = n.saturating_sub(1);
@@ -506,10 +440,14 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         base_created_at(seed_base) + 1000 * (baseline_count as u64 + 1),
         "n40 missed",
     );
-    let missed_ids = missed_workload.event_ids();
-    for wire in &missed_workload.wires {
-        keep[0].node.publish(wire.to_bytes()).await?;
-    }
+    let published_events = publish_all_at_rate(&keep[0].node, &missed_workload, rate)
+        .await
+        .context("publish missed rebind events")?;
+    let missed_ids: Vec<EventId> = missed_workload
+        .event_ids()
+        .into_iter()
+        .take(published_events)
+        .collect();
 
     // Await convergence on the surviving nodes (so we know the missed events
     // really did land on everyone but the target).
@@ -525,7 +463,9 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         nodes: keep,
         audit: audit.clone(),
     };
-    wait_until_all_hold(&surviving, &missed_ids, Duration::from_mins(1)).await;
+    wait_until_all_hold(&surviving, &missed_ids, REBIND_CONVERGENCE_BUDGET)
+        .await
+        .context("surviving nodes did not converge before target respawn")?;
 
     // Respawn the target with the same secret + an empty in-memory store.
     // Spec §6.8 step 6 calls for seeding the target's store with the
@@ -559,16 +499,10 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
 
     // Wait until the target holds every missed event id, or the 60s
     // convergence budget elapses.
-    let mut converged_all = true;
-    for id in &missed_ids {
-        if target_node_handle
-            .wait_until_contains(*id, Duration::from_mins(1))
+    let converged_all =
+        wait_node_holds_all(&target_node_handle, &missed_ids, REBIND_CONVERGENCE_BUDGET)
             .await
-            .is_err()
-        {
-            converged_all = false;
-        }
-    }
+            .context("query rebound target convergence")?;
     let elapsed_ms = t0.elapsed().as_millis();
 
     let target_connected = target_node_handle
@@ -609,7 +543,7 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         config,
         idle: None,
         load: None,
-        published_events: missed_events,
+        published_events,
         cascade,
         notes: vec![note],
     })
@@ -633,50 +567,41 @@ pub async fn run_one_scenario(
     warmup_secs: u64,
     measure_secs: u64,
 ) -> Result<ScenarioResult> {
+    if let Some(r) = rate {
+        validate_positive_rate(r, "rate")?;
+    }
     let readiness = readiness_timeout(n);
-    let baseline_rss = process_rss_bytes().unwrap_or(0);
+    let baseline_rss = process_rss_bytes().context("capture pre-spawn RSS baseline")?;
     let cluster = HarnessCluster::spawn(n, seed_base, readiness)
         .await
         .with_context(|| format!("spawn N={n} cluster"))?;
 
-    // Idle window (short for the single-scenario runner; the matrix runner
-    // drives its own per-N idle window with the full duration).
-    let idle_secs = measure_secs.min(5);
-    let idle_audit = cluster.audit.snapshot();
-    run_window(idle_secs).await;
-    let idle_metrics = cluster_metrics(&cluster, baseline_rss, &idle_audit, idle_secs).await;
-
-    // Warmup, then load.
-    run_window(warmup_secs).await;
-    let warm_audit = cluster.audit.snapshot();
-    let published_events;
-    let load_metrics;
-    let cascade;
-    if let Some(r) = rate {
+    let (idle_metrics, load_metrics, published_events, cascade) = if let Some(r) = rate {
+        // Capture a short idle baseline in the same fresh row cluster, then
+        // warm up before the sampled load window.
+        let idle = measure_idle(&cluster, baseline_rss, measure_secs.min(5)).await?;
+        run_window(warmup_secs).await;
         let workload = Workload::build(
             cluster.room_id,
             &cluster.admin.identity_secret(),
             &cluster.admin.device_secret(),
             cluster.genesis_id,
-            ((r * measure_secs as f64).ceil() as usize).max(1),
+            planned_event_count(r, measure_secs),
             base_created_at(seed_base),
             "n40 load",
         );
-        published_events = workload.wires.len();
-        publish_at_rate(
-            &cluster.nodes[0].node,
-            &workload,
-            r,
-            Duration::from_secs(measure_secs),
+        let load = measure_load(&cluster, baseline_rss, &workload, r, measure_secs).await?;
+        (
+            Some(idle.metrics),
+            Some(load.metrics),
+            load.published_events,
+            load.cascade,
         )
-        .await;
-        load_metrics = cluster_metrics(&cluster, baseline_rss, &warm_audit, measure_secs).await;
-        cascade = classify_cascade(&load_metrics, n.saturating_sub(1), published_events);
     } else {
-        published_events = 0;
-        load_metrics = idle_metrics.clone();
-        cascade = classify_cascade(&idle_metrics, n.saturating_sub(1), 0);
-    }
+        run_window(warmup_secs).await;
+        let idle = measure_idle(&cluster, baseline_rss, measure_secs).await?;
+        (Some(idle.metrics), None, 0, idle.cascade)
+    };
 
     cluster.shutdown().await?;
 
@@ -689,8 +614,8 @@ pub async fn run_one_scenario(
             measure_secs,
             seed_base,
         },
-        idle: Some(idle_metrics),
-        load: Some(load_metrics),
+        idle: idle_metrics,
+        load: load_metrics,
         published_events,
         cascade,
         notes: vec![format!("loopback NetMode::Loopback iroh={IROH_VERSION}")],
@@ -701,50 +626,295 @@ pub async fn run_one_scenario(
 // helpers
 // ---------------------------------------------------------------------------
 
-/// Publish every wire in `workload` from `publisher` at the room-wide `rate`
-/// (events/sec), spaced evenly over `window`. If the workload has fewer
-/// events than `rate * window`, the publisher finishes early.
-async fn publish_at_rate(publisher: &Node, workload: &Workload, rate: f64, window: Duration) {
-    let interval = if rate <= 0.0 {
-        Duration::ZERO
-    } else {
-        Duration::from_secs_f64(1.0 / rate)
-    };
-    let deadline = Instant::now() + window;
-    for wire in &workload.wires {
+struct MeasurementOutcome {
+    metrics: ClusterMetrics,
+    cascade: CascadeVerdict,
+    published_events: usize,
+}
+
+async fn measure_idle(
+    cluster: &HarnessCluster,
+    baseline_rss: u64,
+    measure_secs: u64,
+) -> Result<MeasurementOutcome> {
+    let aggregate_audit = cluster.audit.snapshot();
+    let aggregate_counters = counter_baseline(cluster).await?;
+    let mut windows = Vec::new();
+    let mut elapsed = 0u64;
+
+    while elapsed < measure_secs {
+        let sample_secs = CASCADE_SAMPLE_SECS.min(measure_secs - elapsed);
+        let sample_audit = cluster.audit.snapshot();
+        let sample_counters = counter_baseline(cluster).await?;
+        run_window(sample_secs).await;
+        let metrics = cluster_metrics(
+            cluster,
+            baseline_rss,
+            &sample_audit,
+            &sample_counters,
+            sample_secs,
+        )
+        .await?;
+        windows.push(CascadeWindow {
+            metrics,
+            published_events: 0,
+            duration_secs: sample_secs,
+        });
+        elapsed += sample_secs;
+    }
+
+    let metrics = cluster_metrics(
+        cluster,
+        baseline_rss,
+        &aggregate_audit,
+        &aggregate_counters,
+        measure_secs,
+    )
+    .await?;
+    let recovered = recovered_by_end(&metrics, 0);
+    let cascade = classify_cascade(&windows, recovered);
+    Ok(MeasurementOutcome {
+        metrics,
+        cascade,
+        published_events: 0,
+    })
+}
+
+async fn measure_load(
+    cluster: &HarnessCluster,
+    baseline_rss: u64,
+    workload: &Workload,
+    rate: f64,
+    measure_secs: u64,
+) -> Result<MeasurementOutcome> {
+    let aggregate_audit = cluster.audit.snapshot();
+    let aggregate_counters = counter_baseline(cluster).await?;
+    let mut windows = Vec::new();
+    let mut elapsed = 0u64;
+    let mut published_events = 0usize;
+
+    while elapsed < measure_secs {
+        let sample_secs = CASCADE_SAMPLE_SECS.min(measure_secs - elapsed);
+        let sample_audit = cluster.audit.snapshot();
+        let sample_counters = counter_baseline(cluster).await?;
+        let target = planned_event_count(rate, elapsed + sample_secs).min(workload.wires.len());
+        let published_this_window = publish_at_rate(
+            &cluster.nodes[0].node,
+            workload,
+            published_events,
+            target,
+            rate,
+            Duration::from_secs(sample_secs),
+        )
+        .await?;
+        published_events += published_this_window;
+        let metrics = cluster_metrics(
+            cluster,
+            baseline_rss,
+            &sample_audit,
+            &sample_counters,
+            sample_secs,
+        )
+        .await?;
+        windows.push(CascadeWindow {
+            metrics,
+            published_events: published_this_window,
+            duration_secs: sample_secs,
+        });
+        elapsed += sample_secs;
+    }
+
+    let metrics = cluster_metrics(
+        cluster,
+        baseline_rss,
+        &aggregate_audit,
+        &aggregate_counters,
+        measure_secs,
+    )
+    .await?;
+    let recovered = recovered_by_end(&metrics, published_events);
+    let cascade = classify_cascade(&windows, recovered);
+    Ok(MeasurementOutcome {
+        metrics,
+        cascade,
+        published_events,
+    })
+}
+
+/// Publish the requested workload range at the room-wide rate, returning the
+/// number of successful publishes. A publish error aborts the scenario.
+async fn publish_at_rate(
+    publisher: &Node,
+    workload: &Workload,
+    start_index: usize,
+    target_index: usize,
+    rate: f64,
+    window: Duration,
+) -> Result<usize> {
+    validate_positive_rate(rate, "rate")?;
+    let interval = Duration::from_secs_f64(1.0 / rate);
+    let begin = Instant::now();
+    let deadline = begin + window;
+    let mut successful = 0usize;
+    for wire in workload
+        .wires
+        .iter()
+        .skip(start_index)
+        .take(target_index.saturating_sub(start_index))
+    {
         if Instant::now() >= deadline {
             break;
         }
-        let bytes = wire.to_bytes();
-        let _ = publisher.publish(bytes).await;
-        if Instant::now() < deadline {
-            tokio::time::sleep(interval).await;
+        publisher
+            .publish(wire.to_bytes())
+            .await
+            .context("publish load event")?;
+        successful += 1;
+        let next_due = begin + interval.mul_f64(successful as f64);
+        let wake = next_due.min(deadline);
+        if let Some(remaining) = wake.checked_duration_since(Instant::now()) {
+            tokio::time::sleep(remaining).await;
         }
     }
+    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        tokio::time::sleep(remaining).await;
+    }
+    Ok(successful)
+}
+
+/// Publish an entire workload no faster than the requested room-wide rate.
+/// Unlike a bounded measurement window, the rebind setup must publish every
+/// event before it can assert survivor convergence.
+async fn publish_all_at_rate(publisher: &Node, workload: &Workload, rate: f64) -> Result<usize> {
+    validate_positive_rate(rate, "rate")?;
+    let interval = Duration::from_secs_f64(1.0 / rate);
+    let begin = Instant::now();
+    let mut successful = 0usize;
+
+    for (index, wire) in workload.wires.iter().enumerate() {
+        let due = begin + interval.mul_f64(index as f64);
+        if let Some(remaining) = due.checked_duration_since(Instant::now()) {
+            tokio::time::sleep(remaining).await;
+        }
+        publisher
+            .publish(wire.to_bytes())
+            .await
+            .with_context(|| format!("publish event {index}"))?;
+        successful += 1;
+    }
+
+    // Include the final event's interval so count / elapsed time matches the
+    // configured room-wide rate rather than ending immediately after it.
+    let end = begin + interval.mul_f64(successful as f64);
+    if let Some(remaining) = end.checked_duration_since(Instant::now()) {
+        tokio::time::sleep(remaining).await;
+    }
+    Ok(successful)
 }
 
 /// Wait until every node holds every id in `expected`, or `deadline` elapses.
-async fn wait_until_all_hold(cluster: &HarnessCluster, expected: &[EventId], deadline: Duration) {
-    let start = Instant::now();
+async fn wait_until_all_hold(
+    cluster: &HarnessCluster,
+    expected: &[EventId],
+    deadline: Duration,
+) -> Result<()> {
     let poll = Duration::from_millis(50);
-    while start.elapsed() < deadline {
-        let mut all = true;
-        for hn in &cluster.nodes {
+    let wait = async {
+        loop {
+            let mut all = true;
+            for hn in &cluster.nodes {
+                for id in expected {
+                    if !hn
+                        .node
+                        .store_contains(*id)
+                        .await
+                        .with_context(|| format!("query event {id} on node {}", hn.index))?
+                    {
+                        all = false;
+                        break;
+                    }
+                }
+                if !all {
+                    break;
+                }
+            }
+            if all {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(poll).await;
+        }
+    };
+
+    match tokio::time::timeout(deadline, wait).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "timed out after {deadline:?} waiting for {} events on {} nodes",
+            expected.len(),
+            cluster.nodes.len()
+        ),
+    }
+}
+
+/// Poll all expected ids under one wall-clock budget. A timeout is a measured
+/// non-convergence result; store-query failures remain scenario errors.
+async fn wait_node_holds_all(node: &Node, expected: &[EventId], budget: Duration) -> Result<bool> {
+    let poll = Duration::from_millis(50);
+    let wait = async {
+        loop {
+            let mut all = true;
             for id in expected {
-                if !hn.node.store_contains(*id).await.unwrap_or(false) {
+                if !node
+                    .store_contains(*id)
+                    .await
+                    .with_context(|| format!("query event {id} on rebound target"))?
+                {
                     all = false;
                     break;
                 }
             }
-            if !all {
-                break;
+            if all {
+                return Ok::<(), anyhow::Error>(());
             }
+            tokio::time::sleep(poll).await;
         }
-        if all {
-            return;
-        }
-        tokio::time::sleep(poll).await;
+    };
+
+    match tokio::time::timeout(budget, wait).await {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
     }
+}
+
+fn validate_positive_rate(rate: f64, label: &str) -> Result<()> {
+    if !rate.is_finite() || rate <= 0.0 {
+        bail!("--{label} must be finite and greater than zero, got {rate}");
+    }
+    if Duration::try_from_secs_f64(1.0 / rate).is_err() {
+        bail!("--{label} is outside the supported duration range: {rate}");
+    }
+    Ok(())
+}
+
+fn validate_sweep(start: f64, max: f64, factor: f64) -> Result<()> {
+    validate_positive_rate(start, "start")?;
+    validate_positive_rate(max, "max")?;
+    if max < start {
+        bail!("--max must be greater than or equal to --start");
+    }
+    if !factor.is_finite() || factor <= 1.0 {
+        bail!("--factor must be finite and greater than 1, got {factor}");
+    }
+    Ok(())
+}
+
+fn planned_event_count(rate: f64, secs: u64) -> usize {
+    (rate * secs as f64).ceil() as usize
+}
+
+fn matrix_seed(n: usize, row_index: usize) -> u64 {
+    SEED_MATRIX_BASE
+        .wrapping_add((n as u64).wrapping_mul(0x1_0000))
+        .wrapping_add(row_index as u64)
 }
 
 /// Readiness timeout scales with N so larger meshes still have time to come
@@ -865,6 +1035,37 @@ mod tests {
     #[test]
     fn parse_csv_rates_rejects_non_numeric_non_idle() {
         assert!(parse_csv_rates("0.1,fast").is_err());
+    }
+
+    #[test]
+    fn sweep_validation_rejects_nonterminating_ranges() {
+        assert!(validate_sweep(0.1, 20.0, 2.0).is_ok());
+        assert!(validate_sweep(0.0, 20.0, 2.0).is_err());
+        assert!(validate_sweep(-0.1, 20.0, 2.0).is_err());
+        assert!(validate_sweep(2.0, 1.0, 2.0).is_err());
+        assert!(validate_sweep(0.1, 20.0, 1.0).is_err());
+        assert!(validate_sweep(0.1, 20.0, 0.0).is_err());
+        assert!(validate_sweep(f64::NAN, 20.0, 2.0).is_err());
+        assert!(validate_sweep(0.1, 20.0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn matrix_rows_have_distinct_seed_bases() {
+        let mut seeds = std::collections::BTreeSet::new();
+        for n in [5, 10, 20, 40] {
+            for row in 0..4 {
+                assert!(seeds.insert(matrix_seed(n, row)));
+            }
+        }
+        assert_eq!(seeds.len(), 16);
+    }
+
+    #[test]
+    fn planned_event_count_rounds_partial_events_up() {
+        assert_eq!(planned_event_count(0.1, 5), 1);
+        assert_eq!(planned_event_count(0.1, 10), 1);
+        assert_eq!(planned_event_count(1.0, 5), 5);
+        assert_eq!(planned_event_count(5.0, 60), 300);
     }
 
     #[test]

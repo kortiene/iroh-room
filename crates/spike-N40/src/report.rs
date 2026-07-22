@@ -41,7 +41,7 @@ pub struct ScenarioConfig {
     /// Number of in-process loopback transport nodes (over-cap; NOT a
     /// product-supported active-member room — see `NOTES.md` caveat).
     pub n: usize,
-    /// Room-wide publish rate in events/sec (`None` for idle / rebind).
+    /// Room-wide publish rate in events/sec (`None` for idle).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_events_per_sec: Option<f64>,
     /// Pre-measurement warmup window (excluded from reconnect/sec).
@@ -76,15 +76,15 @@ pub struct NodeMetrics {
     pub outbound_queue_bytes_sum: usize,
     /// Max per-peer outbound queue depth (bytes) on this node.
     pub outbound_queue_bytes_max: usize,
-    /// Engine `accepted` counter for this node.
+    /// Engine `accepted` counter delta for this measurement window.
     pub accepted: u64,
-    /// Engine `frames_sent` counter for this node.
+    /// Engine `frames_sent` counter delta for this measurement window.
     pub frames_sent: u64,
-    /// Engine `parked` counter for this node.
+    /// Engine `parked` counter delta for this measurement window.
     pub parked: u64,
-    /// Engine `backfill_requests` counter for this node.
+    /// Engine `backfill_requests` counter delta for this measurement window.
     pub backfill_requests: u64,
-    /// Engine `early_duplicates` counter for this node.
+    /// Engine `early_duplicates` counter delta for this measurement window.
     pub early_duplicates: u64,
 }
 
