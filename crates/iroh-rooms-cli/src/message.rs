@@ -191,9 +191,11 @@ pub async fn send(
         let mode = net_mode(loopback);
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
         let admission = build_admission(&snapshot);
-        let delivered = match run_push(
+        // `Box::pin` keeps `run_push`'s future off this caller's stack — issue
+        // #141 grew `NetConfig` enough to trip clippy::large_futures here.
+        let delivered = match Box::pin(run_push(
             home, store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
-        )
+        ))
         .await
         {
             Ok(n) => n,
@@ -340,9 +342,11 @@ pub async fn send_agent_status(
         let mode = net_mode(loopback);
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
         let admission = build_admission(&snapshot);
-        let delivered = match run_push(
+        // `Box::pin` keeps `run_push`'s future off this caller's stack — issue
+        // #141 grew `NetConfig` enough to trip clippy::large_futures here.
+        let delivered = match Box::pin(run_push(
             home, store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
-        )
+        ))
         .await
         {
             Ok(n) => n,

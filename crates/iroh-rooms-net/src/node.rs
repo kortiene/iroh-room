@@ -58,7 +58,7 @@ use crate::pipe::{
     TracingPipeAudit,
 };
 use crate::state::{ConnEvent, PeerConnState, PeerEntry};
-use crate::transport::{Inbound, NetConfig, NetTransport, Shared};
+use crate::transport::{InboundReceiver, NetConfig, NetTransport, Shared};
 
 /// The extra input a managed room session needs to also serve the blobs it holds
 /// over the `iroh-blobs` ALPN (IR-0204 spec §5.3). Opt-in: `None` on
@@ -237,6 +237,11 @@ impl core::fmt::Debug for BootstrapProof {
 /// [`watcher`](crate::pipe::watcher) severs revoked sessions each tick.
 pub struct Node {
     transport: NetTransport,
+    /// Local API control channel (publish / tail / snapshot / shutdown). The
+    /// only producers are local `Node::publish`-style methods (no peer can
+    /// push a `Cmd` directly), so this is intentionally **not** on the
+    /// network-derived byte-budget path (#141 grep allowlist: local control,
+    /// not a peer frame-body path).
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     pump: JoinHandle<()>,
     /// The room-scoped peer manager, present only for a managed room session (spec
@@ -421,9 +426,14 @@ impl Node {
         bootstrap_proof: Option<BootstrapProof>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        // A dedicated channel for the Pipe plane's reads against the single-owner
-        // engine (handler + watcher), drained by the same pump (spec §6.5 / D5).
-        let (pipe_query_tx, pipe_query_rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        // A dedicated, **bounded** channel for the Pipe plane's reads against
+        // the single-owner engine (handler + watcher), drained by the same pump
+        // (spec §6.5 / D5). Bounded in #141 so no network-derived pipe-ALPN
+        // request can drive an unbounded control queue: the pipe handler can be
+        // reached by a remote peer, and its queries enter this channel. Capacity
+        // is `NetConfig::pipe_query_capacity` (default `MAX_CONCURRENT_BIDI_STREAMS`).
+        let pipe_query_capacity = cfg.pipe_query_capacity.max(1);
+        let (pipe_query_tx, pipe_query_rx) = mpsc::channel::<PipeQueryMsg>(pipe_query_capacity);
         let pipe_query = PipeQuery::new(pipe_query_tx);
 
         let pipe_registry = Arc::new(PipeRegistry::new());
@@ -1169,11 +1179,11 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one wiring seam; each channel/handle is distinct
 async fn pump(
     mut engine: SyncEngine,
-    mut inbound_rx: mpsc::Receiver<Inbound>,
+    mut inbound_rx: InboundReceiver,
     mut conn_rx: broadcast::Receiver<ConnEvent>,
     shared: Arc<Shared>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
-    mut pipe_query_rx: mpsc::UnboundedReceiver<PipeQueryMsg>,
+    mut pipe_query_rx: mpsc::Receiver<PipeQueryMsg>,
     tick: Duration,
     mut room: Option<RoomReconciler>,
     room_event_tx: broadcast::Sender<StoredEvent>,

@@ -16,14 +16,14 @@ use iroh::endpoint::{ApplicationClose, Connection, ConnectionError, RecvStream, 
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_rooms_core::event::keys::IdentityKey;
 use iroh_rooms_core::sync::PeerId;
-use tokio::sync::mpsc;
 
 use crate::admission::AdmissionDecision;
 use crate::alpn::EVENT_ALPN;
 use crate::frame::{read_frame, write_frame};
 use crate::handler::REJECT_CODE;
+use crate::queue::PushError;
 use crate::state::{OfflineReason, PeerConnState};
-use crate::transport::{Inbound, LinkTeardown, OutboundQueue, Shared};
+use crate::transport::{LinkTeardown, OutboundQueue, OutboundReceiver, Shared};
 
 /// Bridge an iroh [`EndpointId`] (device key) to the engine's [`PeerId`] — both
 /// are the same raw 32 `device_id` bytes (Membership §1).
@@ -32,15 +32,15 @@ pub(crate) fn peer_id(device: EndpointId) -> PeerId {
     PeerId::from_bytes(*device.as_bytes())
 }
 
-/// Wire up a live connection: register the outbound queue + connection handle
-/// (stamping a fresh connection generation, and the provisional mark when
-/// `provisional`) and spawn the reader and writer tasks. Called by both the accept
-/// handler (inbound) and [`dial_loop`] (outbound). The outbound queue is registered
-/// **before** the caller flips the peer to `Connected`, so the engine's
-/// `on_connect` handshake always finds a writer. Returns this link's generation,
-/// which the caller passes to
-/// [`teardown_if_current`](Shared::teardown_if_current) on close so a superseded
-/// link never clobbers its successor (issue #126).
+/// Wire up a live connection: register the byte-bounded outbound queue +
+/// connection handle (stamping a fresh connection generation, and the
+/// provisional mark when `provisional`) and spawn the reader and writer tasks.
+/// Called by both the accept handler (inbound) and [`dial_loop`] (outbound).
+/// The outbound queue is registered **before** the caller flips the peer to
+/// `Connected`, so the engine's `on_connect` handshake always finds a writer.
+/// Returns this link's generation, which the caller passes to
+/// [`teardown_if_current`](Shared::teardown_if_current) on close so a
+/// superseded link never clobbers its successor (issue #126).
 #[must_use]
 pub(crate) fn register_connection(
     shared: Arc<Shared>,
@@ -50,27 +50,28 @@ pub(crate) fn register_connection(
     recv: RecvStream,
     provisional: bool,
 ) -> u64 {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(shared.outbound_frame_capacity());
-    let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let generation =
-        shared.register_link(device, OutboundQueue::new(tx, depth.clone()), provisional);
+    // Issue #141: the per-peer outbound queue is byte-bounded (default 8 MiB
+    // peer / 2 MiB stream) and priority-aware, replacing the prior
+    // frame-count `mpsc::channel(capacity)`.
+    let (queue, rx) = OutboundQueue::new(
+        shared.outbound_peer_queue_bytes(),
+        shared.stream_queue_bytes(),
+    );
+    let generation = shared.register_link(device, queue, provisional);
     shared.register_connection(device, conn);
 
-    tokio::spawn(writer_task(send, rx, depth));
+    tokio::spawn(writer_task(send, rx));
     tokio::spawn(reader_task(shared, device, recv));
     generation
 }
 
-/// Drain the per-peer outbound frame queue, writing each body as a length-prefixed
-/// frame. Ends when the queue's sender is dropped (peer unregistered) or a write
-/// fails (link down).
-async fn writer_task(
-    mut send: SendStream,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    depth: Arc<std::sync::atomic::AtomicUsize>,
-) {
+/// Drain the per-peer outbound byte-priority queue, writing each body as a
+/// length-prefixed frame. Ends when the queue is closed and drained (peer
+/// unregistered via [`Shared::unregister`]) or a write fails (link down). The
+/// receiver refunds queued-body bytes internally on pop, so the writer no
+/// longer touches a depth counter (issue #141).
+async fn writer_task(mut send: SendStream, mut rx: OutboundReceiver) {
     while let Some(body) = rx.recv().await {
-        depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(err) = write_frame(&mut send, &body).await {
             // A locally-queued body over MAX_FRAME_BYTES (e.g. a huge sync
             // message in a very large room) is a per-message failure, not a link
@@ -90,21 +91,25 @@ async fn writer_task(
     let _ = send.finish();
 }
 
-/// Read length-prefixed frames and hand each **verbatim** to the engine inbound
-/// sink (the engine validates; the transport never decodes). Ends on clean EOF or
-/// a frame error.
+/// Read length-prefixed frames and hand each **verbatim** to the byte-bounded
+/// inbound sink (the engine validates; the transport never decodes for
+/// validation — only for queue classification, spec §5 step 2). Ends on clean
+/// EOF, a frame error, or inbound-sink closure (pump shutdown — issue #141).
 async fn reader_task(shared: Arc<Shared>, device: EndpointId, mut recv: RecvStream) {
     let peer = peer_id(device);
     loop {
         match read_frame(&mut recv).await {
-            Ok(Some(bytes)) => match shared.inbound_tx.try_send(Inbound { peer, bytes }) {
+            Ok(Some(bytes)) => match shared.try_enqueue_inbound(peer, bytes) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(PushError::Empty) => {
+                    tracing::debug!(peer = %device, "reader: rejecting empty frame");
+                }
+                Err(PushError::Saturated) => {
                     shared.audit.transport_queue_saturated(device, "inbound");
                     shared.close_connection(device);
                     break;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(PushError::Closed) => {
                     // The driver/engine is gone; nothing left to feed.
                     break;
                 }

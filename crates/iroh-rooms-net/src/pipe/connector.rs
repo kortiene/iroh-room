@@ -85,6 +85,12 @@ pub struct PipeForwarder {
     local_addr: SocketAddr,
     conn: Connection,
     accept_task: JoinHandle<()>,
+    /// Local-loopback outcome reporting for the CLI / tests. Allowlisted under
+    /// #141's grep audit (spec D8.4): every producer is a `forward_one` task
+    /// that first took a permit from the `PIPE_MAX_CONCURRENT_FORWARDS`
+    /// semaphore before it could send, so this queue's high-water mark is
+    /// bounded by that semaphore even though the channel itself is unbounded.
+    /// No remote peer writes to it directly.
     outcomes: mpsc::UnboundedReceiver<PipeOutcome>,
 }
 
@@ -144,6 +150,8 @@ pub async fn connect(
         .await
         .map_err(|e| PipeError::OwnerUnreachable(e.to_string()))?;
 
+    // Local-loopback outcome queue: see `PipeForwarder::outcomes` for the
+    // #141 grep allowlist rationale (bounded by `PIPE_MAX_CONCURRENT_FORWARDS`).
     let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
     let accept_task = tokio::spawn(accept_loop(listener, conn.clone(), pipe_id, outcome_tx));
 

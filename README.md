@@ -177,7 +177,7 @@ Per-code reference:
 | `peer_offline` | Connectivity | `6` | authorized peer is not reachable right now | ask the peer to come online |
 | `blob_unavailable` | Connectivity | `6` | no reachable provider currently serves the requested blob | ask a peer that holds it to run `room tail <ROOM_ID>`, then retry `file fetch` |
 
-Verbose network diagnostics are opt-in. `room members <ROOM_ID> --status --verbose` and `room tail <ROOM_ID> --verbose` append stderr-only `diag:` lines with this node's dialable addresses, `relay=...`, per-peer path classifications such as `path=direct`, `path=relay`, `path=mixed`, or `path=none`, and `outbound_depth=<N>` queue-depth counters. These diagnostics help explain reachability; they grant no trust and do not expose private key material.
+Verbose network diagnostics are opt-in. `room members <ROOM_ID> --status --verbose` and `room tail <ROOM_ID> --verbose` append stderr-only `diag:` lines with this node's dialable addresses, `relay=...`, per-peer path classifications such as `path=direct`, `path=relay`, `path=mixed`, or `path=none`, and `outbound_depth=<N>` queued-body-byte counters (per-peer encoded `SyncMessage` bytes pending on the outbound byte-priority queue). These diagnostics help explain reachability; they grant no trust and do not expose private key material.
 
 ## How it works
 
