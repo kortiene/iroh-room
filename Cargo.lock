@@ -4008,6 +4008,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike-n40"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "iroh-rooms-core",
+ "iroh-rooms-net",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "spike-nat"
 version = "0.1.0"
 dependencies = [

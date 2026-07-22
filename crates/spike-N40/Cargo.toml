@@ -1,0 +1,51 @@
+# Throwaway spike crate (#145 / issue #145). The `n40-probe` loopback harness
+# that measures where the v1 full-mesh event transport with the post-`b0622ec`
+# guardrails in place breaks at N=5/10/20/40: process RSS, per-node task
+# estimates, the queue-close-on-full cascade start, and rebind/NAT-drop
+# convergence (spec `specs/measure-n40-v1-guardrails.md`). It MUST NOT be
+# depended on by the shipping crates (`iroh-rooms-core` /
+# `iroh-rooms-cli` / `iroh-rooms-net` / `iroh-rooms`) and it MUST NOT modify
+# them. See `NOTES.md` for the GO/NO-GO decision memo for #154.
+[package]
+name = "spike-n40"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack has a higher
+# MSRV than the workspace-declared value (mirrors spike-transport / spike-nat /
+# spike-blobs).
+publish = false
+
+[lib]
+name = "spike_n40"
+path = "src/lib.rs"
+
+[[bin]]
+name = "n40-probe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `sync` (which transitively enables `store`) gives us `WireEvent` / `EventId`
+# / the public event builders / `SyncEngine` / `EventStore`, the same feature
+# set the shipping `iroh-rooms-net` carrier uses.
+iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
+# The shipping carrier whose guardrails (byte-bounded queues, dial-with-backoff,
+# #136 dial-stomp fix) this spike exercises. The spike depends on shipping
+# crates; shipping crates must NOT depend on the spike.
+iroh-rooms-net = { path = "../iroh-rooms-net" }
+# The exact pin the shipping carrier (`iroh-rooms-net`) and the other spikes
+# run on.
+iroh = "=1.0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
