@@ -37,7 +37,9 @@ use iroh_rooms_core::membership::{
     active_member_warning_crossed, MembershipSnapshot, MAX_ACTIVE_MEMBERS,
 };
 use iroh_rooms_core::store::StoredEvent;
-use iroh_rooms_core::sync::{Completeness, Outgoing, PeerId, SyncEngine, SyncMessage};
+use iroh_rooms_core::sync::{
+    Completeness, Outgoing, PeerId, SyncCounters, SyncEngine, SyncMessage,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -87,6 +89,11 @@ enum Cmd {
     /// Force an immediate peer-manager reconcile + admission refresh (a test hook;
     /// a no-op for a node with no room session). See [`Node::reconcile_now`].
     Reconcile(oneshot::Sender<()>),
+    /// Read the engine's [`SyncCounters`] (issue #142 — lets e2e tests assert the
+    /// cached-membership-projection recompute counter across the pump boundary).
+    /// Routed through the pump so the engine stays single-owner, like
+    /// [`Cmd::Snapshot`] / [`Cmd::Completeness`].
+    Counters(oneshot::Sender<SyncCounters>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -752,6 +759,22 @@ impl Node {
         rx.await.map_err(|_| anyhow!("pump dropped the reply"))
     }
 
+    /// The engine's current [`SyncCounters`] — the Gate-D evidence memo, including
+    /// `membership_projection_recomputes` (issue #142). Routed through the pump so
+    /// the engine stays single-owner; lets e2e tests assert the cached-membership-
+    /// projection recompute behavior across the real transport boundary (the same
+    /// way [`Node::snapshot`] / [`Node::completeness`] expose other engine state).
+    ///
+    /// # Errors
+    /// Returns an error if the pump is gone.
+    pub async fn counters(&self) -> Result<SyncCounters> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Counters(tx))
+            .map_err(|_| anyhow!("pump task is gone"))?;
+        rx.await.map_err(|_| anyhow!("pump dropped the reply"))
+    }
+
     /// Wait (up to `timeout`) until `device` reaches `want`, polling the table.
     ///
     /// # Errors
@@ -1408,6 +1431,10 @@ fn handle_cmd(
                 room.force_reconcile(engine);
             }
             let _ = reply.send(());
+            false
+        }
+        Cmd::Counters(reply) => {
+            let _ = reply.send(engine.counters());
             false
         }
         Cmd::Shutdown(reply) => {
