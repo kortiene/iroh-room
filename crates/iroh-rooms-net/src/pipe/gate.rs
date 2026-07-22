@@ -107,7 +107,7 @@ mod tests {
 
     /// A `PipeQuery` backed by a dropped receiver — every send immediately errors.
     fn dead_query() -> PipeQuery {
-        let (tx, rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, rx) = mpsc::channel::<PipeQueryMsg>(8);
         drop(rx);
         PipeQuery::new(tx)
     }
@@ -135,7 +135,7 @@ mod tests {
         let reg = PipeRegistry::new();
         reg.insert(minimal_opened(PIPE_ID), loopback(19001))
             .expect("insert");
-        let (tx, mut rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, mut rx) = mpsc::channel::<PipeQueryMsg>(8);
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -158,7 +158,7 @@ mod tests {
         let reg = PipeRegistry::new();
         reg.insert(minimal_opened(PIPE_ID), loopback(19002))
             .expect("insert");
-        let (tx, mut rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, mut rx) = mpsc::channel::<PipeQueryMsg>(8);
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -187,7 +187,7 @@ mod tests {
         let reg = PipeRegistry::new();
         reg.insert(minimal_opened(PIPE_ID), loopback(19003))
             .expect("insert");
-        let (tx, mut rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, mut rx) = mpsc::channel::<PipeQueryMsg>(8);
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {

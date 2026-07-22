@@ -12,7 +12,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -20,7 +19,7 @@ use iroh::endpoint::{presets, Connection, QuicTransportConfig, VarInt};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_rooms_core::sync::{Outgoing, PeerId, SyncTransport};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::admission::Admission;
@@ -30,6 +29,10 @@ use crate::handler::EventProtocolHandler;
 use crate::peer::{dial_loop, peer_id};
 use crate::pipe::alpn::PIPE_ALPN;
 use crate::pipe::PipeProtocolHandler;
+use crate::queue::{
+    self, classify_inbound_bytes, classify_sync_message, BytePriorityQueue, BytePriorityReceiver,
+    PushError, DEFAULT_PER_PEER_QUEUE_BYTES, DEFAULT_PER_STREAM_QUEUE_BYTES,
+};
 use crate::state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
 
 /// Normal application close code for a locally-initiated disconnect (distinct from
@@ -100,10 +103,33 @@ pub struct NetConfig {
     /// Ring capacity of the `Node::room_events` broadcast (issue #83). Lossy on
     /// lag exactly like `conn_event_capacity`; a slow subscriber gets `Lagged`.
     pub room_event_capacity: usize,
-    /// Bounded raw-frame backlog from peer reader tasks into the engine pump.
-    pub inbound_frame_capacity: usize,
-    /// Bounded per-peer raw-frame backlog from the engine pump to peer writers.
-    pub outbound_frame_capacity: usize,
+    /// Per-peer queued-byte cap on the **inbound** event-plane path (issue #141
+    /// / `#134 §12.3` — 8 MiB default). Charges encoded `SyncMessage` body
+    /// bytes only; the 4-byte length prefix and allocator overhead are not
+    /// counted. When exhausted the offending frame is dropped, the link is
+    /// closed, and `transport.queue.saturated` is audited (spec D1 / D6 / §7).
+    pub inbound_peer_queue_bytes: usize,
+    /// Per-peer queued-byte cap on the **outbound** event-plane path (issue
+    /// #141 — 8 MiB default). Same units and recovery shape as
+    /// [`Self::inbound_peer_queue_bytes`].
+    pub outbound_peer_queue_bytes: usize,
+    /// Per-subscribed-stream queued-byte cap (issue #141 / `#134 §12.3` — 2 MiB
+    /// default). V1 carries exactly one logical event ALPN stream per peer, so
+    /// this is the per-peer content/reconciliation bucket (spec D4):
+    /// `Events`/`WantRecentChat`/`WantEvents`/`NotFound` frames charge it
+    /// **and** the per-peer cap; governance / checkpoint / session control
+    /// (`AdminTip` / `WantMembership` / `Heads` / `ProveCapability`) charge the
+    /// per-peer cap only, so they can skip ahead of a saturated content
+    /// backlog (spec D5).
+    pub stream_queue_bytes: usize,
+    /// Bounded capacity of the pipe-plane read-query control channel
+    /// ([`PipeQuery`](crate::pipe::PipeQuery)) that the engine pump drains
+    /// (issue #141 — bounded so no network-derived pipe-ALPN request can drive
+    /// an unbounded control queue). Default is `MAX_CONCURRENT_BIDI_STREAMS`,
+    /// matching the per-connection bidi-stream ceiling the endpoint itself
+    /// enforces; pipe queries are bounded by accept-task spawn anyway, so this
+    /// is defense-in-depth, not the binding constraint.
+    pub pipe_query_capacity: usize,
 }
 
 impl Default for NetConfig {
@@ -112,8 +138,10 @@ impl Default for NetConfig {
             mode: NetMode::Loopback,
             conn_event_capacity: 256,
             room_event_capacity: 256,
-            inbound_frame_capacity: 256,
-            outbound_frame_capacity: 256,
+            inbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+            outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+            stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
+            pipe_query_capacity: MAX_CONCURRENT_BIDI_STREAMS as usize,
         }
     }
 }
@@ -128,26 +156,85 @@ pub struct Inbound {
     pub bytes: Vec<u8>,
 }
 
-/// Shared transport state: the identity/authorizer/audit + the per-peer routing
-/// tables + the inbound sink. Cloned (as `Arc<Shared>`) into the accept handler
-/// and every connection task so they observe one consistent view.
+/// The byte-bounded, priority-aware outbound frame queue for one peer (issue
+/// #141). Cloned (cheaply — one `Arc`) into `Shared::route` for each engine
+/// `Outgoing`; the per-peer writer task owns the consumer.
+///
+/// `depth()` reports **queued body bytes**, not frame count — the unit changed
+/// from frames to bytes in issue #141 (spec D1, acceptance: "`OutboundQueue`
+/// enforces bytes-in-queue, not frame-count; `depth()` reports bytes").
+/// Recovery on true budget exhaustion is unchanged: drop the frame, audit
+/// `transport.queue.saturated` with queue `outbound`, and close the link (§7).
 #[derive(Clone)]
 pub struct OutboundQueue {
-    pub(crate) tx: mpsc::Sender<Vec<u8>>,
-    pub(crate) depth: Arc<AtomicUsize>,
+    queue: BytePriorityQueue,
+}
+
+/// The consumer side of an [`OutboundQueue`], owned by the per-peer writer
+/// task. Each `recv` yields the next encoded body in priority order
+/// (`governance > checkpoint > content > blob-hints`, spec D3).
+pub(crate) struct OutboundReceiver {
+    rx: BytePriorityReceiver,
+}
+
+impl OutboundReceiver {
+    /// Await the next encoded body in priority order. Returns `None` once the
+    /// queue is closed and drained (peer unregistered / link torn down).
+    pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await.map(|f| f.body)
+    }
+
+    /// Non-blocking pop of the next encoded body, or `None` if empty. Used by
+    /// synchronous tests; the writer task uses [`Self::recv`].
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.try_recv().map(|f| f.body)
+    }
 }
 
 impl OutboundQueue {
-    pub fn new(tx: mpsc::Sender<Vec<u8>>, depth: Arc<AtomicUsize>) -> Self {
-        Self { tx, depth }
+    /// Construct a producer/consumer pair with the given byte caps. The peer
+    /// is supplied per-push (a per-peer queue only ever passes one peer id, so
+    /// its internal budget map has at most one entry — spec D2 / D4).
+    pub(crate) fn new(peer_cap: usize, stream_cap: usize) -> (Self, OutboundReceiver) {
+        let (queue, rx) = BytePriorityQueue::channel(peer_cap, stream_cap);
+        (Self { queue }, OutboundReceiver { rx })
     }
 
+    /// Try to enqueue `body` for `peer`, classified by `family`. Non-blocking.
+    /// Charges `body.len()` against the per-peer cap (and the per-stream cap
+    /// when `family.charges_stream_budget()`).
+    pub(crate) fn try_push(
+        &self,
+        peer: PeerId,
+        body: Vec<u8>,
+        family: queue::QueueFamily,
+    ) -> Result<(), PushError> {
+        self.queue.try_push(peer, body, family)
+    }
+
+    /// Current queued body bytes for this peer. **Bytes, not frames** (spec
+    /// D1 / acceptance). Surfaced through `Node::outbound_queue_depths` and the
+    /// verbose CLI `outbound_depth=<N>` diagnostic.
     #[must_use]
     pub fn depth(&self) -> usize {
-        self.depth.load(Ordering::Relaxed)
+        self.queue.depth_bytes()
+    }
+
+    /// Close the queue: future pushes return [`PushError::Closed`], and the
+    /// writer task drains remaining frames then observes `None` from `recv`.
+    /// Called from `Shared::unregister` so a torn-down link's writer task does
+    /// not outlive the queue (spec §9 reliability).
+    pub(crate) fn close(&self) {
+        self.queue.close();
     }
 }
 
+/// Shared transport state: the identity/authorizer/audit + the per-peer routing
+/// tables + the byte-bounded inbound sink. Cloned (as `Arc<Shared>`) into the
+/// accept handler and every connection task so they observe one consistent view
+/// (issue #141: inbound + outbound event-plane paths now use byte-bounded
+/// priority queues, not frame-count `mpsc`).
 pub struct Shared {
     /// This node's authenticated identity (`endpoint.id() == device_id`).
     pub(crate) me: EndpointId,
@@ -159,8 +246,10 @@ pub struct Shared {
     pub(crate) table: PeerTable,
     /// Per-peer outbound frame queues (one writer task each).
     outbound: Mutex<HashMap<EndpointId, OutboundQueue>>,
-    /// Configured per-peer outbound queue capacity.
-    outbound_frame_capacity: usize,
+    /// Configured per-peer outbound queue byte cap (issue #141).
+    outbound_peer_queue_bytes: usize,
+    /// Configured per-stream outbound queue byte cap (issue #141 / spec D4).
+    stream_queue_bytes: usize,
     /// Live connection handles (so a local disconnect can close a specific link).
     connections: Mutex<HashMap<EndpointId, Connection>>,
     /// Devices admitted **provisionally** for the join bootstrap (IR-0104,
@@ -188,8 +277,31 @@ pub struct Shared {
     /// long-superseded link's teardown clobber a same-numbered successor); one
     /// `u64` per distinct device seen, bounded like the other per-device tables.
     generations: Mutex<HashMap<EndpointId, u64>>,
-    /// The bounded inbound sink feeding the engine driver.
-    pub(crate) inbound_tx: mpsc::Sender<Inbound>,
+    /// The byte-bounded, multi-peer inbound sink feeding the engine driver
+    /// (issue #141). Each reader task charges encoded body bytes against both
+    /// the per-peer and per-stream caps; classification is by `SyncMessage`
+    /// variant only — never by decoded payload (spec D1 / §9).
+    pub(crate) inbound: BytePriorityQueue,
+}
+
+/// The consumer side of the inbound byte-priority queue, owned by the engine
+/// driver pump ([`crate::node::Node`]). Yields one [`Inbound`] per popped frame
+/// in priority order. Built by [`NetTransport::bind`]; taken once via
+/// [`NetTransport::take_inbound`].
+pub struct InboundReceiver {
+    rx: BytePriorityReceiver,
+}
+
+impl InboundReceiver {
+    /// Await the next inbound frame in priority order (governance, then
+    /// checkpoint, then content, then blob-hints — spec D3). Returns `None`
+    /// once the queue is closed and drained (transport shutdown).
+    pub async fn recv(&mut self) -> Option<Inbound> {
+        self.rx.recv().await.map(|f| Inbound {
+            peer: f.peer,
+            bytes: f.body,
+        })
+    }
 }
 
 /// The terminal peer-table state a guarded teardown writes (issue #126).
@@ -203,12 +315,19 @@ pub(crate) enum LinkTeardown {
 
 impl Shared {
     /// Register a peer's outbound frame queue (replaces any prior queue for the
-    /// device — last writer wins on a double-connect, spec OQ-4).
+    /// device — last writer wins on a double-connect, spec OQ-4). Closing the
+    /// superseded queue wakes its writer task so it does not outlive the link
+    /// it belonged to (issue #141: dropping the producer handle alone no longer
+    /// ends the writer, since the consumer shares the queue's `Arc` state).
     pub(crate) fn register_outbound(&self, device: EndpointId, queue: OutboundQueue) {
-        self.outbound
+        let prev = self
+            .outbound
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(device, queue);
+        if let Some(prev) = prev {
+            prev.close();
+        }
     }
 
     /// Record a live connection handle for the device.
@@ -219,13 +338,19 @@ impl Shared {
             .insert(device, conn);
     }
 
-    /// Drop a peer's outbound queue + connection handle (on disconnect). Dropping
-    /// the queue's sender ends that peer's writer task.
+    /// Drop a peer's outbound queue + connection handle (on disconnect).
+    /// Closing the queue wakes its writer task so it drains remaining frames
+    /// and exits cleanly (issue #141: the writer no longer observes an
+    /// `mpsc::Sender` drop — it observes the queue's closed+drained state).
     pub(crate) fn unregister(&self, device: EndpointId) {
-        self.outbound
+        let prev = self
+            .outbound
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&device);
+        if let Some(queue) = prev {
+            queue.close();
+        }
         self.connections
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -245,15 +370,23 @@ impl Shared {
         }
     }
 
-    /// Route one engine [`Outgoing`] to its peer's bounded writer queue. Non-blocking;
-    /// **dropped** if the peer has no live writer (offline / unauthorized), and the
-    /// live link is closed if the queue is full so reconnect/backfill becomes the
-    /// recovery path (spec §6 / the [`SyncTransport`] contract).
+    /// Route one engine [`Outgoing`] to its peer's byte-bounded writer queue.
+    /// Non-blocking; **dropped** if the peer has no live writer (offline /
+    /// unauthorized). The frame is classified by `SyncMessage` variant (spec
+    /// D3), charged `body.len()` against the per-peer cap (and per-stream cap
+    /// when applicable, spec D4), and — on true budget exhaustion — dropped,
+    /// audited `transport.queue.saturated` with queue `outbound`, and the link
+    /// is closed so reconnect/backfill becomes the recovery path (spec §6 /
+    /// §7). A closed queue (peer torn down) is a silent drop, matching the
+    /// prior `mpsc::Sender::Closed` path (issue #141).
     pub(crate) fn route(&self, out: &Outgoing) {
         let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
             tracing::warn!("route: outgoing peer id is not a valid endpoint id; dropping");
             return;
         };
+        // Classify before encoding: the family decides priority + which cap
+        // bucket the body charges. Reads only the variant tag (spec D3 / §9).
+        let family = classify_sync_message(&out.msg);
         let body = out.msg.encode();
         let queue = self
             .outbound
@@ -262,20 +395,44 @@ impl Shared {
             .get(&device)
             .cloned();
         if let Some(queue) = queue {
-            queue.depth.fetch_add(1, Ordering::Relaxed);
-            match queue.tx.try_send(body) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    queue.depth.fetch_sub(1, Ordering::Relaxed);
+            match queue.try_push(out.peer, body, family) {
+                // `PushError::Closed` ⇒ peer's writer is gone; the prior
+                // `mpsc::Closed` path was likewise a silent drop, so collapse
+                // the two no-op arms (clippy::match_same_arms).
+                Ok(()) | Err(PushError::Closed) => {}
+                Err(PushError::Saturated) => {
                     self.audit.transport_queue_saturated(device, "outbound");
                     self.close_connection(device);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    queue.depth.fetch_sub(1, Ordering::Relaxed);
                 }
             }
         }
         // No live writer ⇒ peer offline ⇒ drop (engine re-pulls on reconnect).
+    }
+
+    /// Enqueue a raw inbound frame from `peer` onto the byte-bounded,
+    /// priority-aware inbound sink (issue #141). The reader task supplies
+    /// verbatim bytes; classification is by `SyncMessage` variant only, with
+    /// an undecodable body mapping to `BlobHints` (lowest priority, still
+    /// bounded) so the engine pump can decode again and log the drop as before
+    /// (spec §5 step 2 / §6.1.6).
+    ///
+    /// `Saturated` ⇒ the reader audits `transport.queue.saturated` with queue
+    /// `inbound` and closes the link; `Closed` ⇒ the pump is gone and the
+    /// reader exits silently. Same shape as the prior `mpsc::try_send` arms.
+    pub(crate) fn try_enqueue_inbound(
+        &self,
+        peer: PeerId,
+        bytes: Vec<u8>,
+    ) -> Result<(), PushError> {
+        let family = classify_inbound_bytes(&bytes);
+        self.inbound.try_push(peer, bytes, family)
+    }
+
+    /// Close the inbound sink (transport shutdown): reader tasks observe
+    /// `PushError::Closed` on the next push and exit; the pump drains and then
+    /// observes `None` from [`InboundReceiver::recv`].
+    pub(crate) fn close_inbound(&self) {
+        self.inbound.close();
     }
 
     /// Register a new live link for `device` and return its connection generation
@@ -505,10 +662,22 @@ impl Shared {
             .collect()
     }
 
-    pub(crate) const fn outbound_frame_capacity(&self) -> usize {
-        self.outbound_frame_capacity
+    /// Configured per-peer outbound byte cap (issue #141). Used by
+    /// [`peer::register_connection`] to construct each peer's
+    /// [`OutboundQueue`].
+    pub(crate) const fn outbound_peer_queue_bytes(&self) -> usize {
+        self.outbound_peer_queue_bytes
     }
 
+    /// Configured per-stream outbound byte cap (issue #141 / spec D4).
+    pub(crate) const fn stream_queue_bytes(&self) -> usize {
+        self.stream_queue_bytes
+    }
+
+    /// Point-in-time per-peer **queued body bytes** (issue #141: unit is now
+    /// bytes, not frames — spec D1 / acceptance). Surfaced through
+    /// [`NetTransport::outbound_queue_depths`] and the verbose CLI
+    /// `outbound_depth=<N>` diagnostic.
     pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
         self.outbound
             .lock()
@@ -524,7 +693,7 @@ pub struct NetTransport {
     shared: Arc<Shared>,
     endpoint: Endpoint,
     router: Router,
-    inbound_rx: Option<mpsc::Receiver<Inbound>>,
+    inbound_rx: Option<InboundReceiver>,
     dial_tasks: Mutex<Vec<JoinHandle<()>>>,
     mode: NetMode,
 }
@@ -574,19 +743,23 @@ impl NetTransport {
         };
 
         let me = endpoint.id();
-        let (inbound_tx, inbound_rx) = mpsc::channel(cfg.inbound_frame_capacity.max(1));
+        let (inbound, inbound_rx) = BytePriorityQueue::channel(
+            cfg.inbound_peer_queue_bytes.max(1),
+            cfg.stream_queue_bytes.max(1),
+        );
         let shared = Arc::new(Shared {
             me,
             admission,
             audit,
             table: PeerTable::new(cfg.conn_event_capacity),
             outbound: Mutex::new(HashMap::new()),
-            outbound_frame_capacity: cfg.outbound_frame_capacity.max(1),
+            outbound_peer_queue_bytes: cfg.outbound_peer_queue_bytes.max(1),
+            stream_queue_bytes: cfg.stream_queue_bytes.max(1),
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
-            inbound_tx,
+            inbound,
         });
 
         // One Endpoint, one Router serving both planes (ADR-1): the event ALPN is
@@ -607,7 +780,7 @@ impl NetTransport {
             shared,
             endpoint,
             router,
-            inbound_rx: Some(inbound_rx),
+            inbound_rx: Some(InboundReceiver { rx: inbound_rx }),
             dial_tasks: Mutex::new(Vec::new()),
             mode: cfg.mode,
         })
@@ -714,9 +887,10 @@ impl NetTransport {
         self.shared.table.subscribe()
     }
 
-    /// Take the inbound raw-frame receiver (once). The engine driver owns it and
-    /// feeds each frame to `SyncEngine::ingest_frame`.
-    pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Inbound>> {
+    /// Take the inbound frame receiver (once). The engine driver owns it and
+    /// feeds each frame to `SyncEngine::on_message` (issue #141: this is now a
+    /// byte-bounded priority receiver, not an `mpsc::Receiver`).
+    pub fn take_inbound(&mut self) -> Option<InboundReceiver> {
         self.inbound_rx.take()
     }
 
@@ -727,7 +901,10 @@ impl NetTransport {
         self.shared.clone()
     }
 
-    /// Gracefully stop: abort dial loops and shut the router down.
+    /// Gracefully stop: abort dial loops, close the inbound sink so reader
+    /// tasks observe `PushError::Closed` and exit, and shut the router down
+    /// (issue #141: the inbound byte-priority queue is closed explicitly so
+    /// any in-flight reader does not pile frames against an unread queue).
     ///
     /// # Errors
     /// Returns an error if the router shutdown task fails to join.
@@ -740,6 +917,7 @@ impl NetTransport {
         {
             handle.abort();
         }
+        self.shared.close_inbound();
         self.router.shutdown().await.context("router shutdown")?;
         Ok(())
     }
@@ -783,45 +961,63 @@ fn loopback_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Inbound, LinkTeardown, NetConfig, NetMode, OutboundQueue, Shared, RELAY_ONLY_TEST_BUILD,
+        InboundReceiver, LinkTeardown, NetConfig, NetMode, OutboundQueue, OutboundReceiver, Shared,
+        RELAY_ONLY_TEST_BUILD,
     };
     use crate::admission::AllowlistAdmission;
     use crate::audit::TracingAudit;
+    use crate::queue::{
+        BytePriorityQueue, PushError, DEFAULT_PER_PEER_QUEUE_BYTES, DEFAULT_PER_STREAM_QUEUE_BYTES,
+    };
     use crate::state::{OfflineReason, PeerConnState, PeerTable};
     use iroh::{EndpointId, SecretKey};
     use iroh_rooms_core::event::ids::RoomId;
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
 
     fn device(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    /// Construct a `Shared` with no connections or queues registered.
-    fn make_shared() -> (Arc<Shared>, mpsc::Receiver<Inbound>) {
-        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+    /// Construct a `Shared` with no connections or queues registered, backed by
+    /// a real byte-priority inbound sink (#141). The returned receiver is the
+    /// engine driver's inlet; tests that don't care simply drop it.
+    fn make_shared() -> (Arc<Shared>, InboundReceiver) {
+        let (inbound, inbound_rx) = BytePriorityQueue::channel(
+            DEFAULT_PER_PEER_QUEUE_BYTES,
+            DEFAULT_PER_STREAM_QUEUE_BYTES,
+        );
         let shared = Arc::new(Shared {
             me: device(0x01),
             admission: Arc::new(AllowlistAdmission::new()),
             audit: Arc::new(TracingAudit),
             table: PeerTable::new(8),
             outbound: Mutex::new(HashMap::new()),
-            outbound_frame_capacity: 256,
+            outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+            stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
             connections: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
-            inbound_tx,
+            inbound,
         });
-        (shared, inbound_rx)
+        (shared, InboundReceiver { rx: inbound_rx })
     }
 
-    fn outbound_pair(capacity: usize) -> (OutboundQueue, mpsc::Receiver<Vec<u8>>) {
-        let (tx, rx) = mpsc::channel(capacity);
-        (OutboundQueue::new(tx, Arc::new(AtomicUsize::new(0))), rx)
+    /// Build a per-peer outbound queue and its receiver with the default 8 MiB
+    /// peer / 2 MiB stream byte caps (#141). Most tests use
+    /// [`outbound_pair_with_caps`] to drive saturation with a deliberately
+    /// tiny cap.
+    fn outbound_pair() -> (OutboundQueue, OutboundReceiver) {
+        outbound_pair_with_caps(DEFAULT_PER_PEER_QUEUE_BYTES, DEFAULT_PER_STREAM_QUEUE_BYTES)
+    }
+
+    fn outbound_pair_with_caps(
+        peer_cap: usize,
+        stream_cap: usize,
+    ) -> (OutboundQueue, OutboundReceiver) {
+        OutboundQueue::new(peer_cap, stream_cap)
     }
 
     fn dummy_outgoing(peer: EndpointId) -> Outgoing {
@@ -830,6 +1026,36 @@ mod tests {
             msg: SyncMessage::NotFound {
                 room_id: RoomId::from_bytes([0xAA; 32]),
                 ids: vec![],
+            },
+        }
+    }
+
+    fn admin_tip_outgoing(peer: EndpointId) -> Outgoing {
+        Outgoing {
+            peer: PeerId::from_bytes(*peer.as_bytes()),
+            msg: SyncMessage::AdminTip {
+                room_id: RoomId::from_bytes([0xAB; 32]),
+                tip: None,
+            },
+        }
+    }
+
+    fn want_membership_outgoing(peer: EndpointId) -> Outgoing {
+        Outgoing {
+            peer: PeerId::from_bytes(*peer.as_bytes()),
+            msg: SyncMessage::WantMembership {
+                room_id: RoomId::from_bytes([0xAC; 32]),
+                have: vec![],
+            },
+        }
+    }
+
+    fn events_outgoing(peer: EndpointId, payload_len: usize) -> Outgoing {
+        Outgoing {
+            peer: PeerId::from_bytes(*peer.as_bytes()),
+            msg: SyncMessage::Events {
+                room_id: RoomId::from_bytes([0xAD; 32]),
+                frames: vec![vec![0xEE; payload_len]],
             },
         }
     }
@@ -851,10 +1077,19 @@ mod tests {
         assert_eq!(NetConfig::default().room_event_capacity, 256);
     }
 
+    /// Issue #141: `NetConfig` now exposes byte-named caps, not frame-count
+    /// caps. Defaults pin the §12.3 budget — 8 MiB per peer, 2 MiB per stream —
+    /// and the bounded pipe-query capacity defaults to the bidi-stream ceiling.
     #[test]
-    fn net_config_default_frame_queue_capacities_are_256() {
-        assert_eq!(NetConfig::default().inbound_frame_capacity, 256);
-        assert_eq!(NetConfig::default().outbound_frame_capacity, 256);
+    fn net_config_defaults_are_byte_budgets_from_section_12_3() {
+        let cfg = NetConfig::default();
+        assert_eq!(cfg.inbound_peer_queue_bytes, 8 * 1024 * 1024);
+        assert_eq!(cfg.outbound_peer_queue_bytes, 8 * 1024 * 1024);
+        assert_eq!(cfg.stream_queue_bytes, 2 * 1024 * 1024);
+        assert_eq!(
+            cfg.pipe_query_capacity,
+            super::MAX_CONCURRENT_BIDI_STREAMS as usize
+        );
     }
 
     #[test]
@@ -885,7 +1120,7 @@ mod tests {
     fn route_delivers_encoded_frame_to_registered_peer() {
         let (shared, _rx) = make_shared();
         let peer = device(0x03);
-        let (queue, mut rx) = outbound_pair(1);
+        let (queue, mut rx) = outbound_pair();
         shared.register_outbound(peer, queue);
 
         let out = dummy_outgoing(peer);
@@ -898,18 +1133,106 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    /// Issue #141: a saturated outbound byte budget drops the frame, audits
+    /// `transport.queue.saturated`, and closes the link — same recovery shape
+    /// as before, now keyed on bytes not frame count. `outbound_queue_depths`
+    /// reports bytes (the one frame that landed = its `body.len()`).
     #[test]
     fn route_closes_peer_when_outbound_queue_is_full() {
         let (shared, _rx) = make_shared();
         let peer = device(0x05);
-        let (queue, _rx) = outbound_pair(1);
+        // Cap both budgets at exactly one body's length: the first frame fills
+        // the cap; the second must saturate, audit, and close the link.
+        let one_body = dummy_outgoing(peer).msg.encode().len();
+        let (queue, _rx) = outbound_pair_with_caps(one_body, one_body);
         shared.register_outbound(peer, queue);
         shared.table.set(peer, PeerConnState::Connected, None);
 
-        shared.route(&dummy_outgoing(peer));
-        shared.route(&dummy_outgoing(peer));
+        shared.route(&dummy_outgoing(peer)); // admitted; depth == one_body bytes
+        shared.route(&dummy_outgoing(peer)); // saturates; link closed
 
-        assert_eq!(shared.outbound_queue_depths(), vec![(peer, 1)]);
+        assert_eq!(
+            shared.outbound_queue_depths(),
+            vec![(peer, one_body)],
+            "depth reports the one admitted body's bytes, not a frame count"
+        );
+    }
+
+    #[test]
+    fn route_accepts_governance_when_content_stream_budget_is_full() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x06);
+        let content = events_outgoing(peer, 64);
+        let content_body_len = content.msg.encode().len();
+        let admin = admin_tip_outgoing(peer);
+        let admin_body = admin.msg.encode();
+        let want_membership = want_membership_outgoing(peer);
+        let want_membership_body = want_membership.msg.encode();
+        let peer_cap = content_body_len + admin_body.len() + want_membership_body.len();
+        let (queue, mut rx) = outbound_pair_with_caps(peer_cap, content_body_len);
+        shared.register_outbound(peer, queue);
+        shared.table.set(peer, PeerConnState::Connected, None);
+
+        shared.route(&content);
+        shared.route(&admin);
+        shared.route(&want_membership);
+        shared.route(&content);
+
+        assert_eq!(
+            shared.outbound_queue_depths(),
+            vec![(peer, peer_cap)],
+            "the saturated content stream must not consume governance headroom"
+        );
+        assert_eq!(rx.try_recv(), Some(admin_body));
+        assert_eq!(rx.try_recv(), Some(want_membership_body));
+        assert_eq!(rx.try_recv(), Some(content.msg.encode()));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn try_enqueue_inbound_enforces_byte_caps_and_prioritizes_governance() {
+        let peer = device(0x0D);
+        let p = PeerId::from_bytes(*peer.as_bytes());
+        let content = events_outgoing(peer, 64).msg.encode();
+        let admin = admin_tip_outgoing(peer).msg.encode();
+        let want_membership = want_membership_outgoing(peer).msg.encode();
+        let peer_cap = content.len() + admin.len() + want_membership.len();
+        let (inbound, inbound_rx) = BytePriorityQueue::channel(peer_cap, content.len());
+        let shared = Arc::new(Shared {
+            me: device(0x01),
+            admission: Arc::new(AllowlistAdmission::new()),
+            audit: Arc::new(TracingAudit),
+            table: PeerTable::new(8),
+            outbound: Mutex::new(HashMap::new()),
+            outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+            stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
+            connections: Mutex::new(HashMap::new()),
+            provisional: Mutex::new(HashSet::new()),
+            capability_proven: Mutex::new(HashSet::new()),
+            generations: Mutex::new(HashMap::new()),
+            inbound,
+        });
+        let mut rx = InboundReceiver { rx: inbound_rx };
+
+        shared
+            .try_enqueue_inbound(p, content.clone())
+            .expect("content fills the inbound stream cap");
+        shared
+            .try_enqueue_inbound(p, admin.clone())
+            .expect("AdminTip does not charge the saturated stream cap");
+        shared
+            .try_enqueue_inbound(p, want_membership.clone())
+            .expect("WantMembership does not charge the saturated stream cap");
+        assert_eq!(
+            shared.try_enqueue_inbound(p, content.clone()),
+            Err(PushError::Saturated),
+            "another content frame exceeds the inbound stream cap"
+        );
+
+        assert_eq!(rx.rx.try_recv().map(|f| f.body), Some(admin));
+        assert_eq!(rx.rx.try_recv().map(|f| f.body), Some(want_membership));
+        assert_eq!(rx.rx.try_recv().map(|f| f.body), Some(content));
+        assert!(rx.rx.try_recv().is_none());
     }
 
     // --- Shared::unregister removes the outbound queue ---
@@ -918,15 +1241,46 @@ mod tests {
     fn route_drops_frame_after_unregister() {
         let (shared, _rx) = make_shared();
         let peer = device(0x04);
-        let (queue, mut rx) = outbound_pair(1);
+        let (queue, mut rx) = outbound_pair();
         shared.register_outbound(peer, queue);
         shared.unregister(peer);
 
         shared.route(&dummy_outgoing(peer));
         assert!(
-            rx.try_recv().is_err(),
+            rx.try_recv().is_none(),
             "no frame must arrive after the peer is unregistered"
         );
+    }
+
+    /// Issue #141: a double-connect replaces the outbound queue (spec OQ-4,
+    /// last-writer-wins). The superseded queue must be **closed** so its
+    /// writer task observes `None` from `recv` and exits — without this, the
+    /// Arc-shared queue state stays open and the writer task leaks (blocked
+    /// forever on an empty, never-closed queue). Dropping the producer handle
+    /// alone does not close the queue (the consumer shares the state).
+    #[tokio::test]
+    async fn register_outbound_closes_the_superseded_queue_so_its_writer_exits() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x07);
+        let (queue1, mut rx1) = outbound_pair();
+        shared.register_outbound(peer, queue1);
+        let (queue2, mut rx2) = outbound_pair();
+        shared.register_outbound(peer, queue2); // supersedes queue1
+
+        // The superseded consumer must terminate (return None) on the next
+        // `recv`, not block forever.
+        let superseded = tokio::time::timeout(std::time::Duration::from_millis(500), rx1.recv())
+            .await
+            .expect("superseded writer must observe None, not block");
+        assert!(
+            superseded.is_none(),
+            "a superseded queue's writer must terminate, not hang"
+        );
+
+        // The successor queue is unaffected and still delivers routed frames.
+        shared.route(&dummy_outgoing(peer));
+        let delivered = rx2.recv().await.expect("successor queue delivers");
+        assert!(!delivered.is_empty());
     }
 
     // --- Issue #126: connection-generation guard on teardown -----------------
@@ -938,18 +1292,18 @@ mod tests {
         let b = device(0x21);
         // Each successive link on the same device gets a strictly greater stamp,
         // so a superseded link can always be distinguished from its successor.
-        assert_eq!(shared.register_link(a, outbound_pair(1).0, false), 1);
-        assert_eq!(shared.register_link(a, outbound_pair(1).0, false), 2);
-        assert_eq!(shared.register_link(a, outbound_pair(1).0, false), 3);
+        assert_eq!(shared.register_link(a, outbound_pair().0, false), 1);
+        assert_eq!(shared.register_link(a, outbound_pair().0, false), 2);
+        assert_eq!(shared.register_link(a, outbound_pair().0, false), 3);
         // A different device starts its own sequence at 1.
-        assert_eq!(shared.register_link(b, outbound_pair(1).0, false), 1);
+        assert_eq!(shared.register_link(b, outbound_pair().0, false), 1);
     }
 
     #[test]
     fn teardown_if_current_tears_down_only_at_the_current_generation() {
         let (shared, _rx) = make_shared();
         let peer = device(0x22);
-        let gen = shared.register_link(peer, outbound_pair(1).0, true);
+        let gen = shared.register_link(peer, outbound_pair().0, true);
         shared.mark_capability_proven(peer);
         shared.table.set(peer, PeerConnState::Connected, None);
 
@@ -984,10 +1338,10 @@ mod tests {
         // conn2 un-gated.
         let (shared, _rx) = make_shared();
         let peer = device(0x23);
-        let (_queue1, mut rx1) = outbound_pair(1);
-        let (queue2, mut rx2) = outbound_pair(1);
+        let (_queue1, mut rx1) = outbound_pair();
+        let (queue2, mut rx2) = outbound_pair();
 
-        let gen1 = shared.register_link(peer, outbound_pair(1).0, true);
+        let gen1 = shared.register_link(peer, outbound_pair().0, true);
         shared.table.set(peer, PeerConnState::Connected, None);
         // conn2 supersedes conn1: fresh generation, its own writer.
         let gen2 = shared.register_link(peer, queue2, true);
@@ -1014,11 +1368,11 @@ mod tests {
         // conn2's writer still delivers; conn1's is gone.
         shared.route(&dummy_outgoing(peer));
         assert!(
-            rx2.try_recv().is_ok(),
+            rx2.try_recv().is_some(),
             "conn2's writer must survive conn1's close"
         );
         assert!(
-            rx1.try_recv().is_err(),
+            rx1.try_recv().is_none(),
             "conn1's writer was replaced, not the live one"
         );
 
@@ -1043,7 +1397,7 @@ mod tests {
         // CAS were not atomic under one lock, A could clear the mark B just set.
         let (shared, _rx) = make_shared();
         let peer = device(0x25);
-        let mut current = shared.register_link(peer, outbound_pair(1).0, true);
+        let mut current = shared.register_link(peer, outbound_pair().0, true);
 
         for _ in 0..500 {
             let barrier = Arc::new(Barrier::new(2));
@@ -1066,7 +1420,7 @@ mod tests {
                 let barrier = barrier.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    shared.register_link(peer, outbound_pair(1).0, true)
+                    shared.register_link(peer, outbound_pair().0, true)
                 })
             };
 
@@ -1089,7 +1443,7 @@ mod tests {
     fn teardown_if_current_unauthorized_exit_sets_unauthorized() {
         let (shared, _rx) = make_shared();
         let peer = device(0x24);
-        let gen = shared.register_link(peer, outbound_pair(1).0, false);
+        let gen = shared.register_link(peer, outbound_pair().0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         assert!(shared.teardown_if_current(peer, gen, LinkTeardown::Unauthorized));
@@ -1107,7 +1461,7 @@ mod tests {
         let (shared, _rx) = make_shared();
         let peer = device(0x26);
         // An inbound accept link is live at generation `gen`.
-        let gen = shared.register_link(peer, outbound_pair(1).0, false);
+        let gen = shared.register_link(peer, outbound_pair().0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         // Manager deauthorize: invalidate the generation, then force the terminal
@@ -1169,7 +1523,7 @@ mod tests {
         // The inbound accept registers a link (outbound queue + connection
         // generation) and flips the peer Connected — exactly what
         // `peer::register_connection` + the accept handler do.
-        let _gen = shared.register_link(peer, outbound_pair(1).0, false);
+        let _gen = shared.register_link(peer, outbound_pair().0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         assert!(
@@ -1191,7 +1545,7 @@ mod tests {
         // not history.
         let (shared, _rx) = make_shared();
         let peer = device(0x32);
-        let gen = shared.register_link(peer, outbound_pair(1).0, false);
+        let gen = shared.register_link(peer, outbound_pair().0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
         assert!(shared.teardown_if_current(
             peer,
@@ -1231,7 +1585,7 @@ mod tests {
         // backoff tick even though an inbound link is carrying data.
         let (shared, _rx) = make_shared();
         let peer = device(0x34);
-        let _gen = shared.register_link(peer, outbound_pair(1).0, false);
+        let _gen = shared.register_link(peer, outbound_pair().0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         assert!(
@@ -1253,7 +1607,7 @@ mod tests {
         // Connected state intact, not just the first.
         let (shared, _rx) = make_shared();
         let peer = device(0x35);
-        let _gen = shared.register_link(peer, outbound_pair(1).0, false);
+        let _gen = shared.register_link(peer, outbound_pair().0, false);
         shared.table.set(peer, PeerConnState::Connected, None);
 
         for _ in 0..50 {
@@ -1304,7 +1658,7 @@ mod tests {
                 thread::spawn(move || {
                     barrier.wait();
                     // The inbound accept: register the link, then flip Connected.
-                    shared.register_link(peer, outbound_pair(1).0, false);
+                    shared.register_link(peer, outbound_pair().0, false);
                     shared.table.set(peer, PeerConnState::Connected, None);
                 })
             };

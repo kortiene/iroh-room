@@ -7,6 +7,46 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Converted the v1 event-plane queues from frame-count-bounded to
+  **byte-bounded priority queues** (issue #141, `iroh-rooms-net` + a CLI
+  diagnostic wording pass): the inbound sink and the per-peer outbound queue
+  were previously `mpsc` channels bounded by frame count (default 256 each);
+  they now charge encoded `SyncMessage` body bytes against the #134 §12.3
+  budgets. **Experimental-tier `NetConfig` break:** `inbound_frame_capacity` and
+  `outbound_frame_capacity` (default 256 each) are removed and replaced by
+  `inbound_peer_queue_bytes` / `outbound_peer_queue_bytes` (default 8 MiB each),
+  a new `stream_queue_bytes` (default 2 MiB per subscribed stream — v1 carries
+  one logical event stream per peer, so this is the per-peer content bucket),
+  and a new `pipe_query_capacity` (default `MAX_CONCURRENT_BIDI_STREAMS` = 128).
+  Frames are classified by `SyncMessage` variant into four priorities,
+  `governance > checkpoint > content > blob-hints` (`AdminTip` / `WantMembership`
+  > `Heads` / `ProveCapability` > `Events` / `WantRecentChat` > `WantEvents` /
+  `NotFound` / undecodable); governance, checkpoint, and session control charge
+  the per-peer cap only, so a `AdminTip` / `WantMembership` / `Heads` /
+  `ProveCapability` frame still lands when the content stream is saturated. The
+  verbose CLI `outbound_depth=<N>` diagnostic and `OutboundQueue::depth()` now
+  report **queued body bytes** (an intentional unit change from frames — the
+  README diagnostic wording is updated to match). A new `InboundReceiver` type
+  replaces `mpsc::Receiver<Inbound>` as `NetTransport::take_inbound`'s return,
+  yielding frames in priority order; it is exported from `iroh-rooms-net` but,
+  like the prior `mpsc::Receiver`, is not re-exported through this façade (a
+  consumer driving `NetTransport` directly names it via the net crate). The
+  Pipe plane's engine-query control channel (`PipeQuery`) is also now bounded
+  (`pipe_query_capacity`), closing the last unbounded channel on a
+  network-reachable ALPN path; saturation fails closed — `snapshot` /
+  `pipe_opened` return `None` and `pipe_is_closed` returns `true`, the same
+  outcome as a vanished pump — so authorization decisions never branch on queue
+  state. The recovery shape on true budget exhaustion is unchanged: the
+  offending frame is dropped, `transport.queue.saturated` is audited (queue
+  `inbound` / `outbound`), and the peer link is closed so reconnect/backfill
+  becomes the recovery path. No wire-format, canonical-CBOR, signature,
+  membership, validation, authorization, admission, or `SyncMessage` protocol
+  change; the v2 wire protocol's byte budgets remain deferred (this hardens v1
+  independently). **Upgrade note: any consumer that explicitly set the old
+  `inbound_frame_capacity` / `outbound_frame_capacity` fields must rename them to
+  the new byte-named fields — `NetConfig::default()` carries the §12.3 budgets,
+  so callers that only override `mode` (the CLI and all SDK examples) are
+  unaffected.**
 - Cached the membership projection at the sync engine (issue #142,
   `iroh-rooms-core`): an in-memory performance optimization with no wire,
   signature, validation, authorization, or `SQLite` schema change. `RoomMembership`

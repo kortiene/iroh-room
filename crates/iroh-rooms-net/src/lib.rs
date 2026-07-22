@@ -58,6 +58,7 @@ pub mod state;
 pub mod transport;
 
 mod peer;
+mod queue;
 
 pub use admission::{
     Admission, AdmissionDecision, AdmissionView, AllowlistAdmission, JoinBootstrapAdmission,
@@ -77,6 +78,6 @@ pub use pipe::{
 };
 pub use state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable};
 pub use transport::{
-    Inbound, NetConfig, NetMode, NetTransport, OutboundQueue, Shared, MAX_CONCURRENT_BIDI_STREAMS,
-    RELAY_ONLY_TEST_BUILD,
+    Inbound, InboundReceiver, NetConfig, NetMode, NetTransport, OutboundQueue, Shared,
+    MAX_CONCURRENT_BIDI_STREAMS, RELAY_ONLY_TEST_BUILD,
 };

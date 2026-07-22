@@ -9,9 +9,17 @@
 //! own query commands. The handler/watcher hold a cheap, cloneable [`PipeQuery`];
 //! the pump holds the receiver.
 //!
-//! Every read **fails closed**: if the pump is gone (shutdown) or a reply is
-//! dropped, `snapshot`/`pipe_opened` return `None` and `pipe_is_closed` returns
-//! `true`, so a racing teardown/accept denies rather than leaks.
+//! Every read **fails closed**: if the pump is gone (shutdown), the bounded
+//! channel is saturated, or a reply is dropped, `snapshot`/`pipe_opened` return
+//! `None` and `pipe_is_closed` returns `true`, so a racing teardown/accept denies
+//! rather than leaks.
+//!
+//! Issue #141: the channel is **bounded** (`NetConfig::pipe_query_capacity`,
+//! default `MAX_CONCURRENT_BIDI_STREAMS`). A pipe handler services a
+//! network-derived ALPN, so its control queries cannot sit on an unbounded
+//! queue a remote peer could pressure. Saturation fails closed — the same
+//! outcome as a vanished pump — so authorization decisions never branch on
+//! queue state.
 
 use iroh_rooms_core::event::content::PipeOpened;
 use iroh_rooms_core::membership::MembershipSnapshot;
@@ -30,7 +38,7 @@ pub enum PipeQueryMsg {
 /// The Pipe plane's cloneable read handle onto the engine.
 #[derive(Clone)]
 pub struct PipeQuery {
-    tx: mpsc::UnboundedSender<PipeQueryMsg>,
+    tx: mpsc::Sender<PipeQueryMsg>,
 }
 
 impl std::fmt::Debug for PipeQuery {
@@ -40,41 +48,48 @@ impl std::fmt::Debug for PipeQuery {
 }
 
 impl PipeQuery {
-    /// Build a query handle over the channel the pump drains.
+    /// Build a query handle over the bounded channel the pump drains.
     ///
     /// Exposed for unit tests that need a handle backed by a controlled channel.
     #[must_use]
-    pub fn new(tx: mpsc::UnboundedSender<PipeQueryMsg>) -> Self {
+    pub fn new(tx: mpsc::Sender<PipeQueryMsg>) -> Self {
         Self { tx }
     }
 
-    /// The current membership snapshot, or `None` if the engine is gone
-    /// (fail-closed: the caller denies on `None`).
+    /// The current membership snapshot, or `None` if the engine is gone or the
+    /// query channel is saturated (fail-closed: the caller denies on `None`).
     pub async fn snapshot(&self) -> Option<MembershipSnapshot> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(PipeQueryMsg::Snapshot(reply)).is_err() {
+        if self.tx.send(PipeQueryMsg::Snapshot(reply)).await.is_err() {
             return None;
         }
         rx.await.ok()
     }
 
-    /// The governing `pipe.opened` for `pipe_id`, or `None` if unknown / the engine
-    /// is gone.
+    /// The governing `pipe.opened` for `pipe_id`, or `None` if unknown / the
+    /// engine is gone / the query channel is saturated.
     pub async fn pipe_opened(&self, pipe_id: [u8; 16]) -> Option<PipeOpened> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(PipeQueryMsg::Opened(pipe_id, reply)).is_err() {
+        if self
+            .tx
+            .send(PipeQueryMsg::Opened(pipe_id, reply))
+            .await
+            .is_err()
+        {
             return None;
         }
         rx.await.ok().flatten()
     }
 
     /// Whether a `pipe.closed` for `pipe_id` is causally known. **Fail-closed**:
-    /// returns `true` (treat as closed) if the engine is gone or a read fails.
+    /// returns `true` (treat as closed) if the engine is gone, the query channel
+    /// is saturated, or a read fails.
     pub async fn pipe_is_closed(&self, pipe_id: [u8; 16]) -> bool {
         let (reply, rx) = oneshot::channel();
         if self
             .tx
             .send(PipeQueryMsg::IsClosed(pipe_id, reply))
+            .await
             .is_err()
         {
             return true;
@@ -89,11 +104,16 @@ mod tests {
 
     use super::{PipeQuery, PipeQueryMsg};
 
+    /// Test-channel capacity: large enough that the test fixtures (which each
+    /// send a single query) never saturate it, while still exercising the
+    /// bounded-`Sender` shape introduced in #141.
+    const TEST_CHANNEL_CAPACITY: usize = 8;
+
     // ── fail-closed when the pump (mpsc receiver) is gone ──────────────────────
 
     #[tokio::test]
     async fn snapshot_is_none_when_pump_is_gone() {
-        let (tx, rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, rx) = mpsc::channel::<PipeQueryMsg>(TEST_CHANNEL_CAPACITY);
         drop(rx); // engine gone
         let q = PipeQuery::new(tx);
         assert!(
@@ -104,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipe_opened_is_none_when_pump_is_gone() {
-        let (tx, rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, rx) = mpsc::channel::<PipeQueryMsg>(TEST_CHANNEL_CAPACITY);
         drop(rx);
         let q = PipeQuery::new(tx);
         assert!(
@@ -115,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn is_closed_is_true_when_pump_is_gone() {
-        let (tx, rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, rx) = mpsc::channel::<PipeQueryMsg>(TEST_CHANNEL_CAPACITY);
         drop(rx);
         let q = PipeQuery::new(tx);
         assert!(
@@ -128,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_is_none_when_pump_drops_reply_sender() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, mut rx) = mpsc::channel::<PipeQueryMsg>(TEST_CHANNEL_CAPACITY);
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             if let Some(PipeQueryMsg::Snapshot(reply)) = rx.recv().await {
@@ -140,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn is_closed_is_true_when_pump_drops_reply_sender() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, mut rx) = mpsc::channel::<PipeQueryMsg>(TEST_CHANNEL_CAPACITY);
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             if let Some(PipeQueryMsg::IsClosed(_, reply)) = rx.recv().await {
@@ -152,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipe_opened_is_none_when_pump_drops_reply_sender() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PipeQueryMsg>();
+        let (tx, mut rx) = mpsc::channel::<PipeQueryMsg>(TEST_CHANNEL_CAPACITY);
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             if let Some(PipeQueryMsg::Opened(_, reply)) = rx.recv().await {
