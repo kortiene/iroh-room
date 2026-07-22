@@ -739,9 +739,10 @@ fn membership_sub_dag_complete_after_sync() {
 // ── AC4: duplicate events are silently ignored at the engine level ────────────
 
 /// AC4: Re-delivering an already-accepted frame through `ingest_frame` is a
-/// silent no-op: `counters().accepted` must not increase, and
-/// `counters().duplicates` must record each re-delivery (spec §6 step 11 /
-/// Event Protocol §6 duplicate-idempotency / AC4).
+/// silent no-op: `counters().accepted` must not increase, and the duplicate
+/// must be observed by either the early dedup cache (`early_duplicates`,
+/// issue #143) or the post-store idempotent path (`duplicates`, spec §6 step
+/// 11 / Event Protocol §6 duplicate-idempotency / AC4).
 #[test]
 fn engine_duplicates_are_silently_ignored() {
     let built = build_log(2); // genesis + members + 2 chat messages
@@ -752,6 +753,7 @@ fn engine_duplicates_are_silently_ignored() {
     seed_engine(&mut engine, &built.events);
 
     let accepted_before = engine.counters().accepted;
+    let early_before = engine.counters().early_duplicates;
     let dup_before = engine.counters().duplicates;
 
     // Re-deliver every frame via ingest_frame, simulating a peer re-sending.
@@ -765,8 +767,9 @@ fn engine_duplicates_are_silently_ignored() {
         "accepted must not increase on duplicate re-delivery (AC4)"
     );
     assert!(
-        engine.counters().duplicates > dup_before,
-        "duplicates counter must increment for each re-delivered frame (AC4)"
+        engine.counters().early_duplicates + engine.counters().duplicates
+            > early_before + dup_before,
+        "duplicate re-delivery must be observed by the early or post-store path (AC4 / #143)"
     );
 }
 

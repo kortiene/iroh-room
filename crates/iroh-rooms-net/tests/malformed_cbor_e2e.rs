@@ -21,6 +21,8 @@
 //! from. It then proves the node is still alive and correct by publishing a
 //! genuinely valid frame straight afterward.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,31 +167,33 @@ fn allowlist(members: &[&Principal]) -> AllowlistAdmission {
     auth
 }
 
-async fn spawn_loopback_node(
+fn spawn_loopback_node(
     secret: SecretKey,
     admission: AllowlistAdmission,
     room: RoomId,
     log: &[Vec<u8>],
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        secret,
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        Duration::from_millis(100),
-    )
-    .await
-    .expect("spawn loopback node")
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            secret,
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("spawn loopback node")
+    })
 }
 
 /// Bind a bare `iroh::Endpoint` keyed by `secret`, matching `NetMode::Loopback`'s

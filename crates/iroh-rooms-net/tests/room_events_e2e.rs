@@ -21,6 +21,8 @@
 //! Runs unmarked in CI: two in-process nodes on `NetMode::Loopback`, no
 //! external process, mirroring this crate's `message_e2e.rs`/`join_e2e.rs`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,41 +221,43 @@ fn allowlist(members: &[&Principal]) -> AllowlistAdmission {
     auth
 }
 
-async fn spawn_loopback_node_with_capacity(
+fn spawn_loopback_node_with_capacity(
     secret: SecretKey,
     admission: AllowlistAdmission,
     room: RoomId,
     log: &[Vec<u8>],
     room_event_capacity: usize,
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        room_event_capacity,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        secret,
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        Duration::from_millis(100),
-    )
-    .await
-    .expect("spawn loopback node")
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            room_event_capacity,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            secret,
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("spawn loopback node")
+    })
 }
 
-async fn spawn_loopback_node(
+fn spawn_loopback_node(
     secret: SecretKey,
     admission: AllowlistAdmission,
     room: RoomId,
     log: &[Vec<u8>],
-) -> Node {
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
     spawn_loopback_node_with_capacity(
         secret,
         admission,
@@ -261,7 +265,6 @@ async fn spawn_loopback_node(
         log,
         NetConfig::default().room_event_capacity,
     )
-    .await
 }
 
 /// Build `count` chained `MemberInvited` events (never redeemed), each citing

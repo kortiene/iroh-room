@@ -1729,9 +1729,12 @@ fn take_ingested_emits_on_peer_sync() {
 #[test]
 fn take_ingested_skips_peer_delivered_duplicate() {
     // Exactly-once across the peer path: a peer re-delivering an event the store
-    // already holds takes the `InsertOutcome::Duplicate` arm, which never reaches
-    // the emit point. This is the concrete de-dupe the issue calls out (peers
-    // re-advertising), complementing `take_ingested_skips_duplicates` (re-publish).
+    // already holds is silently dropped — either by the early dedup cache
+    // (`early_duplicates`, issue #143, when the id is in the cache window) or
+    // by the `InsertOutcome::Duplicate` arm (when it has aged out). Neither
+    // reaches the emit point. This is the concrete de-dupe the issue calls out
+    // (peers re-advertising), complementing `take_ingested_skips_duplicates`
+    // (re-publish).
     let built = build_log(0, false);
     let mut engine = fresh_engine(built.room, SyncConfig::default());
 
@@ -1741,6 +1744,7 @@ fn take_ingested_skips_peer_delivered_duplicate() {
         .expect("publish invite_bob");
     let _ = engine.take_ingested();
 
+    let early_before = engine.counters().early_duplicates;
     let dups_before = engine.counters().duplicates;
     let _ = engine.ingest_frame(NODE_B, &built.events[1]);
 
@@ -1748,10 +1752,10 @@ fn take_ingested_skips_peer_delivered_duplicate() {
         engine.take_ingested().is_empty(),
         "a peer re-delivering a stored event must not re-emit"
     );
-    assert_eq!(
-        engine.counters().duplicates,
-        dups_before + 1,
-        "the re-see took the Duplicate arm (exactly-once for free)"
+    assert!(
+        engine.counters().early_duplicates + engine.counters().duplicates
+            > early_before + dups_before,
+        "the re-see took the early-dedup or Duplicate arm (exactly-once for free, #143)"
     );
 }
 

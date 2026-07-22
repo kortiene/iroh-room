@@ -21,12 +21,15 @@
 //! The engine adds: backfill (pull), anti-amplification gating, fan-out, and the
 //! admin-tip / fail-closed completeness layer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::event::content::{Content, EventType};
 use crate::event::ids::{EventId, RoomId};
 use crate::event::keys::IdentityKey;
+use crate::event::reject::RejectReason;
+use crate::event::signed;
 use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
+use crate::event::wire::WireEvent;
 use crate::membership::{MembershipSnapshot, RoomMembership, Status};
 use crate::store::{
     EventStore, InsertOutcome, ParkedRow, StoreError, StoredEvent, SyncStateRow, TrustRow,
@@ -194,6 +197,20 @@ pub struct SyncCounters {
     /// records a CRITICAL `store_degraded` [`TrustDecision`].
     pub store_retry_dropped: u64,
 
+    // -- early event-id dedup evidence (issue #143) -----------------------------
+    /// Event-id replays dropped by the in-memory cache **before** signature
+    /// verification or any store work (issue #143 / #134 §22.2). Distinct from
+    /// [`duplicates`](Self::duplicates), which counts duplicates discovered
+    /// *after* the full validation + store path. A replay inside the cache
+    /// window is ignored silently — its signed bytes are already durably
+    /// stored — so the existing duplicate semantics are unchanged.
+    pub early_duplicates: u64,
+    /// Successful batched accepted-event store commits (issue #143). Each tick
+    /// of `flush_store_batch` that lands a non-empty batch bumps this by one —
+    /// useful for capacity/health observations; the per-event accept counter
+    /// remains [`accepted`](Self::accepted).
+    pub store_insert_batches: u64,
+
     // -- silent-loss / fail-open evidence (fix 2) -------------------------------
     /// Unconfirmed admin tips expired by the attempt budget
     /// ([`max_unconfirmed_tip_attempts`](SyncConfig::max_unconfirmed_tip_attempts)).
@@ -250,6 +267,99 @@ struct SuspectTip {
     seq: u64,
     /// Remaining catch-up ticks before this unconfirmed tip is expired.
     attempts: u32,
+}
+
+/// Bounded FIFO event-id dedup cache (issue #143 / #134 §22.2). The cache sits
+/// **in front of** signature verification and any store work, so a replay
+/// inside the cache window avoids Ed25519 verification and a `SQLite` insert
+/// attempt entirely. Correctness never depends on it: a cache miss falls
+/// through to the existing idempotent store path, and the cache is populated
+/// only after the store proves an id is persisted ([`note_event_id_seen`](SyncEngine::note_event_id_seen)),
+/// so an invalid first arrival cannot poison it.
+///
+/// The `BTreeSet` + `VecDeque` shape keeps `contains`/`insert` deterministic
+/// for tests and simulation (no hash-map randomized iteration, R4). `cap == 0`
+/// disables the early path (the supported rollback knob).
+#[derive(Debug)]
+struct EventIdDedupCache {
+    cap: usize,
+    set: BTreeSet<EventId>,
+    order: VecDeque<EventId>,
+}
+
+impl EventIdDedupCache {
+    /// Build an empty cache with capacity `cap`. `cap == 0` disables early
+    /// dedup ([`contains`](Self::contains) always returns `false`).
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            set: BTreeSet::new(),
+            order: VecDeque::with_capacity(cap.min(64)),
+        }
+    }
+
+    /// Whether `id` is currently cached. Read-only and never touches `SQLite` —
+    /// the whole point of the early path.
+    fn contains(&self, id: &EventId) -> bool {
+        self.cap > 0 && self.set.contains(id)
+    }
+
+    /// Record an id as seen, evicting the oldest insertion when at capacity.
+    /// Idempotent: a re-insert of an already-present id does not duplicate it
+    /// in `order` (so the eviction order stays the first-seen order).
+    fn insert(&mut self, id: EventId) {
+        if self.cap == 0 {
+            return;
+        }
+        if !self.set.insert(id) {
+            return;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(id);
+    }
+
+    /// Number of cached ids (test/observability helper; also used by the
+    /// open-time seeding loop to respect the cap when iterating a `BTreeSet`).
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+/// A buffered run of fold-accepted events awaiting a single batched
+/// [`EventStore::insert_all_outcomes`] commit (issue #143). The `from` slot
+/// preserves the per-event origin so a late-landing insert still fans out to
+/// every connected peer except the sender (matching `store_and_fanout`).
+struct PendingStoreBatch {
+    events: Vec<ValidatedEvent>,
+    from: Vec<Option<PeerId>>,
+}
+
+impl PendingStoreBatch {
+    fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            from: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, ev: ValidatedEvent, from: Option<PeerId>) {
+        self.events.push(ev);
+        self.from.push(from);
+    }
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 }
 
 /// Maximum retained log lines (bounded, in-memory; spec §9 / R4).
@@ -349,6 +459,17 @@ pub struct SyncEngine {
     /// Whether the next tick should emit full anti-entropy pulls even if no local
     /// sync activity has happened since the previous tick.
     force_next_tick_pull: bool,
+
+    /// Bounded early event-id dedup cache (issue #143): checked before signature
+    /// verification and any store work, so a replay inside the cache window is a
+    /// cheap no-op. `cap == 0` disables the early path; correctness always rests
+    /// on the store's primary-key idempotency.
+    dedup_cache: EventIdDedupCache,
+    /// Buffered fold-accepted events awaiting one batched store commit
+    /// (issue #143). Flushed at every delivery boundary so consecutive accepted
+    /// events amortize `SQLite` transaction overhead without reordering observable
+    /// post-commit side effects.
+    pending_batch: PendingStoreBatch,
 }
 
 /// How much of the responder's held set a `WantMembership` `have` ancestry
@@ -389,6 +510,23 @@ impl SyncEngine {
         }
         let fold = RoomMembership::from_events(room_id, validated);
 
+        // Seed the early dedup cache (issue #143) from the persisted room ids.
+        // A restart re-covers the recent window without paying store duplicate
+        // paths on a flood of immediate replays. The seed order is bytewise from
+        // the `BTreeSet` (not recency-based) — acceptable, this is a performance
+        // guardrail, not correctness state.
+        let mut dedup_cache = EventIdDedupCache::new(config.early_event_id_dedup_cache_entries);
+        if dedup_cache.cap > 0 {
+            if let Ok(ids) = store.room_event_ids(&room_id) {
+                for id in ids {
+                    dedup_cache.insert(id);
+                    if dedup_cache.len() >= dedup_cache.cap {
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut engine = Self {
             room_id,
             config,
@@ -414,6 +552,8 @@ impl SyncEngine {
             covered_cache: BTreeMap::new(),
             claim_rotation: 0,
             force_next_tick_pull: true,
+            dedup_cache,
+            pending_batch: PendingStoreBatch::new(),
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -464,6 +604,9 @@ impl SyncEngine {
     pub fn ingest_frame(&mut self, from: PeerId, bytes: &[u8]) -> Vec<Outgoing> {
         let mut out = Vec::new();
         self.deliver_bytes(Some(from), bytes, &mut out);
+        // Issue #143: flush any buffered accept and run parked-frame promotion
+        // before returning, so post-commit side effects land in order.
+        self.finalize_delivery(&mut out);
         out
     }
 
@@ -490,6 +633,8 @@ impl SyncEngine {
         let ev = validate_wire_bytes(bytes, &ctx).map_err(SyncError::InvalidFrame)?;
         let mut out = Vec::new();
         self.deliver(ev, None, &mut out);
+        // Issue #143: flush + wake_park before returning.
+        self.finalize_delivery(&mut out);
         Ok(out)
     }
 
@@ -552,6 +697,10 @@ impl SyncEngine {
                 self.serve_want_recent_chat(from, window, &have, &mut out);
             }
             SyncMessage::Events { frames, .. } => {
+                // Issue #143: consecutive accepted frames accumulate into the
+                // pending batch and are flushed as one store commit at the end
+                // of the loop, so N consecutive accepted events commit in
+                // ⌈N/batch⌉ transactions rather than N.
                 for frame in frames {
                     self.deliver_bytes(Some(from), &frame, &mut out);
                 }
@@ -566,6 +715,10 @@ impl SyncEngine {
             // replayed proof never affects the validated set or convergence.
             SyncMessage::ProveCapability { .. } => {}
         }
+        // Issue #143: flush the batched accepted events and run parked-frame
+        // promotion before returning, so post-commit side effects land in
+        // order and the transport adapter observes a consistent store state.
+        self.finalize_delivery(&mut out);
         out
     }
 
@@ -872,6 +1025,26 @@ impl SyncEngine {
     // ------------------------------------------------------------------
 
     fn deliver_bytes(&mut self, from: Option<PeerId>, bytes: &[u8], out: &mut Vec<Outgoing>) {
+        // Issue #143 / #134 §22.2: cheap pre-validation parse + early event-id
+        // dedup. Decoding the outer `WireEvent` and recomputing the id from
+        // `wire.signed` (never trusting the advisory `wire.id`) is far cheaper
+        // than Ed25519 verification or a SQLite insert; a cache hit on a known
+        // id short-circuits both. A malformed envelope or an id mismatch is
+        // still a counted+logged reject (the cache lookup never runs on a frame
+        // the safe parser refuses). See `prevalidate_event_id`.
+        match prevalidate_event_id(bytes) {
+            Ok(event_id) => {
+                if self.dedup_cache.contains(&event_id) {
+                    self.counters.early_duplicates += 1;
+                    return;
+                }
+            }
+            Err(reason) => {
+                self.counters.rejected += 1;
+                self.log(&format!("reject.{}", reason.code()));
+                return;
+            }
+        }
         let ctx = ValidationContext::for_room(self.room_id);
         match validate_wire_bytes(bytes, &ctx) {
             Ok(ev) => self.deliver(ev, from, out),
@@ -906,10 +1079,25 @@ impl SyncEngine {
                 // keeps the map bounded and lets a once-depth-dropped id be
                 // re-delivered cleanly when it later arrives causally complete.
                 self.backfill_depth.remove(&ev.event_id);
-                self.store_and_fanout(&ev, from, out);
-                self.wake_park(out);
+                // Issue #143: buffer the accepted event for a batched store
+                // commit instead of persisting immediately. The flush happens
+                // at deterministic boundaries — batch-size cap, end of the
+                // current frame loop, end of the entry point — so N consecutive
+                // accepted events commit in ⌈N/batch⌉ transactions, not N.
+                self.pending_batch.push(ev, from);
+                if self.pending_batch.len() >= self.config.store_insert_batch_size {
+                    self.flush_store_batch(out);
+                }
+                // NOTE: wake_park is no longer driven from inside `deliver`. It
+                // now runs at entry-point boundaries via `finalize_delivery`,
+                // so a consecutive run of accepted events accumulates into a
+                // single batch (spec D6 — the supported first implementation).
             }
             crate::membership::Ingest::Buffered { missing, .. } => {
+                // Flush any pending accepts BEFORE emitting backfill: prior
+                // accepts must commit so their fanout does not leapfrog this
+                // buffered frame's response (spec D6 flush boundary).
+                self.flush_store_batch(out);
                 self.on_buffered(ev, from, &missing, out);
             }
             crate::membership::Ingest::Rejected { reason, .. } => {
@@ -917,8 +1105,68 @@ impl SyncEngine {
                 // with a stable `reject.<code>`, stored nowhere, fanned out nowhere
                 // (AC3 / spec D8).
                 self.backfill_depth.remove(&ev.event_id);
+                self.flush_store_batch(out);
                 self.counters.rejected += 1;
                 self.log(&format!("reject.{}", reason.code()));
+            }
+        }
+    }
+
+    /// Flush any buffered accepted events as one batched store commit, then
+    /// promote parked frames the fold has since accepted, then flush again —
+    /// the deterministic delivery wrap-up every entry point runs before
+    /// returning its `Outgoing` frames (issue #143 / spec D6). Centralizing
+    /// the wake-park here (instead of inside `deliver`) is what lets a run of
+    /// consecutive accepted frames accumulate into one batch.
+    fn finalize_delivery(&mut self, out: &mut Vec<Outgoing>) {
+        self.flush_store_batch(out);
+        self.wake_park(out);
+        // `wake_park` promotes through the per-event `store_and_fanout`, which
+        // commits inline — no batched residue — but call once more in case a
+        // future change routes parked promotions through the batch too.
+        self.flush_store_batch(out);
+    }
+
+    /// Commit the buffered accepted events in one `SQLite` transaction and apply
+    /// per-event post-commit side effects in input order (issue #143 / spec D7).
+    /// On a batch failure every affected event enters the bounded #119 retry
+    /// path and no side effect runs — the fold/store divergence is healed on a
+    /// later tick or by a peer re-serve, exactly like a failed single insert.
+    fn flush_store_batch(&mut self, out: &mut Vec<Outgoing>) {
+        if self.pending_batch.is_empty() {
+            return;
+        }
+        let batch = std::mem::replace(&mut self.pending_batch, PendingStoreBatch::new());
+        self.force_next_tick_pull = true;
+        match self.store.insert_all_outcomes(&batch.events) {
+            Ok(outcomes) => {
+                self.counters.store_insert_batches += 1;
+                for ((ev, from), outcome) in batch
+                    .events
+                    .iter()
+                    .zip(batch.from.iter().copied())
+                    .zip(outcomes)
+                {
+                    // A successful insert supersedes any pending retry for this
+                    // id (a peer may have re-served an event whose first insert
+                    // failed, issue #119 — `peer_reserve_clears_pending_retry_exactly_once`).
+                    self.store_retry.remove(&ev.event_id);
+                    self.apply_insert_outcome(outcome, ev, from, out);
+                }
+            }
+            Err(e) => {
+                // All-or-nothing: `insert_all_outcomes` ran in one transaction,
+                // so a failure means no event in the batch is durably stored.
+                // Apply NO side effects (spec D8); enqueue retry for each in
+                // input order; log distinctly from a per-event insert failure
+                // while keeping the legacy `store insert failed` substring the
+                // existing #119 tests assert on (no silent degradation).
+                let n = batch.events.len() as u64;
+                self.counters.store_insert_failed += n;
+                self.log(&format!("store insert failed (batch): {e}"));
+                for (ev, from) in batch.events.iter().zip(batch.from.iter().copied()) {
+                    self.enqueue_store_retry(ev, from);
+                }
             }
         }
     }
@@ -934,6 +1182,10 @@ impl SyncEngine {
     /// ([`retry_store`](Self::retry_store)); fan-out, counters, and the push
     /// feed are deferred until the insert actually lands, so nothing is
     /// announced that this node cannot serve.
+    ///
+    /// This is the per-event path, used by `wake_park` for parked-frame
+    /// promotion (spec D6 — the first implementation keeps parked promotions
+    /// per-event; the direct accepted-event path goes through `flush_store_batch`).
     fn store_and_fanout(
         &mut self,
         ev: &ValidatedEvent,
@@ -956,13 +1208,24 @@ impl SyncEngine {
         self.apply_insert_outcome(outcome, ev, from, out);
     }
 
+    /// Record an event id in the early dedup cache (issue #143). Called only
+    /// after the store has proven the id is persisted — on a successful
+    /// `Inserted` or an idempotent `Duplicate` — so a bad-signature first
+    /// arrival can never poison the cache and suppress a later valid copy
+    /// (spec D2). The cache is a performance guardrail; correctness still
+    /// rests on the store's primary-key idempotency.
+    fn note_event_id_seen(&mut self, id: EventId) {
+        self.dedup_cache.insert(id);
+    }
+
     /// Apply the bookkeeping for a **successful** `store.insert`: counters,
     /// cache invalidation, admin fork-detection state, the push-subscription
     /// feed, advisory flags, fan-out, and the completeness recompute. Shared by
-    /// the direct path ([`store_and_fanout`](Self::store_and_fanout)) and the
-    /// deferred insert-retry path ([`retry_store`](Self::retry_store), issue
-    /// #119), so a late-landing event gets exactly the treatment an immediate
-    /// one does.
+    /// the batched direct path ([`flush_store_batch`](Self::flush_store_batch)),
+    /// the per-event parked-promotion path
+    /// ([`store_and_fanout`](Self::store_and_fanout)), and the deferred
+    /// insert-retry path ([`retry_store`](Self::retry_store), issue #119), so a
+    /// late-landing event gets exactly the treatment an immediate one does.
     fn apply_insert_outcome(
         &mut self,
         outcome: InsertOutcome,
@@ -971,6 +1234,10 @@ impl SyncEngine {
         out: &mut Vec<Outgoing>,
     ) {
         let id = ev.event_id;
+        // Issue #143: the store has proven `id` is persisted (Inserted OR
+        // idempotent Duplicate), so the early dedup cache can safely record it
+        // without risking poisoning by an invalid first arrival (spec D2).
+        self.note_event_id_seen(id);
         match outcome {
             InsertOutcome::Duplicate => {
                 self.counters.duplicates += 1;
@@ -2304,6 +2571,27 @@ impl SyncEngine {
 /// Build an [`Outgoing`] addressed to `peer`.
 fn to(peer: PeerId, msg: SyncMessage) -> Outgoing {
     Outgoing { peer, msg }
+}
+
+/// Cheap pre-validation parse for the early event-id dedup path (issue #143 /
+/// #134 §22.2, spec D1). Decodes only the outer [`WireEvent`] and recomputes
+/// the id from `wire.signed` — never trusting the advisory `wire.id` field —
+/// so the dedup cache can be consulted *before* signature verification or any
+/// store work. A malformed envelope or an id mismatch surfaces as the same
+/// [`RejectReason`] the full validator would return, preserving the cheap
+/// `id_mismatch` / `non_canonical_encoding` reject codes that gate the cache
+/// lookup.
+///
+/// On `Ok(id)`, the caller still MUST run [`validate_wire_bytes`]: this helper
+/// intentionally performs no signature, canonical-CSB, content, or room-binding
+/// check. Its only job is to derive a trustworthy id cheaply.
+fn prevalidate_event_id(bytes: &[u8]) -> Result<EventId, RejectReason> {
+    let wire = WireEvent::decode(bytes)?;
+    let event_id = signed::event_id_from_bytes(&wire.signed);
+    if event_id.to_named_string() != wire.id {
+        return Err(RejectReason::IdMismatch);
+    }
+    Ok(event_id)
 }
 
 /// Map a persisted [`TrustRow`] back to the in-memory [`TrustDecision`] (spec D6

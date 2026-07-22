@@ -18,7 +18,9 @@
 //! | P11 | Two pipes exposed; per-pipe session count/info distinguish the connected pipe from the idle one, and closing one pipe decrements only its count | issue #86 |
 //! | P12 | The connector's stream budget saturates: forward #`N+1` is refused with a visible `PipeOutcome::Saturated` and an immediately-closed local socket, never accepted-then-starved | scale guardrails |
 
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,31 +208,36 @@ fn allowlist(members: &[&Principal]) -> AllowlistAdmission {
     auth
 }
 
-async fn spawn_node(
+// Returns a boxed future so the ~16 KB state machine of `Node::spawn` is
+// heap-allocated once instead of being inlined into every caller (clippy
+// `large_futures` — the test bodies each call this 1–3 times).
+fn spawn_node(
     secret: SecretKey,
     admission: AllowlistAdmission,
     room: RoomId,
     log: &[Vec<u8>],
-) -> Node {
-    let store = EventStore::open_in_memory().expect("in-memory store");
-    let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
-    for ev in log {
-        engine.publish(ev).expect("seed event");
-    }
-    let cfg = NetConfig {
-        mode: NetMode::Loopback,
-        ..NetConfig::default()
-    };
-    Node::spawn(
-        secret,
-        Arc::new(admission),
-        Arc::new(TracingAudit),
-        engine,
-        cfg,
-        TICK,
-    )
-    .await
-    .expect("spawn loopback node")
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    Box::pin(async move {
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        for ev in log {
+            engine.publish(ev).expect("seed event");
+        }
+        let cfg = NetConfig {
+            mode: NetMode::Loopback,
+            ..NetConfig::default()
+        };
+        Node::spawn(
+            secret,
+            Arc::new(admission),
+            Arc::new(TracingAudit),
+            engine,
+            cfg,
+            TICK,
+        )
+        .await
+        .expect("spawn loopback node")
+    })
 }
 
 // ---------------------------------------------------------------------------

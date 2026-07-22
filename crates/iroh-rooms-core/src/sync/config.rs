@@ -96,6 +96,24 @@ pub struct SyncConfig {
     /// straight to the CRITICAL `store_degraded` decision, so a store outage
     /// under event flood cannot grow memory unboundedly (Gate-D R4).
     pub max_store_retry_total: usize,
+    /// Maximum number of consecutive fold-accepted events persisted in one
+    /// `BEGIN IMMEDIATE` `SQLite` transaction (issue #143). Default 32 amortizes
+    /// per-transaction overhead while keeping write-lock dwell time short.
+    /// `1` is the supported "disable batching" rollback knob: it restores the
+    /// pre-#119-era one transaction per accepted event. `0` is invalid (a
+    /// batch can never commit). Values above 1024 are rejected to avoid very
+    /// long write transactions (the bound mirrors the park/retry caps).
+    pub store_insert_batch_size: usize,
+    /// Capacity of the in-memory event-id dedup cache checked **before**
+    /// signature verification or any store work (issue #143 / #134 §22.2). A
+    /// cache hit short-circuits the replay path entirely; correctness still
+    /// rests on the store's primary-key idempotency. Default 4096 covers the
+    /// MVP room size and recent-sync windows with modest memory.
+    /// `0` disables early dedup (the supported rollback knob): a replay then
+    /// falls through to full validation and the existing idempotent store
+    /// duplicate path. Values above `1_000_000` are rejected to avoid accidental
+    /// memory blowups.
+    pub early_event_id_dedup_cache_entries: usize,
 }
 
 impl Default for SyncConfig {
@@ -137,6 +155,19 @@ impl Default for SyncConfig {
             // Mirrors `max_parked_total`: the same "bounded in-memory frame
             // buffer" shape, sized for the MVP room target (issue #119).
             max_store_retry_total: 1024,
+            // Issue #143: amortize SQLite transaction overhead across a
+            // consecutive run of accepted events. 32 is a conservative
+            // midpoint of the 16/32 range suggested in the issue — short
+            // enough to keep the write lock brief under contention, large
+            // enough to amortize the BEGIN IMMEDIATE / commit cost on a busy
+            // peer burst. See `store_insert_batch_size` field doc for the
+            // rollback bounds.
+            store_insert_batch_size: 32,
+            // Issue #143 / #134 §22.2: the early duplicate-rejection
+            // guardrail. 4096 is well above the MVP room target and recent-
+            // sync windows; the cache holds raw 32-byte ids, so 4096 ≈ 128
+            // KiB plus the FIFO overhead — modest for the guardrail value.
+            early_event_id_dedup_cache_entries: 4096,
         }
     }
 }
@@ -176,6 +207,21 @@ impl SyncConfig {
             // Zero would silently disable the #119 insert-failure recovery and
             // reopen the permanent-store-hole path.
             return Err("store_retry_zero");
+        }
+        if self.store_insert_batch_size == 0 {
+            // Zero would never commit a batch — every accepted event would
+            // pile up unflushed. `1` is the supported disable-batching knob.
+            return Err("store_batch_size_zero");
+        }
+        if self.store_insert_batch_size > 1024 {
+            // Mirrors the park/retry cap shape: a very large batch would hold
+            // the SQLite write lock for too long under contention.
+            return Err("store_batch_size_oversized");
+        }
+        if self.early_event_id_dedup_cache_entries > 1_000_000 {
+            // Bounded in-memory id store (32 B/id + FIFO overhead) — refuse an
+            // accidental memory blowup. `0` is allowed (disables early dedup).
+            return Err("early_dedup_cache_oversized");
         }
         Ok(())
     }
@@ -254,5 +300,60 @@ mod tests {
         assert_eq!(cfg.effective_window(0), cfg.chat_window_default);
         assert_eq!(cfg.effective_window(5), 5);
         assert_eq!(cfg.effective_window(9999), cfg.chat_window_max);
+    }
+
+    #[test]
+    fn rejects_zero_store_batch_size() {
+        let cfg = SyncConfig {
+            store_insert_batch_size: 0,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("store_batch_size_zero"));
+    }
+
+    #[test]
+    fn accepts_batch_size_one_as_disable_batching() {
+        let cfg = SyncConfig {
+            store_insert_batch_size: 1,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_oversized_store_batch_size() {
+        let cfg = SyncConfig {
+            store_insert_batch_size: 1025,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("store_batch_size_oversized"));
+        let max_ok = SyncConfig {
+            store_insert_batch_size: 1024,
+            ..SyncConfig::default()
+        };
+        assert_eq!(max_ok.validate(), Ok(()));
+    }
+
+    #[test]
+    fn accepts_zero_dedup_cache_as_disabled() {
+        let cfg = SyncConfig {
+            early_event_id_dedup_cache_entries: 0,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_oversized_dedup_cache() {
+        let cfg = SyncConfig {
+            early_event_id_dedup_cache_entries: 1_000_001,
+            ..SyncConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err("early_dedup_cache_oversized"));
+        let max_ok = SyncConfig {
+            early_event_id_dedup_cache_entries: 1_000_000,
+            ..SyncConfig::default()
+        };
+        assert_eq!(max_ok.validate(), Ok(()));
     }
 }
