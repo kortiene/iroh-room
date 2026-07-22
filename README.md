@@ -200,6 +200,7 @@ crates/iroh-rooms-cli/    CLI binary: identity, room, file, pipe, agent
 crates/iroh-rooms/        Rust SDK facade and examples
 crates/spike-nat/         Real-network NAT measurement harness
 crates/spike-transport/   Full-mesh versus gossip transport comparison
+crates/spike-N40/         Loopback harness measuring where v1 transport breaks at N=40
 specs/                    Implementation specs and acceptance criteria
 docs/                     Guides, operations docs, ADRs, release records
 scripts/                  Verification and release scripts
