@@ -15,7 +15,7 @@
 use core::cmp::Ordering;
 
 use crate::cbor::{self, CborValue};
-use crate::domain::{self, MERKLE_EMPTY, MERKLE_KEY, MERKLE_LEAF, MERKLE_NODE};
+use crate::domain::{self, LEGACY_MERKLE_NODE, MERKLE_EMPTY, MERKLE_KEY, MERKLE_LEAF};
 use crate::error::Reject;
 use crate::ids::{MerkleRoot, LEN};
 
@@ -78,11 +78,11 @@ pub fn leaf_hash(key: &Key, value_hash: &Hash) -> Hash {
     *hasher.finalize().as_bytes()
 }
 
-/// The internal-node hash: `BLAKE3(MERKLE_NODE || left || right)` (D7).
+/// The internal-node hash: `BLAKE3(LEGACY_MERKLE_NODE || left || right)` (D7).
 #[must_use]
 pub fn node_hash(left: &Hash, right: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(MERKLE_NODE);
+    hasher.update(LEGACY_MERKLE_NODE);
     hasher.update(left);
     hasher.update(right);
     *hasher.finalize().as_bytes()

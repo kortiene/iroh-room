@@ -33,7 +33,7 @@
     "SNAPSHOT_HASH": "iroh-rooms:v2:snapshot-hash:v1",
     "MERKLE_EMPTY": "iroh-rooms:v2:merkle:empty:v1",
     "MERKLE_LEAF": "iroh-rooms:v2:merkle:leaf:v1",
-    "MERKLE_NODE": "iroh-rooms:v2:merkle:node:v1",
+    "LEGACY_MERKLE_NODE": "iroh-rooms:v2:merkle:node:v1",
     "MERKLE_KEY": "iroh-rooms:v2:merkle:key:v1",
     "FORK_RESOLVE_SIGN": "iroh-rooms:v2:fork-resolve:sign:v1",
     "FORK_RESOLVE_ID": "iroh-rooms:v2:fork-resolve:id:v1"

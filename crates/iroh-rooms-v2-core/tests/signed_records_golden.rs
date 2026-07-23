@@ -571,9 +571,9 @@ fn all_domain_constants_match_golden_vectors() {
         domain::MERKLE_LEAF,
     );
     assert_domain(
-        "MERKLE_NODE",
+        "LEGACY_MERKLE_NODE",
         "iroh-rooms:v2:merkle:node:v1",
-        domain::MERKLE_NODE,
+        domain::LEGACY_MERKLE_NODE,
     );
     assert_domain(
         "MERKLE_KEY",

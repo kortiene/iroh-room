@@ -228,6 +228,14 @@ The issue names `CommunityId derivation`; current code exposes `RoomId` and `dom
 
 If #146 later introduces a dedicated `CommunityId`, update the vector names and test type while preserving the frozen byte/hash expectation or bumping schema version if semantics changed.
 
+> **Update (#146 landed):** #146 *did* introduce a distinct `CommunityId` type (and
+> `GovernanceId`/`StreamId`/`EventId`/`CheckpointId`/`ReplicaId`) in `src/ids.rs`, derived
+> under the frozen `iroh-room-v2/community` domain. The #153 signed-record vectors here
+> deliberately **retain `RoomId` / `domain::ROOM_ID`** for the community vector during the
+> legacy compatibility period (both are still byte-pinned), so this vector's name, type, and
+> frozen bytes are unchanged. The dedicated `CommunityId` derivation is covered by its own
+> frozen fixture in `tests/golden/v2-identifiers.json` (issue #146).
+
 ### D6 — MemberRecord is a projection/leaf vector, not a signed envelope, in current code
 
 Issue #153 lists `MemberRecord` alongside signed record types. Current code has:
@@ -589,7 +597,7 @@ This planning phase should not run implementation tests unless a later phase act
 
 ## 10. Open questions
 
-- **OQ-1:** Does #146 finalize a distinct `CommunityId` type or keep the current `RoomId` naming?
+- **OQ-1:** ~~Does #146 finalize a distinct `CommunityId` type or keep the current `RoomId` naming?~~ **Resolved by #146.** #146 adds a distinct `CommunityId` type under the frozen `iroh-room-v2/community` domain (covered by `tests/golden/v2-identifiers.json`). The #153 signed-record vectors retain `RoomId`/`ROOM_ID` unchanged for the legacy compatibility period; see D5.
 - **OQ-2:** Does #151 require a separately signed `MemberRecord`, or is the member projection/Merkle leaf the intended pinned record boundary?
 - **OQ-3:** Which exact #134 §6.4 rejection rules are normative beyond the current `Reject` enum, and should any current `Reject` codes be split or renamed before vectors freeze?
 - **OQ-4:** Should fixtures be JSON with a dev-only parser, CBOR/hex-only files, or Rust constants plus documentation JSON?

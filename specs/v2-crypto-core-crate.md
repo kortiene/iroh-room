@@ -138,6 +138,14 @@ Every cryptographic boundary must have an explicit context string. Candidate con
 
 Open question OQ-1 tracks whether these exact strings match the July 2026 decision record/#134 text.
 
+> **Update (#146 landed):** #134 §6.2 freezes a different, normative set — the eleven
+> `iroh-room-v2/<kind>` strings (e.g. `iroh-room-v2/community`, `iroh-room-v2/governance-entry`,
+> `iroh-room-v2/content-event`, `iroh-room-v2/merkle-node`, …). These live in
+> `crates/iroh-rooms-v2-core/src/domain.rs` and drive v2 **identifier derivation**; the
+> candidate strings in the table above survive only as private compatibility aliases for the
+> already-frozen #153 signed-record signing contexts, pending a follow-up reconciliation pass.
+> See `specs/v2-identifiers-domain-separation.md` §15.
+
 ### D4 — Governance state is a deterministic pure fold
 
 The crate exposes a fold that consumes a set or sequence of validated governance entries and returns:
@@ -600,7 +608,7 @@ The `cargo tree` result must be inspected or machine-checked for banned dependen
 - [ ] `crates/iroh-rooms-v2-core/Cargo.toml` has `publish = false`.
 - [ ] The crate builds cleanly under workspace CI.
 - [ ] The crate has no dependency on `iroh`, `iroh-blobs`, `iroh-gossip`, `tokio`, `rusqlite`, or runtime/store crates.
-- [ ] #146 identifiers/domain separation implemented and pinned by vectors.
+- [x] #146 identifiers/domain separation implemented and pinned by vectors (eleven frozen `iroh-room-v2/...` domain strings; `CommunityId`/`GovernanceId`/`StreamId`/`EventId`/`CheckpointId`/`ReplicaId` newtypes with typed derivation helpers; golden vectors in `tests/identifiers.rs` + `tests/golden/v2-identifiers.json`; see `specs/v2-identifiers-domain-separation.md` §15).
 - [ ] #147 governance entry/approval/state-root implemented and pinned by vectors.
 - [ ] #148 authorization rules implemented with exhaustive allow/deny tests.
 - [ ] #149 fork detection and `fork.resolve` implemented with fail-closed unresolved-fork behavior.
@@ -690,7 +698,7 @@ Because no production runtime consumes the crate at initial landing, rollback is
 
 ## 15. Open questions
 
-- **OQ-1:** What are the exact domain-separation strings from #134/#146? The table in D3 is a candidate and must be reconciled before code lands.
+- **OQ-1:** ~~What are the exact domain-separation strings from #134/#146? The table in D3 is a candidate and must be reconciled before code lands.~~ **Resolved by #146.** #134 §6.2 freezes eleven `iroh-room-v2/<kind>` strings (see D3 update above and `specs/v2-identifiers-domain-separation.md`); the D3 candidate strings remain only as legacy compatibility aliases.
 - **OQ-2:** What is the exact v2 key model: v1-style identity key plus device key, or a changed principal/device model?
 - **OQ-3:** What exact governance actions and approval thresholds does #134 §7 define?
 - **OQ-4:** Does `state_root` commit to unresolved fork evidence directly, or only to accepted/resolved governance state plus a separate fork set?

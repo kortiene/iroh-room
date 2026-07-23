@@ -64,12 +64,16 @@ pub mod governance;
 pub mod ids;
 pub mod keys;
 pub mod member;
+pub mod schema;
 pub mod signed;
 
 pub use error::Reject;
 
 /// Re-export of the principal/identity public-key type used across the crate.
 pub use ids::{MemberId, PrincipalId};
+
+/// Re-export of the #134 §6.3 frozen v2 identifier newtypes (issue #146).
+pub use ids::{CheckpointId, CommunityId, EventId, GovernanceId, ReplicaId, StreamId};
 
 /// The canonical CBOR value type (spec §6.2).
 pub use cbor::CborValue;
