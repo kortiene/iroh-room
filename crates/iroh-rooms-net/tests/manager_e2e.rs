@@ -401,6 +401,83 @@ async fn managed_room_auto_dials_active_member() {
     member_node.shutdown().await.expect("shutdown member");
 }
 
+#[cfg(feature = "gossip_overlay")]
+async fn wait_for_gossip_neighbors(node: &Node, expected: usize, budget: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if node.gossip_neighbor_count() == expected {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Review regressions for the managed gossip lifecycle:
+///
+/// * the first node's initial subscription fails while its seed is unreachable,
+///   then a later reconcile tick retries successfully;
+/// * the second node reaches that first seed using only its explicit loopback
+///   `addr_hint`, proving the hint was registered with iroh's address lookup;
+/// * removing the member invalidates the topic epoch and drops the live gossip
+///   neighbor on both sides, so the removed peer cannot keep receiving Events.
+#[cfg(feature = "gossip_overlay")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gossip_mesh_retries_with_addr_hints_and_tears_down_on_revocation() {
+    let admin = Actor::new(0x41);
+    let member = Actor::new(0x42);
+    let (room_id, genesis_id, genesis_bytes) = mk_genesis(&admin);
+    let (invite_id, invite_bytes) =
+        mk_invite(&admin, room_id, &[genesis_id], member.identity(), 1, T0 + 1);
+    let (join_id, join_bytes) = mk_join(&member, room_id, &[invite_id], 1, T0 + 2);
+    let events = [genesis_bytes, invite_bytes, join_bytes];
+
+    // Admin knows the member only by id. Let the initial 5-second gossip join
+    // timeout elapse so success below necessarily comes from a retry.
+    let admin_node = spawn_room_node(&admin, make_engine(room_id, &events), vec![]).await;
+    let admin_addr = admin_node.endpoint_addr().expect("admin addr");
+    tokio::time::sleep(Duration::from_millis(5_500)).await;
+    assert_eq!(admin_node.gossip_neighbor_count(), 0);
+
+    // Member has the one explicit address hint. The managed Node wiring adds it
+    // to iroh's MemoryLookup before subscribing by EndpointId.
+    let member_node =
+        spawn_room_node(&member, make_engine(room_id, &events), vec![admin_addr]).await;
+    assert!(
+        wait_for_gossip_neighbors(&admin_node, 1, WAIT).await,
+        "admin retry must form a gossip neighbor after member comes online"
+    );
+    assert!(
+        wait_for_gossip_neighbors(&member_node, 1, WAIT).await,
+        "member must bootstrap gossip through its explicit address hint"
+    );
+
+    let (remove_id, remove_bytes) =
+        mk_remove(&admin, room_id, &[join_id], member.identity(), T0 + 3);
+    admin_node
+        .publish(remove_bytes)
+        .await
+        .expect("publish member.removed");
+    member_node
+        .wait_until_contains(remove_id, WAIT)
+        .await
+        .expect("removed member learns the revocation before link teardown");
+
+    assert!(
+        wait_for_gossip_neighbors(&admin_node, 0, WAIT).await,
+        "admin must unsubscribe/restart without the removed neighbor"
+    );
+    assert!(
+        wait_for_gossip_neighbors(&member_node, 0, WAIT).await,
+        "removed peer's gossip neighbor must be disconnected"
+    );
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    member_node.shutdown().await.expect("shutdown member");
+}
+
 // ===========================================================================
 // AC2: unknown inbound rejected by the live SnapshotAdmission
 // ===========================================================================

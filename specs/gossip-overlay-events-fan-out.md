@@ -55,7 +55,7 @@ that fails admission at the connection level never reaches the gossip layer.
 | ALPN registration | One `Endpoint`, one `Router`, `.accept()` chain: `EVENT_ALPN` → `PIPE_ALPN` → `iroh_blobs::ALPN` | `crates/iroh-rooms-net/src/transport.rs:766-778`; ALPN constant `alpn.rs:14` | **Extended: add `GOSSIP_ALPN` accept chain (D2).** |
 | PeerManager (warm dial set) | `desired_devices` = every Active member device minus self; `reconcile` starts/stops one `dial_loop` per device | `crates/iroh-rooms-net/src/manager.rs:84-175` | **Rearchitected: dial a seed subset, not every active member (D3).** |
 | Active-member ceiling | `MAX_ACTIVE_MEMBERS = 5`; fold enforces `RejectReason::RoomFull`; `ACTIVE_MEMBER_WARNING_THRESHOLD = 4` | `crates/iroh-rooms-core/src/membership/model.rs:14-22` | **Raised last, behind a feature flag, after the overlay is proven (D4/D7).** |
-| Provisional join-bootstrap gate | `provisional_allows` permits `Events`/`AdminTip`/`Heads`/`NotFound` to a provisional dialer; `WantMembership` only after capability proven | `crates/iroh-rooms-net/src/node.rs:1558-1571` | Behavior preserved; see §6.4 for the provisional-over-gossip interaction. |
+| Provisional join-bootstrap gate | `provisional_allows` permits `Events`/`AdminTip`/`Heads`/`NotFound` on the point-to-point event plane; `WantMembership` only after capability proven | `crates/iroh-rooms-net/src/node.rs:1558-1571` | The event-plane bootstrap behavior is preserved. The gossip ALPN requires full admission and rejects provisional peers before delegation; see §6.5. |
 | Connection generation guard (#126) | `register_link` stamps a monotonic generation; `teardown_if_current` no-ops a superseded link | `crates/iroh-rooms-net/src/transport.rs:451-475` | Unchanged. Gossip neighbor up/down is a separate signal (D8). |
 | iroh-gossip 0.101 API recon | `Gossip::builder().spawn(endpoint)`; `subscribe(TopicId, bootstrap)` → `GossipTopic::split()` → `(GossipSender, GossipReceiver)`; `Event::Received(Message{content,..})`, `Event::Lagged`, `Event::NeighborUp/Down`; `GossipReceiver::joined()` is load-bearing for topology formation | `crates/spike-transport/src/gossip.rs:82-148`, `crates/spike-transport/NOTES.md` §1, §6 surprise 1 | **Reused verbatim** as the integration template. |
 | Open-topic admission weakness (measured) | An interloper that knows only the 32-byte `TopicId` + one bootstrap addr joins and publishes; no identity check anywhere in gossip's join/publish path | `crates/spike-transport/NOTES.md` §3 auth row, §4; `tests/self_check.rs::gossip_admits_interloper_with_no_auth_check` | **Closed by D2** (gossip ALPN admission wrapper). |
@@ -332,12 +332,13 @@ Mapping:
 - **`Received`**: decode `content` as a `SyncMessage` (the body is the same canonical CBOR the
   sender encoded in D1). Hand the decoded frame to the engine via the **existing inbound
   sink** — `Shared::try_enqueue_inbound(delivered_from_as_peer_id, content_bytes)` — so the
-  engine-driver pump processes it through the same `on_message` path, the same
-  `provisional_allows` gate, the same counters, and the same audit hooks as a point-to-point
-  frame. This keeps the engine sans-IO and the trust boundary (re-validate every `WireEvent`
-  on accept) byte-identical. **Critical:** `delivered_from` is the gossip neighbor that handed
-  us the frame, *not* necessarily the original author; the engine already keys dedup on
-  `event_id`, not on the delivering peer, so this is correct.
+  engine-driver pump processes it through the same `on_message` path, counters, and audit
+  hooks as a point-to-point frame. Gossip neighbors are fully admitted before subscription;
+  the receiver also re-checks current admission before enqueueing as defense in depth. This
+  keeps the engine sans-IO and the trust boundary (re-validate every `WireEvent` on accept)
+  byte-identical. **Critical:** `delivered_from` is the gossip neighbor that handed us the
+  frame, *not* necessarily the original author; the engine already keys dedup on `event_id`,
+  not on the delivering peer, so this is correct.
 - **`Lagged`**: audit `transport.queue.saturated` (queue label `gossip`) and trigger an
   anti-entropy pull — issue `WantMembership` + `WantRecentChat` to a warm seed (D3), exactly
   the recovery path the mesh uses on reconnect. `Lagged` is the gossip equivalent of the mesh's
@@ -468,14 +469,17 @@ existing `PeerConnState` trichotomy.
 
 ### 6.5 Provisional join-bootstrap interaction
 
-`provisional_allows` (`node.rs:1558-1571`) already permits `SyncMessage::Events` to a
-provisional dialer. Under the overlay, a provisionally-admitted device that subscribes the
-gossip topic will receive live `Events` broadcasts — consistent with today's behavior (the
-provisional peer may push its `member.joined` and receive `Events`/`AdminTip`/`Heads`/
-`NotFound`). The capability-proof gate (`#112`) and the upgrade-on-learn path (`#121`) are
-unchanged because they operate at the engine layer, below the transport's routing decision.
-**Pin a test**: a provisional dialer receives a gossip `Events` broadcast but its
-`WantMembership` is still gated on capability proof.
+`provisional_allows` (`node.rs:1558-1571`) continues to permit the bootstrap response set on
+the point-to-point `EVENT_ALPN` path. A provisionally admitted device must **not** subscribe
+to the room's public gossip topic: the topic carries the room's live event stream and has no
+per-message authorization boundary. `GossipProtocolHandler` therefore treats
+`AdmitProvisional` as unauthorized, records `gossip_topic_rejected`, closes with
+`REJECT_CODE`, and does not delegate to iroh-gossip. Once the membership fold upgrades the
+device to fully admitted, it may reconnect and subscribe normally. The capability-proof gate
+(`#112`) and upgrade-on-learn path (`#121`) remain unchanged on the event plane.
+
+**Pin a test**: a provisional gossip connection is rejected before the inner protocol handler
+runs, while the existing point-to-point provisional bootstrap tests remain green.
 
 ### 6.6 Migration / rollout / rollback
 

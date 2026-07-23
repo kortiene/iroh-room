@@ -319,6 +319,15 @@ are ever exchanged with an unadmitted device. Pinned by
 `gossip_alpn_reject_propagates_the_admission_cause` (loopback QUIC), plus a
 loopback delivery test `gossip_overlay_broadcast_delivers_events_to_inbound_sink`.
 
+**Review hardening:** provisional devices are rejected on `GOSSIP_ALPN` before
+delegation (their bounded bootstrap remains on `EVENT_ALPN`); membership revocation
+invalidates the current subscription and tears down its neighbor links; failed
+subscriptions retry on the reconciler tick and consume the room address hints. Pulls
+to admitted non-seed members use bounded, idle-expiring on-demand event links instead
+of being dropped. Both gossip send and receive paths enforce `MAX_FRAME_BYTES`, the
+receiver re-checks live admission, and mesh receiver tasks hold only the neighbor
+counter rather than the mesh itself so removing a mesh does not create an `Arc` cycle.
+
 **What did NOT change (deliberately deferred — see spec D4):**
 
 - `MAX_ACTIVE_MEMBERS` is **still 5**. The cap raise is Phase C, its own

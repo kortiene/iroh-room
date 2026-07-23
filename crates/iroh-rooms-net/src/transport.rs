@@ -12,6 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(feature = "gossip_overlay")]
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -289,6 +291,10 @@ pub struct Shared {
     /// broadcast mesh in O(1).
     #[cfg(feature = "gossip_overlay")]
     pub(crate) gossip_state: crate::gossip::GossipState,
+    /// Weak back-reference used only to start bounded on-demand event links for
+    /// pull/query traffic. Weak avoids `Shared <-> PeerManager` ownership cycles.
+    #[cfg(feature = "gossip_overlay")]
+    peer_manager: Mutex<Option<Weak<crate::manager::PeerManager>>>,
 }
 
 /// The consumer side of the inbound byte-priority queue, owned by the engine
@@ -321,6 +327,16 @@ pub(crate) enum LinkTeardown {
 }
 
 impl Shared {
+    /// Install the managed-room dial owner after both `Shared` and
+    /// `PeerManager` have been placed in `Arc`s.
+    #[cfg(feature = "gossip_overlay")]
+    pub(crate) fn set_peer_manager(&self, manager: Weak<crate::manager::PeerManager>) {
+        *self
+            .peer_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manager);
+    }
+
     /// Register a peer's outbound frame queue (replaces any prior queue for the
     /// device — last writer wins on a double-connect, spec OQ-4). Closing the
     /// superseded queue wakes its writer task so it does not outlive the link
@@ -448,6 +464,17 @@ impl Shared {
                     self.audit.transport_queue_saturated(device, "outbound");
                     self.close_connection(device);
                 }
+            }
+        } else {
+            #[cfg(feature = "gossip_overlay")]
+            if let Some(manager) = self
+                .peer_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                manager.route_on_demand(out.clone());
             }
         }
         // No live writer ⇒ peer offline ⇒ drop (engine re-pulls on reconnect).
@@ -829,6 +856,8 @@ impl NetTransport {
             inbound,
             #[cfg(feature = "gossip_overlay")]
             gossip_state: crate::gossip::GossipState::with_actor(gossip_actor),
+            #[cfg(feature = "gossip_overlay")]
+            peer_manager: Mutex::new(None),
         });
 
         // One Endpoint, one Router serving both planes (ADR-1): the event ALPN is
@@ -1108,6 +1137,8 @@ mod tests {
             inbound,
             #[cfg(feature = "gossip_overlay")]
             gossip_state: crate::gossip::GossipState::inert(),
+            #[cfg(feature = "gossip_overlay")]
+            peer_manager: Mutex::new(None),
         });
         (shared, InboundReceiver { rx: inbound_rx })
     }
@@ -1349,6 +1380,8 @@ mod tests {
             inbound,
             #[cfg(feature = "gossip_overlay")]
             gossip_state: crate::gossip::GossipState::inert(),
+            #[cfg(feature = "gossip_overlay")]
+            peer_manager: Mutex::new(None),
         });
         let mut rx = InboundReceiver { rx: inbound_rx };
 
@@ -1946,7 +1979,7 @@ mod tests {
     #[cfg(feature = "gossip_overlay")]
     mod gossip_admission {
         use super::*;
-        use crate::admission::{Admission, AllowlistAdmission, RejectCause};
+        use crate::admission::{Admission, AdmissionDecision, AllowlistAdmission, RejectCause};
         use crate::alpn::GOSSIP_ALPN;
         use crate::audit::AuditSink;
         use crate::gossip::{spawn_gossip_actor, GossipProtocolHandler};
@@ -2005,6 +2038,7 @@ mod tests {
                 generations: Mutex::new(HashMap::new()),
                 inbound,
                 gossip_state: crate::gossip::GossipState::inert(),
+                peer_manager: Mutex::new(None),
             })
         }
 
@@ -2016,6 +2050,14 @@ mod tests {
                 .next()
                 .expect("bound UDP socket");
             EndpointAddr::new(ep.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        }
+
+        struct ProvisionalAdmission;
+
+        impl Admission for ProvisionalAdmission {
+            fn authorize(&self, _device: EndpointId) -> AdmissionDecision {
+                AdmissionDecision::AdmitProvisional
+            }
         }
 
         /// Issue #171 / spec §4 D2 (Risk 1 — non-negotiable): a `GOSSIP_ALPN`
@@ -2105,6 +2147,65 @@ mod tests {
                 shared.table.state_of(dialer_id),
                 Some(PeerConnState::Unauthorized),
                 "a rejected GOSSIP_ALPN device must be marked Unauthorized"
+            );
+        }
+
+        /// Review regression: an open join window may provisionally admit an
+        /// unknown device on `EVENT_ALPN`, but gossip has no membership-only
+        /// capability protocol. The same verdict must therefore be rejected
+        /// before the inner gossip handler sees the connection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_alpn_rejects_provisional_device_before_delegate() {
+            let server_sk = SecretKey::from_bytes(&[0x75; 32]);
+            let dialer_sk = SecretKey::from_bytes(&[0x76; 32]);
+            let server_id = server_sk.public();
+            let dialer_id = dialer_sk.public();
+            let spy = Arc::new(SpyAudit::default());
+            let shared = make_shared_with_gate(
+                server_id,
+                Arc::new(ProvisionalAdmission),
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            );
+
+            let server_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(server_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("server bind");
+            let gossip = spawn_gossip_actor(server_ep.clone());
+            let _router = Router::builder(server_ep.clone())
+                .accept(
+                    GOSSIP_ALPN,
+                    GossipProtocolHandler::new(shared.clone(), gossip),
+                )
+                .spawn();
+            let dialer_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(dialer_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("dialer bind");
+            let conn = dialer_ep
+                .connect(loopback_addr(&server_ep), GOSSIP_ALPN)
+                .await
+                .expect("dialer connect");
+
+            let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .expect("provisional gossip connection must close");
+            assert!(matches!(
+                closed,
+                ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+                    if error_code == REJECT_CODE
+            ));
+            assert_eq!(
+                spy.topic_rejected.lock().unwrap().as_slice(),
+                &[(dialer_id, RejectCause::UnknownDevice)]
+            );
+            assert_eq!(
+                shared.table.state_of(dialer_id),
+                Some(PeerConnState::Unauthorized)
             );
         }
 
@@ -2336,6 +2437,7 @@ mod tests {
                 generations: Mutex::new(HashMap::new()),
                 inbound,
                 gossip_state: crate::gossip::GossipState::with_actor(gossip.clone()),
+                peer_manager: Mutex::new(None),
             });
 
             let handler = GossipProtocolHandler::new(shared.clone(), gossip);
@@ -2477,6 +2579,93 @@ mod tests {
                 delivered.peer.as_bytes(),
                 a_id.as_bytes(),
                 "delivered_from must be A's device id (B's only gossip neighbor)"
+            );
+        }
+
+        /// Review regression: both sides of the gossip boundary enforce the
+        /// direct event-plane `MAX_FRAME_BYTES` contract. The public sender
+        /// refuses an oversized body, and even a bypassed/raw gossip sender
+        /// cannot enqueue that body into the receiver's inbound sink.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_overlay_rejects_oversized_bodies_on_send_and_receive() {
+            let room = RoomId::from_bytes([0xAF; 32]);
+            let a_seed = 0x63;
+            let b_seed = 0x64;
+            let spy = Arc::new(BroadcastSpy::default());
+            let (a_shared, _a_rx, a_ep, _a_router) = spawn_overlay_node_with_audit(
+                a_seed,
+                &[a_seed, b_seed],
+                vec![],
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            )
+            .await;
+            let (b_shared, mut b_rx, _b_ep, _b_router) =
+                spawn_overlay_node(b_seed, &[a_seed, b_seed], vec![loopback_addr(&a_ep)]).await;
+
+            let a_mesh = GossipMesh::spawn(
+                a_shared.clone(),
+                a_shared.gossip_state.actor().unwrap().clone(),
+                room,
+                vec![],
+            )
+            .await
+            .expect("A mesh");
+            a_shared.gossip_state.install_mesh(room, a_mesh.clone());
+            let b_mesh = GossipMesh::spawn(
+                b_shared.clone(),
+                b_shared.gossip_state.actor().unwrap().clone(),
+                room,
+                vec![a_ep.id()],
+            )
+            .await
+            .expect("B mesh");
+            b_shared.gossip_state.install_mesh(room, b_mesh);
+            assert!(wait_for_neighbors(&a_shared, 1, WAIT).await);
+
+            let oversized = vec![0xCD; crate::frame::MAX_FRAME_BYTES as usize + 1];
+            a_mesh.broadcast_events(
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+                a_ep.id(),
+                oversized.clone(),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(spy.outcomes(), 0, "sender must not call iroh-gossip");
+
+            a_mesh
+                .broadcast_unchecked_for_test(oversized)
+                .await
+                .expect("raw test broadcast reaches receiver guard");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), b_rx.recv())
+                    .await
+                    .is_err(),
+                "receiver must not enqueue an oversized gossip body"
+            );
+        }
+
+        /// Review regression: the receiver task must not own its parent mesh.
+        /// Removing the final map/local handles drops the mesh immediately and
+        /// aborts the task instead of leaving a self-sustaining Arc cycle.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn removing_mesh_breaks_receiver_task_ownership() {
+            let room = RoomId::from_bytes([0xB0; 32]);
+            let (shared, _rx, _ep, _router) = spawn_overlay_node(0x65, &[0x65], vec![]).await;
+            let mesh = GossipMesh::spawn(
+                shared.clone(),
+                shared.gossip_state.actor().unwrap().clone(),
+                room,
+                vec![],
+            )
+            .await
+            .expect("mesh");
+            let weak = Arc::downgrade(&mesh);
+            shared.gossip_state.install_mesh(room, mesh.clone());
+            drop(mesh);
+            drop(shared.gossip_state.remove_mesh(&room));
+            tokio::task::yield_now().await;
+            assert!(
+                weak.upgrade().is_none(),
+                "receiver task must not retain its GossipMesh"
             );
         }
 

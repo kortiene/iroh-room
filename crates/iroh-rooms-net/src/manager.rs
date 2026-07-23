@@ -19,8 +19,13 @@ use std::sync::{Arc, Mutex};
 
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_rooms_core::membership::MembershipSnapshot;
+#[cfg(feature = "gossip_overlay")]
+use iroh_rooms_core::sync::{Outgoing, SyncMessage};
+#[cfg(feature = "gossip_overlay")]
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::admission::AdmissionDecision;
 use crate::peer::dial_loop;
 use crate::state::{OfflineReason, PeerConnState};
 use crate::transport::Shared;
@@ -45,6 +50,13 @@ pub const GOSSIP_BOOTSTRAP_SEEDS: usize = 3;
 /// regardless of N.
 pub const MAX_ON_DEMAND_LINKS: usize = 8;
 
+/// Number of pull/query frames that may wait for one on-demand connection to
+/// come up. Each frame is independently bounded by `MAX_FRAME_BYTES`; keeping
+/// this queue small prevents an unreachable non-seed from accumulating
+/// unbounded engine output.
+#[cfg(feature = "gossip_overlay")]
+const ON_DEMAND_PENDING_FRAMES: usize = 16;
+
 /// One running managed dial loop: the task handle and the address it is dialing.
 struct DialEntry {
     handle: JoinHandle<()>,
@@ -52,6 +64,12 @@ struct DialEntry {
     /// could be detected (spec §4.2 step 4 / D4; a no-op while hints are immutable).
     #[allow(dead_code)]
     addr: EndpointAddr,
+}
+
+#[cfg(feature = "gossip_overlay")]
+struct OnDemandEntry {
+    tx: mpsc::Sender<Outgoing>,
+    handle: JoinHandle<()>,
 }
 
 /// Room-scoped manager of the outbound dial set (spec §4.1).
@@ -72,6 +90,14 @@ pub struct PeerManager {
     /// Operator-supplied addressing hints (`--peer`), by device id. Immutable for a
     /// session (spec D4).
     addr_hints: HashMap<EndpointId, EndpointAddr>,
+    /// Full admitted-member set. Warm dials use only `desired_seeds`, while
+    /// this set authorizes lazy point-to-point pulls to non-seeds.
+    #[cfg(feature = "gossip_overlay")]
+    active_links: Mutex<BTreeSet<EndpointId>>,
+    /// Lazily-created, quiescence-bounded `EVENT_ALPN` links for pull/query
+    /// variants targeting active members outside the warm seed set.
+    #[cfg(feature = "gossip_overlay")]
+    on_demand: Mutex<HashMap<EndpointId, OnDemandEntry>>,
 }
 
 impl PeerManager {
@@ -91,6 +117,10 @@ impl PeerManager {
             self_device,
             dials: Mutex::new(HashMap::new()),
             addr_hints,
+            #[cfg(feature = "gossip_overlay")]
+            active_links: Mutex::new(BTreeSet::new()),
+            #[cfg(feature = "gossip_overlay")]
+            on_demand: Mutex::new(HashMap::new()),
         }
     }
 
@@ -195,6 +225,39 @@ impl PeerManager {
     ///   `Offline{Deauthorized}`, and audit `peer.deauthorized` — for each running
     ///   loop whose device is no longer desired (removed / left the room).
     pub fn reconcile(&self, snapshot: &MembershipSnapshot) {
+        self.reconcile_inner(snapshot, false);
+    }
+
+    /// Production reconcile after the room driver has refreshed the live
+    /// admission cell. In addition to membership removal, this tears down
+    /// fail-closed subjects that remain nominally Active in the fold.
+    pub(crate) fn reconcile_admitted(&self, snapshot: &MembershipSnapshot) {
+        self.reconcile_inner(snapshot, true);
+    }
+
+    fn reconcile_inner(&self, snapshot: &MembershipSnapshot, enforce_admission: bool) {
+        // Membership is necessary but not sufficient: fail-closed subjects
+        // remain nominally Active in the fold and must still lose every live
+        // transport. The admission cell is refreshed immediately before this
+        // production entry point is called, so filtering through it ties direct
+        // links to the same revocation lifecycle as the accept gates. The public
+        // `reconcile` keeps its historical pure membership-set contract for
+        // focused manager users/tests that deliberately provide no admission.
+        let membership_links = Self::desired_devices(snapshot, self.self_device);
+        let admitted_links: BTreeSet<EndpointId> = if enforce_admission {
+            membership_links
+                .into_iter()
+                .filter(|device| {
+                    matches!(
+                        self.shared.admission.authorize(*device),
+                        AdmissionDecision::Admit { .. }
+                    )
+                })
+                .collect()
+        } else {
+            membership_links
+        };
+
         // The desired warm dial set: every active member (full mesh) when the
         // gossip overlay is off — the path the v1 spike measured at N≤5. When
         // the overlay is on, only the K-bounded seed subset is dialed warm;
@@ -206,9 +269,37 @@ impl PeerManager {
         // desired set whenever N-1 ≤ K, so the seed selector is a no-op at
         // the current cap.
         #[cfg(feature = "gossip_overlay")]
-        let desired = Self::desired_seeds(snapshot, self.self_device);
+        let desired: BTreeSet<EndpointId> = Self::desired_seeds(snapshot, self.self_device)
+            .intersection(&admitted_links)
+            .copied()
+            .collect();
         #[cfg(not(feature = "gossip_overlay"))]
-        let desired = Self::desired_devices(snapshot, self.self_device);
+        let desired = admitted_links.clone();
+
+        #[cfg(feature = "gossip_overlay")]
+        {
+            self.active_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&admitted_links);
+
+            // A removed/fail-closed peer must lose any transient link too.
+            let mut on_demand = self
+                .on_demand
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale: Vec<_> = on_demand
+                .keys()
+                .filter(|device| !admitted_links.contains(*device))
+                .copied()
+                .collect();
+            for device in stale {
+                if let Some(entry) = on_demand.remove(&device) {
+                    entry.handle.abort();
+                }
+                self.shared.close_connection(device);
+            }
+        }
 
         let mut dials = self
             .dials
@@ -235,10 +326,17 @@ impl PeerManager {
                 self.shared.invalidate_link(device);
                 self.shared.close_connection(device);
                 self.shared.unregister(device);
-                self.shared
-                    .table
-                    .set_offline(device, OfflineReason::Deauthorized, None);
-                self.shared.audit.deauthorized(device);
+                if admitted_links.contains(&device) {
+                    // Still Active but no longer selected as a warm seed.
+                    self.shared
+                        .table
+                        .set_offline(device, OfflineReason::LinkDropped, None);
+                } else {
+                    self.shared
+                        .table
+                        .set_offline(device, OfflineReason::Deauthorized, None);
+                    self.shared.audit.deauthorized(device);
+                }
             }
         }
 
@@ -271,6 +369,77 @@ impl PeerManager {
             .len()
     }
 
+    /// Queue a targeted pull on a bounded, lazy `EVENT_ALPN` link when the peer is
+    /// Active but not currently connected as a warm seed. Called synchronously
+    /// by `Shared::route`; dialing and delivery happen in the spawned task.
+    #[cfg(feature = "gossip_overlay")]
+    pub(crate) fn route_on_demand(&self, out: Outgoing) {
+        if !matches!(
+            &out.msg,
+            SyncMessage::WantMembership { .. }
+                | SyncMessage::WantRecentChat { .. }
+                | SyncMessage::WantEvents { .. }
+        ) {
+            return;
+        }
+        let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
+            return;
+        };
+        if !self
+            .active_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&device)
+        {
+            return;
+        }
+
+        let mut entries = self
+            .on_demand
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|_, entry| !entry.handle.is_finished());
+        if let Some(entry) = entries.get(&device) {
+            if entry.tx.try_send(out).is_err() {
+                self.shared
+                    .audit
+                    .transport_queue_saturated(device, "on_demand");
+            }
+            return;
+        }
+        if entries.len() >= MAX_ON_DEMAND_LINKS {
+            self.shared
+                .audit
+                .transport_queue_saturated(device, "on_demand");
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(ON_DEMAND_PENDING_FRAMES);
+        if tx.try_send(out).is_err() {
+            return;
+        }
+        let handle = tokio::spawn(crate::peer::on_demand_dial(
+            self.shared.clone(),
+            self.endpoint.clone(),
+            self.resolve_addr(device),
+            rx,
+        ));
+        entries.insert(device, OnDemandEntry { tx, handle });
+    }
+
+    /// Number of live/connecting transient links (tests and diagnostics).
+    #[cfg(feature = "gossip_overlay")]
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn on_demand_count(&self) -> usize {
+        self.on_demand
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|entry| !entry.handle.is_finished())
+            .count()
+    }
+
     /// Abort every running dial loop (idempotent; also runs on `Drop`).
     pub fn shutdown(&self) {
         let mut dials = self
@@ -278,6 +447,15 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, entry) in dials.drain() {
+            entry.handle.abort();
+        }
+        #[cfg(feature = "gossip_overlay")]
+        for (_, entry) in self
+            .on_demand
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
             entry.handle.abort();
         }
     }
@@ -289,6 +467,12 @@ impl Drop for PeerManager {
         // beyond Drop is a non-goal, spec N6).
         if let Ok(mut dials) = self.dials.lock() {
             for (_, entry) in dials.drain() {
+                entry.handle.abort();
+            }
+        }
+        #[cfg(feature = "gossip_overlay")]
+        if let Ok(mut on_demand) = self.on_demand.lock() {
+            for (_, entry) in on_demand.drain() {
                 entry.handle.abort();
             }
         }
@@ -312,6 +496,17 @@ mod tests {
     };
     use iroh_rooms_core::event::wire::WireEvent;
     use iroh_rooms_core::membership::RoomMembership;
+    #[cfg(feature = "gossip_overlay")]
+    use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
+    #[cfg(feature = "gossip_overlay")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "gossip_overlay")]
+    use crate::admission::{Admission, AllowlistAdmission};
+    #[cfg(feature = "gossip_overlay")]
+    use crate::audit::TracingAudit;
+    #[cfg(feature = "gossip_overlay")]
+    use crate::transport::{NetConfig, NetTransport};
 
     // Deterministic fixtures shared across the tests below.
     const NONCE: [u8; 16] = [0xcc; 16];
@@ -847,5 +1042,119 @@ mod tests {
         // The per-node transient-dial cap (D3 step 4). K + MAX_ON_DEMAND_LINKS
         // is the total per-node connection count bound.
         assert_eq!(super::MAX_ON_DEMAND_LINKS, 8);
+    }
+
+    /// Review regression: the fourth non-self member at the current five-member
+    /// cap is outside K=3. A targeted pull to that member must create a bounded
+    /// transient link and deliver the frame instead of being silently dropped.
+    #[cfg(feature = "gossip_overlay")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // full queued-dial boundary setup and teardown
+    async fn non_seed_pull_dials_on_demand_and_delivers_queued_frame() {
+        let admin = Actor::new(0x21);
+        let members = [
+            Actor::new(0x22),
+            Actor::new(0x23),
+            Actor::new(0x24),
+            Actor::new(0x25),
+        ];
+        let (room_id, genesis) = mk_genesis(&admin);
+        let mut events = vec![genesis];
+        let mut prev = events[0].event_id;
+        for (index, member) in members.iter().enumerate() {
+            let n = u8::try_from(index + 1).expect("small fixture");
+            let invite = mk_invite(
+                &admin,
+                room_id,
+                &[prev],
+                member.identity(),
+                n,
+                T0 + u64::from(n) * 2 - 1,
+            );
+            let join = mk_join(
+                member,
+                room_id,
+                &[invite.event_id],
+                n,
+                T0 + u64::from(n) * 2,
+            );
+            prev = join.event_id;
+            events.push(invite);
+            events.push(join);
+        }
+        let snapshot = RoomMembership::from_events(room_id, events).snapshot();
+        let desired = PeerManager::desired_devices(&snapshot, admin.endpoint_id());
+        let seeds = PeerManager::desired_seeds(&snapshot, admin.endpoint_id());
+        let omitted = *desired
+            .difference(&seeds)
+            .next()
+            .expect("five-member room has one non-seed target at K=3");
+        let target_actor = members
+            .iter()
+            .find(|member| member.endpoint_id() == omitted)
+            .expect("omitted endpoint belongs to a fixture member");
+
+        let source_gate = members
+            .iter()
+            .fold(AllowlistAdmission::new(), |gate, member| {
+                gate.bind_device(member.endpoint_id(), member.identity())
+                    .set_active(member.identity())
+            });
+        let target_gate = AllowlistAdmission::new()
+            .bind_device(admin.endpoint_id(), admin.identity())
+            .set_active(admin.identity());
+        let mut target = NetTransport::bind(
+            SecretKey::from_bytes(&target_actor.dev_sk.to_seed()),
+            Arc::new(target_gate) as Arc<dyn Admission>,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind target transport");
+        let target_addr = target.endpoint_addr().expect("target loopback address");
+        let mut target_inbound = target.take_inbound().expect("target inbound receiver");
+
+        let source = NetTransport::bind(
+            SecretKey::from_bytes(&admin.dev_sk.to_seed()),
+            Arc::new(source_gate) as Arc<dyn Admission>,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind source transport");
+        let shared = source.shared();
+        let manager = Arc::new(PeerManager::new(
+            shared.clone(),
+            source.endpoint(),
+            source.id(),
+            vec![target_addr],
+        ));
+        shared.set_peer_manager(Arc::downgrade(&manager));
+        manager.reconcile(&snapshot);
+
+        let out = Outgoing {
+            peer: PeerId::from_bytes(*omitted.as_bytes()),
+            msg: SyncMessage::WantMembership {
+                room_id,
+                have: Vec::new(),
+            },
+        };
+        let expected = out.msg.encode();
+        shared.route(&out);
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), target_inbound.recv())
+                .await
+                .expect("on-demand dial must deliver within budget")
+                .expect("target inbound remains open");
+        assert_eq!(delivered.bytes, expected);
+        assert_eq!(manager.on_demand_count(), 1);
+
+        manager.shutdown();
+        source.shutdown().await.expect("source shutdown");
+        target.shutdown().await.expect("target shutdown");
     }
 }

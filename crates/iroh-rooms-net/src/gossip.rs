@@ -47,8 +47,9 @@ use iroh_rooms_core::event::ids::RoomId;
 use n0_future::StreamExt;
 use tokio::task::JoinHandle;
 
-use crate::admission::AdmissionDecision;
+use crate::admission::{AdmissionDecision, RejectCause};
 use crate::alpn::GOSSIP_ALPN;
+use crate::frame::MAX_FRAME_BYTES;
 use crate::handler::REJECT_CODE;
 use crate::peer::peer_id;
 use crate::state::PeerConnState;
@@ -114,11 +115,11 @@ pub fn events_topic(room_id: &RoomId) -> TopicId {
 /// gossip bytes are exchanged with a rejected device; the structural
 /// reject-before-bytes guarantee is preserved.
 ///
-/// On `Admit { identity }` / `AdmitProvisional` the wrapper delegates to the
-/// inner `Gossip` handler, which then runs its own ALPN handshake. A
-/// provisionally-admitted device (the join-bootstrap seam, IR-0104) is allowed
-/// to reach the gossip layer, consistent with the provisional peer receiving
-/// `Events` over the mesh today (spec §6.5).
+/// Only `Admit { identity }` delegates to the inner `Gossip` handler. The event
+/// ALPN has a membership-only provisional protocol, but gossip has no equivalent
+/// per-message capability gate; allowing `AdmitProvisional` here would expose
+/// every room event before the invitee proves its capability. Provisional peers
+/// are therefore rejected as unknown on this ALPN.
 pub struct GossipProtocolHandler {
     shared: Arc<Shared>,
     inner: Gossip,
@@ -163,11 +164,19 @@ impl ProtocolHandler for GossipProtocolHandler {
                 conn.close(REJECT_CODE, b"unauthorized");
                 Ok(())
             }
-            // Admit (Active member) or AdmitProvisional (join bootstrap): let
-            // the inner gossip handler run its own ALPN handshake and forward
-            // the connection to the actor (spec §4 D2 step 3 / §6.5).
-            AdmissionDecision::Admit { .. } | AdmissionDecision::AdmitProvisional => {
-                self.inner.accept(conn).await
+            AdmissionDecision::Admit { .. } => self.inner.accept(conn).await,
+            AdmissionDecision::AdmitProvisional => {
+                // The provisional event-plane protocol is deliberately absent
+                // from gossip. Reject before delegating so the peer exchanges no
+                // gossip bytes and cannot subscribe to the public room topic.
+                self.shared
+                    .audit
+                    .gossip_topic_rejected(device, RejectCause::UnknownDevice);
+                self.shared
+                    .table
+                    .set(device, PeerConnState::Unauthorized, None);
+                conn.close(REJECT_CODE, b"unauthorized");
+                Ok(())
             }
         }
     }
@@ -206,7 +215,7 @@ pub struct GossipMesh {
     receiver_task: Mutex<Option<JoinHandle<()>>>,
     /// Live `gossip-neighbor` count for this topic (`HyParView` partial view),
     /// updated by the receiver task on `NeighborUp` / `NeighborDown`.
-    neighbors: AtomicUsize,
+    neighbors: Arc<AtomicUsize>,
     /// Recent broadcast body hashes (issue #171 dedup). Collapses the N-1
     /// identical bodies the engine's per-peer fan-out produces per accepted
     /// event into a single gossip broadcast. Bounded FIFO; see
@@ -267,11 +276,14 @@ impl GossipMesh {
             room_id,
             sender: Mutex::new(sender),
             receiver_task: Mutex::new(None),
-            neighbors: AtomicUsize::new(initial_neighbors),
+            neighbors: Arc::new(AtomicUsize::new(initial_neighbors)),
             recent_broadcasts: Mutex::new(VecDeque::new()),
         });
 
-        let handle = tokio::spawn(receiver_task(shared, mesh.clone(), receiver));
+        // Pass only the state the task mutates. Capturing `mesh.clone()` here
+        // would form `mesh -> JoinHandle -> task -> mesh`, preventing Drop from
+        // ever aborting the receiver when a room unsubscribes.
+        let handle = tokio::spawn(receiver_task(shared, Arc::clone(&mesh.neighbors), receiver));
         *mesh
             .receiver_task
             .lock()
@@ -296,6 +308,15 @@ impl GossipMesh {
         me: EndpointId,
         body: Vec<u8>,
     ) {
+        if body.len() > MAX_FRAME_BYTES as usize {
+            tracing::warn!(
+                declared = body.len(),
+                max = MAX_FRAME_BYTES,
+                "gossip: dropped oversized outbound frame"
+            );
+            return;
+        }
+
         // Dedup (issue #171): the engine fans an accepted `Events` frame out to
         // every connected peer, so `Shared::route` reaches here once per peer
         // with the *identical* encoded body per event. iroh-gossip 0.101 does
@@ -348,6 +369,21 @@ impl GossipMesh {
     pub fn neighbor_count(&self) -> usize {
         self.neighbors.load(Ordering::Relaxed)
     }
+
+    /// Test seam for exercising the receiver's independent frame-size guard;
+    /// production callers must use [`Self::broadcast_events`].
+    #[cfg(test)]
+    pub(crate) async fn broadcast_unchecked_for_test(&self, body: Vec<u8>) -> Result<()> {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        sender
+            .broadcast(Bytes::from(body))
+            .await
+            .context("unchecked test gossip broadcast")
+    }
 }
 
 impl Drop for GossipMesh {
@@ -383,12 +419,40 @@ impl Drop for GossipMesh {
 ///   pull (D8: same shape as the mesh's "link dropped, re-pull" signal).
 /// - `NeighborUp` / `NeighborDown` → audit + bump/draining the live neighbor
 ///   count.
-async fn receiver_task(shared: Arc<Shared>, mesh: Arc<GossipMesh>, mut receiver: GossipReceiver) {
+async fn receiver_task(
+    shared: Arc<Shared>,
+    neighbors: Arc<AtomicUsize>,
+    mut receiver: GossipReceiver,
+) {
     loop {
         match receiver.next().await {
             Some(Ok(Event::Received(msg))) => {
                 let from = peer_id(msg.delivered_from);
                 let byte_len = msg.content.len();
+                if byte_len > MAX_FRAME_BYTES as usize {
+                    tracing::warn!(
+                        peer = %msg.delivered_from,
+                        declared = byte_len,
+                        max = MAX_FRAME_BYTES,
+                        "gossip: dropped oversized inbound frame"
+                    );
+                    continue;
+                }
+                // Admission is re-checked at delivery time as defense in depth.
+                // The room reconciler also drops/re-subscribes the topic when a
+                // member is revoked, which tears down the actual gossip link;
+                // this check closes the small interval while that async leave is
+                // being processed by iroh-gossip.
+                if !matches!(
+                    shared.admission.authorize(msg.delivered_from),
+                    AdmissionDecision::Admit { .. }
+                ) {
+                    tracing::debug!(
+                        peer = %msg.delivered_from,
+                        "gossip: dropped frame from no-longer-admitted neighbor"
+                    );
+                    continue;
+                }
                 // The same inbound sink the mesh reader task uses. The engine
                 // pump re-decodes, runs `provisional_allows`, re-validates
                 // every `WireEvent`, and dedups by `event_id` (D8).
@@ -410,11 +474,15 @@ async fn receiver_task(shared: Arc<Shared>, mesh: Arc<GossipMesh>, mut receiver:
                 // warm seed link. The trigger is observability-only here.
             }
             Some(Ok(Event::NeighborUp(device))) => {
-                mesh.neighbors.fetch_add(1, Ordering::Relaxed);
+                neighbors.fetch_add(1, Ordering::Relaxed);
                 shared.audit.gossip_neighbor_up(device);
             }
             Some(Ok(Event::NeighborDown(device))) => {
-                mesh.neighbors.fetch_sub(1, Ordering::Relaxed);
+                // Duplicate/down-after-restart notifications must not wrap the
+                // observable count to usize::MAX.
+                let _ = neighbors.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
                 shared.audit.gossip_neighbor_down(device);
             }
             // The receiver errored or ended (topic closed / actor shutdown).
@@ -432,6 +500,10 @@ async fn receiver_task(shared: Arc<Shared>, mesh: Arc<GossipMesh>, mut receiver:
 pub(crate) struct GossipState {
     actor: Option<Gossip>,
     meshes: Mutex<HashMap<RoomId, Arc<GossipMesh>>>,
+    /// Monotonic room subscription epoch. A background join may finish after a
+    /// roster change cancelled it; epochs prevent that stale task from
+    /// reinstalling a mesh that still contains a revoked neighbor.
+    mesh_epochs: Mutex<HashMap<RoomId, u64>>,
 }
 
 impl GossipState {
@@ -440,6 +512,7 @@ impl GossipState {
         Self {
             actor: Some(actor),
             meshes: Mutex::new(HashMap::new()),
+            mesh_epochs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -449,6 +522,7 @@ impl GossipState {
         Self {
             actor: None,
             meshes: Mutex::new(HashMap::new()),
+            mesh_epochs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -459,6 +533,7 @@ impl GossipState {
 
     /// Install (or replace) the per-room mesh. Called by the room-session
     /// driver after [`GossipMesh::spawn`] succeeds.
+    #[cfg(test)]
     pub(crate) fn install_mesh(&self, room_id: RoomId, mesh: Arc<GossipMesh>) {
         self.meshes
             .lock()
@@ -466,11 +541,47 @@ impl GossipState {
             .insert(room_id, mesh);
     }
 
-    /// Remove (and return) the per-room mesh. Called on room teardown /
-    /// unsubscribe. Not yet exercised by the room-session lifecycle in Phase A
-    /// (the mesh lives for the session); the surface is complete so a future
-    /// unsubscribe path can call it without an API change.
-    #[allow(dead_code)]
+    /// Start a new background subscription attempt and invalidate/drop any
+    /// previous room mesh under the same epoch lock used by installation.
+    pub(crate) fn begin_mesh_attempt(&self, room_id: RoomId) -> u64 {
+        let mut epochs = self
+            .mesh_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let epoch = epochs.get(&room_id).copied().unwrap_or(0).wrapping_add(1);
+        epochs.insert(room_id, epoch);
+        self.meshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&room_id);
+        epoch
+    }
+
+    /// Install only if no newer retry/revocation attempt superseded this task.
+    pub(crate) fn install_mesh_if_current(
+        &self,
+        room_id: RoomId,
+        epoch: u64,
+        mesh: Arc<GossipMesh>,
+    ) -> bool {
+        let epochs = self
+            .mesh_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if epochs.get(&room_id).copied() != Some(epoch) {
+            return false;
+        }
+        self.meshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id, mesh);
+        true
+    }
+
+    /// Remove (and return) the per-room mesh. The room reconciler calls this
+    /// before re-subscribing after a member is deauthorized; dropping the topic
+    /// halves makes iroh-gossip leave the topic and tear down obsolete neighbor
+    /// links before the replacement mesh is installed.
     pub(crate) fn remove_mesh(&self, room_id: &RoomId) -> Option<Arc<GossipMesh>> {
         self.meshes
             .lock()
@@ -488,6 +599,16 @@ impl GossipState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(room_id)
             .cloned()
+    }
+
+    /// Whether a room currently has an installed subscription. Unlike
+    /// [`Self::mesh_for`], this does not extend the mesh lifetime while the room
+    /// reconciler decides whether a retry is needed.
+    pub(crate) fn has_mesh(&self, room_id: &RoomId) -> bool {
+        self.meshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(room_id)
     }
 
     /// Point-in-time gossip-neighbor count summed across every installed mesh.
@@ -516,6 +637,14 @@ impl std::fmt::Debug for GossipState {
                 "meshes",
                 &self
                     .meshes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
+            .field(
+                "mesh_epochs",
+                &self
+                    .mesh_epochs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .len(),

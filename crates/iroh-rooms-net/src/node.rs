@@ -26,6 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
+#[cfg(feature = "gossip_overlay")]
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
 use iroh_rooms_core::event::content::{Content, PipeOpened};
@@ -44,6 +46,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+#[cfg(feature = "gossip_overlay")]
+use crate::admission::AdmissionDecision;
 use crate::admission::{Admission, AdmissionView};
 use crate::audit::AuditSink;
 use crate::blob::{self, BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
@@ -137,6 +141,115 @@ struct RoomReconciler {
     /// **not** emit an initial warning — `room members --status` is the
     /// current-state surface for that).
     last_active_member_count: Option<usize>,
+    /// Retryable, revocation-aware room gossip subscription lifecycle.
+    #[cfg(feature = "gossip_overlay")]
+    gossip: Option<GossipReconciler>,
+}
+
+/// Owns the background room-topic subscription. A failed join is retried on a
+/// later pump tick; removal/fail-closed invalidates the current epoch, drops the
+/// topic (tearing down its neighbor links), and starts a clean subscription.
+#[cfg(feature = "gossip_overlay")]
+struct GossipReconciler {
+    shared: Arc<Shared>,
+    actor: iroh_gossip::net::Gossip,
+    room_id: RoomId,
+    self_device: EndpointId,
+    last_admitted: BTreeSet<EndpointId>,
+    attempt: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "gossip_overlay")]
+impl GossipReconciler {
+    fn admitted_devices(&self, snapshot: &MembershipSnapshot) -> BTreeSet<EndpointId> {
+        PeerManager::desired_devices(snapshot, self.self_device)
+            .into_iter()
+            .filter(|device| {
+                matches!(
+                    self.shared.admission.authorize(*device),
+                    AdmissionDecision::Admit { .. }
+                )
+            })
+            .collect()
+    }
+
+    fn reconcile(&mut self, snapshot: &MembershipSnapshot) {
+        let admitted = self.admitted_devices(snapshot);
+        let revoked = self
+            .last_admitted
+            .iter()
+            .any(|device| !admitted.contains(device));
+        self.last_admitted.clone_from(&admitted);
+
+        if revoked {
+            if let Some(attempt) = self.attempt.take() {
+                attempt.abort();
+            }
+            // Invalidate stale background work and drop both topic halves now.
+            // Do not re-subscribe in the same pump turn: iroh-gossip processes
+            // topic-leave asynchronously, and an immediate same-topic join can
+            // keep the revoked neighbor alive by making the topic continuously
+            // needed. The next tick performs the retry after the leave settles.
+            self.shared.gossip_state.begin_mesh_attempt(self.room_id);
+            return;
+        }
+
+        if self.shared.gossip_state.has_mesh(&self.room_id) && !revoked {
+            return;
+        }
+        if self
+            .attempt
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+            && !revoked
+        {
+            return;
+        }
+        self.attempt = None;
+
+        let bootstrap: Vec<_> = PeerManager::desired_seeds(snapshot, self.self_device)
+            .intersection(&admitted)
+            .copied()
+            .collect();
+        let epoch = self.shared.gossip_state.begin_mesh_attempt(self.room_id);
+        let shared = self.shared.clone();
+        let actor = self.actor.clone();
+        let room_id = self.room_id;
+        self.attempt = Some(tokio::spawn(async move {
+            match crate::gossip::GossipMesh::spawn(shared.clone(), actor, room_id, bootstrap).await
+            {
+                Ok(mesh) => {
+                    if !shared
+                        .gossip_state
+                        .install_mesh_if_current(room_id, epoch, mesh)
+                    {
+                        tracing::debug!(
+                            room = %room_id,
+                            "discarded stale gossip mesh subscription"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        reason = "gossip.mesh.spawn_failed",
+                        room = %room_id,
+                        error = %err,
+                        "could not spawn the room events gossip mesh; retrying on a later reconcile tick"
+                    );
+                }
+            }
+        }));
+    }
+}
+
+#[cfg(feature = "gossip_overlay")]
+impl Drop for GossipReconciler {
+    fn drop(&mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            attempt.abort();
+        }
+        let _ = self.shared.gossip_state.remove_mesh(&self.room_id);
+    }
 }
 
 impl RoomReconciler {
@@ -179,6 +292,10 @@ impl RoomReconciler {
         }
 
         if !membership_changed {
+            #[cfg(feature = "gossip_overlay")]
+            if let Some(gossip) = self.gossip.as_mut() {
+                gossip.reconcile(&snapshot);
+            }
             return; // no membership-relevant change since last reconcile
         }
         // Refresh admission first so the accept gate is never *more* permissive than
@@ -187,7 +304,11 @@ impl RoomReconciler {
             .cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = view.clone();
-        self.manager.reconcile(&snapshot);
+        self.manager.reconcile_admitted(&snapshot);
+        #[cfg(feature = "gossip_overlay")]
+        if let Some(gossip) = self.gossip.as_mut() {
+            gossip.reconcile(&snapshot);
+        }
         self.last = Some(view);
     }
 
@@ -505,12 +626,43 @@ impl Node {
                 admission_cell,
                 ..
             }) => {
+                #[cfg(feature = "gossip_overlay")]
+                let gossip = {
+                    // iroh-gossip bootstraps by EndpointId, so explicit
+                    // loopback/LAN `--peer` addresses must be visible through
+                    // the endpoint's lookup services before subscribe/join.
+                    if !addr_hints.is_empty() {
+                        let lookup = MemoryLookup::from_endpoint_info(addr_hints.clone());
+                        match transport.endpoint().address_lookup() {
+                            Ok(services) => services.add(lookup),
+                            Err(err) => tracing::warn!(
+                                reason = "gossip.address_lookup.unavailable",
+                                error = %err,
+                                "could not register room address hints for gossip bootstrap"
+                            ),
+                        }
+                    }
+                    shared
+                        .gossip_state
+                        .actor()
+                        .cloned()
+                        .map(|actor| GossipReconciler {
+                            shared: shared.clone(),
+                            actor,
+                            room_id: *engine.room_id(),
+                            self_device: transport.id(),
+                            last_admitted: BTreeSet::new(),
+                            attempt: None,
+                        })
+                };
                 let manager = Arc::new(PeerManager::new(
                     shared.clone(),
                     transport.endpoint(),
                     transport.id(),
                     addr_hints,
                 ));
+                #[cfg(feature = "gossip_overlay")]
+                shared.set_peer_manager(Arc::downgrade(&manager));
                 let reconciler = RoomReconciler {
                     manager: manager.clone(),
                     cell: admission_cell,
@@ -519,71 +671,13 @@ impl Node {
                     last_referenced: None,
                     audit: transport.shared().audit.clone(),
                     last_active_member_count: None,
+                    #[cfg(feature = "gossip_overlay")]
+                    gossip,
                 };
                 (Some(manager), Some(reconciler))
             }
             None => (None, None),
         };
-
-        // The per-room gossip mesh (issue #171 / spec §4 D1/D5/Step 2). When
-        // the overlay feature is on AND this is a managed room session, spawn
-        // the mesh for the engine's `room_id`, bootstrapping from the
-        // deterministic seed set the manager computes from the current
-        // membership snapshot (D3). The mesh installs itself into
-        // `Shared.gossip_state.meshes`, so `Shared::route`'s `Events` branch
-        // can find it for broadcast.
-        //
-        // The mesh spawns in a **background task** (issue #171): `GossipMesh::spawn`
-        // awaits `receiver.joined()` under a 5s timeout when bootstrap seeds are
-        // present, and loopback endpoints lack the address discovery the dialer
-        // needs — so the join waits the full timeout. Awaiting it inline blocked
-        // `Node::start` for up to 5s per joining node (~54x slowdown on the e2e
-        // suite under `--features gossip_overlay`). Backgrounding it makes
-        // `Node::start` return immediately: the mesh installs itself once formed,
-        // and `Events` broadcasts issued before then hit `mesh_for == None` and are
-        // silently dropped — the documented fallback (same shape as no-mesh / a peer
-        // with no live writer), recovered by anti-entropy on the next tick.
-        //
-        // Failure to spawn the mesh is **non-fatal**: the events plane falls
-        // back to silent-drop for `Events` (the same shape as a peer with no
-        // live writer), and pull/query variants continue unchanged on the
-        // per-peer queue path. Anti-entropy pulls recover any dropped frame on
-        // the next tick. We log the error rather than failing the whole node
-        // — a partial degradation (events plane down, pulls still working) is
-        // more recoverable than a startup crash.
-        #[cfg(feature = "gossip_overlay")]
-        if peer_manager.is_some() {
-            let room_id = *engine.room_id();
-            let snapshot = engine.snapshot();
-            let bootstrap = PeerManager::desired_seeds(&snapshot, transport.id())
-                .into_iter()
-                .collect();
-            if let Some(actor) = shared.gossip_state.actor().cloned() {
-                let shared_for_mesh = shared.clone();
-                tokio::spawn(async move {
-                    match crate::gossip::GossipMesh::spawn(
-                        shared_for_mesh.clone(),
-                        actor,
-                        room_id,
-                        bootstrap,
-                    )
-                    .await
-                    {
-                        Ok(mesh) => {
-                            shared_for_mesh.gossip_state.install_mesh(room_id, mesh);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                reason = "gossip.mesh.spawn_failed",
-                                room = %room_id,
-                                error = %err,
-                                "could not spawn the room events gossip mesh; Events frames will be silently dropped until the next retry"
-                            );
-                        }
-                    }
-                });
-            }
-        }
 
         let pump = tokio::spawn(pump(
             engine,
