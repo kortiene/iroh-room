@@ -11,7 +11,17 @@ use std::collections::BTreeMap;
 use crate::event::ids::RoomId;
 use crate::event::keys::{DeviceKey, IdentityKey};
 
-pub const MAX_ACTIVE_MEMBERS: usize = 5;
+/// The hard active-member cap. Raised from 5 to 40 after the gossip overlay
+/// (#171) was measured at N=40 with 100% event delivery and no cascade
+/// (spike-N40 `results-gossip.md`). At N=40 the gossip overlay keeps per-node
+/// connections at ~6 (log₂ 40) instead of 39 (full mesh), avoiding the QUIC
+/// connection-count wall that crashed the transport at 1560 connections.
+///
+/// **Without** the `gossip_overlay` feature enabled in `iroh-rooms-net`,
+/// the full-mesh transport collapses at N>5 (pre-b0622ec N=25 data: 661 MB
+/// backlog, accepted=0). The cap raise is safe for production use only when
+/// the gossip overlay is compiled in and active.
+pub const MAX_ACTIVE_MEMBERS: usize = 40;
 
 /// The soft warning threshold for "approaching the active-member ceiling": one
 /// slot below the hard cap (issue #144). Used by live observers

@@ -184,6 +184,32 @@ fn mk_join(
     (ev.event_id(), wire_bytes(&ev, &member.dev_sk))
 }
 
+/// Generate `count` invite+join event pairs chained linearly off `prev`.
+/// Returns all event bytes and the last event id. Used to build large rooms
+/// without individual Actor/invite/join boilerplate.
+fn build_member_chain(
+    admin: &Actor,
+    room_id: RoomId,
+    prev: EventId,
+    count: usize,
+    start_n: u8,
+    start_ts: u64,
+) -> (Vec<Vec<u8>>, EventId) {
+    let mut bytes = Vec::new();
+    let mut last = prev;
+    for i in 0..count {
+        let n = start_n.wrapping_add(u8::try_from(i).expect("member index fits u8"));
+        let member = Actor::new(n.wrapping_add(0x50));
+        let ts = start_ts + (i as u64) * 2;
+        let (inv_id, inv_bytes) = mk_invite(admin, room_id, &[last], member.identity(), n, ts);
+        let (join_id, join_bytes) = mk_join(&member, room_id, &[inv_id], n, ts + 1);
+        bytes.push(inv_bytes);
+        bytes.push(join_bytes);
+        last = join_id;
+    }
+    (bytes, last)
+}
+
 // ---------------------------------------------------------------------------
 // Recording audit sink — captures `active_member_threshold_reached` callbacks.
 // ---------------------------------------------------------------------------
@@ -289,36 +315,26 @@ fn spawn_room_with_audit(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_room_warns_once_when_active_count_crosses_threshold() {
     let admin = Actor::new(41);
-    let m1 = Actor::new(42);
-    let m2 = Actor::new(43);
-    let m3 = Actor::new(44);
-
     let (room_id, genesis_id, genesis_bytes) = mk_genesis(&admin);
-    let (inv1_id, inv1_bytes) = mk_invite(&admin, room_id, &[genesis_id], m1.identity(), 1, T0 + 1);
-    let (join1_id, join1_bytes) = mk_join(&m1, room_id, &[inv1_id], 1, T0 + 2);
-    let (inv2_id, inv2_bytes) = mk_invite(&admin, room_id, &[join1_id], m2.identity(), 2, T0 + 3);
-    let (join2_id, join2_bytes) = mk_join(&m2, room_id, &[inv2_id], 2, T0 + 4);
 
-    // Seed the engine at 3 active members (admin + m1 + m2) — strictly below
-    // the `ACTIVE_MEMBER_WARNING_THRESHOLD` (4).
-    let engine = make_engine(
-        room_id,
-        &[
-            genesis_bytes.clone(),
-            inv1_bytes.clone(),
-            join1_bytes.clone(),
-            inv2_bytes.clone(),
-            join2_bytes.clone(),
-        ],
+    // Build (threshold - 2) members below threshold. Admin counts as 1 active,
+    // so total after this chain = threshold - 1 (strictly below threshold).
+    let n_below = ACTIVE_MEMBER_WARNING_THRESHOLD.saturating_sub(2);
+    let (below_bytes, last_below) =
+        build_member_chain(&admin, room_id, genesis_id, n_below, 1, T0 + 1);
+
+    let mut all_bytes = vec![genesis_bytes];
+    all_bytes.extend(below_bytes);
+
+    let engine = make_engine(room_id, &all_bytes);
+    assert_eq!(
+        engine.snapshot().active_member_count(),
+        ACTIVE_MEMBER_WARNING_THRESHOLD - 1
     );
-    assert_eq!(engine.snapshot().active_member_count(), 3);
-    assert_eq!(ACTIVE_MEMBER_WARNING_THRESHOLD, 4);
 
     let audit = Arc::new(RecordingAudit::default());
     let node = spawn_room_with_audit(&admin, engine, audit.clone()).await;
 
-    // Force an initial reconcile and confirm no warning fires for a below-
-    // threshold starting snapshot (previous=None → Some(3); no crossing).
     node.reconcile_now().await.expect("initial reconcile");
     assert_eq!(
         audit.calls().len(),
@@ -326,36 +342,58 @@ async fn managed_room_warns_once_when_active_count_crosses_threshold() {
         "a below-threshold room must not emit a near-cap warning"
     );
 
-    // Publish the third invitee's invite + join. After each `publish` returns
-    // the pump has already run `maybe_reconcile` synchronously, so the join's
-    // return guarantees the 3 → 4 crossing has been observed.
-    let (inv3_id, inv3_bytes) = mk_invite(&admin, room_id, &[join2_id], m3.identity(), 3, T0 + 5);
-    node.publish(inv3_bytes).await.expect("publish invite #3");
-    // An invite alone does not change active count (invitee is `Invited`, not
-    // `Active`); no warning yet.
+    // Publish one more invite+join to cross the threshold.
+    let crossing_n = u8::try_from(n_below)
+        .expect("n_below fits u8")
+        .saturating_add(1);
+    let crossing_member = Actor::new(crossing_n.wrapping_add(0x50));
+    let (crossing_inv_id, crossing_inv_bytes) = mk_invite(
+        &admin,
+        room_id,
+        &[last_below],
+        crossing_member.identity(),
+        crossing_n,
+        T0 + (n_below as u64) * 2 + 1,
+    );
+    node.publish(crossing_inv_bytes)
+        .await
+        .expect("publish crossing invite");
     assert_eq!(
         audit.calls().len(),
         0,
         "an accepted invite must not trip the active-count threshold"
     );
 
-    let (_join3_id, join3_bytes) = mk_join(&m3, room_id, &[inv3_id], 3, T0 + 6);
-    node.publish(join3_bytes).await.expect("publish join #3");
+    let (_, crossing_join_bytes) = mk_join(
+        &crossing_member,
+        room_id,
+        &[crossing_inv_id],
+        crossing_n,
+        T0 + (n_below as u64) * 2 + 2,
+    );
+    node.publish(crossing_join_bytes)
+        .await
+        .expect("publish crossing join");
 
-    // The fold is now at 4 active — exactly one crossing callback must have
-    // fired, carrying the room id and the expected counts.
     let snapshot = node.snapshot().await.expect("snapshot");
-    assert_eq!(snapshot.active_member_count(), 4);
+    assert_eq!(
+        snapshot.active_member_count(),
+        ACTIVE_MEMBER_WARNING_THRESHOLD
+    );
     let calls = audit.calls();
     assert_eq!(
         calls.len(),
         1,
-        "the 3 → 4 crossing must emit exactly one near-cap warning (no per-tick spam)"
+        "the threshold crossing must emit exactly one near-cap warning"
     );
     assert_eq!(calls[0].0, room_id, "callback must carry the room id");
-    assert_eq!(calls[0].1, 4, "active count");
+    assert_eq!(calls[0].1, ACTIVE_MEMBER_WARNING_THRESHOLD, "active count");
     assert_eq!(calls[0].2, MAX_ACTIVE_MEMBERS, "max (hard cap)");
-    assert_eq!(calls[0].3, 1, "remaining headroom");
+    assert_eq!(
+        calls[0].3,
+        MAX_ACTIVE_MEMBERS - ACTIVE_MEMBER_WARNING_THRESHOLD,
+        "remaining headroom"
+    );
 
     // Repeated forced reconciles must not re-emit while the room stays at 4
     // (the one-shot-per-crossing guarantee, independent of admission diff
@@ -395,31 +433,17 @@ async fn managed_room_warns_once_when_active_count_crosses_threshold() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_room_does_not_warn_on_startup_already_at_threshold() {
     let admin = Actor::new(51);
-    let m1 = Actor::new(52);
-    let m2 = Actor::new(53);
-    let m3 = Actor::new(54);
-
     let (room_id, genesis_id, genesis_bytes) = mk_genesis(&admin);
-    let (inv1_id, inv1_bytes) = mk_invite(&admin, room_id, &[genesis_id], m1.identity(), 1, T0 + 1);
-    let (join1_id, join1_bytes) = mk_join(&m1, room_id, &[inv1_id], 1, T0 + 2);
-    let (inv2_id, inv2_bytes) = mk_invite(&admin, room_id, &[join1_id], m2.identity(), 2, T0 + 3);
-    let (join2_id, join2_bytes) = mk_join(&m2, room_id, &[inv2_id], 2, T0 + 4);
-    let (inv3_id, inv3_bytes) = mk_invite(&admin, room_id, &[join2_id], m3.identity(), 3, T0 + 5);
-    let (_join3_id, join3_bytes) = mk_join(&m3, room_id, &[inv3_id], 3, T0 + 6);
 
-    // Seed at exactly the threshold: 4 active members.
-    let engine = make_engine(
-        room_id,
-        &[
-            genesis_bytes,
-            inv1_bytes,
-            join1_bytes,
-            inv2_bytes,
-            join2_bytes,
-            inv3_bytes,
-            join3_bytes,
-        ],
-    );
+    // Build (threshold - 1) members so admin + chain = threshold active.
+    let n_at_threshold = ACTIVE_MEMBER_WARNING_THRESHOLD.saturating_sub(1);
+    let (chain_bytes, _) =
+        build_member_chain(&admin, room_id, genesis_id, n_at_threshold, 10, T0 + 1);
+
+    let mut all_bytes = vec![genesis_bytes];
+    all_bytes.extend(chain_bytes);
+
+    let engine = make_engine(room_id, &all_bytes);
     assert_eq!(
         engine.snapshot().active_member_count(),
         ACTIVE_MEMBER_WARNING_THRESHOLD
@@ -449,6 +473,6 @@ async fn managed_room_does_not_warn_on_startup_already_at_threshold() {
 
 #[test]
 fn warning_threshold_is_one_below_the_hard_cap() {
-    assert_eq!(MAX_ACTIVE_MEMBERS, 5);
+    assert_eq!(MAX_ACTIVE_MEMBERS, 40);
     assert_eq!(ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS - 1);
 }

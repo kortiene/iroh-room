@@ -295,44 +295,23 @@ impl HarnessCluster {
             .await
             .context("publish genesis from admin")?;
 
-        // Mesh formation: full mesh or gossip seed-only.
+        // Mesh formation: full mesh (every ordered pair). For the gossip
+        // measurement, the matrix was run with a seed-only connect override
+        // documented in results/results-gossip.md.
         let addrs: Vec<EndpointAddr> = nodes
             .iter()
             .map(HarnessNode::endpoint_addr)
             .collect::<Result<Vec<_>>>()?;
-
-        #[cfg(feature = "gossip_overlay")]
-        {
-            // Gossip seed-only: each node connects to K seeds (circular).
-            // The iroh-gossip HyParView overlay grows the rest. This is the
-            // connect pattern the gossip-enabled PeerManager uses (manager.rs
-            // GOSSIP_BOOTSTRAP_SEEDS=3), and it is what keeps per-node
-            // connections at K+MAX_ON_DEMAND_LINKS regardless of N.
-            let k = iroh_rooms_net::manager::GOSSIP_BOOTSTRAP_SEEDS
-                .min(nodes.len().saturating_sub(1));
-            for (i, node) in nodes.iter().enumerate() {
-                for offset in 1..=k {
-                    let j = (i + offset) % nodes.len();
-                    node.node.connect_to(addrs[j].clone());
+        for (i, node) in nodes.iter().enumerate() {
+            for (j, addr) in addrs.iter().enumerate() {
+                if i == j {
+                    continue;
                 }
-            }
-        }
-        #[cfg(not(feature = "gossip_overlay"))]
-        {
-            // Full mesh: every ordered pair (i, j), i != j. This mirrors the
-            // dial pressure of a managed v1 mesh where every active device dials
-            // every other (D2).
-            for (i, node) in nodes.iter().enumerate() {
-                for (j, addr) in addrs.iter().enumerate() {
-                    if i == j {
-                        continue;
-                    }
-                    node.node.connect_to(addr.clone());
-                }
+                node.node.connect_to(addr.clone());
             }
         }
 
-        // Await readiness: every node reports expected Connected peers, or
+        // Await readiness: every node reports `N - 1` Connected peers, or
         // the readiness timeout elapses (recorded as partial — the harness
         // still runs but the metrics reflect the partial state).
         Self::await_readiness(&nodes, readiness_timeout).await;
@@ -351,9 +330,6 @@ impl HarnessCluster {
     /// final per-node connected counts; the caller records partial readiness
     /// in the metrics notes when not all nodes reached full mesh.
     async fn await_readiness(nodes: &[HarnessNode], deadline: Duration) -> Vec<usize> {
-        #[cfg(feature = "gossip_overlay")]
-        let expected = iroh_rooms_net::manager::GOSSIP_BOOTSTRAP_SEEDS.min(nodes.len().saturating_sub(1));
-        #[cfg(not(feature = "gossip_overlay"))]
         let expected = nodes.len().saturating_sub(1);
         let start = Instant::now();
         let poll = Duration::from_millis(50);
@@ -420,18 +396,10 @@ impl HarnessCluster {
     }
 }
 
-/// Expected directed peer entries for the configured mesh topology.
+/// Expected directed peer entries for an N-node full mesh.
 #[must_use]
 pub fn expected_connected_peer_entries_for_n(n: usize) -> usize {
-    #[cfg(feature = "gossip_overlay")]
-    {
-        let k = iroh_rooms_net::manager::GOSSIP_BOOTSTRAP_SEEDS.min(n.saturating_sub(1));
-        k.saturating_mul(n)
-    }
-    #[cfg(not(feature = "gossip_overlay"))]
-    {
-        n.saturating_sub(1).saturating_mul(n)
-    }
+    n.saturating_sub(1).saturating_mul(n)
 }
 
 #[cfg(test)]

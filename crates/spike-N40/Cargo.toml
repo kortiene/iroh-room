@@ -49,6 +49,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
-
-[features]
-gossip_overlay = ["iroh-rooms-net/gossip_overlay"]
