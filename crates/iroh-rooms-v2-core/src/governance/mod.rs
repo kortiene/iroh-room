@@ -11,6 +11,12 @@ pub mod authz;
 pub mod checkpoint;
 pub mod fold;
 pub mod fork;
+/// The normative v2 governance-log foundation (#134 §7.1–§7.3, issue #147):
+/// `GenesisConfig`, the entry/approval records, the closed §7.3 operation
+/// registry, the six-component state + state-root record, and pure apply
+/// functions. Additive to the candidate scaffolding above; uses the frozen
+/// #146 domains and `CommunityId`/`GovernanceId` names.
+pub mod log;
 pub mod model;
 pub mod state_root;
 

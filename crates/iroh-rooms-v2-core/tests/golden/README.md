@@ -31,6 +31,17 @@ changing the frozen byte/hash expectations.
 
 ### Change log
 
+- **v3** — `#147` landed the normative v2 governance-log approval pipeline under
+  `governance::log` (`verify_genesis` / `verify_entry_full`), which emits
+  `Reject::InvalidApproval` for approvals not bound to their enclosing entry's
+  `entry_id`, for duplicate approvers, and for non-admin genesis signers (spec
+  `v2-governance-log-entry-approval-state-root.md` §8). The `invalid-approval`
+  negative vector therefore transitions from `status = "blocked"` to
+  `status = "active"`. **No frozen bytes** (CSBs/ids/signatures) change — only the
+  reachability/placeholder metadata for this one `Reject` code. The candidate
+  scaffolding vectors (schema v2) remain untouched as the frozen path until a
+  deliberate migration. See `negative_invalid_approval` in
+  `signed_records_golden.rs`; `BLOCKED_CODES` is now just `["wrong_domain"]`.
 - **v2** — Migrated the Merkle leaf/internal-node hash boundaries from the legacy
   candidate strings (`iroh-rooms:v2:merkle:leaf|node:v1`) onto the frozen `#134 §6.2`
   domains `iroh-room-v2/member-leaf` and `iroh-room-v2/merkle-node`. This changes
@@ -107,13 +118,14 @@ One vector per `Reject::code()`, asserting the implementation returns exactly th
 typed reason. See the `negative` section of the JSON and the `negative_*` tests in
 `signed_records_golden.rs`.
 
-**Implementation gaps (blocked, do not fake):** the codes `wrong_domain` and
-`invalid_approval` are declared in `error::Reject` but are **not emitted by any
-current public path** (verified by `rg "Reject::(WrongDomain|InvalidApproval)"`).
-Per spec §5 Step 6 / risk row, these are recorded as `status = "blocked"` vector
-entries rather than fabricated vectors. The `negative_blocked_codes_have_no_reachable_vector`
-test documents this gap and will force a real vector to be added when the codes
-become reachable.
+**Implementation gap (blocked, do not fake):** the code `wrong_domain` is
+declared in `error::Reject` but is **not emitted by any current public path**
+(verified by `rg "Reject::WrongDomain" src/`). Per spec §5 Step 6 / risk row, it
+is recorded as a `status = "blocked"` vector entry rather than a fabricated vector.
+The `negative_blocked_codes_have_no_reachable_vector` test documents this gap and
+will force a real vector to be added when the code becomes reachable. (Until `#147`
+landed the normative governance-log approval pipeline, `invalid_approval` shared
+this blocked status; it now has a real vector — see change-log v3.)
 
 ### Identifier vectors (#146)
 

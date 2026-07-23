@@ -121,7 +121,14 @@ const POSITIVE_RECORD_TYPES: &[&str] = &[
 // Codes currently declared in `Reject` but emitted by NO public path. Per spec
 // §5 Step 6 we do not fabricate vectors for them; the completeness test below
 // pins this list so a real vector must be added the moment a path appears.
-const BLOCKED_CODES: &[&str] = &["wrong_domain", "invalid_approval"];
+//
+// Note: `invalid_approval` was a member of this set until #147 landed the
+// normative v2 governance-log approval pipeline (`governance::log`), whose
+// `verify_genesis` / `verify_entry_full` paths emit `Reject::InvalidApproval`
+// for non-admin genesis signers, duplicate approvers, and approval/entry
+// binding failures (spec §8 table). It now has a real vector below
+// (`negative_invalid_approval`); see `change_log` v3 in the JSON fixture.
+const BLOCKED_CODES: &[&str] = &["wrong_domain"];
 
 // ============================================================================
 // Helpers
@@ -962,6 +969,50 @@ fn negative_state_root_mismatch() {
 }
 
 #[test]
+fn negative_invalid_approval() {
+    // #147 made `Reject::InvalidApproval` reachable: the normative v2
+    // governance-log approval pipeline (`governance::log`) emits it when an
+    // approval is not bound to its enclosing entry's `entry_id` (spec §5.3 /
+    // §8 table). This replaces the former blocked placeholder.
+    use iroh_rooms_v2_core::governance::log::{
+        GovernanceApproval, GovernanceApprovalBody, GovernanceEntry,
+    };
+    use iroh_rooms_v2_core::governance::log::{GovernanceEntryBody, GovernanceOperationKind};
+    use iroh_rooms_v2_core::governance::log::{GovernanceOperationPayload, MemberGrant, Role};
+    use iroh_rooms_v2_core::ids::{CommunityId, GovernanceId};
+
+    let author = admin_key();
+    let approver = key(0xc0);
+    let community = CommunityId::from_bytes([0x70; LEN]);
+    let body = GovernanceEntryBody {
+        community_id: community,
+        seq: 1,
+        prev: None,
+        created_at_ms: 1_000,
+        kind: GovernanceOperationKind::MemberGrant,
+        payload: GovernanceOperationPayload::MemberGrant(MemberGrant {
+            member_id: MemberId::from_bytes([0xc0; LEN]),
+            role: Role::Member,
+        }),
+        state_root: iroh_rooms_v2_core::ids::StateRoot::from_bytes([0x33; LEN]),
+    };
+    // An approval that references a DIFFERENT entry id than the enclosing entry.
+    let bad_approval_body = GovernanceApprovalBody {
+        community_id: community,
+        entry_id: GovernanceId::from_bytes([0xee; LEN]),
+        state_root: body.state_root,
+        approver: approver.member_id(),
+        created_at_ms: 1_001,
+    };
+    let approval = GovernanceApproval::new(bad_approval_body, &approver);
+    let entry = GovernanceEntry::new(body, &author, vec![approval]);
+    assert_eq!(
+        iroh_rooms_v2_core::governance::log::verify_entry_full(&entry).err(),
+        Some(Reject::InvalidApproval)
+    );
+}
+
+#[test]
 fn negative_snapshot_hash_mismatch() {
     // Reachable via the empty-`unresolved_forks`-array normalization gap: when
     // the CSB carries an explicit empty array but the body re-encode omits it
@@ -1028,18 +1079,32 @@ fn negative_invalid_merkle_proof() {
 
 #[test]
 fn negative_blocked_codes_have_no_reachable_vector() {
-    // Verified by `rg "Reject::(WrongDomain|InvalidApproval)" src/` — the two
-    // codes below appear ONLY in error.rs (their enum definition + all_codes),
-    // never at a construction site. Per spec §5 Step 6 we do not fake vectors
-    // for unreachable codes; the completeness test pins this list.
-    assert!(
-        !code_is_constructed_in_lib("WrongDomain"),
-        "WrongDomain became reachable: replace this blocked entry with a real vector"
-    );
-    assert!(
-        !code_is_constructed_in_lib("InvalidApproval"),
-        "InvalidApproval became reachable: replace this blocked entry with a real vector"
-    );
+    // Data-driven from `BLOCKED_CODES`: every code still in that set MUST NOT
+    // be constructed anywhere in `src/` outside `error.rs`. Per spec §5 Step 6
+    // we do not fake vectors for unreachable codes; the moment a path appears
+    // the code must be removed from `BLOCKED_CODES` and given a real vector
+    // (as `invalid_approval` was in #147 — see `negative_invalid_approval`).
+    for code in BLOCKED_CODES {
+        let variant = code_to_variant(code);
+        assert!(
+            !code_is_constructed_in_lib(&variant),
+            "{variant} became reachable: replace this blocked entry with a real vector"
+        );
+    }
+}
+
+/// Convert a reject `code` string (`snake_case`) to its enum variant name
+/// (`CamelCase`), e.g. `wrong_domain` → `WrongDomain`.
+fn code_to_variant(code: &str) -> String {
+    code.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// Heuristic reachability check: scan the crate's source for a construction site
