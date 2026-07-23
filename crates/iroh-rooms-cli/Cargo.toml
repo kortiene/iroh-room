@@ -25,10 +25,11 @@ workspace = true
 # `SyncEngine` through `iroh-rooms-net` (spec IR-0105 D2). The membership fold is
 # always compiled (no feature).
 iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
-# The shipping full-mesh QUIC event-transport carrier (IR-0005): `room send` and
-# `room tail` bring up a `Node` over it to push/receive `message.text` frames
-# (spec IR-0105 D2).
-iroh-rooms-net = { path = "../iroh-rooms-net" }
+# The shipping QUIC event-transport carrier (IR-0005): `room send` and
+# `room tail` bring up a `Node` over it to push/receive `message.text` frames.
+# The CLI enables `gossip_overlay` so the raised active-member cap rides the
+# bounded gossip topology instead of the no-gossip full-mesh path.
+iroh-rooms-net = { path = "../iroh-rooms-net", features = ["gossip_overlay"] }
 # The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
 # (spec AC2). The offline authoring path imports stable items through here
 # instead of `iroh-rooms-core` directly; `experimental` is enabled so the

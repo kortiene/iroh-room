@@ -51,6 +51,8 @@ pub struct ScenarioConfig {
     /// The deterministic seed base this scenario's principals were derived
     /// from (so a re-run is byte-reproducible).
     pub seed_base: u64,
+    /// Transport topology selected by `n40-probe --connect-mode`.
+    pub connect_mode: String,
 }
 
 /// One node's metrics snapshot at the end of a scenario window (spec §6.2 /
@@ -65,8 +67,8 @@ pub struct NodeMetrics {
     pub connected_peers: usize,
     /// Expected peer count (`N - 1`).
     pub expected_peers: usize,
-    /// Dial loops this node is running. By construction = `N - 1` for the
-    /// full mesh (D2).
+    /// Dial loops this node is running. Full-mesh mode is `N - 1`; gossip mode
+    /// is bounded by the seed selector.
     pub dial_loop_tasks: usize,
     /// Estimated writer tasks (= live connected peers; one writer per link).
     pub writer_tasks_est: usize,
@@ -309,8 +311,9 @@ pub fn results_md(rows: &[MatrixRow]) -> String {
     let mut out = String::new();
     out.push_str("# `spike-N40` matrix results\n\n");
     out.push_str(
-        "Rendered from `n40-probe matrix` (loopback `NetMode::Loopback`, no relay/discovery). \
-         Regenerate with the command documented in `crates/spike-N40/results/README.md`.\n\n",
+        "Rendered from `n40-probe matrix` (loopback `NetMode::Loopback`, no relay/discovery; \
+         topology is recorded in each row's JSON `connect_mode`). Regenerate with the command \
+         documented in `crates/spike-N40/results/README.md`.\n\n",
     );
     out.push_str(
         "| N | rate events/s | mode | survives? | rss total MiB | rss/node est MiB | \
@@ -401,6 +404,7 @@ mod tests {
             warmup_secs: 5,
             measure_secs: 10,
             seed_base: 0x1000,
+            connect_mode: "full-mesh".to_owned(),
         }
     }
 

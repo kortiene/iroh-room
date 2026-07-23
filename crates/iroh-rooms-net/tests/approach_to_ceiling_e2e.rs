@@ -1,10 +1,11 @@
 //! End-to-end coverage for issue #144 — the approach-to-ceiling warning emitted
 //! by the live `RoomReconciler` when the active-member count crosses the soft
-//! threshold (`ACTIVE_MEMBER_WARNING_THRESHOLD = MAX_ACTIVE_MEMBERS - 1 = 4`).
+//! threshold (`ACTIVE_MEMBER_WARNING_THRESHOLD = MAX_ACTIVE_MEMBERS - 1`).
 //!
 //! These tests cross the **engine-fold → pump-task → `RoomReconciler` →
-//! `AuditSink`** boundary — the wiring that turns a live `3 → 4` active-member
-//! fold transition into exactly one `room.active_members.near_cap` callback.
+//! `AuditSink`** boundary — the wiring that turns a live below-threshold →
+//! threshold active-member fold transition into exactly one
+//! `room.active_members.near_cap` callback.
 //! The pure `active_member_warning_crossed` helper, the audit-sink formatters,
 //! and the `active_capacity_line` CLI formatter each have their own unit tests;
 //! only an end-to-end run through a real `Node` can prove the pump actually
@@ -14,10 +15,10 @@
 //!
 //! Acceptance coverage:
 //! * **AC1** — `managed_room_warns_once_when_active_count_crosses_threshold`:
-//!   a room growing `3 → 4` active members emits exactly one
-//!   `active_member_threshold_reached` callback with `(active=4, max=5,
-//!   remaining=1)`; subsequent ticks and forced reconciles do not re-emit
-//!   (no per-tick spam).
+//!   a room growing from below the threshold to the threshold emits exactly one
+//!   `active_member_threshold_reached` callback with `(active=threshold,
+//!   max=MAX_ACTIVE_MEMBERS, remaining=1)`; subsequent ticks and forced
+//!   reconciles do not re-emit (no per-tick spam).
 //! * **OQ-1** — `managed_room_does_not_warn_on_startup_already_at_threshold`:
 //!   a node whose first observed snapshot is already at the threshold emits no
 //!   initial warning (spec §4 D3 / OQ-1 recommended default — `room members
@@ -297,11 +298,11 @@ fn spawn_room_with_audit(
 }
 
 // ---------------------------------------------------------------------------
-// AC1: a live 3 → 4 fold transition emits exactly one near-cap warning
+// AC1: a live below-threshold → threshold fold transition emits one warning
 // ===========================================================================
 
-/// AC1 (issue #144): a managed room at 3 active members (admin + two joined
-/// invitees) that grows to 4 must emit exactly one
+/// AC1 (issue #144): a managed room below the warning threshold that grows to
+/// the threshold must emit exactly one
 /// `active_member_threshold_reached` callback with the expected counts, and
 /// must **not** re-emit on subsequent ticks or forced reconciles (one-shot per
 /// crossing, not per-tick spam).
@@ -395,8 +396,8 @@ async fn managed_room_warns_once_when_active_count_crosses_threshold() {
         "remaining headroom"
     );
 
-    // Repeated forced reconciles must not re-emit while the room stays at 4
-    // (the one-shot-per-crossing guarantee, independent of admission diff
+    // Repeated forced reconciles must not re-emit while the room stays at the
+    // threshold (the one-shot-per-crossing guarantee, independent of admission diff
     // cadence — `force_reconcile` resets the admission detector but not
     // `last_active_member_count`).
     for _ in 0..3 {
@@ -468,11 +469,10 @@ async fn managed_room_does_not_warn_on_startup_already_at_threshold() {
 // ---------------------------------------------------------------------------
 // Sanity: the threshold and cap are what this test file assumes. If these ever
 // change, the tests above must be re-read for correctness (the protocol
-// invariant is intentionally not configurable).
+// invariant is intentionally not runtime-configurable).
 // ---------------------------------------------------------------------------
 
 #[test]
 fn warning_threshold_is_one_below_the_hard_cap() {
-    assert_eq!(MAX_ACTIVE_MEMBERS, 40);
     assert_eq!(ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS - 1);
 }

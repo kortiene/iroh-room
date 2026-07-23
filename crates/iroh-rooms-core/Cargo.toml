@@ -26,6 +26,12 @@ store = ["dep:rusqlite"]
 # §2.3 / D1).
 sync = ["store"]
 
+# Raise the active-member protocol cap from the default no-gossip/full-mesh-safe
+# value (5) to the gossip-backed target (40). This is intentionally not a
+# default core feature: `iroh-rooms-net/gossip_overlay` enables it when the
+# bounded gossip topology is compiled in.
+large_rooms = []
+
 [dependencies]
 # Ed25519 signing/verification. Pinned EXACTLY to the version `iroh 1.0` resolves
 # (`3.0.0-rc.0`, recorded in PHASE-0-SPIKE.md Event Protocol §1 / spec D2 / R6) so

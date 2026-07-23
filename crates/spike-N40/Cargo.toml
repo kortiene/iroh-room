@@ -35,8 +35,10 @@ workspace = true
 iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # The shipping carrier whose guardrails (byte-bounded queues, dial-with-backoff,
 # #136 dial-stomp fix) this spike exercises. The spike depends on shipping
-# crates; shipping crates must NOT depend on the spike.
-iroh-rooms-net = { path = "../iroh-rooms-net" }
+# crates; shipping crates must NOT depend on the spike. The harness enables the
+# gossip overlay so `--connect-mode gossip` exercises the same bounded topology
+# that gates the 40-member cap.
+iroh-rooms-net = { path = "../iroh-rooms-net", features = ["gossip_overlay"] }
 # The exact pin the shipping carrier (`iroh-rooms-net`) and the other spikes
 # run on.
 iroh = "=1.0.1"

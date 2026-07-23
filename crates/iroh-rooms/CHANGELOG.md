@@ -72,22 +72,23 @@ where feasible); the **experimental** tier may change on any release.
   No behavioral change to admission, `PeerManager::reconcile`, or any access
   verdict.
 - Made the approach to the active-member ceiling observable (issue #144,
-  `iroh-rooms-core` / `iroh-rooms-net` / `iroh-rooms-cli`): the hard
-  `MAX_ACTIVE_MEMBERS = 5` cap and its `RejectReason::RoomFull` reject are
-  unchanged, but the room no longer silently approaches them. The re-exported
-  `MembershipSnapshot` gains two additive, side-effect-free methods —
-  `active_member_limit() -> usize` (returns `MAX_ACTIVE_MEMBERS`) and
+  `iroh-rooms-core` / `iroh-rooms-net` / `iroh-rooms-cli`): no-gossip/full-mesh
+  builds keep the original hard `MAX_ACTIVE_MEMBERS = 5` cap and its
+  `RejectReason::RoomFull` reject, while the `large_rooms` core feature raises
+  the cap to 40 only when paired with `iroh-rooms-net/gossip_overlay` (enabled by
+  the CLI and the experimental SDK). The re-exported `MembershipSnapshot` gains
+  two additive, side-effect-free methods — `active_member_limit() -> usize`
+  (returns the compiled `MAX_ACTIVE_MEMBERS`) and
   `active_member_headroom() -> usize` (`limit.saturating_sub(active_count)`) —
   so status/audit callers can render headroom without importing the constant
   separately. The online `AuditSink` trait gains a default-no-op
   `active_member_threshold_reached(room_id, active, max, remaining)` hook; the
   CLI's `room members <ROOM_ID> --status` prints an
-  `active: <n>/5 (<k> slots remaining)` line, and a live observer
+  `active: <n>/<max> (<k> slots remaining)` line, and a live observer
   (`RoomReconciler`) emits a one-shot-per-crossing `room.active_members.near_cap`
   audit record (plus a `warning[room_near_capacity]:` stderr line) when the
   locally observed active count crosses from below `MAX_ACTIVE_MEMBERS - 1` to
-  at/above it. Pure observability: no new room events, no authorization change,
-  no configurable cap. Note: `ACTIVE_MEMBER_WARNING_THRESHOLD` and
+  at/above it. Note: `ACTIVE_MEMBER_WARNING_THRESHOLD` and
   `active_member_warning_crossed` are added to `iroh_rooms_core::membership` but
   are not yet re-exported through this façade (tracked as SDK-coverage drift in
   `docs/sdk-coverage.md`).

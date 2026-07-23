@@ -11,16 +11,22 @@ use std::collections::BTreeMap;
 use crate::event::ids::RoomId;
 use crate::event::keys::{DeviceKey, IdentityKey};
 
-/// The hard active-member cap. Raised from 5 to 40 after the gossip overlay
-/// (#171) was measured at N=40 with 100% event delivery and no cascade
-/// (spike-N40 `results-gossip.md`). At N=40 the gossip overlay keeps per-node
-/// connections at ~6 (log₂ 40) instead of 39 (full mesh), avoiding the QUIC
-/// connection-count wall that crashed the transport at 1560 connections.
+/// The hard active-member cap enforced by the membership fold.
 ///
-/// **Without** the `gossip_overlay` feature enabled in `iroh-rooms-net`,
-/// the full-mesh transport collapses at N>5 (pre-b0622ec N=25 data: 661 MB
-/// backlog, accepted=0). The cap raise is safe for production use only when
-/// the gossip overlay is compiled in and active.
+/// Default builds stay at 5, the full-mesh-safe bound measured before the gossip
+/// overlay. The `large_rooms` feature raises the cap to 40 for binaries that also
+/// compile the bounded gossip topology (`iroh-rooms-net/gossip_overlay`), whose
+/// spike-N40 run survived N=40 with 100% event delivery and no cascade.
+#[cfg(not(feature = "large_rooms"))]
+pub const MAX_ACTIVE_MEMBERS: usize = 5;
+
+/// The hard active-member cap enforced by the membership fold.
+///
+/// Default builds stay at 5, the full-mesh-safe bound measured before the gossip
+/// overlay. The `large_rooms` feature raises the cap to 40 for binaries that also
+/// compile the bounded gossip topology (`iroh-rooms-net/gossip_overlay`), whose
+/// spike-N40 run survived N=40 with 100% event delivery and no cascade.
+#[cfg(feature = "large_rooms")]
 pub const MAX_ACTIVE_MEMBERS: usize = 40;
 
 /// The soft warning threshold for "approaching the active-member ceiling": one
@@ -214,11 +220,11 @@ impl MembershipSnapshot {
 /// "one-shot warning per crossing" callers (`RoomReconciler`) consume so a
 /// room that stays at the threshold does not emit a warning on every tick.
 ///
-/// * `previous = Some(3), current = 4` → `true` (the canonical 3 → 4 cross)
-/// * `previous = Some(4), current = 4` → `false` (no transition)
-/// * `previous = Some(4), current = 5` → `false` (already at/above; not a cross)
-/// * `previous = Some(3), current = 5` → `true` (concurrent-join jump across)
-/// * `previous = Some(5), current = 3` → `false` (room shrank; not a warning)
+/// * `previous = Some(threshold - 1), current = threshold` → `true`
+/// * `previous = Some(threshold), current = threshold` → `false` (no transition)
+/// * `previous = Some(threshold), current = MAX_ACTIVE_MEMBERS` → `false`
+/// * `previous = Some(threshold - 1), current = MAX_ACTIVE_MEMBERS` → `true`
+/// * `previous = Some(MAX_ACTIVE_MEMBERS), current = threshold - 1` → `false`
 /// * `previous = None`           , any `current` → `false` (no prior observation;
 ///   recommended default for `RoomReconciler` startup — see spec §4 D3 / OQ-1)
 #[must_use]
@@ -236,6 +242,14 @@ mod tests {
     use super::{
         active_member_warning_crossed, ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS,
     };
+
+    #[test]
+    fn active_member_cap_matches_feature_flag() {
+        #[cfg(not(feature = "large_rooms"))]
+        assert_eq!(MAX_ACTIVE_MEMBERS, 5);
+        #[cfg(feature = "large_rooms")]
+        assert_eq!(MAX_ACTIVE_MEMBERS, 40);
+    }
 
     #[test]
     fn active_member_warning_crossed_is_one_shot_per_below_to_threshold_crossing() {

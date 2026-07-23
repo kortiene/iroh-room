@@ -47,8 +47,8 @@ async fn main() -> anyhow::Result<()> {
     // These two roles run on two different peers in reality (mirroring
     // `docs/getting-started.md` Step 6's two terminals); they are shown
     // sequentially here purely to illustrate both halves of the API.
-    expose_pipe().await?;
-    connect_to_pipe().await?;
+    Box::pin(expose_pipe()).await?;
+    Box::pin(connect_to_pipe()).await?;
     Ok(())
 }
 

@@ -59,6 +59,11 @@ pub mod pipe;
 pub mod state;
 pub mod transport;
 
+#[cfg(not(feature = "gossip_overlay"))]
+const _: () = assert!(iroh_rooms_core::membership::MAX_ACTIVE_MEMBERS == 5);
+#[cfg(feature = "gossip_overlay")]
+const _: () = assert!(iroh_rooms_core::membership::MAX_ACTIVE_MEMBERS == 40);
+
 mod peer;
 mod queue;
 
@@ -72,7 +77,7 @@ pub use blob::{BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
 pub use diag::{classify_remote_info, PathType};
 pub use frame::{FrameError, MAX_FRAME_BYTES};
 pub use handler::EventProtocolHandler;
-pub use manager::PeerManager;
+pub use manager::{PeerManager, GOSSIP_BOOTSTRAP_SEEDS};
 pub use node::{BlobServeConfig, BootstrapProof, Node, DEFAULT_TICK};
 pub use pipe::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,

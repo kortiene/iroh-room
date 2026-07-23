@@ -22,8 +22,8 @@ use std::time::Duration;
 use anyhow::Result;
 use iroh_rooms_core::event::ids::EventId;
 use iroh_rooms_core::event::signed::event_id_from_bytes;
-use iroh_rooms_net::PeerConnState;
-use spike_n40::cluster::HarnessCluster;
+use iroh_rooms_net::{PeerConnState, GOSSIP_BOOTSTRAP_SEEDS};
+use spike_n40::cluster::{ConnectMode, HarnessCluster};
 use spike_n40::metrics::{classify_cascade, cluster_metrics, counter_baseline, CascadeWindow};
 use spike_n40::report::{results_md, CascadeVerdict, MatrixRow, ScenarioConfig};
 use spike_n40::rss::process_rss_bytes;
@@ -37,7 +37,24 @@ const RECONNECT: Duration = Duration::from_secs(15);
 
 /// Spawn an N=5 cluster (used by every test below).
 async fn spawn() -> Result<HarnessCluster> {
-    HarnessCluster::spawn(N, SEED_BASE, READY).await
+    HarnessCluster::spawn(N, SEED_BASE, READY, ConnectMode::FullMesh).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n5_cluster_reaches_gossip_readiness() {
+    let cluster = HarnessCluster::spawn(N, SEED_BASE + 0x100, READY, ConnectMode::Gossip)
+        .await
+        .expect("spawn N=5 gossip cluster");
+    assert_eq!(cluster.connect_mode, ConnectMode::Gossip);
+    let expected = GOSSIP_BOOTSTRAP_SEEDS.min(N - 1);
+    let connected = cluster.connected_counts();
+    let total: usize = connected.iter().sum();
+    assert!(
+        total >= expected * N,
+        "gossip cluster reached {total}/{} aggregate seed connections: {connected:?}",
+        expected * N
+    );
+    cluster.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -221,6 +238,7 @@ async fn n5_mini_rebound_node_catches_missed_events() {
 
     // Wait until every surviving node holds the missed event.
     let surviving = HarnessCluster {
+        connect_mode: ConnectMode::FullMesh,
         room_id,
         genesis_id,
         admin: spike_n40::cluster::AdminPrincipal {
@@ -298,6 +316,7 @@ async fn n5_metrics_render_markdown_and_json_without_panic() {
         warmup_secs: 0,
         measure_secs: 1,
         seed_base: SEED_BASE,
+        connect_mode: ConnectMode::FullMesh.label().to_owned(),
     };
     let cascade = classify_cascade(
         &[CascadeWindow {

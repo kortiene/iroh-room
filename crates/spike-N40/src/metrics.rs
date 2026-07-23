@@ -3,9 +3,9 @@
 //! Sampling pulls from the same public seams the shipping `Node` exposes for
 //! its CLI / observability surface — `peer_states`, `peer_entries`,
 //! `outbound_queue_depths`, `counters`, plus the [`crate::RecordingAudit`]'s
-//! reconnect/saturation deltas. Task counts are by-construction / peer-entry
-//! estimates (spec §6.6 / risk 3): `dial_loop_tasks = N - 1` by construction,
-//! `writer_tasks_est = reader_tasks_est = connected_peers`.
+//! reconnect/saturation deltas. Task counts are observability / peer-entry
+//! estimates (spec §6.6 / risk 3): `dial_loop_tasks` comes from the node handle,
+//! while `writer_tasks_est = reader_tasks_est = connected_peers`.
 //!
 //! # Casts
 //!
@@ -124,9 +124,7 @@ pub async fn node_metrics(
         node_index,
         connected_peers: connected,
         expected_peers: expected,
-        // By construction: this node dials every other node (D2), so the dial
-        // loop count is exactly N - 1 whether or not every loop has connected.
-        dial_loop_tasks: expected,
+        dial_loop_tasks: hn.node.dial_count(),
         writer_tasks_est: connected,
         reader_tasks_est: connected,
         outbound_queue_bytes_sum: bytes_sum,

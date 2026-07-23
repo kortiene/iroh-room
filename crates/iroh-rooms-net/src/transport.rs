@@ -100,6 +100,11 @@ pub const RELAY_ONLY_TEST_BUILD: bool = cfg!(feature = "relay-only-test");
 pub struct NetConfig {
     /// Loopback vs real-network endpoint stack.
     pub mode: NetMode,
+    /// Optional fixed socket for [`NetMode::Loopback`]. `None` preserves the
+    /// existing OS-assigned loopback port behavior; the spike-N40 gossip harness
+    /// uses a fixed value so every node's address hint is known before spawning a
+    /// managed room session.
+    pub loopback_bind_addr: Option<SocketAddr>,
     /// Broadcast backlog for the [`ConnEvent`] stream before a slow observer lags.
     pub conn_event_capacity: usize,
     /// Ring capacity of the `Node::room_events` broadcast (issue #83). Lossy on
@@ -138,6 +143,7 @@ impl Default for NetConfig {
     fn default() -> Self {
         Self {
             mode: NetMode::Loopback,
+            loopback_bind_addr: None,
             conn_event_capacity: 256,
             room_event_capacity: 256,
             inbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
@@ -805,13 +811,20 @@ impl NetTransport {
         blobs_handler: Option<iroh_blobs::BlobsProtocol>,
     ) -> Result<Self> {
         let endpoint = match cfg.mode {
-            NetMode::Loopback => Endpoint::builder(presets::Minimal)
-                .secret_key(secret)
-                .relay_mode(RelayMode::Disabled)
-                .transport_config(transport_config())
-                .bind()
-                .await
-                .context("bind loopback endpoint")?,
+            NetMode::Loopback => {
+                let builder = Endpoint::builder(presets::Minimal)
+                    .secret_key(secret)
+                    .relay_mode(RelayMode::Disabled)
+                    .transport_config(transport_config());
+                let builder = if let Some(addr) = cfg.loopback_bind_addr {
+                    builder
+                        .bind_addr(addr)
+                        .context("configure loopback bind address")?
+                } else {
+                    builder
+                };
+                builder.bind().await.context("bind loopback endpoint")?
+            }
             NetMode::RealNetwork => {
                 let builder = Endpoint::builder(presets::N0)
                     .secret_key(secret)
@@ -975,6 +988,15 @@ impl NetTransport {
     #[must_use]
     pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
         self.shared.outbound_queue_depths()
+    }
+
+    /// The number of unmanaged dial loops currently running.
+    #[must_use]
+    pub fn dial_count(&self) -> usize {
+        self.dial_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// The total gossip-neighbor count across every per-room mesh this node has
@@ -1225,6 +1247,11 @@ mod tests {
     #[test]
     fn net_config_default_mode_is_loopback() {
         assert_eq!(NetConfig::default().mode, NetMode::Loopback);
+    }
+
+    #[test]
+    fn net_config_default_loopback_bind_addr_is_os_assigned() {
+        assert_eq!(NetConfig::default().loopback_bind_addr, None);
     }
 
     #[test]

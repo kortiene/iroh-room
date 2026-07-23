@@ -767,6 +767,15 @@ impl Node {
         self.transport.outbound_queue_depths()
     }
 
+    /// The number of event-plane dial loops this node is currently running.
+    #[must_use]
+    pub fn dial_count(&self) -> usize {
+        self.peer_manager.as_ref().map_or_else(
+            || self.transport.dial_count(),
+            |manager| manager.dial_count(),
+        )
+    }
+
     /// The total gossip-neighbor count across every per-room mesh this node has
     /// subscribed (issue #171 / spec §5.4). Zero when the `gossip_overlay`
     /// feature is off, no room session is active, or the swarm has not yet
