@@ -1,0 +1,44 @@
+[package]
+name = "iroh-rooms-v2-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Pure v2 cryptographic/deterministic-algorithm foundation (spec §1/§12, issue
+# #140). Lands as unused, isolated infrastructure: never published, never
+# re-exported from the SDK in this phase. Runtime/store/network crates may wire to
+# it through separate, later issues.
+publish = false
+description = "Pure v2 crypto core: canonical CBOR, BLAKE3/Ed25519 identifiers, governance state machine, fork detection, Merkle map. No network, no store, no async."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The full v2 crypto core depends ONLY on these three protocol primitives. The
+# crate must not pull in `iroh`, `iroh-blobs`, `iroh-gossip`, `tokio`, or
+# `rusqlite`; the `banned_dependencies` test (spec §8 step 1.7 / §9 CI commands)
+# machine-checks this via `cargo tree`.
+# Ed25519 signing/verification (RFC 8032). Pinned to the same line as
+# `iroh-rooms-core` so signature bytes stay reproducible across the workspace.
+ed25519-dalek = "=3.0.0-rc.0"
+# BLAKE3-256: identifiers, state roots, snapshot hashes, Merkle nodes (spec §1).
+blake3 = "1"
+# Lowercase hex presentation of ids/keys (no `0x`, no uppercase).
+hex = "0.4"
+# Zeroize transient secret-seed buffers in `SigningKey` helpers (spec §11).
+zeroize = "1"
+# OS CSPRNG entropy source for `SigningKey::generate()` (spec §4 D1 / §14
+# assumption 5: generation is optional but pure). Already in `Cargo.lock`; keeps
+# `generate()` parameter-free so the public surface is not coupled to a rand
+# version. Dev vectors use seed-derived keys (`from_seed`), never `generate()`.
+getrandom = "0.4"
+
+[dev-dependencies]
+# Deterministic seed-derived test keys (spec §11 / §12: vectors use non-secret
+# seeds only). Dev-only so the shipped pure core stays minimal.
+proptest = "1"

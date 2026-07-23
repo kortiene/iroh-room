@@ -2172,6 +2172,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-rooms-v2-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hex",
+ "proptest",
+ "zeroize",
+]
+
+[[package]]
 name = "iroh-tickets"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

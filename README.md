@@ -198,6 +198,7 @@ crates/iroh-rooms-core/   Protocol, event model, membership, store, sync
 crates/iroh-rooms-net/    iroh transport, blob serving, live pipe runtime
 crates/iroh-rooms-cli/    CLI binary: identity, room, file, pipe, agent
 crates/iroh-rooms/        Rust SDK facade and examples
+crates/iroh-rooms-v2-core/  Pure v2 crypto core (unused this phase): canonical CBOR, BLAKE3/Ed25519 ids, governance state machine, fork detection, member Merkle map
 crates/spike-nat/         Real-network NAT measurement harness
 crates/spike-transport/   Full-mesh versus gossip transport comparison
 crates/spike-N40/         Loopback harness measuring where v1 transport breaks at N=40

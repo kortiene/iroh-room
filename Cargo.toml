@@ -1,6 +1,13 @@
 [workspace]
 members = [
   "crates/iroh-rooms-core",
+  # The pure v2 cryptographic/deterministic-algorithm core (issue #140 / spec
+  # `v2-crypto-core-crate.md`). A NEW crate, independent of `iroh-rooms-core`
+  # (spec D1): canonical CBOR, BLAKE3/Ed25519 identifiers, governance state
+  # machine, fork detection, sparse Merkle map. No network/store/async
+  # dependencies; `publish = false` and unused pure infrastructure in this phase
+  # (spec §12), so it stays compatible with the P-26/D-9 schema-evolution gate.
+  "crates/iroh-rooms-v2-core",
   "crates/iroh-rooms-cli",
   # The real full-mesh iroh QUIC event-transport adapter (IR-0005). A shipping
   # crate (the CLI will depend on it), unlike the throwaway spike below.
