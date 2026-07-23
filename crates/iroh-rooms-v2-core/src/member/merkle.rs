@@ -2,9 +2,9 @@
 //!
 //! Hashing (all BLAKE3, domain-separated):
 //!
-//! - **map key**: `BLAKE3(MERKLE_KEY_CONTEXT || logical_key_bytes)` (32 bytes);
-//! - **leaf hash**: `BLAKE3(MERKLE_LEAF_CONTEXT || key || value_hash)`;
-//! - **internal hash**: `BLAKE3(MERKLE_NODE_CONTEXT || left_hash || right_hash)`;
+//! - **map key**: `BLAKE3(MERKLE_KEY || logical_key_bytes)` (32 bytes);
+//! - **leaf hash**: `BLAKE3(MEMBER_LEAF || key || value_hash)` (frozen `#134 §6.2`);
+//! - **internal hash**: `BLAKE3(MERKLE_NODE || left_hash || right_hash)` (frozen `#134 §6.2`);
 //! - **empty node at depth `d`**: `BLAKE3(MERKLE_EMPTY_CONTEXT || d_be)` where
 //!   `d` is the depth from the root (root is depth 0; leaves are depth 255).
 //!
@@ -15,7 +15,7 @@
 use core::cmp::Ordering;
 
 use crate::cbor::{self, CborValue};
-use crate::domain::{self, LEGACY_MERKLE_NODE, MERKLE_EMPTY, MERKLE_KEY, MERKLE_LEAF};
+use crate::domain::{self, MEMBER_LEAF, MERKLE_EMPTY, MERKLE_KEY, MERKLE_NODE};
 use crate::error::Reject;
 use crate::ids::{MerkleRoot, LEN};
 
@@ -68,21 +68,21 @@ pub fn map_key(logical_key: &[u8]) -> Key {
     domain::blake3_domain(MERKLE_KEY, logical_key)
 }
 
-/// The leaf hash: `BLAKE3(MERKLE_LEAF || key || value_hash)` (D7).
+/// The leaf hash: `BLAKE3(MEMBER_LEAF || key || value_hash)` (D7; frozen `#134 §6.2`).
 #[must_use]
 pub fn leaf_hash(key: &Key, value_hash: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(MERKLE_LEAF);
+    hasher.update(MEMBER_LEAF);
     hasher.update(key);
     hasher.update(value_hash);
     *hasher.finalize().as_bytes()
 }
 
-/// The internal-node hash: `BLAKE3(LEGACY_MERKLE_NODE || left || right)` (D7).
+/// The internal-node hash: `BLAKE3(MERKLE_NODE || left || right)` (D7; frozen `#134 §6.2`).
 #[must_use]
 pub fn node_hash(left: &Hash, right: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(LEGACY_MERKLE_NODE);
+    hasher.update(MERKLE_NODE);
     hasher.update(left);
     hasher.update(right);
     *hasher.finalize().as_bytes()

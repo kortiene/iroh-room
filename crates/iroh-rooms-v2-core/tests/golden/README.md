@@ -29,6 +29,17 @@ If `#134` lands and renames `CommunityId` or splits a `Reject` code, update only
 an explicit schema bump (`schema` field below) while preserving or documentedly
 changing the frozen byte/hash expectations.
 
+### Change log
+
+- **v2** — Migrated the Merkle leaf/internal-node hash boundaries from the legacy
+  candidate strings (`iroh-rooms:v2:merkle:leaf|node:v1`) onto the frozen `#134 §6.2`
+  domains `iroh-room-v2/member-leaf` and `iroh-room-v2/merkle-node`. This changes
+  `LEAF_HASH`, `MEMBER_ROOT`, the governance `state_root`, and the governance
+  approval/checkpoint CSBs/ids/signatures. No compatibility impact: `iroh-rooms-v2-core`
+  is `publish = false` and unused this phase. The legacy strings survive as documented
+  aliases in `domain.rs` (`MERKLE_LEAF`, `LEGACY_MERKLE_NODE`); the active Merkle
+  computation no longer references them (PR #176 review resolution).
+
 ## Fixture format
 
 - `v2-signed-records.json` — the single aggregate, hand-reviewable JSON file for the
@@ -47,7 +58,7 @@ Per-vector schema marker (present on the aggregate and every vector):
 
 ```json
 {
-  "schema": "iroh-rooms-v2-golden-vectors/v1",
+  "schema": "iroh-rooms-v2-golden-vectors/v2",
   "frozen": true,
   "requires_schema_bump_on_change": true
 }
