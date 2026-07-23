@@ -12,6 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(feature = "gossip_overlay")]
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -282,6 +284,17 @@ pub struct Shared {
     /// the per-peer and per-stream caps; classification is by `SyncMessage`
     /// variant only — never by decoded payload (spec D1 / §9).
     pub(crate) inbound: BytePriorityQueue,
+    /// The gossip overlay state (issue #171 / spec §4 D1). Present only when
+    /// the `gossip_overlay` feature is on. `inert()` (no actor, no meshes) for
+    /// test fixtures; `with_actor(...)` for the production bind path. The mesh
+    /// map is keyed by `RoomId` so `route`'s `Events` branch can find a room's
+    /// broadcast mesh in O(1).
+    #[cfg(feature = "gossip_overlay")]
+    pub(crate) gossip_state: crate::gossip::GossipState,
+    /// Weak back-reference used only to start bounded on-demand event links for
+    /// pull/query traffic. Weak avoids `Shared <-> PeerManager` ownership cycles.
+    #[cfg(feature = "gossip_overlay")]
+    peer_manager: Mutex<Option<Weak<crate::manager::PeerManager>>>,
 }
 
 /// The consumer side of the inbound byte-priority queue, owned by the engine
@@ -314,6 +327,16 @@ pub(crate) enum LinkTeardown {
 }
 
 impl Shared {
+    /// Install the managed-room dial owner after both `Shared` and
+    /// `PeerManager` have been placed in `Arc`s.
+    #[cfg(feature = "gossip_overlay")]
+    pub(crate) fn set_peer_manager(&self, manager: Weak<crate::manager::PeerManager>) {
+        *self
+            .peer_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manager);
+    }
+
     /// Register a peer's outbound frame queue (replaces any prior queue for the
     /// device — last writer wins on a double-connect, spec OQ-4). Closing the
     /// superseded queue wakes its writer task so it does not outlive the link
@@ -380,6 +403,43 @@ impl Shared {
     /// §7). A closed queue (peer torn down) is a silent drop, matching the
     /// prior `mpsc::Sender::Closed` path (issue #141).
     pub(crate) fn route(&self, out: &Outgoing) {
+        // Gossip overlay fan-out (issue #171 / spec §4 D1 + open question 4):
+        // when the feature is on AND the message is `SyncMessage::Events` AND a
+        // gossip mesh is installed for the room, broadcast the encoded body on
+        // the room's gossip topic. This is **additive** with the per-peer
+        // queue path below — Events is also delivered to the destination
+        // peer's queue when a live writer exists. The engine's `event_id`
+        // G-set dedup makes a frame delivered by both paths idempotent, so
+        // dual-path is correct (spec open question 4 explicitly leaves the
+        // gossip-only vs dual-path choice to Phase A; dual-path is chosen here
+        // for minimum regression risk: the loopback endpoint lacks the
+        // address-discovery service `iroh-gossip`'s dialer needs, so a
+        // gossip-only path would silently drop Events in loopback tests).
+        //
+        // At production scale (N>5, real-network mode with DNS discovery) the
+        // gossip path dominates Events delivery; the per-peer queue path is
+        // the fallback / coexisting channel. The K-bounded seed selector
+        // (PeerManager::desired_seeds) bounds the warm-link count regardless.
+        // A future Phase B revisit can switch to gossip-only once the
+        // loopback discovery gap is closed.
+        //
+        // Pull/query variants stay on the queue path only — they rely on
+        // per-link FIFO that gossip's epidemic delivery does not provide
+        // (spec §4 D1 consequence).
+        #[cfg(feature = "gossip_overlay")]
+        {
+            if let iroh_rooms_core::sync::SyncMessage::Events { room_id, .. } = &out.msg {
+                if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
+                    mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
+                }
+                // Fall through to the per-peer queue path: dual-path delivery.
+                // If no mesh is installed (loopback / early startup), the
+                // queue path carries Events alone — exactly the pre-overlay
+                // behavior, so existing tests pass under both feature
+                // configurations.
+            }
+        }
+
         let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
             tracing::warn!("route: outgoing peer id is not a valid endpoint id; dropping");
             return;
@@ -404,6 +464,17 @@ impl Shared {
                     self.audit.transport_queue_saturated(device, "outbound");
                     self.close_connection(device);
                 }
+            }
+        } else {
+            #[cfg(feature = "gossip_overlay")]
+            if let Some(manager) = self
+                .peer_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                manager.route_on_demand(out.clone());
             }
         }
         // No live writer ⇒ peer offline ⇒ drop (engine re-pulls on reconnect).
@@ -709,8 +780,22 @@ impl NetTransport {
     /// `.accept()` on the same router (IR-0204 spec §5.3) — the established
     /// one-endpoint-many-planes pattern already used for `pipe_handler`.
     ///
+    /// When the `gossip_overlay` feature is enabled at compile time, a fourth
+    /// `.accept()` chain is added for [`GOSSIP_ALPN`](crate::alpn::GOSSIP_ALPN),
+    /// wrapped in [`GossipProtocolHandler`](crate::gossip::GossipProtocolHandler)
+    /// so the same `Arc<dyn Admission>` instance gates both planes (issue #171
+    /// / spec §4 D2). Reject-before-bytes is preserved: an unadmitted device's
+    /// `GOSSIP_ALPN` connection is closed at `accept()` time before the inner
+    /// gossip handler runs.
+    ///
     /// # Errors
     /// Returns an error if the endpoint fails to bind.
+    ///
+    /// # Panics
+    /// Panics if the gossip actor was not installed on `Shared` before the
+    /// `GOSSIP_ALPN` wrapper is built. This is impossible by construction
+    /// (the actor is installed on the line just above) — the `expect` is a
+    /// construction-order invariant check, not a runtime hazard.
     pub async fn bind(
         secret: SecretKey,
         admission: Arc<dyn Admission>,
@@ -748,6 +833,14 @@ impl NetTransport {
             cfg.inbound_peer_queue_bytes.max(1),
             cfg.stream_queue_bytes.max(1),
         );
+
+        // The gossip overlay actor (issue #171 / spec §4 D2 / Step 1). Spawned
+        // on the same endpoint the event plane already bound — one Endpoint,
+        // many planes (ADR-1). The actor is held by `Shared.gossip_state`; a
+        // clone is taken below to build the admission-gated accept wrapper.
+        #[cfg(feature = "gossip_overlay")]
+        let gossip_actor = crate::gossip::spawn_gossip_actor(endpoint.clone());
+
         let shared = Arc::new(Shared {
             me,
             admission,
@@ -761,6 +854,10 @@ impl NetTransport {
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
             inbound,
+            #[cfg(feature = "gossip_overlay")]
+            gossip_state: crate::gossip::GossipState::with_actor(gossip_actor),
+            #[cfg(feature = "gossip_overlay")]
+            peer_manager: Mutex::new(None),
         });
 
         // One Endpoint, one Router serving both planes (ADR-1): the event ALPN is
@@ -774,6 +871,25 @@ impl NetTransport {
         }
         if let Some(blobs_handler) = blobs_handler {
             builder = builder.accept(iroh_blobs::ALPN, blobs_handler);
+        }
+        // The gossip overlay plane (issue #171 / spec §4 D2). The wrapper
+        // closes a GOSSIP_ALPN connection at `accept()` time before the inner
+        // gossip handler runs whenever admission fails — zero gossip bytes are
+        // exchanged with an unadmitted device. The wrapper shares the same
+        // `Arc<Shared>` (and so the same `Arc<dyn Admission>` instance) as the
+        // event-plane handler, so admission decisions are byte-identical on
+        // both ALPNs.
+        #[cfg(feature = "gossip_overlay")]
+        {
+            let handler = crate::gossip::GossipProtocolHandler::new(
+                shared.clone(),
+                shared
+                    .gossip_state
+                    .actor()
+                    .expect("gossip actor installed just above")
+                    .clone(),
+            );
+            builder = builder.accept(crate::alpn::GOSSIP_ALPN, handler);
         }
         let router = builder.spawn();
 
@@ -859,6 +975,23 @@ impl NetTransport {
     #[must_use]
     pub fn outbound_queue_depths(&self) -> Vec<(EndpointId, usize)> {
         self.shared.outbound_queue_depths()
+    }
+
+    /// The total gossip-neighbor count across every per-room mesh this node has
+    /// subscribed (issue #171 / spec §5.4). Zero when the `gossip_overlay`
+    /// feature is off, no room session is active, or the swarm has not yet
+    /// formed a direct neighbor link. Surfaced through `Node::gossip_neighbor_count`
+    /// so the CLI / spike harness can read it.
+    #[must_use]
+    pub fn gossip_neighbor_count(&self) -> usize {
+        #[cfg(feature = "gossip_overlay")]
+        {
+            self.shared.gossip_state.neighbor_count()
+        }
+        #[cfg(not(feature = "gossip_overlay"))]
+        {
+            0
+        }
     }
 
     /// The current state of one device, if known.
@@ -1002,6 +1135,10 @@ mod tests {
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
             inbound,
+            #[cfg(feature = "gossip_overlay")]
+            gossip_state: crate::gossip::GossipState::inert(),
+            #[cfg(feature = "gossip_overlay")]
+            peer_manager: Mutex::new(None),
         });
         (shared, InboundReceiver { rx: inbound_rx })
     }
@@ -1046,6 +1183,28 @@ mod tests {
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::WantMembership {
                 room_id: RoomId::from_bytes([0xAC; 32]),
+                have: vec![],
+            },
+        }
+    }
+
+    /// A `WantRecentChat` frame — used in queue-budget tests as the
+    /// Content-priority / stream-charging variant. `Events` is also
+    /// Content-priority but, under the `gossip_overlay` feature, routes to the
+    /// gossip mesh instead of the per-peer queue (issue #171 / spec §4 D1); a
+    /// `WantRecentChat` pull is a pull/query variant that always rides the
+    /// queue, so the queue-budget properties hold under both feature
+    /// configurations.
+    fn want_recent_chat_outgoing(peer: EndpointId) -> Outgoing {
+        use iroh_rooms_core::sync::Window;
+        Outgoing {
+            peer: PeerId::from_bytes(*peer.as_bytes()),
+            msg: SyncMessage::WantRecentChat {
+                room_id: RoomId::from_bytes([0xAE; 32]),
+                window: Window {
+                    max_count: 10,
+                    since_ms: None,
+                },
                 have: vec![],
             },
         }
@@ -1163,7 +1322,14 @@ mod tests {
     fn route_accepts_governance_when_content_stream_budget_is_full() {
         let (shared, _rx) = make_shared();
         let peer = device(0x06);
-        let content = events_outgoing(peer, 64);
+        // `WantRecentChat` (Subscription family) is Content-priority and
+        // stream-charging — the same queue classification as `Events` — but it
+        // is a pull variant that always rides the per-peer queue (issue #171
+        // / spec §4 D1: pull/query variants stay on the queue path). Using it
+        // instead of `Events` keeps this queue-budget test meaningful under
+        // both feature configurations: under `gossip_overlay`, `Events`
+        // detours through the gossip mesh and would never reach the queue.
+        let content = want_recent_chat_outgoing(peer);
         let content_body_len = content.msg.encode().len();
         let admin = admin_tip_outgoing(peer);
         let admin_body = admin.msg.encode();
@@ -1212,6 +1378,10 @@ mod tests {
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
             inbound,
+            #[cfg(feature = "gossip_overlay")]
+            gossip_state: crate::gossip::GossipState::inert(),
+            #[cfg(feature = "gossip_overlay")]
+            peer_manager: Mutex::new(None),
         });
         let mut rx = InboundReceiver { rx: inbound_rx };
 
@@ -1718,5 +1888,905 @@ mod tests {
             shared.connected_peers().is_empty(),
             "Connecting is not authenticated; connected_peers must exclude it"
         );
+    }
+
+    // --- Issue #171: Shared::route branches Events → gossip broadcast --------
+    //
+    // The surgical seam (spec §4 D1). When the `gossip_overlay` feature is on,
+    // `Events` frames are broadcast on the room's gossip topic instead of
+    // per-peer queue fan-out; every other variant stays on the queue path
+    // unchanged. The pull/query variants rely on per-link FIFO that gossip's
+    // epidemic delivery does not provide.
+    //
+    // These tests run under both feature configurations:
+    // - default (overlay off): `Events` rides the queue path like today; the
+    //   branch test confirms a registered peer still receives the frame.
+    // - `gossip_overlay`: `Events` is routed through the (absent) gossip mesh
+    //   and silently dropped; pull/query variants still land on the queue.
+    //   This pins the spec's "no mesh ⇒ silent drop" contract (D1) and the
+    //   "pull variants unchanged" contract.
+
+    /// Issue #171 / spec §4 D1 + open question 4: under the gossip overlay,
+    /// an `Events` frame is ALSO broadcast on the room's gossip mesh when one
+    /// is installed (dual-path delivery); the per-peer queue path is retained
+    /// as the fallback / coexisting channel (engine `event_id` dedup makes a
+    /// duplicate idempotent). Without the overlay, the legacy per-peer queue
+    /// path is the only path. This test pins the queue-side guarantee under
+    /// both feature configurations: a registered peer always receives Events
+    /// via the queue. The gossip-side delivery is exercised by the loopback
+    /// integration test (Step 2 verify).
+    #[test]
+    fn route_events_branch_respects_gossip_overlay_feature() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x40);
+        let (queue, mut rx) = outbound_pair();
+        shared.register_outbound(peer, queue);
+
+        shared.route(&events_outgoing(peer, 64));
+
+        // The per-peer queue always carries Events under both feature
+        // configurations (dual-path under the overlay, queue-only otherwise).
+        assert!(
+            rx.try_recv().is_some(),
+            "Events must ride the per-peer queue under both feature configurations"
+        );
+    }
+
+    /// Issue #171 / spec §4 D1: pull/query variants stay on the per-peer queue
+    /// path regardless of the overlay feature — they rely on per-link FIFO
+    /// that gossip cannot provide. Pinned for both `WantMembership`
+    /// (governance) and `AdminTip` (governance) so a future variant
+    /// reclassification cannot silently move them onto gossip.
+    #[test]
+    fn route_pull_variants_stay_on_per_peer_queue_under_overlay() {
+        let (shared, _rx) = make_shared();
+        let peer = device(0x41);
+        let (queue, mut rx) = outbound_pair();
+        shared.register_outbound(peer, queue);
+
+        let want_membership_body = want_membership_outgoing(peer).msg.encode();
+        let admin_tip_body = admin_tip_outgoing(peer).msg.encode();
+
+        shared.route(&want_membership_outgoing(peer));
+        shared.route(&admin_tip_outgoing(peer));
+
+        // Pull/query variants always land on the queue, in priority order
+        // (governance first). The order itself is exercised by
+        // `route_accepts_governance_when_content_stream_budget_is_full`
+        // above; here we only assert both bodies arrive.
+        let bodies = [rx.try_recv(), rx.try_recv()];
+        assert!(bodies.iter().all(std::option::Option::is_some));
+        let got: Vec<Vec<u8>> = bodies.into_iter().map(|b| b.expect("queued")).collect();
+        assert!(
+            got.contains(&want_membership_body),
+            "WantMembership must ride the per-peer queue"
+        );
+        assert!(
+            got.contains(&admin_tip_body),
+            "AdminTip must ride the per-peer queue"
+        );
+    }
+
+    // ── Issue #171 / spec §4 D2 + Step 1 verify: GOSSIP_ALPN admission gate ──
+    //
+    // The non-negotiable reject-before-bytes guarantee, pinned by deterministic
+    // loopback QUIC (no external services). An unadmitted device's GOSSIP_ALPN
+    // connection must close with `REJECT_CODE` before the inner gossip handler
+    // runs — zero gossip bytes are ever exchanged. This is the focused
+    // negative/security regression for Risk 1; the route-branch tests above
+    // cover the D1 routing seam, and these cover the D2 admission seam.
+
+    #[cfg(feature = "gossip_overlay")]
+    mod gossip_admission {
+        use super::*;
+        use crate::admission::{Admission, AdmissionDecision, AllowlistAdmission, RejectCause};
+        use crate::alpn::GOSSIP_ALPN;
+        use crate::audit::AuditSink;
+        use crate::gossip::{spawn_gossip_actor, GossipProtocolHandler};
+        use crate::handler::REJECT_CODE;
+
+        use iroh::endpoint::presets;
+        use iroh::endpoint::{ApplicationClose, ConnectionError};
+        use iroh::protocol::Router;
+        use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+        use iroh_rooms_core::event::keys::IdentityKey;
+
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::time::Duration;
+
+        /// A spy `AuditSink` that records every `gossip_topic_rejected` call so
+        /// the reject path can be asserted to have run (and run exactly once).
+        #[derive(Default)]
+        struct SpyAudit {
+            topic_rejected: Mutex<Vec<(EndpointId, RejectCause)>>,
+        }
+
+        impl AuditSink for SpyAudit {
+            fn accepted(&self, _device: EndpointId, _identity: &IdentityKey) {}
+            fn rejected(&self, _device: EndpointId, _cause: RejectCause) {}
+            fn connected(&self, _device: EndpointId) {}
+            fn disconnected(&self, _device: EndpointId) {}
+            fn gossip_topic_rejected(&self, device: EndpointId, cause: RejectCause) {
+                self.topic_rejected.lock().unwrap().push((device, cause));
+            }
+        }
+
+        /// Build a minimal `Shared` over `admission` + `audit`, with empty
+        /// routing tables and an inert gossip state. Mirrors the parent module's
+        /// `make_shared` so the wrapper under test consults the exact same state
+        /// shape production uses, without needing a full `NetTransport::bind`.
+        fn make_shared_with_gate(
+            me: EndpointId,
+            admission: Arc<dyn Admission>,
+            audit: Arc<dyn AuditSink>,
+        ) -> Arc<Shared> {
+            let (inbound, _inbound_rx) = BytePriorityQueue::channel(
+                DEFAULT_PER_PEER_QUEUE_BYTES,
+                DEFAULT_PER_STREAM_QUEUE_BYTES,
+            );
+            Arc::new(Shared {
+                me,
+                admission,
+                audit,
+                table: PeerTable::new(8),
+                outbound: Mutex::new(HashMap::new()),
+                outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+                stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
+                connections: Mutex::new(HashMap::new()),
+                provisional: Mutex::new(HashSet::new()),
+                capability_proven: Mutex::new(HashSet::new()),
+                generations: Mutex::new(HashMap::new()),
+                inbound,
+                gossip_state: crate::gossip::GossipState::inert(),
+                peer_manager: Mutex::new(None),
+            })
+        }
+
+        fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
+            let port = ep
+                .bound_sockets()
+                .into_iter()
+                .map(|s| s.port())
+                .next()
+                .expect("bound UDP socket");
+            EndpointAddr::new(ep.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        }
+
+        struct ProvisionalAdmission;
+
+        impl Admission for ProvisionalAdmission {
+            fn authorize(&self, _device: EndpointId) -> AdmissionDecision {
+                AdmissionDecision::AdmitProvisional
+            }
+        }
+
+        /// Issue #171 / spec §4 D2 (Risk 1 — non-negotiable): a `GOSSIP_ALPN`
+        /// connection from a device the admission gate rejects (here:
+        /// `UnknownDevice` — an unbound device) is closed with `REJECT_CODE`
+        /// before the inner gossip handler runs. Pinned by (a) the dialer
+        /// observing the application close at `REJECT_CODE`, (b) the spy
+        /// recording exactly one `gossip_topic_rejected`, and (c) the device
+        /// table flipping to `Unauthorized`. The audit + table writes precede
+        /// `conn.close()` in the handler, so observing the close guarantees
+        /// they have run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_alpn_rejects_unadmitted_device_before_delegate() {
+            let server_sk = SecretKey::from_bytes(&[0x71; 32]);
+            let dialer_sk = SecretKey::from_bytes(&[0x72; 32]);
+            let server_id = server_sk.public();
+            let dialer_id = dialer_sk.public();
+
+            // Admission binds NO devices → the dialer resolves to UnknownDevice.
+            let admission: Arc<dyn Admission> = Arc::new(AllowlistAdmission::new());
+            let spy = Arc::new(SpyAudit::default());
+            let shared =
+                make_shared_with_gate(server_id, admission, Arc::clone(&spy) as Arc<dyn AuditSink>);
+
+            let server_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(server_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("server bind");
+            let server_addr = loopback_addr(&server_ep);
+
+            let gossip = spawn_gossip_actor(server_ep.clone());
+            let handler = GossipProtocolHandler::new(Arc::clone(&shared), gossip.clone());
+            // Keep the router alive for the test's duration: dropping it stops
+            // the accept loop before the reject can be observed.
+            let _router = Router::builder(server_ep.clone())
+                .accept(GOSSIP_ALPN, handler)
+                .spawn();
+
+            let dialer_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(dialer_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("dialer bind");
+
+            let conn = dialer_ep
+                .connect(server_addr, GOSSIP_ALPN)
+                .await
+                .expect("dialer connect");
+
+            // The server's accept() rejects and closes before delegating.
+            // Observe the application close on the dialer side.
+            let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .expect("connection must close (reject-before-bytes)");
+            match closed {
+                ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. }) => {
+                    assert_eq!(
+                        error_code, REJECT_CODE,
+                        "the GOSSIP_ALPN admission gate must close with REJECT_CODE"
+                    );
+                }
+                other => panic!("expected an ApplicationClosed at REJECT_CODE, got: {other:?}"),
+            }
+
+            // The reject path ran exactly once and recorded the dialer + cause.
+            let recorded = spy.topic_rejected.lock().unwrap().clone();
+            assert_eq!(
+                recorded.len(),
+                1,
+                "admission must audit the GOSSIP_ALPN reject exactly once"
+            );
+            assert_eq!(
+                recorded[0].0, dialer_id,
+                "the rejected device is the dialer"
+            );
+            assert_eq!(
+                recorded[0].1,
+                RejectCause::UnknownDevice,
+                "an unbound device rejects as UnknownDevice"
+            );
+
+            // The device table flipped to Unauthorized (mirrors `handler.rs:60`).
+            assert_eq!(
+                shared.table.state_of(dialer_id),
+                Some(PeerConnState::Unauthorized),
+                "a rejected GOSSIP_ALPN device must be marked Unauthorized"
+            );
+        }
+
+        /// Review regression: an open join window may provisionally admit an
+        /// unknown device on `EVENT_ALPN`, but gossip has no membership-only
+        /// capability protocol. The same verdict must therefore be rejected
+        /// before the inner gossip handler sees the connection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_alpn_rejects_provisional_device_before_delegate() {
+            let server_sk = SecretKey::from_bytes(&[0x75; 32]);
+            let dialer_sk = SecretKey::from_bytes(&[0x76; 32]);
+            let server_id = server_sk.public();
+            let dialer_id = dialer_sk.public();
+            let spy = Arc::new(SpyAudit::default());
+            let shared = make_shared_with_gate(
+                server_id,
+                Arc::new(ProvisionalAdmission),
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            );
+
+            let server_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(server_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("server bind");
+            let gossip = spawn_gossip_actor(server_ep.clone());
+            let _router = Router::builder(server_ep.clone())
+                .accept(
+                    GOSSIP_ALPN,
+                    GossipProtocolHandler::new(shared.clone(), gossip),
+                )
+                .spawn();
+            let dialer_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(dialer_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("dialer bind");
+            let conn = dialer_ep
+                .connect(loopback_addr(&server_ep), GOSSIP_ALPN)
+                .await
+                .expect("dialer connect");
+
+            let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .expect("provisional gossip connection must close");
+            assert!(matches!(
+                closed,
+                ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+                    if error_code == REJECT_CODE
+            ));
+            assert_eq!(
+                spy.topic_rejected.lock().unwrap().as_slice(),
+                &[(dialer_id, RejectCause::UnknownDevice)]
+            );
+            assert_eq!(
+                shared.table.state_of(dialer_id),
+                Some(PeerConnState::Unauthorized)
+            );
+        }
+
+        /// Issue #171 / spec §4 D2: the gossip gate inherits the event plane's
+        /// reject-cause vocabulary because both consult the same
+        /// `Arc<dyn Admission>`. A device that IS bound but whose identity is
+        /// not Active rejects as `NotActive` (not `UnknownDevice`). Pinned so a
+        /// future change cannot collapse the §16.3 reject vocabulary on the
+        /// gossip path.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_alpn_reject_propagates_the_admission_cause() {
+            let server_sk = SecretKey::from_bytes(&[0x73; 32]);
+            let dialer_sk = SecretKey::from_bytes(&[0x74; 32]);
+            let server_id = server_sk.public();
+            let dialer_id = dialer_sk.public();
+            let bound_identity = IdentityKey::from_bytes([0xB0; 32]);
+
+            // Bound but NOT Active → NotActive.
+            let admission: Arc<dyn Admission> =
+                Arc::new(AllowlistAdmission::new().bind_device(dialer_id, bound_identity));
+            let spy = Arc::new(SpyAudit::default());
+            let shared =
+                make_shared_with_gate(server_id, admission, Arc::clone(&spy) as Arc<dyn AuditSink>);
+
+            let server_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(server_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("server bind");
+            let server_addr = loopback_addr(&server_ep);
+            let gossip = spawn_gossip_actor(server_ep.clone());
+            let handler = GossipProtocolHandler::new(Arc::clone(&shared), gossip.clone());
+            let _router = Router::builder(server_ep.clone())
+                .accept(GOSSIP_ALPN, handler)
+                .spawn();
+
+            let dialer_ep = Endpoint::builder(presets::Minimal)
+                .secret_key(dialer_sk)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("dialer bind");
+            let conn = dialer_ep
+                .connect(server_addr, GOSSIP_ALPN)
+                .await
+                .expect("dialer connect");
+
+            let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .expect("connection must close");
+            assert!(
+                matches!(
+                    closed,
+                    ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+                        if error_code == REJECT_CODE
+                ),
+                "bound-but-inactive device must still be rejected at REJECT_CODE; got: {closed:?}"
+            );
+
+            let recorded = spy.topic_rejected.lock().unwrap().clone();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].0, dialer_id);
+            assert_eq!(
+                recorded[0].1,
+                RejectCause::NotActive,
+                "a bound-but-inactive device rejects as NotActive on the gossip plane"
+            );
+        }
+    }
+
+    // ── Issue #171 / spec §4 D1 + Step 2 verify: gossip overlay delivery ──
+    //
+    // The loopback integration test the spec's Step 2 verify names and the
+    // `route_events_branch_respects_gossip_overlay_feature` test above
+    // references ("The gossip-side delivery is exercised by the loopback
+    // integration test"). Two in-process nodes, each with a real `GossipMesh`
+    // installed on a real `Shared`, wired through a `MemoryLookup` so the
+    // `iroh-gossip` swarm can form on loopback (loopback has no discovery
+    // service — the same seam `spike-transport/src/gossip.rs::spawn` uses).
+    // Broadcasting an encoded `SyncMessage::Events` via `Shared::route` must
+    // arrive at the receiver's inbound sink as the same canonical CBOR bytes
+    // (D1), having crossed the `GOSSIP_ALPN` admission gate on both sides
+    // (D2). This crosses the full boundary the focused route tests cannot:
+    // `route` → `GossipMesh::broadcast_events` → real GOSSIP_ALPN QUIC →
+    // receiver task → `try_enqueue_inbound` → inbound sink.
+
+    #[cfg(feature = "gossip_overlay")]
+    mod gossip_overlay_delivery {
+        use super::*;
+        use crate::admission::{Admission, RejectCause};
+        use crate::alpn::GOSSIP_ALPN;
+        use crate::audit::AuditSink;
+        use crate::gossip::{events_topic, spawn_gossip_actor, GossipMesh, GossipProtocolHandler};
+        use iroh_rooms_core::event::keys::IdentityKey;
+
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+        use iroh::{Endpoint, EndpointAddr, RelayMode};
+
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// Per-step budget — loopback gossip swarm forms in well under this.
+        const WAIT: Duration = Duration::from_secs(15);
+
+        /// A throwaway identity deterministically derived from the device seed
+        /// (admission needs *some* bound identity to mark Active; its value is
+        /// irrelevant to the overlay delivery path under test).
+        fn identity(seed: u8) -> IdentityKey {
+            IdentityKey::from_bytes([seed.wrapping_add(0x40); 32])
+        }
+
+        fn loopback_addr(ep: &Endpoint) -> EndpointAddr {
+            let port = ep
+                .bound_sockets()
+                .into_iter()
+                .map(|s| s.port())
+                .next()
+                .expect("bound UDP socket");
+            EndpointAddr::new(ep.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        }
+
+        /// A recording `AuditSink` that counts gossip-broadcast outcomes on the
+        /// sender: `gossip_broadcast` (the broadcast task completed Ok) and
+        /// `transport_queue_saturated("gossip_out")` (it errored). Exactly one
+        /// outcome fires per broadcast task that actually ran, so the combined
+        /// count is the observable that pins the per-mesh dedup (issue #171):
+        /// routing the identical body N times must collapse to one outcome.
+        #[derive(Default)]
+        struct BroadcastSpy {
+            ok: AtomicUsize,
+            err: AtomicUsize,
+        }
+
+        impl BroadcastSpy {
+            fn outcomes(&self) -> usize {
+                self.ok.load(Ordering::Relaxed) + self.err.load(Ordering::Relaxed)
+            }
+        }
+
+        impl AuditSink for BroadcastSpy {
+            fn accepted(&self, _: EndpointId, _: &IdentityKey) {}
+            fn rejected(&self, _: EndpointId, _: RejectCause) {}
+            fn connected(&self, _: EndpointId) {}
+            fn disconnected(&self, _: EndpointId) {}
+            fn gossip_broadcast(&self, _: RoomId, _: usize) {
+                self.ok.fetch_add(1, Ordering::Relaxed);
+            }
+            fn transport_queue_saturated(&self, _: EndpointId, queue: &'static str) {
+                if queue == "gossip_out" {
+                    self.err.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        /// One gossip-overlay node on loopback: a real `Endpoint` (with a
+        /// `MemoryLookup` pre-loaded with `known_addrs` so the gossip actor can
+        /// dial bootstrap `EndpointId`s — loopback has no discovery service,
+        /// the same seam `spike-transport/src/gossip.rs::spawn` uses), a real
+        /// gossip actor spawned on it, the `GOSSIP_ALPN` admission-gate handler
+        /// chained on the router (D2), and a `Shared` whose `gossip_state`
+        /// carries the live actor.
+        ///
+        /// The returned `Router` and `InboundReceiver` must outlive the test
+        /// body: dropping the `Router` stops the `GOSSIP_ALPN` accept loop, and
+        /// the `InboundReceiver` is the inlet a gossip-delivered frame surfaces
+        /// on.
+        async fn spawn_overlay_node(
+            seed: u8,
+            members: &[u8],
+            known_addrs: Vec<EndpointAddr>,
+        ) -> (Arc<Shared>, InboundReceiver, Endpoint, Router) {
+            spawn_overlay_node_with_audit(seed, members, known_addrs, Arc::new(TracingAudit)).await
+        }
+
+        /// Same as [`spawn_overlay_node`] but with a caller-supplied audit sink
+        /// — used by the dedup test to count broadcasts at the sender (the exact
+        /// point the N-1 amplification occurs; iroh-gossip dedups identical
+        /// content at delivery, so receiver-side counting cannot surface it).
+        async fn spawn_overlay_node_with_audit(
+            seed: u8,
+            members: &[u8],
+            known_addrs: Vec<EndpointAddr>,
+            audit: Arc<dyn AuditSink>,
+        ) -> (Arc<Shared>, InboundReceiver, Endpoint, Router) {
+            let sk = SecretKey::from_bytes(&[seed; 32]);
+            let me = sk.public();
+
+            let mut admission = AllowlistAdmission::new();
+            for &s in members {
+                admission = admission
+                    .bind_device(device(s), identity(s))
+                    .set_active(identity(s));
+            }
+            let admission: Arc<dyn Admission> = Arc::new(admission);
+
+            let lookup = MemoryLookup::new();
+            for addr in &known_addrs {
+                lookup.add_endpoint_info(addr.clone());
+            }
+            let endpoint = Endpoint::builder(presets::Minimal)
+                .secret_key(sk)
+                .relay_mode(RelayMode::Disabled)
+                .address_lookup(lookup)
+                .bind()
+                .await
+                .expect("bind loopback endpoint");
+
+            let gossip = spawn_gossip_actor(endpoint.clone());
+
+            let (inbound, inbound_rx) = BytePriorityQueue::channel(
+                DEFAULT_PER_PEER_QUEUE_BYTES,
+                DEFAULT_PER_STREAM_QUEUE_BYTES,
+            );
+            let shared = Arc::new(Shared {
+                me,
+                admission,
+                audit,
+                table: PeerTable::new(8),
+                outbound: Mutex::new(HashMap::new()),
+                outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+                stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
+                connections: Mutex::new(HashMap::new()),
+                provisional: Mutex::new(HashSet::new()),
+                capability_proven: Mutex::new(HashSet::new()),
+                generations: Mutex::new(HashMap::new()),
+                inbound,
+                gossip_state: crate::gossip::GossipState::with_actor(gossip.clone()),
+                peer_manager: Mutex::new(None),
+            });
+
+            let handler = GossipProtocolHandler::new(shared.clone(), gossip);
+            let router = Router::builder(endpoint.clone())
+                .accept(GOSSIP_ALPN, handler)
+                .spawn();
+
+            (shared, InboundReceiver { rx: inbound_rx }, endpoint, router)
+        }
+
+        /// Poll the overlay's gossip-neighbor count until it reaches
+        /// `threshold` or `budget` elapses (spec §5.4 — the swarm formed a
+        /// direct neighbor link, the precondition for broadcast delivery and
+        /// the observability surface `Node::gossip_neighbor_count` exposes).
+        async fn wait_for_neighbors(shared: &Shared, threshold: usize, budget: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if shared.gossip_state.neighbor_count() >= threshold {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Issue #171 / spec §4 D1 + Step 2 verify: an encoded
+        /// `SyncMessage::Events` body broadcast on the room's gossip topic by
+        /// `Shared::route` arrives at the receiver's inbound sink as the same
+        /// canonical CBOR bytes — the headline positive-delivery proof for the
+        /// gossip overlay.
+        ///
+        /// The two nodes are admitted to each other (D2: the `GOSSIP_ALPN` gate
+        /// lets the swarm connection through on both sides), and the swarm is
+        /// given time to form a direct neighbor link before the broadcast
+        /// (spike surprise 1: `joined()` is awaited inside `GossipMesh::spawn`).
+        /// The delivered bytes are byte-compared against a freshly encoded copy
+        /// — D1's "a peer cannot tell which path delivered it" contract.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_overlay_broadcast_delivers_events_to_inbound_sink() {
+            let room = RoomId::from_bytes([0xAD; 32]);
+            let a_seed: u8 = 0x61;
+            let b_seed: u8 = 0x62;
+
+            // Node A: first member, no known peer addrs yet. Both nodes admit
+            // each other's device (D2 — the GOSSIP_ALPN connection must clear
+            // admission on both sides for the swarm to form).
+            let (a_shared, _a_rx, a_ep, _a_router) =
+                spawn_overlay_node(a_seed, &[a_seed, b_seed], vec![]).await;
+            let a_addr = loopback_addr(&a_ep);
+            let a_id = a_ep.id();
+
+            // Node B: knows A's loopback addr so the gossip actor can dial A's
+            // EndpointId as a bootstrap seed (loopback has no discovery).
+            let (b_shared, mut b_rx, b_ep, _b_router) =
+                spawn_overlay_node(b_seed, &[a_seed, b_seed], vec![a_addr]).await;
+            let b_id = b_ep.id();
+
+            // Sanity: the derived topic is the same pure function both peers
+            // compute from the public room_id (D5) — a mismatch would mean the
+            // two meshes subscribe to different topics and never see each other.
+            assert_eq!(
+                crate::gossip::events_topic(&room),
+                events_topic(&room),
+                "both peers must derive the same per-room TopicId (D5)"
+            );
+
+            // Install the per-room gossip mesh on both nodes. A subscribes with
+            // no bootstrap (first member); B bootstraps from A's EndpointId —
+            // the deterministic seed set (D3). `GossipMesh::spawn` awaits
+            // `receiver.joined()` on B's side before returning (spike surprise
+            // 1), so the swarm has a direct neighbor link by the time we
+            // broadcast.
+            let a_actor = a_shared
+                .gossip_state
+                .actor()
+                .expect("A has a live gossip actor")
+                .clone();
+            let a_mesh = GossipMesh::spawn(a_shared.clone(), a_actor, room, vec![])
+                .await
+                .expect("A subscribes the room gossip topic");
+            a_shared.gossip_state.install_mesh(room, a_mesh);
+
+            let b_actor = b_shared
+                .gossip_state
+                .actor()
+                .expect("B has a live gossip actor")
+                .clone();
+            let b_mesh = GossipMesh::spawn(b_shared.clone(), b_actor, room, vec![a_id])
+                .await
+                .expect("B subscribes + joins the room gossip topic");
+            b_shared.gossip_state.install_mesh(room, b_mesh);
+
+            // The swarm formed a direct neighbor link on both sides (D8
+            // NeighborUp, surfaced for observability — spec §5.4). This is the
+            // precondition for broadcast delivery and pins the
+            // `Node::gossip_neighbor_count` surface.
+            assert!(
+                wait_for_neighbors(&a_shared, 1, WAIT).await,
+                "A must report at least one gossip neighbor after B joined"
+            );
+            assert!(
+                wait_for_neighbors(&b_shared, 1, WAIT).await,
+                "B must report at least one gossip neighbor after joining"
+            );
+
+            // The surgical seam (D1): routing an `Events` frame broadcasts the
+            // encoded body on the room's gossip topic. `broadcast_events` is
+            // fire-and-forget (spawns a task), so delivery is awaited below.
+            let out = Outgoing {
+                peer: PeerId::from_bytes(*b_id.as_bytes()),
+                msg: SyncMessage::Events {
+                    room_id: room,
+                    frames: vec![vec![0xEE; 64]],
+                },
+            };
+            let expected_body = out.msg.encode();
+            a_shared.route(&out);
+
+            // The receiver task feeds the broadcast content into B's inbound
+            // sink as verbatim bytes (D8). The bytes are the same canonical
+            // CBOR the per-peer queue path would have sent (D1).
+            let delivered = tokio::time::timeout(WAIT, b_rx.recv())
+                .await
+                .expect("B must receive the gossip broadcast within budget")
+                .expect("B's inbound stream must not close");
+            assert_eq!(
+                delivered.bytes, expected_body,
+                "the gossip-delivered bytes must equal the encoded SyncMessage \
+                 (D1: same canonical CBOR as the per-peer queue path)"
+            );
+
+            // The delivering peer recorded by the inbound sink is A (the gossip
+            // neighbor that handed B the frame), as a PeerId carrying A's
+            // device-id bytes — the engine keys dedup on event_id, not on the
+            // delivering peer, so this is correct (D8).
+            assert_eq!(
+                delivered.peer.as_bytes(),
+                a_id.as_bytes(),
+                "delivered_from must be A's device id (B's only gossip neighbor)"
+            );
+        }
+
+        /// Review regression: both sides of the gossip boundary enforce the
+        /// direct event-plane `MAX_FRAME_BYTES` contract. The public sender
+        /// refuses an oversized body, and even a bypassed/raw gossip sender
+        /// cannot enqueue that body into the receiver's inbound sink.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gossip_overlay_rejects_oversized_bodies_on_send_and_receive() {
+            let room = RoomId::from_bytes([0xAF; 32]);
+            let a_seed = 0x63;
+            let b_seed = 0x64;
+            let spy = Arc::new(BroadcastSpy::default());
+            let (a_shared, _a_rx, a_ep, _a_router) = spawn_overlay_node_with_audit(
+                a_seed,
+                &[a_seed, b_seed],
+                vec![],
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            )
+            .await;
+            let (b_shared, mut b_rx, _b_ep, _b_router) =
+                spawn_overlay_node(b_seed, &[a_seed, b_seed], vec![loopback_addr(&a_ep)]).await;
+
+            let a_mesh = GossipMesh::spawn(
+                a_shared.clone(),
+                a_shared.gossip_state.actor().unwrap().clone(),
+                room,
+                vec![],
+            )
+            .await
+            .expect("A mesh");
+            a_shared.gossip_state.install_mesh(room, a_mesh.clone());
+            let b_mesh = GossipMesh::spawn(
+                b_shared.clone(),
+                b_shared.gossip_state.actor().unwrap().clone(),
+                room,
+                vec![a_ep.id()],
+            )
+            .await
+            .expect("B mesh");
+            b_shared.gossip_state.install_mesh(room, b_mesh);
+            assert!(wait_for_neighbors(&a_shared, 1, WAIT).await);
+
+            let oversized = vec![0xCD; crate::frame::MAX_FRAME_BYTES as usize + 1];
+            a_mesh.broadcast_events(
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+                a_ep.id(),
+                oversized.clone(),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(spy.outcomes(), 0, "sender must not call iroh-gossip");
+
+            a_mesh
+                .broadcast_unchecked_for_test(oversized)
+                .await
+                .expect("raw test broadcast reaches receiver guard");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), b_rx.recv())
+                    .await
+                    .is_err(),
+                "receiver must not enqueue an oversized gossip body"
+            );
+        }
+
+        /// Review regression: the receiver task must not own its parent mesh.
+        /// Removing the final map/local handles drops the mesh immediately and
+        /// aborts the task instead of leaving a self-sustaining Arc cycle.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn removing_mesh_breaks_receiver_task_ownership() {
+            let room = RoomId::from_bytes([0xB0; 32]);
+            let (shared, _rx, _ep, _router) = spawn_overlay_node(0x65, &[0x65], vec![]).await;
+            let mesh = GossipMesh::spawn(
+                shared.clone(),
+                shared.gossip_state.actor().unwrap().clone(),
+                room,
+                vec![],
+            )
+            .await
+            .expect("mesh");
+            let weak = Arc::downgrade(&mesh);
+            shared.gossip_state.install_mesh(room, mesh.clone());
+            drop(mesh);
+            drop(shared.gossip_state.remove_mesh(&room));
+            tokio::task::yield_now().await;
+            assert!(
+                weak.upgrade().is_none(),
+                "receiver task must not retain its GossipMesh"
+            );
+        }
+
+        /// Issue #171 dedup: the engine fans an accepted `Events` frame out to
+        /// every connected peer (`engine.rs` per-peer loop), so `Shared::route`
+        /// reaches `broadcast_events` once per peer carrying the **identical**
+        /// encoded body. Without per-mesh dedup this is N-1 identical gossip
+        /// broadcasts per event — the O(N²) fan-out issue #171 exists to
+        /// eliminate. The headline delivery test above runs at N=2 (one peer),
+        /// so it cannot surface the redundancy.
+        ///
+        /// This pins the dedup by counting the sender's broadcast outcomes via
+        /// a recording audit: iroh-gossip dedups identical content at
+        /// *delivery*, so counting received copies would not surface the bug —
+        /// only the sender-side audit (one outcome per broadcast task that ran)
+        /// does. Routing the same body to several distinct peers must collapse
+        /// to exactly one outcome.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn route_dedups_identical_events_bodies_to_one_gossip_broadcast() {
+            // Number of distinct peers the engine's per-peer fan-out simulates
+            // (5 > the N=2 the headline delivery test runs at).
+            const FANOUT_PEERS: u8 = 5;
+            let room = RoomId::from_bytes([0xAE; 32]);
+            let a_seed: u8 = 0x71;
+            let b_seed: u8 = 0x72;
+
+            // A carries a recording audit so the dedup is measured at the
+            // broadcast source.
+            let spy = Arc::new(BroadcastSpy::default());
+            let (a_shared, _a_rx, a_ep, _a_router) = spawn_overlay_node_with_audit(
+                a_seed,
+                &[a_seed, b_seed],
+                vec![],
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            )
+            .await;
+            let a_addr = loopback_addr(&a_ep);
+            let a_id = a_ep.id();
+
+            let (b_shared, _b_rx, _b_ep, _b_router) =
+                spawn_overlay_node(b_seed, &[a_seed, b_seed], vec![a_addr]).await;
+
+            // Same topology + neighbor wait as the delivery test: both meshes
+            // installed, a direct neighbor link formed so A's broadcast reliably
+            // completes (and fires its audit).
+            let a_actor = a_shared
+                .gossip_state
+                .actor()
+                .expect("A has a live gossip actor")
+                .clone();
+            let a_mesh = GossipMesh::spawn(a_shared.clone(), a_actor, room, vec![])
+                .await
+                .expect("A subscribes the room gossip topic");
+            a_shared.gossip_state.install_mesh(room, a_mesh);
+
+            let b_actor = b_shared
+                .gossip_state
+                .actor()
+                .expect("B has a live gossip actor")
+                .clone();
+            let b_mesh = GossipMesh::spawn(b_shared.clone(), b_actor, room, vec![a_id])
+                .await
+                .expect("B subscribes + joins the room gossip topic");
+            b_shared.gossip_state.install_mesh(room, b_mesh);
+
+            assert!(
+                wait_for_neighbors(&a_shared, 1, WAIT).await,
+                "A must report at least one gossip neighbor after B joined"
+            );
+            assert!(
+                wait_for_neighbors(&b_shared, 1, WAIT).await,
+                "B must report at least one gossip neighbor after joining"
+            );
+
+            // Simulate the engine's per-peer fan-out: route the SAME Events body
+            // to several distinct peers (5 > the N=2 the headline delivery test
+            // runs at). All carry byte-identical frames → one body hash, so the
+            // per-mesh dedup must collapse them to a single gossip broadcast.
+            let frame = vec![0xEE; 64];
+            for n in 0..FANOUT_PEERS {
+                let peer = PeerId::from_bytes([0xC0 + n; 32]);
+                let out = Outgoing {
+                    peer,
+                    msg: SyncMessage::Events {
+                        room_id: room,
+                        frames: vec![frame.clone()],
+                    },
+                };
+                a_shared.route(&out);
+            }
+
+            // The broadcast task is fire-and-forget, so poll the spy until the
+            // outcome count stabilizes (≥1 outcome with no increase for 150ms)
+            // or it reaches FANOUT_PEERS (a definite regression — stop early).
+            // With the dedup exactly one task runs → one outcome; without it,
+            // FANOUT_PEERS tasks run → FANOUT_PEERS outcomes.
+            let mut last = 0usize;
+            let mut stable_at = tokio::time::Instant::now();
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                let total = spy.outcomes();
+                if total != last {
+                    last = total;
+                    stable_at = tokio::time::Instant::now();
+                }
+                if total >= FANOUT_PEERS as usize {
+                    break;
+                }
+                if last >= 1 && stable_at.elapsed() >= Duration::from_millis(150) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                last, 1,
+                "the per-mesh dedup must collapse the {FANOUT_PEERS} identical route calls to one \
+                 gossip broadcast (observed {last} broadcast outcomes)",
+            );
+        }
     }
 }

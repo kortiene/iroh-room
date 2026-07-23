@@ -15,7 +15,13 @@ use std::time::Duration;
 use iroh::endpoint::{ApplicationClose, Connection, ConnectionError, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_rooms_core::event::keys::IdentityKey;
+#[cfg(feature = "gossip_overlay")]
+use iroh_rooms_core::sync::Outgoing;
 use iroh_rooms_core::sync::PeerId;
+#[cfg(feature = "gossip_overlay")]
+use tokio::sync::mpsc;
+#[cfg(feature = "gossip_overlay")]
+use tokio::time::Instant;
 
 use crate::admission::AdmissionDecision;
 use crate::alpn::EVENT_ALPN;
@@ -257,6 +263,141 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
 
         attempt = attempt.saturating_add(1);
         tokio::time::sleep(backoff(attempt, &shared.me)).await;
+    }
+}
+
+/// Lazily establish one `EVENT_ALPN` link for targeted pull/query traffic, queue
+/// every request that arrives while dialing, and close the link after a bounded
+/// idle period. Unlike [`dial_loop`], this task does not keep a non-seed warm:
+/// a later request creates a fresh task through `PeerManager::route_on_demand`.
+#[cfg(feature = "gossip_overlay")]
+#[allow(clippy::too_many_lines)] // one connection lifecycle; splitting obscures guarded teardown ownership
+pub(crate) async fn on_demand_dial(
+    shared: Arc<Shared>,
+    endpoint: Endpoint,
+    addr: EndpointAddr,
+    mut pending: mpsc::Receiver<Outgoing>,
+) {
+    const QUIESCENCE: Duration = Duration::from_secs(30);
+
+    let target = addr.id;
+    let mut backlog = std::collections::VecDeque::new();
+    let mut attempt = 0u32;
+    let mut deadline = Instant::now() + QUIESCENCE;
+
+    loop {
+        while let Ok(out) = pending.try_recv() {
+            backlog.push_back(out);
+            deadline = Instant::now() + QUIESCENCE;
+        }
+        if backlog.is_empty() {
+            match tokio::time::timeout_at(deadline, pending.recv()).await {
+                Ok(Some(out)) => {
+                    backlog.push_back(out);
+                    deadline = Instant::now() + QUIESCENCE;
+                }
+                Ok(None) | Err(_) => return,
+            }
+        }
+
+        shared.set_connecting_if_no_link(target);
+        let connected =
+            tokio::time::timeout_at(deadline, endpoint.connect(addr.clone(), EVENT_ALPN)).await;
+        let conn = match connected {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(err)) => {
+                tracing::debug!(%err, peer = %target, "on-demand dial: connect failed");
+                shared.set_offline_if_no_link(target, OfflineReason::Unreachable);
+                attempt = attempt.saturating_add(1);
+                let delay = backoff(attempt, &shared.me);
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    next = pending.recv() => {
+                        let Some(out) = next else { return };
+                        backlog.push_back(out);
+                        deadline = Instant::now() + QUIESCENCE;
+                    }
+                    () = tokio::time::sleep_until(deadline) => return,
+                }
+                continue;
+            }
+            Err(_) => return,
+        };
+
+        let remote = conn.remote_id();
+        let identity = match shared.admission.authorize(remote) {
+            AdmissionDecision::Admit { identity } => identity,
+            AdmissionDecision::Reject(cause) => {
+                shared.audit.rejected(remote, cause);
+                shared.table.set(remote, PeerConnState::Unauthorized, None);
+                conn.close(REJECT_CODE, b"unauthorized-remote");
+                return;
+            }
+            AdmissionDecision::AdmitProvisional => {
+                conn.close(REJECT_CODE, b"provisional-not-allowed");
+                return;
+            }
+        };
+
+        let generation = match establish_outbound(&shared, &conn, remote, identity).await {
+            Established::Up(generation) => generation,
+            Established::RemoteRejected => {
+                shared.table.set(remote, PeerConnState::Unauthorized, None);
+                return;
+            }
+            Established::Failed => {
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        // The writer queue now exists, so replay every request retained while
+        // the connection was coming up through the normal bounded route path.
+        while let Some(out) = backlog.pop_front() {
+            shared.route(&out);
+        }
+        deadline = Instant::now() + QUIESCENCE;
+
+        loop {
+            tokio::select! {
+                _ = conn.closed() => {
+                    let rejected = rejected_by_remote(&conn);
+                    let exit = if rejected {
+                        LinkTeardown::Unauthorized
+                    } else {
+                        LinkTeardown::Offline(OfflineReason::LinkDropped)
+                    };
+                    if shared.teardown_if_current(remote, generation, exit) {
+                        shared.audit.disconnected(remote);
+                    }
+                    return;
+                }
+                next = pending.recv() => {
+                    let Some(out) = next else {
+                        conn.close(0u32.into(), b"on-demand-owner-dropped");
+                        let _ = shared.teardown_if_current(
+                            remote,
+                            generation,
+                            LinkTeardown::Offline(OfflineReason::LinkDropped),
+                        );
+                        return;
+                    };
+                    shared.route(&out);
+                    deadline = Instant::now() + QUIESCENCE;
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    conn.close(0u32.into(), b"on-demand-idle");
+                    if shared.teardown_if_current(
+                        remote,
+                        generation,
+                        LinkTeardown::Offline(OfflineReason::LinkDropped),
+                    ) {
+                        shared.audit.disconnected(remote);
+                    }
+                    return;
+                }
+            }
+        }
     }
 }
 

@@ -76,6 +76,8 @@ Out of scope for this threat model:
 - `crates/iroh-rooms-core/src/membership/access.rs`: blob and pipe access
   predicates.
 - `crates/iroh-rooms-net/src/admission.rs`: transport admission gate.
+- `crates/iroh-rooms-net/src/gossip.rs`: optional gossip overlay admission
+  wrapper (`GossipProtocolHandler`) for the `GOSSIP_ALPN` (issue #171 / T26).
 - `crates/iroh-rooms-net/src/audit.rs`: admission/blob audit surface.
 - `crates/iroh-rooms-cli/src/audit.rs`: CLI stderr plus `audit.ndjson` sink.
 - `crates/iroh-rooms-cli/src/pipe.rs`: pipe CLI warning and pipe audit sink.
@@ -265,6 +267,7 @@ Status uses:
 | T23 | Agent over-trust or implicit access | High | Agent has own identity, explicit invite, least-privileged role, normal file/pipe gates | Add agent-specific guidance for external integrators | Partial |
 | T24 | Diagnostics leak secrets | High | Diagnostics are secret-free by design; tests cover seed leakage | Extend bug template and audit guidance | Partial |
 | T25 | Availability misunderstood as guaranteed delivery | Medium | Docs and release notes state no cloud inbox/no guaranteed offline delivery | Beta must measure whether users understand this model | Partial |
+| T26 | Unadmitted peer joins the gossip overlay and receives event bytes | High | The optional `gossip_overlay` feature adds a `GOSSIP_ALPN` whose `GossipProtocolHandler` consults the same `Arc<dyn Admission>` instance as the event-plane gate, closing the connection with `REJECT_CODE` at `accept()` time **before** the inner gossip handler runs (reject-before-bytes preserved); the per-room `TopicId` is derived from the public `room_id` and is a rendezvous point, not the boundary; the forwarding set stays ⊆ admitted device keys (issue #171 / #154, spec §4 D2) | Feature is default-off and not CLI-wired; the shipped runtime keeps full-mesh. The boundary is structural (verified by loopback reject tests) and applies the moment an operator enables the overlay. Forwarding-visibility posture is unchanged vs full-mesh | Controlled |
 
 ## Production-Blocking Decisions
 

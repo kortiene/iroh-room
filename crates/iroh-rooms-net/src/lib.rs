@@ -50,6 +50,8 @@ pub mod blob;
 pub mod demo;
 pub mod diag;
 pub mod frame;
+#[cfg(feature = "gossip_overlay")]
+pub mod gossip;
 pub mod handler;
 pub mod manager;
 pub mod node;
@@ -64,7 +66,7 @@ pub use admission::{
     Admission, AdmissionDecision, AdmissionView, AllowlistAdmission, JoinBootstrapAdmission,
     RejectCause, SnapshotAdmission,
 };
-pub use alpn::EVENT_ALPN;
+pub use alpn::{EVENT_ALPN, GOSSIP_ALPN};
 pub use audit::{AuditSink, BlobDenyCause, TracingAudit};
 pub use blob::{BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
 pub use diag::{classify_remote_info, PathType};

@@ -19,11 +19,43 @@ use std::sync::{Arc, Mutex};
 
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_rooms_core::membership::MembershipSnapshot;
+#[cfg(feature = "gossip_overlay")]
+use iroh_rooms_core::sync::{Outgoing, SyncMessage};
+#[cfg(feature = "gossip_overlay")]
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::admission::AdmissionDecision;
 use crate::peer::dial_loop;
 use crate::state::{OfflineReason, PeerConnState};
 use crate::transport::Shared;
+
+/// How many warm dial loops a node maintains toward other active members when
+/// the `gossip_overlay` feature is on (issue #171 / spec §4 D3). The `HyParView`
+/// partial view maintained by `iroh-gossip` grows the overlay the rest of the
+/// way, so the warm-link count is bounded by a small constant K rather than
+/// `O(N)` — the change that lets N grow past the QUIC-connection-count wall the
+/// spike-N40 measured at N=40.
+///
+/// K=3 is the recommended v1 constant: enough for redundancy at the target
+/// N=20 (D7), small enough that the warm connection count is bounded regardless
+/// of N. Revisit if Phase B's spike-N40 re-run shows connectedness <95%.
+pub const GOSSIP_BOOTSTRAP_SEEDS: usize = 3;
+
+/// Per-node cap on simultaneously-live on-demand dial loops toward non-seed
+/// active members (issue #171 / spec §4 D3 step 4). When the engine targets a
+/// pull/query at a peer that is not a warm seed, `Shared::route` triggers a
+/// transient dial that tears itself down after a quiescence timeout. The cap
+/// keeps the total per-node connection count at `K + MAX_ON_DEMAND_LINKS`
+/// regardless of N.
+pub const MAX_ON_DEMAND_LINKS: usize = 8;
+
+/// Number of pull/query frames that may wait for one on-demand connection to
+/// come up. Each frame is independently bounded by `MAX_FRAME_BYTES`; keeping
+/// this queue small prevents an unreachable non-seed from accumulating
+/// unbounded engine output.
+#[cfg(feature = "gossip_overlay")]
+const ON_DEMAND_PENDING_FRAMES: usize = 16;
 
 /// One running managed dial loop: the task handle and the address it is dialing.
 struct DialEntry {
@@ -32,6 +64,12 @@ struct DialEntry {
     /// could be detected (spec §4.2 step 4 / D4; a no-op while hints are immutable).
     #[allow(dead_code)]
     addr: EndpointAddr,
+}
+
+#[cfg(feature = "gossip_overlay")]
+struct OnDemandEntry {
+    tx: mpsc::Sender<Outgoing>,
+    handle: JoinHandle<()>,
 }
 
 /// Room-scoped manager of the outbound dial set (spec §4.1).
@@ -52,6 +90,14 @@ pub struct PeerManager {
     /// Operator-supplied addressing hints (`--peer`), by device id. Immutable for a
     /// session (spec D4).
     addr_hints: HashMap<EndpointId, EndpointAddr>,
+    /// Full admitted-member set. Warm dials use only `desired_seeds`, while
+    /// this set authorizes lazy point-to-point pulls to non-seeds.
+    #[cfg(feature = "gossip_overlay")]
+    active_links: Mutex<BTreeSet<EndpointId>>,
+    /// Lazily-created, quiescence-bounded `EVENT_ALPN` links for pull/query
+    /// variants targeting active members outside the warm seed set.
+    #[cfg(feature = "gossip_overlay")]
+    on_demand: Mutex<HashMap<EndpointId, OnDemandEntry>>,
 }
 
 impl PeerManager {
@@ -71,6 +117,10 @@ impl PeerManager {
             self_device,
             dials: Mutex::new(HashMap::new()),
             addr_hints,
+            #[cfg(feature = "gossip_overlay")]
+            active_links: Mutex::new(BTreeSet::new()),
+            #[cfg(feature = "gossip_overlay")]
+            on_demand: Mutex::new(HashMap::new()),
         }
     }
 
@@ -98,6 +148,61 @@ impl PeerManager {
         out
     }
 
+    /// The gossip-bootstrap seed set: a K-bounded deterministic subset of
+    /// [`desired_devices`](Self::desired_devices) (issue #171 / spec §4 D3).
+    ///
+    /// Selection (D3 step 2): the K lowest-bytewise `EndpointId`s among active
+    /// members (excluding self), plus the room admin's device if it is Active
+    /// and not self and not already in the seed set. Determinism is
+    /// load-bearing: every node must compute the same seed set from the same
+    /// snapshot so the seeds are mutually reachable (a node's seed set is who
+    /// it dials warm; mismatches would leave some seeds unreachable).
+    ///
+    /// K is [`GOSSIP_BOOTSTRAP_SEEDS`] (3 for v1). At small N (N-1 ≤ K) the
+    /// seed set equals the full desired set, so the seed selector is a no-op
+    /// at the current `MAX_ACTIVE_MEMBERS = 5` — every active member is a
+    /// seed. The change only takes effect when N grows past K+1 (Phase C,
+    /// behind the `large_rooms` feature).
+    ///
+    /// The returned set is the **warm dial target** — `reconcile` starts/stops
+    /// loops only for these devices when the overlay is on. Pull/query
+    /// variants to non-seed peers ride on-demand dials bounded by
+    /// [`MAX_ON_DEMAND_LINKS`] (D3 step 4).
+    #[must_use]
+    pub fn desired_seeds(
+        snapshot: &MembershipSnapshot,
+        self_device: EndpointId,
+    ) -> BTreeSet<EndpointId> {
+        // `desired_devices` returns a `BTreeSet<EndpointId>`; iteration is
+        // already in bytewise order, so the first K are the K lowest-bytewise.
+        let desired = Self::desired_devices(snapshot, self_device);
+        let mut seeds: BTreeSet<EndpointId> =
+            desired.into_iter().take(GOSSIP_BOOTSTRAP_SEEDS).collect();
+
+        // The room admin (if Active and not self) is always a seed: it is the
+        // stable rendezvous point for join bootstrap and the canonical source
+        // of the admin chain. The admin is identified by the snapshot's
+        // genesis `admin` identity, so a member is the admin iff its identity
+        // equals `snapshot.admin()`. `active_members` already includes the
+        // admin when Active, so this is a guarantee, not an addition, when
+        // the admin is among the K lowest-bytewise; otherwise it widens the
+        // set past K by exactly one (acceptable: K+1 warm links, still O(1)).
+        let admin_identity = snapshot.admin();
+        for m in snapshot.active_members() {
+            if Some(&m.identity) != admin_identity {
+                continue;
+            }
+            let Some(dev) = m.device else { continue };
+            let Ok(id) = EndpointId::from_bytes(dev.as_bytes()) else {
+                continue;
+            };
+            if id != self_device {
+                seeds.insert(id);
+            }
+        }
+        seeds
+    }
+
     /// Resolve a device to a dialable [`EndpointAddr`]: an explicit `--peer` hint if
     /// one matches (deterministic loopback/LAN), else a bare `EndpointId` (iroh
     /// discovery resolves it in real-network mode) — identical to `build_dial_set`.
@@ -120,7 +225,81 @@ impl PeerManager {
     ///   `Offline{Deauthorized}`, and audit `peer.deauthorized` — for each running
     ///   loop whose device is no longer desired (removed / left the room).
     pub fn reconcile(&self, snapshot: &MembershipSnapshot) {
-        let desired = Self::desired_devices(snapshot, self.self_device);
+        self.reconcile_inner(snapshot, false);
+    }
+
+    /// Production reconcile after the room driver has refreshed the live
+    /// admission cell. In addition to membership removal, this tears down
+    /// fail-closed subjects that remain nominally Active in the fold.
+    pub(crate) fn reconcile_admitted(&self, snapshot: &MembershipSnapshot) {
+        self.reconcile_inner(snapshot, true);
+    }
+
+    fn reconcile_inner(&self, snapshot: &MembershipSnapshot, enforce_admission: bool) {
+        // Membership is necessary but not sufficient: fail-closed subjects
+        // remain nominally Active in the fold and must still lose every live
+        // transport. The admission cell is refreshed immediately before this
+        // production entry point is called, so filtering through it ties direct
+        // links to the same revocation lifecycle as the accept gates. The public
+        // `reconcile` keeps its historical pure membership-set contract for
+        // focused manager users/tests that deliberately provide no admission.
+        let membership_links = Self::desired_devices(snapshot, self.self_device);
+        let admitted_links: BTreeSet<EndpointId> = if enforce_admission {
+            membership_links
+                .into_iter()
+                .filter(|device| {
+                    matches!(
+                        self.shared.admission.authorize(*device),
+                        AdmissionDecision::Admit { .. }
+                    )
+                })
+                .collect()
+        } else {
+            membership_links
+        };
+
+        // The desired warm dial set: every active member (full mesh) when the
+        // gossip overlay is off — the path the v1 spike measured at N≤5. When
+        // the overlay is on, only the K-bounded seed subset is dialed warm;
+        // the HyParView partial view maintained by iroh-gossip grows the
+        // overlay the rest of the way, and pull/query frames to non-seed
+        // peers ride on-demand dials bounded by `MAX_ON_DEMAND_LINKS`
+        // (issue #171 / spec §4 D3 step 3). At N≤5 (the current
+        // `MAX_ACTIVE_MEMBERS = 5`) and K=3 the seed set equals the full
+        // desired set whenever N-1 ≤ K, so the seed selector is a no-op at
+        // the current cap.
+        #[cfg(feature = "gossip_overlay")]
+        let desired: BTreeSet<EndpointId> = Self::desired_seeds(snapshot, self.self_device)
+            .intersection(&admitted_links)
+            .copied()
+            .collect();
+        #[cfg(not(feature = "gossip_overlay"))]
+        let desired = admitted_links.clone();
+
+        #[cfg(feature = "gossip_overlay")]
+        {
+            self.active_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&admitted_links);
+
+            // A removed/fail-closed peer must lose any transient link too.
+            let mut on_demand = self
+                .on_demand
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale: Vec<_> = on_demand
+                .keys()
+                .filter(|device| !admitted_links.contains(*device))
+                .copied()
+                .collect();
+            for device in stale {
+                if let Some(entry) = on_demand.remove(&device) {
+                    entry.handle.abort();
+                }
+                self.shared.close_connection(device);
+            }
+        }
 
         let mut dials = self
             .dials
@@ -147,10 +326,17 @@ impl PeerManager {
                 self.shared.invalidate_link(device);
                 self.shared.close_connection(device);
                 self.shared.unregister(device);
-                self.shared
-                    .table
-                    .set_offline(device, OfflineReason::Deauthorized, None);
-                self.shared.audit.deauthorized(device);
+                if admitted_links.contains(&device) {
+                    // Still Active but no longer selected as a warm seed.
+                    self.shared
+                        .table
+                        .set_offline(device, OfflineReason::LinkDropped, None);
+                } else {
+                    self.shared
+                        .table
+                        .set_offline(device, OfflineReason::Deauthorized, None);
+                    self.shared.audit.deauthorized(device);
+                }
             }
         }
 
@@ -183,6 +369,77 @@ impl PeerManager {
             .len()
     }
 
+    /// Queue a targeted pull on a bounded, lazy `EVENT_ALPN` link when the peer is
+    /// Active but not currently connected as a warm seed. Called synchronously
+    /// by `Shared::route`; dialing and delivery happen in the spawned task.
+    #[cfg(feature = "gossip_overlay")]
+    pub(crate) fn route_on_demand(&self, out: Outgoing) {
+        if !matches!(
+            &out.msg,
+            SyncMessage::WantMembership { .. }
+                | SyncMessage::WantRecentChat { .. }
+                | SyncMessage::WantEvents { .. }
+        ) {
+            return;
+        }
+        let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
+            return;
+        };
+        if !self
+            .active_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&device)
+        {
+            return;
+        }
+
+        let mut entries = self
+            .on_demand
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|_, entry| !entry.handle.is_finished());
+        if let Some(entry) = entries.get(&device) {
+            if entry.tx.try_send(out).is_err() {
+                self.shared
+                    .audit
+                    .transport_queue_saturated(device, "on_demand");
+            }
+            return;
+        }
+        if entries.len() >= MAX_ON_DEMAND_LINKS {
+            self.shared
+                .audit
+                .transport_queue_saturated(device, "on_demand");
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(ON_DEMAND_PENDING_FRAMES);
+        if tx.try_send(out).is_err() {
+            return;
+        }
+        let handle = tokio::spawn(crate::peer::on_demand_dial(
+            self.shared.clone(),
+            self.endpoint.clone(),
+            self.resolve_addr(device),
+            rx,
+        ));
+        entries.insert(device, OnDemandEntry { tx, handle });
+    }
+
+    /// Number of live/connecting transient links (tests and diagnostics).
+    #[cfg(feature = "gossip_overlay")]
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn on_demand_count(&self) -> usize {
+        self.on_demand
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|entry| !entry.handle.is_finished())
+            .count()
+    }
+
     /// Abort every running dial loop (idempotent; also runs on `Drop`).
     pub fn shutdown(&self) {
         let mut dials = self
@@ -190,6 +447,15 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, entry) in dials.drain() {
+            entry.handle.abort();
+        }
+        #[cfg(feature = "gossip_overlay")]
+        for (_, entry) in self
+            .on_demand
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
             entry.handle.abort();
         }
     }
@@ -201,6 +467,12 @@ impl Drop for PeerManager {
         // beyond Drop is a non-goal, spec N6).
         if let Ok(mut dials) = self.dials.lock() {
             for (_, entry) in dials.drain() {
+                entry.handle.abort();
+            }
+        }
+        #[cfg(feature = "gossip_overlay")]
+        if let Ok(mut on_demand) = self.on_demand.lock() {
+            for (_, entry) in on_demand.drain() {
                 entry.handle.abort();
             }
         }
@@ -224,6 +496,17 @@ mod tests {
     };
     use iroh_rooms_core::event::wire::WireEvent;
     use iroh_rooms_core::membership::RoomMembership;
+    #[cfg(feature = "gossip_overlay")]
+    use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
+    #[cfg(feature = "gossip_overlay")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "gossip_overlay")]
+    use crate::admission::{Admission, AllowlistAdmission};
+    #[cfg(feature = "gossip_overlay")]
+    use crate::audit::TracingAudit;
+    #[cfg(feature = "gossip_overlay")]
+    use crate::transport::{NetConfig, NetTransport};
 
     // Deterministic fixtures shared across the tests below.
     const NONCE: [u8; 16] = [0xcc; 16];
@@ -537,5 +820,341 @@ mod tests {
             !result.contains(&member.endpoint_id()),
             "removed member's device must not be in the desired set"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // desired_seeds: the K-bounded gossip-bootstrap subset (issue #171 / §4 D3)
+    // -----------------------------------------------------------------------
+    //
+    // `desired_seeds` selects the K lowest-bytewise active devices + the room
+    // admin (if Active and not self). Determinism is load-bearing: every node
+    // must compute the same seed set from the same snapshot so the seeds are
+    // mutually reachable. At N-1 ≤ K the seed set equals the full desired set
+    // (the no-op at the current `MAX_ACTIVE_MEMBERS = 5`).
+
+    #[test]
+    fn desired_seeds_empty_fold_is_empty() {
+        let room_id = RoomId::from_bytes([0u8; 32]);
+        let snapshot = RoomMembership::new(room_id).snapshot();
+        let self_dev = SecretKey::from_bytes(&[1u8; 32]).public();
+        assert!(
+            PeerManager::desired_seeds(&snapshot, self_dev).is_empty(),
+            "empty fold must yield an empty seed set"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_excludes_self() {
+        // Only the admin is Active after a genesis fold. If admin == self, the
+        // seed set must be empty.
+        let admin = Actor::new(1);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let snapshot = RoomMembership::from_events(room_id, [genesis_ev]).snapshot();
+
+        assert!(
+            PeerManager::desired_seeds(&snapshot, admin.endpoint_id()).is_empty(),
+            "self device must be excluded from the seed set"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_at_small_n_equals_full_desired_set() {
+        // At N=3 (admin + m1 + m2) and K=3, every non-self active member is a
+        // seed — the no-op at the current cap. Pin this so the seed selector
+        // never accidentally drops a peer at N≤5 (where the spike measured the
+        // mesh path).
+        let admin = Actor::new(5);
+        let m1 = Actor::new(6);
+        let m2 = Actor::new(7);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let gid = genesis_ev.event_id;
+        let invite1 = mk_invite(&admin, room_id, &[gid], m1.identity(), 1, T0 + 1);
+        let i1id = invite1.event_id;
+        let join1 = mk_join(&m1, room_id, &[i1id], 1, T0 + 2);
+        let j1id = join1.event_id;
+        let invite2 = mk_invite(&admin, room_id, &[j1id], m2.identity(), 2, T0 + 3);
+        let i2id = invite2.event_id;
+        let join2 = mk_join(&m2, room_id, &[i2id], 2, T0 + 4);
+
+        let snapshot =
+            RoomMembership::from_events(room_id, [genesis_ev, invite1, join1, invite2, join2])
+                .snapshot();
+
+        let seeds = PeerManager::desired_seeds(&snapshot, admin.endpoint_id());
+        let full = PeerManager::desired_devices(&snapshot, admin.endpoint_id());
+        assert_eq!(
+            seeds, full,
+            "at N=3 with K=3, every non-self active member must be a seed"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_is_bounded_by_k_plus_admin_at_large_n() {
+        // At N=12 (admin + 11 members) and K=3, the seed set is at most K+1
+        // (the K lowest-bytewise members + the admin, if not already among
+        // them). This is the load-bearing property: the warm-link count is
+        // bounded regardless of N (issue #171 / spec §4 D3).
+        let admin = Actor::new(1);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let mut prev = genesis_ev.event_id;
+        let mut events = vec![genesis_ev];
+        for n in 2u8..=12 {
+            let m = Actor::new(n);
+            let invite = mk_invite(&admin, room_id, &[prev], m.identity(), n, T0 + u64::from(n));
+            let iid = invite.event_id;
+            let join = mk_join(&m, room_id, &[iid], n, T0 + u64::from(n) + 100);
+            prev = join.event_id;
+            events.push(invite);
+            events.push(join);
+        }
+        let snapshot = RoomMembership::from_events(room_id, events).snapshot();
+
+        // Self is an outsider so the admin counts toward the seed set.
+        let outsider: EndpointId = SecretKey::from_bytes(&[99u8; 32]).public();
+        let seeds = PeerManager::desired_seeds(&snapshot, outsider);
+        let k = super::GOSSIP_BOOTSTRAP_SEEDS;
+        assert!(
+            seeds.len() <= k + 1,
+            "seed set must be bounded by K+1 (K lowest-bytewise + admin); got {} (K={k})",
+            seeds.len()
+        );
+        assert!(
+            seeds.contains(&admin.endpoint_id()),
+            "the active admin must always be a seed"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_is_deterministic_across_calls() {
+        // Every node must compute the same seed set from the same snapshot, so
+        // the selection must be a pure function of (snapshot, self_device).
+        let admin = Actor::new(5);
+        let m1 = Actor::new(6);
+        let m2 = Actor::new(7);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let gid = genesis_ev.event_id;
+        let invite1 = mk_invite(&admin, room_id, &[gid], m1.identity(), 1, T0 + 1);
+        let i1id = invite1.event_id;
+        let join1 = mk_join(&m1, room_id, &[i1id], 1, T0 + 2);
+        let j1id = join1.event_id;
+        let invite2 = mk_invite(&admin, room_id, &[j1id], m2.identity(), 2, T0 + 3);
+        let i2id = invite2.event_id;
+        let join2 = mk_join(&m2, room_id, &[i2id], 2, T0 + 4);
+
+        let snapshot =
+            RoomMembership::from_events(room_id, [genesis_ev, invite1, join1, invite2, join2])
+                .snapshot();
+
+        let outsider: EndpointId = SecretKey::from_bytes(&[99u8; 32]).public();
+        assert_eq!(
+            PeerManager::desired_seeds(&snapshot, outsider),
+            PeerManager::desired_seeds(&snapshot, outsider),
+            "seed selection must be deterministic"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_is_a_subset_of_desired_devices() {
+        // The seed selector narrows the desired set; it must never invent a
+        // device that is not an active member's bound device (minus self). This
+        // is the load-bearing invariant for "only admitted peers are dialed
+        // warm" (issue #171 / spec §4 D3): a seed outside `desired_devices`
+        // would mean dialing a device that admission would reject, or — worse
+        // — a device the snapshot does not know at all. Pinned at large N so
+        // both the K-take and the admin-injection paths are exercised.
+        let admin = Actor::new(1);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let mut prev = genesis_ev.event_id;
+        let mut events = vec![genesis_ev];
+        for n in 2u8..=9 {
+            let m = Actor::new(n);
+            let invite = mk_invite(&admin, room_id, &[prev], m.identity(), n, T0 + u64::from(n));
+            let iid = invite.event_id;
+            let join = mk_join(&m, room_id, &[iid], n, T0 + u64::from(n) + 100);
+            prev = join.event_id;
+            events.push(invite);
+            events.push(join);
+        }
+        let snapshot = RoomMembership::from_events(room_id, events).snapshot();
+
+        // Self is an outsider so admin + members are all candidates.
+        let outsider: EndpointId = SecretKey::from_bytes(&[99u8; 32]).public();
+        let seeds = PeerManager::desired_seeds(&snapshot, outsider);
+        let desired = PeerManager::desired_devices(&snapshot, outsider);
+        assert!(
+            seeds.is_subset(&desired),
+            "seed set ({seeds:?}) must be a subset of desired devices ({desired:?}); \
+             a warm-dial target outside the active set would bypass admission"
+        );
+
+        // And self must never appear in either set.
+        assert!(
+            !seeds.contains(&outsider),
+            "self must never be a warm-dial seed target"
+        );
+    }
+
+    #[test]
+    fn desired_seeds_excludes_admin_when_admin_is_self_even_with_members() {
+        // The `desired_seeds_excludes_self` test only covers the genesis case
+        // (admin alone). Here self == admin AND there are active members, so
+        // the seed set is non-empty but must still exclude self. Catches a
+        // regression where the admin-injection path re-adds self when self is
+        // the admin.
+        let admin = Actor::new(3);
+        let m1 = Actor::new(4);
+        let m2 = Actor::new(5);
+        let (room_id, genesis_ev) = mk_genesis(&admin);
+        let gid = genesis_ev.event_id;
+        let invite1 = mk_invite(&admin, room_id, &[gid], m1.identity(), 1, T0 + 1);
+        let i1id = invite1.event_id;
+        let join1 = mk_join(&m1, room_id, &[i1id], 1, T0 + 2);
+        let j1id = join1.event_id;
+        let invite2 = mk_invite(&admin, room_id, &[j1id], m2.identity(), 2, T0 + 3);
+        let i2id = invite2.event_id;
+        let join2 = mk_join(&m2, room_id, &[i2id], 2, T0 + 4);
+
+        let snapshot =
+            RoomMembership::from_events(room_id, [genesis_ev, invite1, join1, invite2, join2])
+                .snapshot();
+
+        let seeds = PeerManager::desired_seeds(&snapshot, admin.endpoint_id());
+        assert!(
+            !seeds.contains(&admin.endpoint_id()),
+            "admin's own device must be excluded from its seed set even with members present"
+        );
+        assert!(
+            !seeds.is_empty(),
+            "with two active non-self members, the seed set must be non-empty"
+        );
+    }
+
+    #[test]
+    fn gossip_bootstrap_seeds_constant_is_the_v1_value() {
+        // K=3 is the recommended v1 constant (spec §4 D3 step 1). Pin it so a
+        // future change is caught: raising K widens the warm-link count and
+        // must be re-justified by Phase B's spike-N40 re-run.
+        assert_eq!(super::GOSSIP_BOOTSTRAP_SEEDS, 3);
+    }
+
+    #[test]
+    fn max_on_demand_links_constant_is_the_v1_value() {
+        // The per-node transient-dial cap (D3 step 4). K + MAX_ON_DEMAND_LINKS
+        // is the total per-node connection count bound.
+        assert_eq!(super::MAX_ON_DEMAND_LINKS, 8);
+    }
+
+    /// Review regression: the fourth non-self member at the current five-member
+    /// cap is outside K=3. A targeted pull to that member must create a bounded
+    /// transient link and deliver the frame instead of being silently dropped.
+    #[cfg(feature = "gossip_overlay")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // full queued-dial boundary setup and teardown
+    async fn non_seed_pull_dials_on_demand_and_delivers_queued_frame() {
+        let admin = Actor::new(0x21);
+        let members = [
+            Actor::new(0x22),
+            Actor::new(0x23),
+            Actor::new(0x24),
+            Actor::new(0x25),
+        ];
+        let (room_id, genesis) = mk_genesis(&admin);
+        let mut events = vec![genesis];
+        let mut prev = events[0].event_id;
+        for (index, member) in members.iter().enumerate() {
+            let n = u8::try_from(index + 1).expect("small fixture");
+            let invite = mk_invite(
+                &admin,
+                room_id,
+                &[prev],
+                member.identity(),
+                n,
+                T0 + u64::from(n) * 2 - 1,
+            );
+            let join = mk_join(
+                member,
+                room_id,
+                &[invite.event_id],
+                n,
+                T0 + u64::from(n) * 2,
+            );
+            prev = join.event_id;
+            events.push(invite);
+            events.push(join);
+        }
+        let snapshot = RoomMembership::from_events(room_id, events).snapshot();
+        let desired = PeerManager::desired_devices(&snapshot, admin.endpoint_id());
+        let seeds = PeerManager::desired_seeds(&snapshot, admin.endpoint_id());
+        let omitted = *desired
+            .difference(&seeds)
+            .next()
+            .expect("five-member room has one non-seed target at K=3");
+        let target_actor = members
+            .iter()
+            .find(|member| member.endpoint_id() == omitted)
+            .expect("omitted endpoint belongs to a fixture member");
+
+        let source_gate = members
+            .iter()
+            .fold(AllowlistAdmission::new(), |gate, member| {
+                gate.bind_device(member.endpoint_id(), member.identity())
+                    .set_active(member.identity())
+            });
+        let target_gate = AllowlistAdmission::new()
+            .bind_device(admin.endpoint_id(), admin.identity())
+            .set_active(admin.identity());
+        let mut target = NetTransport::bind(
+            SecretKey::from_bytes(&target_actor.dev_sk.to_seed()),
+            Arc::new(target_gate) as Arc<dyn Admission>,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind target transport");
+        let target_addr = target.endpoint_addr().expect("target loopback address");
+        let mut target_inbound = target.take_inbound().expect("target inbound receiver");
+
+        let source = NetTransport::bind(
+            SecretKey::from_bytes(&admin.dev_sk.to_seed()),
+            Arc::new(source_gate) as Arc<dyn Admission>,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind source transport");
+        let shared = source.shared();
+        let manager = Arc::new(PeerManager::new(
+            shared.clone(),
+            source.endpoint(),
+            source.id(),
+            vec![target_addr],
+        ));
+        shared.set_peer_manager(Arc::downgrade(&manager));
+        manager.reconcile(&snapshot);
+
+        let out = Outgoing {
+            peer: PeerId::from_bytes(*omitted.as_bytes()),
+            msg: SyncMessage::WantMembership {
+                room_id,
+                have: Vec::new(),
+            },
+        };
+        let expected = out.msg.encode();
+        shared.route(&out);
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), target_inbound.recv())
+                .await
+                .expect("on-demand dial must deliver within budget")
+                .expect("target inbound remains open");
+        assert_eq!(delivered.bytes, expected);
+        assert_eq!(manager.on_demand_count(), 1);
+
+        manager.shutdown();
+        source.shutdown().await.expect("source shutdown");
+        target.shutdown().await.expect("target shutdown");
     }
 }

@@ -2162,6 +2162,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-blobs",
+ "iroh-gossip",
  "iroh-rooms-core",
  "n0-future",
  "tempfile",

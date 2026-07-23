@@ -25,6 +25,16 @@ default = []
 # deliberately compile-time: ordinary SDK/application binaries cannot switch
 # transport policy at runtime, and their default behavior remains unchanged.
 relay-only-test = []
+# The gossip overlay for `SyncMessage::Events` fan-out (issue #171 / #154 GO
+# decision). When enabled, `Shared::route` broadcasts `Events` frames on a
+# per-room `iroh-gossip` topic among admitted device keys instead of the
+# per-peer queue fan-out; the connection-level admission gate
+# (`GossipProtocolHandler`) still rejects unadmitted devices before any gossip
+# byte is exchanged (reject-before-bytes preserved, spec §4 D2). Default off:
+# at N≤5 the full-mesh path the spike measured is retained verbatim, so the
+# overlay is inert until an operator opts in. Rollback = flip the flag; the
+# pure-mesh `route` branch compiles back in.
+gossip_overlay = ["dep:iroh-gossip"]
 
 [lints]
 workspace = true            # inherits `unsafe_code = "forbid"` (our code only;
@@ -76,6 +86,12 @@ anyhow = "1"               # binary/edge error context only
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# The gossip overlay for `Events` fan-out (issue #171 / spec §4 D1). The exact
+# pin `crates/spike-transport` reconciled against `iroh = "=1.0.1"` with zero
+# API drift (spike-transport/NOTES.md §1). Optional: enabled by the
+# `gossip_overlay` feature so the default build stays on the full-mesh path
+# the v1 spike measured. See `src/gossip.rs` for the integration notes.
+iroh-gossip = { version = "=0.101.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

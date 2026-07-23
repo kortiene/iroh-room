@@ -148,6 +148,46 @@ pub trait AuditSink: Send + Sync + 'static {
         _remaining: usize,
     ) {
     }
+
+    /// A `SyncMessage::Events` body was broadcast on the room's gossip topic
+    /// (issue #171 / spec §5.4). `bytes` is the encoded body length. Stable
+    /// reason code: `gossip.broadcast`. Default: no-op, so existing sinks need
+    /// not change. Only emitted when the `gossip_overlay` feature is on.
+    fn gossip_broadcast(&self, _room_id: RoomId, _bytes: usize) {}
+
+    /// A frame arrived over the gossip overlay from `device` (issue #171 /
+    /// spec §5.4). `bytes` is the encoded body length. Stable reason code:
+    /// `gossip.received`. Default: no-op, so existing sinks need not change.
+    /// Only emitted when the `gossip_overlay` feature is on.
+    fn gossip_received(&self, _device: EndpointId, _bytes: usize) {}
+
+    /// The gossip receiver fell behind and dropped frames (issue #171 / spec
+    /// §5.4, §4 D8). The recovery path is the engine's next anti-entropy pull
+    /// (same shape as the mesh's "link dropped, re-pull" signal). Stable
+    /// reason code: `gossip.lagged`. Default: no-op, so existing sinks need
+    /// not change. Only emitted when the `gossip_overlay` feature is on.
+    fn gossip_lagged(&self, _device: EndpointId) {}
+
+    /// A gossip swarm neighbor came up for one of this node's subscribed
+    /// topics (issue #171 / spec §5.4). Stable reason code:
+    /// `gossip.neighbor_up`. Default: no-op, so existing sinks need not
+    /// change. Only emitted when the `gossip_overlay` feature is on.
+    fn gossip_neighbor_up(&self, _device: EndpointId) {}
+
+    /// A gossip swarm neighbor went down for one of this node's subscribed
+    /// topics (issue #171 / spec §5.4). Stable reason code:
+    /// `gossip.neighbor_down`. Default: no-op, so existing sinks need not
+    /// change. Only emitted when the `gossip_overlay` feature is on.
+    fn gossip_neighbor_down(&self, _device: EndpointId) {}
+
+    /// A `GOSSIP_ALPN` connection was rejected before any gossip byte was
+    /// exchanged (issue #171 / spec §4 D2 / §5.4). The wrapper closes the
+    /// connection at the same `REJECT_CODE` the event-plane gate uses, so the
+    /// dialing side's reject-detection logic works for gossip redials too.
+    /// Stable reason code: `gossip.topic_rejected:<cause>`. Default: no-op, so
+    /// existing sinks need not change. Only emitted when the `gossip_overlay`
+    /// feature is on.
+    fn gossip_topic_rejected(&self, _device: EndpointId, _cause: RejectCause) {}
 }
 
 /// The default audit sink: structured `tracing` events with stable reason codes.
@@ -329,6 +369,68 @@ impl AuditSink for TracingAudit {
             "room is approaching the active-member ceiling"
         );
     }
+
+    fn gossip_broadcast(&self, room_id: RoomId, bytes: usize) {
+        // `gossip.broadcast` — an Events frame fanned out over the gossip
+        // overlay (issue #171 / spec §5.4). DEBUG: a hot-path event, one per
+        // Events send.
+        tracing::debug!(
+            reason = "gossip.broadcast",
+            room = %room_id,
+            bytes,
+            "broadcast an Events frame on the room gossip topic"
+        );
+    }
+
+    fn gossip_received(&self, device: EndpointId, bytes: usize) {
+        // `gossip.received` — a frame arrived over the overlay (issue #171).
+        // DEBUG: hot-path, one per delivered gossip frame.
+        tracing::debug!(
+            reason = "gossip.received",
+            peer = %device,
+            bytes,
+            "received an Events frame over the gossip overlay"
+        );
+    }
+
+    fn gossip_lagged(&self, device: EndpointId) {
+        // `gossip.lagged` — the receiver fell behind; anti-entropy will recover
+        // (issue #171 / spec §4 D8). WARN: a delivery-gap signal.
+        tracing::warn!(
+            reason = "gossip.lagged",
+            peer = %device,
+            "gossip receiver lagged; anti-entropy pull will recover"
+        );
+    }
+
+    fn gossip_neighbor_up(&self, device: EndpointId) {
+        tracing::debug!(
+            reason = "gossip.neighbor_up",
+            peer = %device,
+            "gossip swarm neighbor came up"
+        );
+    }
+
+    fn gossip_neighbor_down(&self, device: EndpointId) {
+        tracing::debug!(
+            reason = "gossip.neighbor_down",
+            peer = %device,
+            "gossip swarm neighbor went down"
+        );
+    }
+
+    fn gossip_topic_rejected(&self, device: EndpointId, cause: RejectCause) {
+        // `gossip.topic_rejected:<cause>` mirrors `peer.rejected:<cause>` for
+        // the GOSSIP_ALPN admission wrapper (issue #171 / spec §4 D2). WARN:
+        // a security-relevant event — an unadmitted device attempted to join
+        // the gossip plane.
+        tracing::warn!(
+            reason = "gossip.topic_rejected",
+            cause = cause.code(),
+            peer = %device,
+            "rejected a GOSSIP_ALPN connection before any gossip byte"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -444,5 +546,48 @@ mod tests {
             audit.blob_serve_rejected(device(7), cause, Some([0xCD; 32]));
             audit.blob_serve_rejected(device(7), cause, None);
         }
+    }
+
+    // ── gossip.* (issue #171 / spec §5.4) ────────────────────────────────────
+    //
+    // The gossip overlay audit events must be non-blocking and non-panicking on
+    // every path through the sink, mirroring the existing admission/lifecycle
+    // guarantees. They surface only when the `gossip_overlay` feature is on,
+    // but the trait/impl contracts must hold regardless.
+
+    #[test]
+    fn tracing_audit_gossip_events_do_not_panic() {
+        let audit = TracingAudit;
+        let room = iroh_rooms_core::event::ids::RoomId::from_bytes([0x71; 32]);
+        audit.gossip_broadcast(room, 1024);
+        audit.gossip_received(device(8), 1024);
+        audit.gossip_lagged(device(8));
+        audit.gossip_neighbor_up(device(9));
+        audit.gossip_neighbor_down(device(9));
+        audit.gossip_topic_rejected(device(10), RejectCause::UnknownDevice);
+        audit.gossip_topic_rejected(device(10), RejectCause::NotActive);
+        audit.gossip_topic_rejected(device(10), RejectCause::FailClosed);
+    }
+
+    #[test]
+    fn default_gossip_events_are_no_ops() {
+        // A minimal sink relying on the trait default must compile and not
+        // panic for the gossip events, so legacy sinks (the CLI's stderr
+        // renderer, custom hosts) need no changes when the overlay is on.
+        struct Minimal;
+        impl AuditSink for Minimal {
+            fn accepted(&self, _device: EndpointId, _identity: &IdentityKey) {}
+            fn rejected(&self, _device: EndpointId, _cause: RejectCause) {}
+            fn connected(&self, _device: EndpointId) {}
+            fn disconnected(&self, _device: EndpointId) {}
+        }
+        let m = Minimal;
+        let room = iroh_rooms_core::event::ids::RoomId::from_bytes([0x71; 32]);
+        m.gossip_broadcast(room, 0);
+        m.gossip_received(device(11), 0);
+        m.gossip_lagged(device(11));
+        m.gossip_neighbor_up(device(12));
+        m.gossip_neighbor_down(device(12));
+        m.gossip_topic_rejected(device(12), RejectCause::NotActive);
     }
 }
