@@ -134,7 +134,7 @@ pub trait AuditSink: Send + Sync + 'static {
     /// `RejectReason::RoomFull` cap, or the signed event log.
     ///
     /// - `active` is the current active-member count.
-    /// - `max` is the hard cap (`MAX_ACTIVE_MEMBERS`, currently `5`).
+    /// - `max` is the hard cap (`MAX_ACTIVE_MEMBERS`).
     /// - `remaining` is `max.saturating_sub(active)` (the headroom left).
     ///
     /// Stable reason code: `room.active_members.near_cap`. Emitters must keep

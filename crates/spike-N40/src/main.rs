@@ -2,11 +2,13 @@
 //!
 //! ```text
 //! n40-probe self-check [--json]
-//! n40-probe matrix [--nodes 5,10,20,40] [--rates idle,0.1,1,5]
+//! n40-probe matrix [--connect-mode full-mesh|gossip]
+//!                  [--nodes 5,10,20,40] [--rates idle,0.1,1,5]
 //!                  [--idle-secs 30] [--load-secs 60] [--low-rate-secs 120]
 //!                  [--warmup-secs 10] [--json results/<name>.json]
 //!                  [--markdown results/results.md]
 //! n40-probe sweep --n 40 --start 0.1 --max 20 --factor 2
+//!                 [--connect-mode full-mesh|gossip]
 //!                 [--load-secs 60] [--warmup-secs 10]
 //! n40-probe rebind --n 40 [--missed-events 10] [--rate 0.1]
 //!                   [--json results/rebind.json]
@@ -46,7 +48,7 @@ use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::{NetConfig, NetMode, Node, PeerConnState};
 use serde_json::json;
 use spike_n40::cluster::{
-    full_mesh_admission, node_seeds, AdminPrincipal, HarnessCluster, HARNESS_TICK,
+    full_mesh_admission, node_seeds, AdminPrincipal, ConnectMode, HarnessCluster, HARNESS_TICK,
 };
 use spike_n40::metrics::{
     classify_cascade, cluster_metrics, counter_baseline, recovered_by_end, run_window,
@@ -98,11 +100,13 @@ async fn main() -> Result<()> {
 const USAGE: &str = "\
 usage:
   n40-probe self-check [--json]
-  n40-probe matrix [--nodes 5,10,20,40] [--rates idle,0.1,1,5]
+  n40-probe matrix [--connect-mode full-mesh|gossip]
+                  [--nodes 5,10,20,40] [--rates idle,0.1,1,5]
                   [--idle-secs 30] [--load-secs 60] [--low-rate-secs 120]
                   [--warmup-secs 10] [--json results/<name>.json]
                   [--markdown results/results.md]
   n40-probe sweep --n 40 --start 0.1 --max 20 --factor 2
+                 [--connect-mode full-mesh|gossip]
                  [--load-secs 60] [--warmup-secs 10]
   n40-probe rebind --n 40 [--missed-events 10] [--rate 0.1]
                    [--json results/rebind.json]";
@@ -119,7 +123,16 @@ usage:
 /// Propagates any cluster spawn / publish / shutdown error.
 pub async fn self_check() -> Result<ScenarioResult> {
     let n = 5usize;
-    run_one_scenario(n, SEED_SELF_CHECK, ScenarioKind::Load, Some(1.0), 2, 8).await
+    run_one_scenario(
+        n,
+        SEED_SELF_CHECK,
+        ScenarioKind::Load,
+        Some(1.0),
+        2,
+        8,
+        ConnectMode::FullMesh,
+    )
+    .await
 }
 
 async fn run_self_check(args: &[String]) -> Result<()> {
@@ -178,6 +191,7 @@ async fn run_matrix(args: &[String]) -> Result<()> {
         .unwrap_or(10);
     let json_path = flag_value(args, "--json");
     let markdown_path = flag_value(args, "--markdown");
+    let connect_mode = parse_connect_mode(args)?;
 
     let nodes: Vec<usize> = parse_csv_usize(&nodes_arg, "nodes")?;
     let rates: Vec<Option<f64>> = parse_csv_rates(&rates_arg)?;
@@ -201,12 +215,20 @@ async fn run_matrix(args: &[String]) -> Result<()> {
                 ScenarioKind::Idle
             };
             let row_warmup = if rate_opt.is_some() { warmup_secs } else { 0 };
-            let result = run_one_scenario(n, seed_base, kind, *rate_opt, row_warmup, measure_secs)
-                .await
-                .with_context(|| {
-                    let rate = rate_opt.map_or_else(|| "idle".to_owned(), |r| r.to_string());
-                    format!("run matrix row N={n} rate={rate}")
-                })?;
+            let result = run_one_scenario(
+                n,
+                seed_base,
+                kind,
+                *rate_opt,
+                row_warmup,
+                measure_secs,
+                connect_mode,
+            )
+            .await
+            .with_context(|| {
+                let rate = rate_opt.map_or_else(|| "idle".to_owned(), |r| r.to_string());
+                format!("run matrix row N={n} rate={rate}")
+            })?;
 
             let metrics = if rate_opt.is_some() {
                 result
@@ -301,6 +323,7 @@ async fn run_sweep(args: &[String]) -> Result<()> {
         .map(|s| s.parse())
         .transpose()?
         .unwrap_or(10);
+    let connect_mode = parse_connect_mode(args)?;
 
     validate_sweep(start, max, factor)?;
 
@@ -315,6 +338,7 @@ async fn run_sweep(args: &[String]) -> Result<()> {
             Some(rate),
             warmup_secs,
             load_secs,
+            connect_mode,
         )
         .await?;
         let began = r.cascade.began;
@@ -379,7 +403,7 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
 
     let seed_base = SEED_REBIND;
     let readiness = readiness_timeout(n);
-    let cluster = HarnessCluster::spawn(n, seed_base, readiness)
+    let cluster = HarnessCluster::spawn(n, seed_base, readiness, ConnectMode::FullMesh)
         .await
         .context("spawn rebind cluster")?;
 
@@ -452,6 +476,7 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
     // Await convergence on the surviving nodes (so we know the missed events
     // really did land on everyone but the target).
     let surviving = HarnessCluster {
+        connect_mode: ConnectMode::FullMesh,
         room_id,
         genesis_id,
         admin: AdminPrincipal {
@@ -530,6 +555,7 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         warmup_secs: 0,
         measure_secs: 60,
         seed_base,
+        connect_mode: ConnectMode::FullMesh.label().to_owned(),
     };
     let cascade = CascadeVerdict::from_triggers(
         false,
@@ -566,13 +592,14 @@ pub async fn run_one_scenario(
     rate: Option<f64>,
     warmup_secs: u64,
     measure_secs: u64,
+    connect_mode: ConnectMode,
 ) -> Result<ScenarioResult> {
     if let Some(r) = rate {
         validate_positive_rate(r, "rate")?;
     }
     let readiness = readiness_timeout(n);
     let baseline_rss = process_rss_bytes().context("capture pre-spawn RSS baseline")?;
-    let cluster = HarnessCluster::spawn(n, seed_base, readiness)
+    let cluster = HarnessCluster::spawn(n, seed_base, readiness, connect_mode)
         .await
         .with_context(|| format!("spawn N={n} cluster"))?;
 
@@ -613,6 +640,7 @@ pub async fn run_one_scenario(
             warmup_secs,
             measure_secs,
             seed_base,
+            connect_mode: connect_mode.label().to_owned(),
         },
         idle: idle_metrics,
         load: load_metrics,
@@ -938,7 +966,7 @@ fn render_run_document(results: &[ScenarioResult]) -> serde_json::Value {
         "net_mode": "loopback",
         "relay": "disabled",
         "caveats": [
-            "over-cap transport allowlist, NOT a literal >5 active membership fold (D1)",
+            "connect_mode records whether links were formed by full-mesh connect_to or managed gossip seeds",
             "per-node RSS is derived from process RSS / N (D3)",
             "writer/reader task counts are estimated from connected peer entries (risk 3)",
         ],
@@ -955,6 +983,12 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
+}
+
+fn parse_connect_mode(args: &[String]) -> Result<ConnectMode> {
+    flag_value(args, "--connect-mode")
+        .as_deref()
+        .map_or(Ok(ConnectMode::FullMesh), ConnectMode::parse)
 }
 
 fn parse_csv_usize(s: &str, label: &str) -> Result<Vec<usize>> {
@@ -1005,6 +1039,16 @@ mod tests {
             .map(std::string::ToString::to_string)
             .collect();
         assert!(flag_value(&trailing, "--n").is_none());
+    }
+
+    #[test]
+    fn parse_connect_mode_defaults_to_full_mesh_and_accepts_gossip() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(parse_connect_mode(&empty).unwrap(), ConnectMode::FullMesh);
+        let args = vec!["--connect-mode".to_owned(), "gossip".to_owned()];
+        assert_eq!(parse_connect_mode(&args).unwrap(), ConnectMode::Gossip);
+        let bad = vec!["--connect-mode".to_owned(), "mesh".to_owned()];
+        assert!(parse_connect_mode(&bad).is_err());
     }
 
     #[test]
@@ -1108,6 +1152,7 @@ mod tests {
             parse_csv_rates(DEFAULT_MATRIX_RATES).unwrap(),
             vec![None, Some(0.1), Some(1.0), Some(5.0)]
         );
+        assert!(USAGE.contains("--connect-mode full-mesh|gossip"));
         assert!(USAGE.contains("--nodes 5,10,20,40"));
         assert!(USAGE.contains("--rates idle,0.1,1,5"));
     }

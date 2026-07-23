@@ -31,10 +31,11 @@ relay-only-test = []
 # per-peer queue fan-out; the connection-level admission gate
 # (`GossipProtocolHandler`) still rejects unadmitted devices before any gossip
 # byte is exchanged (reject-before-bytes preserved, spec §4 D2). Default off:
-# at N≤5 the full-mesh path the spike measured is retained verbatim, so the
-# overlay is inert until an operator opts in. Rollback = flip the flag; the
-# pure-mesh `route` branch compiles back in.
-gossip_overlay = ["dep:iroh-gossip"]
+# direct net consumers keep the N≤5 full-mesh path and core cap. Enabling this
+# feature also enables `iroh-rooms-core/large_rooms`, so the 40-member cap is
+# paired with the bounded gossip topology. Rollback = flip the flag; the
+# pure-mesh `route` branch and cap=5 compile back in.
+gossip_overlay = ["dep:iroh-gossip", "iroh-rooms-core/large_rooms"]
 
 [lints]
 workspace = true            # inherits `unsafe_code = "forbid"` (our code only;

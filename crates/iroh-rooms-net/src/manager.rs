@@ -160,9 +160,9 @@ impl PeerManager {
     ///
     /// K is [`GOSSIP_BOOTSTRAP_SEEDS`] (3 for v1). At small N (N-1 ≤ K) the
     /// seed set equals the full desired set, so the seed selector is a no-op
-    /// at the current `MAX_ACTIVE_MEMBERS = 5` — every active member is a
-    /// seed. The change only takes effect when N grows past K+1 (Phase C,
-    /// behind the `large_rooms` feature).
+    /// for no-gossip/default builds where `MAX_ACTIVE_MEMBERS = 5`; when
+    /// `gossip_overlay` enables the larger cap, the selector bounds warm links
+    /// once N grows past K+1.
     ///
     /// The returned set is the **warm dial target** — `reconcile` starts/stops
     /// loops only for these devices when the overlay is on. Pull/query
@@ -264,10 +264,9 @@ impl PeerManager {
         // the HyParView partial view maintained by iroh-gossip grows the
         // overlay the rest of the way, and pull/query frames to non-seed
         // peers ride on-demand dials bounded by `MAX_ON_DEMAND_LINKS`
-        // (issue #171 / spec §4 D3 step 3). At N≤5 (the current
-        // `MAX_ACTIVE_MEMBERS = 5`) and K=3 the seed set equals the full
-        // desired set whenever N-1 ≤ K, so the seed selector is a no-op at
-        // the current cap.
+        // (issue #171 / spec §4 D3 step 3). At N≤5 and K=3 the seed set equals
+        // the full desired set whenever N-1 ≤ K, so the selector is a no-op
+        // for default no-gossip builds that keep `MAX_ACTIVE_MEMBERS = 5`.
         #[cfg(feature = "gossip_overlay")]
         let desired: BTreeSet<EndpointId> = Self::desired_seeds(snapshot, self.self_device)
             .intersection(&admitted_links)
@@ -829,8 +828,7 @@ mod tests {
     // `desired_seeds` selects the K lowest-bytewise active devices + the room
     // admin (if Active and not self). Determinism is load-bearing: every node
     // must compute the same seed set from the same snapshot so the seeds are
-    // mutually reachable. At N-1 ≤ K the seed set equals the full desired set
-    // (the no-op at the current `MAX_ACTIVE_MEMBERS = 5`).
+    // mutually reachable. At N-1 ≤ K the seed set equals the full desired set.
 
     #[test]
     fn desired_seeds_empty_fold_is_empty() {

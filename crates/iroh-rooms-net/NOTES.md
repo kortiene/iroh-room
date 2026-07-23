@@ -275,10 +275,11 @@ notes: `src/gossip.rs`.
 
 **What landed (Phase A — the overlay, behind a feature flag):**
 
-- `gossip_overlay` cargo feature on this crate, **default off**. With it off the
-  pure full-mesh path the v1 spike measured compiles back in verbatim; rollback
-  is flipping the flag. The CLI does not wire it, so the shipped binary stays on
-  full-mesh. Opt-in is a build-time seam for the Phase B spike re-run.
+- `gossip_overlay` cargo feature on this crate, **default off** for direct net
+  consumers. With it off the pure full-mesh path the v1 spike measured compiles
+  back in verbatim and `iroh-rooms-core` stays at the no-gossip hard cap of 5;
+  rollback is flipping the flag. The CLI and the experimental SDK enable it so
+  the raised cap is paired with the bounded gossip topology.
 - `iroh-gossip = "=0.101.0"` (optional), reconciled against `iroh = "=1.0.1"`
   with zero API drift (same recon as `spike-transport/NOTES.md` §1).
 - A second ALPN `GOSSIP_ALPN = b"/iroh-rooms/gossip/1"` (`alpn.rs`), distinct
@@ -303,8 +304,8 @@ notes: `src/gossip.rs`.
   HyParView partial-view size for the CLI / spike harness.
 - `PeerManager::desired_seeds` computes a K-bounded (`GOSSIP_BOOTSTRAP_SEEDS = 3`)
   deterministic bootstrap subset (K lowest-bytewise Active devices + admin) for
-  warm dialing. At the current `MAX_ACTIVE_MEMBERS = 5` the seed selector is a
-  no-op (N-1 ≤ K), so it only takes effect once N grows past K+1.
+  warm dialing. At N≤5 the seed selector is a no-op (N-1 ≤ K); under the
+  gossip-backed larger cap it bounds warm links once N grows past K+1.
 
 **Auth preservation (non-negotiable, verified):** `spike-transport` §4 measured
 the decisive axis — open gossip topics admit anyone who learns the topic id, while
@@ -328,15 +329,15 @@ of being dropped. Both gossip send and receive paths enforce `MAX_FRAME_BYTES`, 
 receiver re-checks live admission, and mesh receiver tasks hold only the neighbor
 counter rather than the mesh itself so removing a mesh does not create an `Arc` cycle.
 
-**What did NOT change (deliberately deferred — see spec D4):**
+**What changed in Phase C (cap/topology coupling):**
 
-- `MAX_ACTIVE_MEMBERS` is **still 5**. The cap raise is Phase C, its own
-  feature-flagged (`large_rooms`) change, landing **only after** Phase B re-runs
-  `crates/spike-N40` at N=10/20/40 with the overlay and the acceptance criteria
-  (no cascade at 1 event/s, connectedness >95%, delivery >95%) pass. Do not read
-  the overlay landing as a room-size increase; the declared ≤5-peer ceiling,
-  the hard `RejectReason::RoomFull` reject, and the near-cap warning are
-  unchanged.
+- `iroh-rooms-core/large_rooms` raises `MAX_ACTIVE_MEMBERS` to 40, and
+  `iroh-rooms-net/gossip_overlay` enables that feature. Default no-gossip builds
+  still compile a hard cap of 5, so 6–40 members are never admitted onto the
+  pure full-mesh path.
+
+**What did NOT change:**
+
 - The engine, the `SyncMessage` wire protocol, encoding/decoding, the membership
   fold, the admission trait shape, and the pull/query variants are byte-for-byte
   unchanged. Gossip is live fan-out only; the SQLite store and anti-entropy pulls

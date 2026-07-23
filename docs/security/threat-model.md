@@ -267,7 +267,7 @@ Status uses:
 | T23 | Agent over-trust or implicit access | High | Agent has own identity, explicit invite, least-privileged role, normal file/pipe gates | Add agent-specific guidance for external integrators | Partial |
 | T24 | Diagnostics leak secrets | High | Diagnostics are secret-free by design; tests cover seed leakage | Extend bug template and audit guidance | Partial |
 | T25 | Availability misunderstood as guaranteed delivery | Medium | Docs and release notes state no cloud inbox/no guaranteed offline delivery | Beta must measure whether users understand this model | Partial |
-| T26 | Unadmitted peer joins the gossip overlay and receives event bytes | High | The optional `gossip_overlay` feature adds a `GOSSIP_ALPN` whose `GossipProtocolHandler` consults the same `Arc<dyn Admission>` instance as the event-plane gate, closing the connection with `REJECT_CODE` at `accept()` time **before** the inner gossip handler runs (reject-before-bytes preserved); the per-room `TopicId` is derived from the public `room_id` and is a rendezvous point, not the boundary; the forwarding set stays ⊆ admitted device keys (issue #171 / #154, spec §4 D2) | Feature is default-off and not CLI-wired; the shipped runtime keeps full-mesh. The boundary is structural (verified by loopback reject tests) and applies the moment an operator enables the overlay. Forwarding-visibility posture is unchanged vs full-mesh | Controlled |
+| T26 | Unadmitted peer joins the gossip overlay and receives event bytes | High | The `gossip_overlay` feature adds a `GOSSIP_ALPN` whose `GossipProtocolHandler` consults the same `Arc<dyn Admission>` instance as the event-plane gate, closing the connection with `REJECT_CODE` at `accept()` time **before** the inner gossip handler runs (reject-before-bytes preserved); the per-room `TopicId` is derived from the public `room_id` and is a rendezvous point, not the boundary; the forwarding set stays ⊆ admitted device keys (issue #171 / #154, spec §4 D2) | The feature is default-off for low-level net consumers, but the supported CLI/experimental SDK wire it when enabling the raised cap. The boundary is structural (verified by loopback reject tests) and applies the moment an operator enables the overlay. Forwarding-visibility posture is unchanged vs full-mesh | Controlled |
 
 ## Production-Blocking Decisions
 
@@ -352,7 +352,7 @@ state them plainly:
 - No full group E2EE ratchet or perfect forward secrecy.
 - No secure multi-device recovery.
 - No full metadata privacy.
-- Small rooms only.
+- Room size is capped at the compiled topology-safe limit.
 - Single immutable admin.
 - TCP-only pipes.
 - No public room discovery.

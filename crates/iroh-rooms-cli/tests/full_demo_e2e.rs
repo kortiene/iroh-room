@@ -781,7 +781,7 @@ fn seed_full_event_type_chain(home: &TempDir) -> String {
         ),
     );
 
-    // 4/5. member.joined (Bob) + member.joined (Agent).
+    // member.joined (Bob) + member.joined (Agent).
     let ts = ts + 1_000;
     let bob_binding = DeviceBinding::create(&room_id, &bob_identity, bob_device.device_key());
     let join_bob_id = seed(

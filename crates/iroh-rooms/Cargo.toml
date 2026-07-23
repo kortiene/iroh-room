@@ -26,8 +26,9 @@ workspace = true
 default = []
 # The online runtime tier (spec D3/D4): transport, sync engine, local store,
 # blob serve/fetch, live-pipe forwarding. Off by default so a default-features
-# consumer cannot even name an experimental type.
-experimental = ["dep:iroh-rooms-net", "iroh-rooms-core/sync", "dep:iroh"]
+# consumer cannot even name an experimental type. Enables the gossip overlay so
+# the experimental online surface uses the same cap/topology pairing as the CLI.
+experimental = ["dep:iroh-rooms-net", "iroh-rooms-net/gossip_overlay", "iroh-rooms-core/sync", "dep:iroh"]
 # Diagnostic-only forwarding seam. A consumer must opt in explicitly; the
 # normal `experimental` and `full` features keep direct-capable networking.
 relay-only-test = ["experimental", "iroh-rooms-net/relay-only-test"]

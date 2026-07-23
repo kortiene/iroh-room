@@ -14,17 +14,22 @@
 //! `AllowlistAdmission` constructed in this module admits exactly the right
 //! devices and the audit sink records the real device ids.
 
-use std::sync::Arc;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms_core::event::binding::DeviceBinding;
+use iroh_rooms_core::event::capability_hash;
 use iroh_rooms_core::event::ids::RoomId;
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
+use iroh_rooms_core::event::{build_member_invited, build_member_joined, validate_wire_bytes};
+use iroh_rooms_core::membership::RoomMembership;
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_net::admission::AllowlistAdmission;
-use iroh_rooms_net::{NetConfig, NetMode, Node, PeerConnState};
+use iroh_rooms_net::admission::{AdmissionView, AllowlistAdmission, SnapshotAdmission};
+use iroh_rooms_net::{NetConfig, NetMode, Node, PeerConnState, GOSSIP_BOOTSTRAP_SEEDS};
 
 use crate::workload::{build_genesis_for_admin, deterministic_room_nonce};
 use crate::RecordingAudit;
@@ -33,6 +38,42 @@ use crate::RecordingAudit;
 /// tick keeps anti-entropy / reconnect catch-up brisk; matches the shipping
 /// loopback test posture).
 pub const HARNESS_TICK: Duration = Duration::from_millis(150);
+
+/// How the harness forms live transport links after spawning nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectMode {
+    /// Explicitly call `Node::connect_to` for every ordered pair.
+    FullMesh,
+    /// Let the managed-room `PeerManager` and gossip overlay form the bounded
+    /// seed topology from the live membership snapshot.
+    Gossip,
+}
+
+impl ConnectMode {
+    /// Stable CLI/JSON label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FullMesh => "full-mesh",
+            Self::Gossip => "gossip",
+        }
+    }
+
+    /// Parse the `--connect-mode` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any value other than `full-mesh` or `gossip`.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "full-mesh" => Ok(Self::FullMesh),
+            "gossip" => Ok(Self::Gossip),
+            other => {
+                anyhow::bail!("invalid --connect-mode {other:?}; expected full-mesh or gossip")
+            }
+        }
+    }
+}
 
 /// One harness node: the live [`Node`] handle plus the seeded identity
 /// material needed to respawn it in the rebind scenario (spec §6.8 step 6).
@@ -87,6 +128,8 @@ impl HarnessNode {
 /// The full N-node loopback cluster: the shared recording audit, the room
 /// id, the genesis id, the admin principal, and the per-node live handles.
 pub struct HarnessCluster {
+    /// How this cluster formed its transport links.
+    pub connect_mode: ConnectMode,
     /// The room every node is admitted to (transport scope; not a product
     /// supported active-member room — see D1 caveat).
     pub room_id: RoomId,
@@ -219,25 +262,20 @@ pub fn full_mesh_admission(seeds: &[NodeSeeds]) -> AllowlistAdmission {
     auth
 }
 
-impl HarnessCluster {
-    /// Spawn N in-process loopback nodes, publish the genesis from node 0,
-    /// wait for the full mesh to come up via every ordered `(i, j)` pair's
-    /// `connect_to`, and await readiness up to `readiness_timeout`
-    /// (spec §6.4 step 1-5 / D2).
-    ///
-    /// # Errors
-    /// Returns an error if any endpoint fails to bind or genesis publish fails.
-    pub async fn spawn(n: usize, seed_base: u64, readiness_timeout: Duration) -> Result<Self> {
-        let audit = Arc::new(RecordingAudit::new());
-        let seeds = node_seeds(n, seed_base);
-        let admission = Arc::new(full_mesh_admission(&seeds));
+struct MembershipFixture {
+    room_id: RoomId,
+    genesis_id: iroh_rooms_core::event::EventId,
+    admin: AdminPrincipal,
+    wires: Vec<Vec<u8>>,
+    view: AdmissionView,
+}
 
-        // Genesis: admin (node 0) authors room.created. Vary the nonce per
-        // spawn so two scenarios in one process never collide on room_id.
+impl MembershipFixture {
+    fn build(seeds: &[NodeSeeds], seed_base: u64) -> Result<Self> {
         let admin_seeds = &seeds[0];
         let admin_identity_secret = admin_seeds.identity_secret();
         let admin_device_secret = admin_seeds.device_secret();
-        let room_name = format!("spike-N40 n={n}");
+        let room_name = format!("spike-N40 n={}", seeds.len());
         let nonce = deterministic_room_nonce(seed_base);
         let created_at = 1_770_000_000_000 + seed_base;
         let (room_id, genesis_wire) = build_genesis_for_admin(
@@ -248,33 +286,181 @@ impl HarnessCluster {
             created_at,
         );
         let genesis_id = iroh_rooms_core::event::signed::event_id_from_bytes(&genesis_wire.signed);
-
-        let admin_principal = AdminPrincipal {
+        let admin = AdminPrincipal {
             identity: admin_identity_secret.identity_key(),
             identity_seed: admin_seeds.identity_seed,
             device_seed: admin_seeds.device_seed,
             endpoint_id: admin_seeds.endpoint_id(),
         };
 
-        // Spawn every node first so all endpoint addresses are known.
+        let mut wires = vec![genesis_wire.to_bytes()];
+        let mut prev = genesis_id;
+        for (idx, s) in seeds.iter().enumerate().skip(1) {
+            let invite_id = short_id(seed_base, idx as u64, 0);
+            let secret = short_id(seed_base, idx as u64, 1);
+            let cap = capability_hash(&room_id, &invite_id, &secret);
+            let invited = build_member_invited(
+                &admin_identity_secret,
+                &admin_device_secret,
+                &room_id,
+                &invite_id,
+                &cap,
+                "member",
+                &s.identity(),
+                None,
+                None,
+                &[prev],
+                created_at + (idx as u64 * 2),
+            );
+            let invite_event_id =
+                iroh_rooms_core::event::signed::event_id_from_bytes(&invited.signed);
+            let member_identity = s.identity_secret();
+            let member_device = s.device_secret();
+            let binding =
+                DeviceBinding::create(&room_id, &member_identity, member_device.device_key());
+            let joined = build_member_joined(
+                &member_identity,
+                &member_device,
+                &room_id,
+                &invite_id,
+                &secret,
+                "member",
+                binding,
+                None,
+                &[invite_event_id],
+                created_at + (idx as u64 * 2) + 1,
+            );
+            prev = iroh_rooms_core::event::signed::event_id_from_bytes(&joined.signed);
+            wires.push(invited.to_bytes());
+            wires.push(joined.to_bytes());
+        }
+
+        let validated = wires
+            .iter()
+            .map(|wire| {
+                validate_wire_bytes(
+                    wire,
+                    &iroh_rooms_core::event::ValidationContext::for_room(room_id),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|reason| {
+                anyhow::anyhow!("fixture membership event failed validation: {reason:?}")
+            })?;
+        let membership = RoomMembership::from_events(room_id, validated);
+        for member in membership.snapshot().active_members() {
+            if member.device.is_some() {
+                continue;
+            }
+            anyhow::bail!("active fixture member has no bound device");
+        }
+        let active = membership.snapshot().active_member_count();
+        if active != seeds.len() {
+            anyhow::bail!(
+                "fixture membership active count {active} != node count {}",
+                seeds.len()
+            );
+        }
+        let view = AdmissionView::from_snapshot(&membership.snapshot(), &[]);
+
+        Ok(Self {
+            room_id,
+            genesis_id,
+            admin,
+            wires,
+            view,
+        })
+    }
+}
+
+fn short_id(seed_base: u64, index: u64, salt: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&seed_base.wrapping_add(index).to_le_bytes());
+    out[8..].copy_from_slice(&salt.to_le_bytes());
+    out
+}
+
+fn planned_loopback_addr(seed: &NodeSeeds, seed_base: u64) -> EndpointAddr {
+    let socket = SocketAddr::from((Ipv4Addr::LOCALHOST, loopback_port(seed_base, seed.index)));
+    EndpointAddr::new(seed.endpoint_id()).with_ip_addr(socket)
+}
+
+fn loopback_port(seed_base: u64, index: usize) -> u16 {
+    let base = 30_000 + u16::try_from(seed_base % 20_000).expect("port base fits u16");
+    base.saturating_add(u16::try_from(index).expect("spike-N40 index fits u16"))
+}
+
+impl HarnessCluster {
+    /// Spawn N in-process loopback nodes and form links according to
+    /// `connect_mode` (spec §6.4 step 1-5 / D2).
+    ///
+    /// # Errors
+    /// Returns an error if any endpoint fails to bind or fixture publishing fails.
+    pub async fn spawn(
+        n: usize,
+        seed_base: u64,
+        readiness_timeout: Duration,
+        connect_mode: ConnectMode,
+    ) -> Result<Self> {
+        let audit = Arc::new(RecordingAudit::new());
+        let seeds = node_seeds(n, seed_base);
+        let fixture = MembershipFixture::build(&seeds, seed_base)?;
+        let planned_addrs: Vec<EndpointAddr> = seeds
+            .iter()
+            .map(|seed| planned_loopback_addr(seed, seed_base))
+            .collect();
+        let admission = Arc::new(full_mesh_admission(&seeds));
+
         let mut nodes: Vec<HarnessNode> = Vec::with_capacity(n);
         for s in &seeds {
             let store = EventStore::open_in_memory().context("open in-memory event store")?;
-            let engine = SyncEngine::open(store, room_id, SyncConfig::default())
+            let mut engine = SyncEngine::open(store, fixture.room_id, SyncConfig::default())
                 .context("open sync engine")?;
+            for wire in &fixture.wires {
+                engine.publish(wire).context("seed membership fixture")?;
+            }
             let cfg = NetConfig {
                 mode: NetMode::Loopback,
+                loopback_bind_addr: matches!(connect_mode, ConnectMode::Gossip).then_some(
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, loopback_port(seed_base, s.index))),
+                ),
                 ..NetConfig::default()
             };
-            let node = Node::spawn(
-                s.iroh_secret(),
-                admission.clone(),
-                audit.clone(),
-                engine,
-                cfg,
-                HARNESS_TICK,
-            )
-            .await
+            let node = match connect_mode {
+                ConnectMode::FullMesh => {
+                    Node::spawn(
+                        s.iroh_secret(),
+                        admission.clone(),
+                        audit.clone(),
+                        engine,
+                        cfg,
+                        HARNESS_TICK,
+                    )
+                    .await
+                }
+                ConnectMode::Gossip => {
+                    let cell = Arc::new(Mutex::new(fixture.view.clone()));
+                    let snapshot_admission = Arc::new(SnapshotAdmission::new(cell.clone()));
+                    let hints = planned_addrs
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != s.index)
+                        .map(|(_, addr)| addr.clone())
+                        .collect();
+                    Node::spawn_room(
+                        s.iroh_secret(),
+                        snapshot_admission,
+                        audit.clone(),
+                        engine,
+                        cfg,
+                        HARNESS_TICK,
+                        hints,
+                        cell,
+                        None,
+                    )
+                    .await
+                }
+            }
             .with_context(|| format!("spawn node {}", s.index))?;
             nodes.push(HarnessNode {
                 index: s.index,
@@ -286,51 +472,43 @@ impl HarnessCluster {
             });
         }
 
-        // Genesis: publish from node 0 (the admin) so every node's store
-        // receives it through the mesh. Each node's local SyncEngine ingests
-        // it on receipt.
-        nodes[0]
-            .node
-            .publish(genesis_wire.to_bytes())
-            .await
-            .context("publish genesis from admin")?;
-
-        // Full mesh: every ordered pair (i, j), i != j. This mirrors the
-        // dial pressure of a managed v1 mesh where every active device dials
-        // every other (D2).
-        let addrs: Vec<EndpointAddr> = nodes
-            .iter()
-            .map(HarnessNode::endpoint_addr)
-            .collect::<Result<Vec<_>>>()?;
-        for (i, node) in nodes.iter().enumerate() {
-            for (j, addr) in addrs.iter().enumerate() {
-                if i == j {
-                    continue;
+        match connect_mode {
+            ConnectMode::FullMesh => {
+                let addrs: Vec<EndpointAddr> = nodes
+                    .iter()
+                    .map(HarnessNode::endpoint_addr)
+                    .collect::<Result<Vec<_>>>()?;
+                for (i, node) in nodes.iter().enumerate() {
+                    for (j, addr) in addrs.iter().enumerate() {
+                        if i != j {
+                            node.node.connect_to(addr.clone());
+                        }
+                    }
                 }
-                node.node.connect_to(addr.clone());
             }
+            ConnectMode::Gossip => {}
         }
 
-        // Await readiness: every node reports `N - 1` Connected peers, or
-        // the readiness timeout elapses (recorded as partial — the harness
-        // still runs but the metrics reflect the partial state).
-        Self::await_readiness(&nodes, readiness_timeout).await;
+        Self::await_readiness(&nodes, readiness_timeout, connect_mode).await;
 
         Ok(Self {
-            room_id,
-            genesis_id,
-            admin: admin_principal,
+            connect_mode,
+            room_id: fixture.room_id,
+            genesis_id: fixture.genesis_id,
+            admin: fixture.admin,
             nodes,
             audit,
         })
     }
 
-    /// Wait until every node reports `expected` Connected peers, or
-    /// `deadline` elapses (whichever comes first). Non-fatal: returns the
-    /// final per-node connected counts; the caller records partial readiness
-    /// in the metrics notes when not all nodes reached full mesh.
-    async fn await_readiness(nodes: &[HarnessNode], deadline: Duration) -> Vec<usize> {
-        let expected = nodes.len().saturating_sub(1);
+    /// Wait until every node reports the mode-specific minimum readiness, or
+    /// `deadline` elapses. Non-fatal: returns the final per-node connected counts.
+    async fn await_readiness(
+        nodes: &[HarnessNode],
+        deadline: Duration,
+        connect_mode: ConnectMode,
+    ) -> Vec<usize> {
+        let expected = expected_connected_peers_per_node(nodes.len(), connect_mode);
         let start = Instant::now();
         let poll = Duration::from_millis(50);
         loop {
@@ -344,7 +522,12 @@ impl HarnessCluster {
                         .count()
                 })
                 .collect();
-            let ready = connected_counts.iter().all(|&c| c >= expected);
+            let ready = match connect_mode {
+                ConnectMode::FullMesh => connected_counts.iter().all(|&c| c >= expected),
+                ConnectMode::Gossip => {
+                    connected_counts.iter().sum::<usize>() >= expected * nodes.len()
+                }
+            };
             if ready || start.elapsed() >= deadline {
                 return connected_counts;
             }
@@ -352,11 +535,10 @@ impl HarnessCluster {
         }
     }
 
-    /// The expected connected peer entries for this cluster: `N * (N - 1)`
-    /// (every node's view of every other, both directions counted).
+    /// The expected connected peer entries for this cluster.
     #[must_use]
     pub fn expected_connected_peer_entries(&self) -> usize {
-        expected_connected_peer_entries_for_n(self.nodes.len())
+        expected_connected_peer_entries_for_n(self.nodes.len(), self.connect_mode)
     }
 
     /// Per-node connected peer counts at this instant.
@@ -396,10 +578,17 @@ impl HarnessCluster {
     }
 }
 
-/// Expected directed peer entries for an N-node full mesh.
+/// Expected directed peer entries for an N-node cluster under `connect_mode`.
 #[must_use]
-pub fn expected_connected_peer_entries_for_n(n: usize) -> usize {
-    n.saturating_sub(1).saturating_mul(n)
+pub fn expected_connected_peer_entries_for_n(n: usize, connect_mode: ConnectMode) -> usize {
+    expected_connected_peers_per_node(n, connect_mode).saturating_mul(n)
+}
+
+fn expected_connected_peers_per_node(n: usize, connect_mode: ConnectMode) -> usize {
+    match connect_mode {
+        ConnectMode::FullMesh => n.saturating_sub(1),
+        ConnectMode::Gossip => n.saturating_sub(1).min(GOSSIP_BOOTSTRAP_SEEDS),
+    }
 }
 
 #[cfg(test)]
@@ -460,12 +649,38 @@ mod tests {
     }
 
     #[test]
-    fn expected_connected_peer_entries_is_n_squared_minus_n() {
-        assert_eq!(expected_connected_peer_entries_for_n(0), 0);
-        assert_eq!(expected_connected_peer_entries_for_n(1), 0);
-        assert_eq!(expected_connected_peer_entries_for_n(5), 20);
-        assert_eq!(expected_connected_peer_entries_for_n(10), 90);
-        assert_eq!(expected_connected_peer_entries_for_n(20), 380);
-        assert_eq!(expected_connected_peer_entries_for_n(40), 1560);
+    fn expected_connected_peer_entries_tracks_connect_mode() {
+        assert_eq!(
+            expected_connected_peer_entries_for_n(0, ConnectMode::FullMesh),
+            0
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(1, ConnectMode::FullMesh),
+            0
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(5, ConnectMode::FullMesh),
+            20
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(10, ConnectMode::FullMesh),
+            90
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(20, ConnectMode::FullMesh),
+            380
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(40, ConnectMode::FullMesh),
+            1560
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(5, ConnectMode::Gossip),
+            15
+        );
+        assert_eq!(
+            expected_connected_peer_entries_for_n(40, ConnectMode::Gossip),
+            120
+        );
     }
 }
