@@ -1,9 +1,19 @@
 {
-  "schema": "iroh-rooms-v2-golden-vectors/v1",
+  "schema": "iroh-rooms-v2-golden-vectors/v2",
   "frozen": true,
   "requires_schema_bump_on_change": true,
   "issue": 153,
   "description": "Frozen byte-exact golden vectors for every signed record and domain-separated hash boundary produced by iroh-rooms-v2-core. Changing any value here requires an explicit schema-version bump and a protocol-change note.",
+  "change_log": [
+    {
+      "version": 1,
+      "note": "Initial frozen vector set (schema v1)."
+    },
+    {
+      "version": 2,
+      "note": "Migrated the Merkle leaf/internal-node hash boundaries from the legacy candidate strings to the frozen #134 §6.2 domains iroh-room-v2/member-leaf and iroh-room-v2/merkle-node. This changes LEAF_HASH, MEMBER_ROOT, the governance state_root, and the governance approval/checkpoint CSBs/ids/signatures. No compatibility impact: iroh-rooms-v2-core is publish=false and unused this phase. Resolves review threads on PR #176 (the silent LEGACY_MERKLE_NODE fixture rename under v1)."
+    }
+  ],
   "seeds": {
     "admin_seed_hex": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
     "member_seed_hex": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
@@ -32,9 +42,11 @@
     "CHECKPOINT_SIGN": "iroh-rooms:v2:checkpoint:sign:v1",
     "SNAPSHOT_HASH": "iroh-rooms:v2:snapshot-hash:v1",
     "MERKLE_EMPTY": "iroh-rooms:v2:merkle:empty:v1",
-    "MERKLE_LEAF": "iroh-rooms:v2:merkle:leaf:v1",
-    "MERKLE_NODE": "iroh-rooms:v2:merkle:node:v1",
     "MERKLE_KEY": "iroh-rooms:v2:merkle:key:v1",
+    "MEMBER_LEAF": "iroh-room-v2/member-leaf",
+    "MERKLE_NODE": "iroh-room-v2/merkle-node",
+    "MERKLE_LEAF": "iroh-rooms:v2:merkle:leaf:v1 (legacy alias; unused by the Merkle impl since schema v2)",
+    "LEGACY_MERKLE_NODE": "iroh-rooms:v2:merkle:node:v1 (legacy alias; unused by the Merkle impl since schema v2)",
     "FORK_RESOLVE_SIGN": "iroh-rooms:v2:fork-resolve:sign:v1",
     "FORK_RESOLVE_ID": "iroh-rooms:v2:fork-resolve:id:v1"
   },
@@ -67,12 +79,12 @@
       "name": "governance-approval-add-member-v1",
       "record_type": "governance_approval",
       "positive": true,
-      "logical": { "epoch": 1002, "proposed_state_root": "blake3:ba3a072e87578cfd1717e72f28aa61acb1feb67ee00fbf266fe57fd18fa4fd88" },
+      "logical": { "epoch": 1002, "proposed_state_root": "blake3:66ff86bbf84c9accba8250719c797a070a888c15e9d60f03a31f3e58a86ffd01" },
       "domains": { "sign": "iroh-rooms:v2:governance-approval:sign:v1", "id": "iroh-rooms:v2:governance-approval:id:v1" },
-      "canonical_cbor_hex": "a66565706f63681903ea67726f6f6d5f69645820707070707070707070707070707070707070707070707070707070707070707068617070726f76657258205b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd68656e7472795f696458200b75b61c5c53a7afb9dfca9a894ae387e5f10a966061201d3a3726c1edd0f6906e736368656d615f76657273696f6e027370726f706f7365645f73746174655f726f6f745820ba3a072e87578cfd1717e72f28aa61acb1feb67ee00fbf266fe57fd18fa4fd88",
-      "id": "blake3:05fead7d6898c7a37b510c576ff4da2ea92faed1da83daa01a9a992df479efcf",
+      "canonical_cbor_hex": "a66565706f63681903ea67726f6f6d5f69645820707070707070707070707070707070707070707070707070707070707070707068617070726f76657258205b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd68656e7472795f696458200b75b61c5c53a7afb9dfca9a894ae387e5f10a966061201d3a3726c1edd0f6906e736368656d615f76657273696f6e027370726f706f7365645f73746174655f726f6f74582066ff86bbf84c9accba8250719c797a070a888c15e9d60f03a31f3e58a86ffd01",
+      "id": "blake3:d0ef79f3a87f2a5536e2b70d0acd522a070e033026702c7e24cd56928b20c784",
       "signer_hex": "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd",
-      "signature_hex": "17e541ee95288cad9e0f031fd556e762654faef09a33bc729812e748d8990d6ba30348ebab75d3095b818c45dca9e10d280951758d14a6f77eae52e6db6a1b03",
+      "signature_hex": "b7eaee69879b0a90027cd3865d020e7b7e00f9d6bb846a1bf649f0a6825c26aa4f502bd654da2ebfd99d3ff1d85f69dd0f3d3dab78d474271d1ec08223318102",
       "expected_result": "ok"
     },
     {
@@ -81,12 +93,12 @@
       "positive": true,
       "logical": { "epoch": 1003, "seq": 1, "unresolved_forks": [] },
       "domains": { "sign": "iroh-rooms:v2:checkpoint:sign:v1", "id": "iroh-rooms:v2:snapshot-hash:v1" },
-      "canonical_cbor_hex": "a763736571016565706f63681903eb67726f6f6d5f6964582070707070707070707070707070707070707070707070707070707070707070706a73746174655f726f6f745820ba3a072e87578cfd1717e72f28aa61acb1feb67ee00fbf266fe57fd18fa4fd886b6d656d6265725f726f6f7458205706269e94f6a6e3b086f44ebe94587325e1ca321036c338e7263ad7ea1665cd6e676f7665726e616e63655f74697058200b75b61c5c53a7afb9dfca9a894ae387e5f10a966061201d3a3726c1edd0f6906e736368656d615f76657273696f6e02",
-      "id": "blake3:72ee05393d0b28d0b374f60ab999c9c05d27ce12fbb61ee9faed05bf095ea947",
+      "canonical_cbor_hex": "a763736571016565706f63681903eb67726f6f6d5f6964582070707070707070707070707070707070707070707070707070707070707070706a73746174655f726f6f74582066ff86bbf84c9accba8250719c797a070a888c15e9d60f03a31f3e58a86ffd016b6d656d6265725f726f6f7458200cf0f8e94b408f8fb352fba8ab3de37e0fea74a04250366e45bfc361e892dcad6e676f7665726e616e63655f74697058200b75b61c5c53a7afb9dfca9a894ae387e5f10a966061201d3a3726c1edd0f6906e736368656d615f76657273696f6e02",
+      "id": "blake3:033bdad5db6ac98d308277c101195b16ef0139062fb77d66487840494366e748",
       "signer_hex": "b533d8ad9fcfbdde0b481c1b334ddc3c53412fd614564e7e5afd020368d382c3",
-      "signature_hex": "71d25941e0c5563063162ba8162269d10fbe167285d446b6b1d7407377b43b177fdf92d5ea59e41115925ccfac05ab28eaba337fafc88f76f0c776945b2ce90d",
-      "state_root": "blake3:ba3a072e87578cfd1717e72f28aa61acb1feb67ee00fbf266fe57fd18fa4fd88",
-      "member_root": "blake3:5706269e94f6a6e3b086f44ebe94587325e1ca321036c338e7263ad7ea1665cd",
+      "signature_hex": "12d8ab5e1c459578a0b8a1928e01edacfb5afb6f478ea85c0c98849b5fad376ccfef5d0bacc02228e9cbb441996d8fde7fc2d28bb669dd1c8bc2d05242eba208",
+      "state_root": "blake3:66ff86bbf84c9accba8250719c797a070a888c15e9d60f03a31f3e58a86ffd01",
+      "member_root": "blake3:0cf0f8e94b408f8fb352fba8ab3de37e0fea74a04250366e45bfc361e892dcad",
       "expected_result": "ok"
     },
     {
@@ -94,12 +106,12 @@
       "record_type": "member_record",
       "positive": true,
       "logical": { "member_id": "b533d8ad9fcfbdde0b481c1b334ddc3c53412fd614564e7e5afd020368d382c3", "role": "admin", "status": "active" },
-      "domains": { "merkle_key": "iroh-rooms:v2:merkle:key:v1", "merkle_leaf": "iroh-rooms:v2:merkle:leaf:v1" },
+      "domains": { "merkle_key": "iroh-rooms:v2:merkle:key:v1", "member_leaf": "iroh-room-v2/member-leaf", "merkle_node": "iroh-room-v2/merkle-node" },
       "canonical_cbor_hex": "a564726f6c656561646d696e6673746174757366616374697665696d656d6265725f69645820b533d8ad9fcfbdde0b481c1b334ddc3c53412fd614564e7e5afd020368d382c36b6465766963655f6b657973815820b533d8ad9fcfbdde0b481c1b334ddc3c53412fd614564e7e5afd020368d382c371676f7665726e616e63655f637572736f7258208d8b827177834cd49d6c7e0543c94bef4a245ea3747b288ebf9e47ee20021019",
       "merkle_key_hex": "151402008fcf1fc9c75c67b71495db4b4d9a20eb8e11736b9f0a0b193ce8bcdc",
       "value_hash_hex": "2b2d345d2bdf96a05ef89adb7b7885fcccb47fd53b61a5947dd9d4ba926b7c0b",
-      "leaf_hash_hex": "948ee15a33f13dbd8b59f643098ab2d68c271ddb972a7724d92719227dca9ef2",
-      "member_root": "blake3:5706269e94f6a6e3b086f44ebe94587325e1ca321036c338e7263ad7ea1665cd",
+      "leaf_hash_hex": "b90ccd49a192a83f525d7b64b5f1e54fff549d24a7de0d1fbafec8585adeb9f1",
+      "member_root": "blake3:0cf0f8e94b408f8fb352fba8ab3de37e0fea74a04250366e45bfc361e892dcad",
       "expected_result": "ok"
     },
     {

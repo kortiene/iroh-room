@@ -1,0 +1,104 @@
+{
+  "schema": "iroh-room-v2-identifiers/v1",
+  "frozen": true,
+  "requires_schema_bump_on_change": true,
+  "description": "Frozen golden vectors for the #134 §6.3 v2 identifiers over the #134 §6.2 frozen domain-separation strings (issue #146). Every digest is BLAKE3(domain || preimage) where preimage is the canonical-CBOR bytes of the named descriptor. Mirrors the Rust constants in tests/identifiers.rs; changing any value requires a schema bump and a protocol-change note. All preimages are deterministic public test data.",
+  "normative_source": "#134 §6.2 (domains) and §6.3 (identifier derivations). §6.3 byte layouts were unavailable in checkout; per spec D2 the default derivation BLAKE3(domain || canonical_preimage) is used and each assumption is documented at the derivation helper in src/ids.rs.",
+  "domains": {
+    "COMMUNITY": "iroh-room-v2/community",
+    "GOVERNANCE_ENTRY": "iroh-room-v2/governance-entry",
+    "GOVERNANCE_APPROVAL": "iroh-room-v2/governance-approval",
+    "CONTENT_EVENT": "iroh-room-v2/content-event",
+    "MEMBER_LEAF": "iroh-room-v2/member-leaf",
+    "MERKLE_NODE": "iroh-room-v2/merkle-node",
+    "GOVERNANCE_STATE": "iroh-room-v2/governance-state",
+    "REPLICA_RECEIPT": "iroh-room-v2/replica-receipt",
+    "GOVERNANCE_CHECKPOINT": "iroh-room-v2/governance-checkpoint",
+    "STREAM_CHECKPOINT": "iroh-room-v2/stream-checkpoint",
+    "MIGRATION": "iroh-room-v2/migration"
+  },
+  "vectors": [
+    {
+      "name": "community-id-basic-v1",
+      "identifier": "CommunityId",
+      "domain": "iroh-room-v2/community",
+      "preimage_descriptor": {"epoch": 1, "name": "golden-community"},
+      "preimage_hex": "a2646e616d6570676f6c64656e2d636f6d6d756e6974796565706f636801",
+      "digest_hex": "e593db90754f6d24cdfc13f59c0b2a709d541aecf5d62c05d8fd14bc9e6f5a4a",
+      "display": "blake3:e593db90754f6d24cdfc13f59c0b2a709d541aecf5d62c05d8fd14bc9e6f5a4a",
+      "wrongdomain_hex": "024925d9375f8b8b35ab44c6dd269f2e7e64858e9c8739918f6781de6c62ef3b",
+      "wrongdomain_note": "same preimage under iroh-room-v2/governance-entry must differ",
+      "expected_result": "ok"
+    },
+    {
+      "name": "governance-id-basic-v1",
+      "identifier": "GovernanceId",
+      "domain": "iroh-room-v2/governance-entry",
+      "preimage_descriptor": {"epoch": 1000, "kind": "init_room", "seq": 1},
+      "preimage_hex": "a36373657101646b696e6469696e69745f726f6f6d6565706f63681903e8",
+      "digest_hex": "518ce110d11f63da61cc335705e2063e0185f50ed20a5b5398925defb5bff8d9",
+      "display": "blake3:518ce110d11f63da61cc335705e2063e0185f50ed20a5b5398925defb5bff8d9",
+      "expected_result": "ok"
+    },
+    {
+      "name": "stream-id-basic-v1",
+      "identifier": "StreamId",
+      "domain": "iroh-room-v2/content-event",
+      "preimage_descriptor": {"name": "golden-stream", "seq": 1},
+      "preimage_hex": "a26373657101646e616d656d676f6c64656e2d73747265616d",
+      "digest_hex": "78559e86ff09920b1d07cc4dcaa28d9b613d08df6c4f96d8b6e417d6fdf8ec60",
+      "display": "blake3:78559e86ff09920b1d07cc4dcaa28d9b613d08df6c4f96d8b6e417d6fdf8ec60",
+      "expected_result": "ok"
+    },
+    {
+      "name": "event-id-basic-v1",
+      "identifier": "EventId",
+      "domain": "iroh-room-v2/content-event",
+      "preimage_descriptor": {"body": "hello golden v2", "kind": "message.text", "seq": 1},
+      "preimage_hex": "a3637365710164626f64796f68656c6c6f20676f6c64656e207632646b696e646c6d6573736167652e74657874",
+      "digest_hex": "14ff4a5b86dbd7f13b6e40b6892eb14eeeeb55f3f721120647e2c1b4da10077c",
+      "display": "blake3:14ff4a5b86dbd7f13b6e40b6892eb14eeeeb55f3f721120647e2c1b4da10077c",
+      "expected_result": "ok"
+    },
+    {
+      "name": "checkpoint-id-governance-v1",
+      "identifier": "CheckpointId",
+      "kind": "governance",
+      "domain": "iroh-room-v2/governance-checkpoint",
+      "preimage_descriptor": {"epoch": 2000, "seq": 1},
+      "preimage_hex": "a263736571016565706f63681907d0",
+      "digest_hex": "9b14d6abe5645f6f3476a384ee9679f3ac0411c0dcb586a8a3345a0505aef138",
+      "display": "blake3:9b14d6abe5645f6f3476a384ee9679f3ac0411c0dcb586a8a3345a0505aef138",
+      "expected_result": "ok"
+    },
+    {
+      "name": "checkpoint-id-stream-v1",
+      "identifier": "CheckpointId",
+      "kind": "stream",
+      "domain": "iroh-room-v2/stream-checkpoint",
+      "preimage_descriptor": {"epoch": 2000, "seq": 1},
+      "preimage_hex": "a263736571016565706f63681907d0",
+      "digest_hex": "c18eef16358a6058cf702314deeca21da045126589c520ac54a0601333f3a331",
+      "display": "blake3:c18eef16358a6058cf702314deeca21da045126589c520ac54a0601333f3a331",
+      "expected_result": "ok"
+    },
+    {
+      "name": "replica-id-basic-v1",
+      "identifier": "ReplicaId",
+      "domain": "iroh-room-v2/replica-receipt",
+      "preimage_descriptor": {"kind": "replica", "seq": 1},
+      "preimage_hex": "a26373657101646b696e64677265706c696361",
+      "digest_hex": "0e389a8f70f6c6035cad205ca4f3bd680b7ea3e394a3b342f412b8bfe52944b0",
+      "display": "blake3:0e389a8f70f6c6035cad205ca4f3bd680b7ea3e394a3b342f412b8bfe52944b0",
+      "expected_result": "ok"
+    },
+    {
+      "name": "non-canonical-duplicate-key-v1",
+      "category": "negative",
+      "expected_reject_code": "non_canonical_encoding",
+      "description": "A 2-entry CBOR map with the same text key 'id' twice. The strict decoder rejects the duplicate before any identifier/schema work.",
+      "canonical_cbor_hex": "a26269640162696401",
+      "expected_result": "reject"
+    }
+  ]
+}
