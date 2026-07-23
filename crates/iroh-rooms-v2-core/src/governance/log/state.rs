@@ -504,11 +504,26 @@ pub fn apply_invite_revoke(
 
 /// `policy.set`: replace the community policy (canonicalized).
 ///
+/// The append-only marker sets — `revoked_invites`, `fork_markers`, and
+/// `migrations` — are accumulated history, not replaceable policy (review thread
+/// #5). They are unioned back in after the replacement so a `policy.set` can
+/// extend but never wipe them (e.g. a `policy.set(empty)` can no longer clear the
+/// migrations set to re-accept a duplicate `migration.accept`).
+///
 /// # Errors
 /// This transition is total over structurally valid payloads; it does not fail.
 pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<GovernanceState, Reject> {
     let mut next = old.clone();
+    let kept_invites = next.policy.revoked_invites.clone();
+    let kept_migrations = next.policy.migrations.clone();
+    let kept_forks = next.policy.fork_markers.clone();
     next.policy = p.policy.clone();
+    next.policy.revoked_invites.extend(kept_invites);
+    next.policy.migrations.extend(kept_migrations);
+    next.policy.fork_markers.extend(kept_forks);
+    next.policy
+        .fork_markers
+        .sort_by_key(|m| (*m.evidence[0].as_bytes(), *m.evidence[1].as_bytes()));
     Ok(next)
 }
 
@@ -571,16 +586,23 @@ pub fn apply_verified_entry(
     Ok(new)
 }
 
-/// Validate a single chain link: `seq == 1` ⇒ `prev == None`; `seq > 1` ⇒
-/// `prev == expected_prev` (spec D5). Fork detection beyond this single check
-/// is #149.
+/// Validate a single chain link: `seq == expected_seq` (no skipped entries),
+/// `seq == 1` ⇒ `prev == None`; `seq > 1` ⇒ `prev == expected_prev` (spec D5).
+/// Fork detection beyond this single check is #149.
 ///
 /// # Errors
 /// Returns [`Reject::InvalidContent`] on a chain-rule violation.
 pub fn check_chain_link(
     body: &GovernanceEntryBody,
     expected_prev: Option<crate::ids::GovernanceId>,
+    expected_seq: u64,
 ) -> Result<(), Reject> {
+    // The sequence number must be exactly the next expected one (review thread
+    // #2): comparing only `prev` previously let a non-contiguous chain (e.g.
+    // seq 3 linking back to seq 1) fold with seq 2 silently skipped.
+    if body.seq != expected_seq {
+        return Err(Reject::InvalidContent);
+    }
     if body.seq == 1 {
         if body.prev.is_some() {
             return Err(Reject::InvalidContent);
@@ -973,6 +995,43 @@ mod tests {
     }
 
     #[test]
+    fn apply_policy_set_preserves_append_only_markers() {
+        // Review thread #5: revoked invites, fork markers, and migration
+        // acceptances are accumulated history. A policy.set must not wipe them,
+        // so it cannot be used to re-accept a duplicate migration.
+        let s = state();
+        let with_migration = apply_migration_accept(
+            &s,
+            &MigrationAccept {
+                migration_id: [0xcc; N],
+            },
+        )
+        .unwrap();
+        let wiped = apply_policy_set(
+            &with_migration,
+            &PolicySet {
+                policy: CommunityPolicy::empty(),
+            },
+        )
+        .unwrap();
+        assert!(
+            wiped.policy.migrations.contains(&[0xcc; N]),
+            "policy.set must not wipe append-only migration markers"
+        );
+        assert_eq!(
+            apply_migration_accept(
+                &wiped,
+                &MigrationAccept {
+                    migration_id: [0xcc; N]
+                }
+            )
+            .err(),
+            Some(Reject::InvalidContent),
+            "a policy.set must not enable re-accepting a duplicate migration"
+        );
+    }
+
+    #[test]
     fn apply_migration_accept_records_marker() {
         let s = state();
         let next = apply_migration_accept(
@@ -1229,13 +1288,13 @@ mod tests {
             payload: payload.clone(),
             state_root: compute_state_root(&apply(&s, &payload).unwrap()),
         };
-        // seq == 1 with prev == None is valid.
-        assert!(check_chain_link(&first, None).is_ok());
+        // seq == 1 with prev == None is valid (expected_seq == 1).
+        assert!(check_chain_link(&first, None, 1).is_ok());
         // seq == 1 with a non-None prev is rejected.
         let mut bad_first = first.clone();
         bad_first.prev = Some(GovernanceId::from_bytes([0x01; N]));
         assert_eq!(
-            check_chain_link(&bad_first, None).err(),
+            check_chain_link(&bad_first, None, 1).err(),
             Some(Reject::InvalidContent)
         );
 
@@ -1249,17 +1308,29 @@ mod tests {
             payload,
             state_root: first.state_root,
         };
-        // seq > 1 with matching prev is valid.
-        assert!(check_chain_link(&second, Some(prev_id)).is_ok());
+        // seq > 1 with matching prev + expected_seq is valid.
+        assert!(check_chain_link(&second, Some(prev_id), 2).is_ok());
         // seq > 1 with wrong prev is rejected.
         assert_eq!(
-            check_chain_link(&second, Some(GovernanceId::from_bytes([0xff; N]))).err(),
+            check_chain_link(&second, Some(GovernanceId::from_bytes([0xff; N])), 2).err(),
             Some(Reject::InvalidContent)
         );
         // seq > 1 with None expected_prev is rejected.
         assert_eq!(
-            check_chain_link(&second, None).err(),
+            check_chain_link(&second, None, 2).err(),
             Some(Reject::InvalidContent)
+        );
+
+        // Skipped sequence number (review thread #2): an entry at seq 3 that
+        // links back to entry 1 must be rejected even though its `prev` matches
+        // entry 1's id — seq 2 was never produced. The old check, which compared
+        // only `prev`, accepted this non-contiguous chain.
+        let mut skipped = second.clone();
+        skipped.seq = 3;
+        assert_eq!(
+            check_chain_link(&skipped, Some(prev_id), 2).err(),
+            Some(Reject::InvalidContent),
+            "a non-contiguous seq (3 when 2 is expected) must be rejected"
         );
     }
 

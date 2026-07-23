@@ -237,6 +237,7 @@ fn receive_and_fold(
     old: &GovernanceState,
     wire: &WireEntry,
     expected_prev: Option<GovernanceId>,
+    expected_seq: u64,
 ) -> Result<(GovernanceState, GovernanceId), Reject> {
     // Canonical decode of the exact received CSB (the trust boundary).
     let body = decode_entry_csb(&wire.csb)?;
@@ -253,8 +254,8 @@ fn receive_and_fold(
         verified, body,
         "verified body must equal the decoded wire body"
     );
-    // Chain invariant (spec D5): seq/prev link.
-    check_chain_link(&verified, expected_prev)?;
+    // Chain invariant (spec D5): seq/prev link (contiguous seq, review thread #2).
+    check_chain_link(&verified, expected_prev, expected_seq)?;
     // Pure apply + declared-root recompute + compare (spec §7.3).
     let new = apply_verified_entry(old, &verified)?;
     Ok((new, entry_id(&verified)))
@@ -288,7 +289,7 @@ fn fold_one(
     // Seal + attach an approval bound to the entry, then hand the raw bytes to
     // the receiver pipeline.
     let wire = with_approval(seal(&body, author), &body, approver);
-    receive_and_fold(old, &wire, prev).expect("fold must succeed for a well-formed entry")
+    receive_and_fold(old, &wire, prev, seq).expect("fold must succeed for a well-formed entry")
 }
 
 /// The full #147 governance-log lifecycle: genesis → five entries crossing
@@ -785,7 +786,7 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
             state_root: declared_root,
         };
         let wire = with_approval(seal(&body, &author), &body, &approver);
-        let (new_state, new_id) = receive_and_fold(&prior, &wire, None)
+        let (new_state, new_id) = receive_and_fold(&prior, &wire, None, 1)
             .unwrap_or_else(|e| panic!("fold failed for `{label}`: {e:?}"));
         // The transition must be state-root-visible (no silent no-op), and the
         // folded entry id must recompute from the wire CSB.

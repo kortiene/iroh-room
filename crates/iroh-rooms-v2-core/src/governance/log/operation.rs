@@ -498,9 +498,16 @@ impl GovernanceOperationPayload {
                     &["stream_id", "archived"],
                     Reject::InvalidContent,
                 )?;
+                // The encoder emits only 0 or 1 (review thread #4); accept no
+                // other value so a canonical `archived = 2` is rejected as
+                // malformed content instead of silently coerced to `true`.
+                let archived_val = super::read_uint_field(entries, "archived")?;
+                if archived_val > 1 {
+                    return Err(Reject::InvalidContent);
+                }
                 Self::StreamArchive(StreamArchive {
                     stream_id: super::read_stream_field(entries, "stream_id")?,
-                    archived: super::read_uint_field(entries, "archived")? != 0,
+                    archived: archived_val == 1,
                 })
             }
             GovernanceOperationKind::InviteRevoke => {
@@ -692,6 +699,41 @@ mod tests {
                 .err(),
             Some(Reject::InvalidContent)
         );
+    }
+
+    #[test]
+    fn stream_archive_rejects_non_boolean_flag() {
+        // The encoder emits only 0 or 1 for `archived` (review thread #4). A
+        // canonical payload carrying `archived = 2` must be rejected as malformed
+        // content rather than silently coerced to `true` (which would also
+        // normalize to different bytes when re-encoded).
+        let cbor = CborValue::Map(vec![
+            ("stream_id".to_owned(), CborValue::Bytes(vec![0x0c; LEN])),
+            ("archived".to_owned(), CborValue::Uint(2)),
+        ]);
+        assert_eq!(
+            GovernanceOperationPayload::from_canonical(
+                GovernanceOperationKind::StreamArchive,
+                &cbor,
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+        // Sanity: 0 and 1 still decode.
+        for v in [0u64, 1u64] {
+            let cbor = CborValue::Map(vec![
+                ("stream_id".to_owned(), CborValue::Bytes(vec![0x0c; LEN])),
+                ("archived".to_owned(), CborValue::Uint(v)),
+            ]);
+            assert!(
+                GovernanceOperationPayload::from_canonical(
+                    GovernanceOperationKind::StreamArchive,
+                    &cbor,
+                )
+                .is_ok(),
+                "archived = {v} must still decode"
+            );
+        }
     }
 
     #[test]

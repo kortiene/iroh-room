@@ -78,10 +78,16 @@ pub(super) fn opt_field<'a>(
 }
 
 /// Read a required `u64` field.
+///
+/// Returns [`Reject::InvalidContent`] (not `NonCanonicalEncoding`) when the field
+/// is missing or non-integer: the surrounding CBOR has already decoded canonically
+/// at this point, so a missing/wrong-typed field is a content problem, consistent
+/// with the content-event taxonomy (spec §6.4 / review thread #3). Byte-width
+/// violations elsewhere remain `NonCanonicalEncoding`.
 pub(super) fn read_uint_field(entries: &[(String, CborValue)], key: &str) -> Result<u64, Reject> {
     opt_field(entries, key)
         .and_then(CborValue::as_uint)
-        .ok_or(Reject::NonCanonicalEncoding)
+        .ok_or(Reject::InvalidContent)
 }
 
 /// Read a required `u64` field and narrow it to `u8`, rejecting overflow as
@@ -96,24 +102,28 @@ pub(super) fn read_u16_field(entries: &[(String, CborValue)], key: &str) -> Resu
     u16::try_from(read_uint_field(entries, key)?).map_err(|_| Reject::InvalidContent)
 }
 
-/// Read a required text field.
+/// Read a required text field. Missing or non-text → [`Reject::InvalidContent`]
+/// (content error after canonical decode; see [`read_uint_field`]).
 pub(super) fn read_text_field<'a>(
     entries: &'a [(String, CborValue)],
     key: &str,
 ) -> Result<&'a str, Reject> {
     opt_field(entries, key)
         .and_then(CborValue::as_text)
-        .ok_or(Reject::NonCanonicalEncoding)
+        .ok_or(Reject::InvalidContent)
 }
 
-/// Read a required byte-string field.
+/// Read a required byte-string field. Missing or non-bytes →
+/// [`Reject::InvalidContent`] (content error after canonical decode). A wrong
+/// *width* is still surfaced as `NonCanonicalEncoding` by the id-field wrappers
+/// (§6.4 byte-width rule).
 pub(super) fn read_bytes_field<'a>(
     entries: &'a [(String, CborValue)],
     key: &str,
 ) -> Result<&'a [u8], Reject> {
     opt_field(entries, key)
         .and_then(CborValue::as_bytes)
-        .ok_or(Reject::NonCanonicalEncoding)
+        .ok_or(Reject::InvalidContent)
 }
 
 /// Reject any map key outside the allowed set, surfacing `code` (spec D8).
@@ -207,10 +217,10 @@ pub(super) fn read_principal_array(
 ) -> Result<Vec<PrincipalId>, Reject> {
     let arr = opt_field(entries, key)
         .and_then(CborValue::as_array)
-        .ok_or(Reject::NonCanonicalEncoding)?;
+        .ok_or(Reject::InvalidContent)?;
     arr.iter()
         .map(|v| {
-            let bytes = v.as_bytes().ok_or(Reject::NonCanonicalEncoding)?;
+            let bytes = v.as_bytes().ok_or(Reject::InvalidContent)?;
             let arr = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
             Ok(PrincipalId::from_bytes(arr))
         })
@@ -240,10 +250,10 @@ pub(super) fn read_byte_array_set(
 ) -> Result<std::collections::BTreeSet<[u8; LEN]>, Reject> {
     let arr = opt_field(entries, key)
         .and_then(CborValue::as_array)
-        .ok_or(Reject::NonCanonicalEncoding)?;
+        .ok_or(Reject::InvalidContent)?;
     let mut set = std::collections::BTreeSet::new();
     for v in arr {
-        let bytes = v.as_bytes().ok_or(Reject::NonCanonicalEncoding)?;
+        let bytes = v.as_bytes().ok_or(Reject::InvalidContent)?;
         let arr = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
         if !set.insert(arr) {
             return Err(Reject::NonCanonicalEncoding);
@@ -258,13 +268,13 @@ pub(super) fn read_governance_id_pair(
 ) -> Result<[GovernanceId; 2], Reject> {
     let arr = opt_field(entries, key)
         .and_then(CborValue::as_array)
-        .ok_or(Reject::NonCanonicalEncoding)?;
+        .ok_or(Reject::InvalidContent)?;
     if arr.len() != 2 {
         return Err(Reject::InvalidContent);
     }
     let mut out = [GovernanceId::from_bytes([0; LEN]); 2];
     for (i, v) in arr.iter().enumerate() {
-        let bytes = v.as_bytes().ok_or(Reject::NonCanonicalEncoding)?;
+        let bytes = v.as_bytes().ok_or(Reject::InvalidContent)?;
         let b = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
         out[i] = GovernanceId::from_bytes(b);
     }
@@ -277,7 +287,7 @@ pub(super) fn read_marker_array(
 ) -> Result<Vec<model::ForkResolutionMarker>, Reject> {
     let arr = opt_field(entries, key)
         .and_then(CborValue::as_array)
-        .ok_or(Reject::NonCanonicalEncoding)?;
+        .ok_or(Reject::InvalidContent)?;
     arr.iter()
         .map(model::ForkResolutionMarker::from_canonical)
         .collect()
