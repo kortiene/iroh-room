@@ -609,7 +609,7 @@ The `cargo tree` result must be inspected or machine-checked for banned dependen
 - [ ] The crate builds cleanly under workspace CI.
 - [ ] The crate has no dependency on `iroh`, `iroh-blobs`, `iroh-gossip`, `tokio`, `rusqlite`, or runtime/store crates.
 - [x] #146 identifiers/domain separation implemented and pinned by vectors (eleven frozen `iroh-room-v2/...` domain strings; `CommunityId`/`GovernanceId`/`StreamId`/`EventId`/`CheckpointId`/`ReplicaId` newtypes with typed derivation helpers; golden vectors in `tests/identifiers.rs` + `tests/golden/v2-identifiers.json`; see `specs/v2-identifiers-domain-separation.md` §15).
-- [ ] #147 governance entry/approval/state-root implemented and pinned by vectors.
+- [x] #147 governance entry/approval/state-root implemented and pinned by vectors (the normative #134 §7.1–§7.3 governance-log foundation in `governance/log/`: `GenesisConfig` + non-recursive `CommunityId`, `GovernanceEntryBody`/`GovernanceApproval`/`GovernanceEntry`, the closed 14-operation §7.3 registry with pure `apply(old, op) -> new_state` functions, the six-component `GovernanceStateRootRecord` under `iroh-room-v2/governance-state`, declared-root recompute, and byte-pinned golden vectors; see `specs/v2-governance-log-entry-approval-state-root.md` §17).
 - [ ] #148 authorization rules implemented with exhaustive allow/deny tests.
 - [ ] #149 fork detection and `fork.resolve` implemented with fail-closed unresolved-fork behavior.
 - [ ] #150 checkpoints and snapshot hashes implemented and pinned by vectors.
