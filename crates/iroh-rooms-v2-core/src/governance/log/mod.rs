@@ -19,16 +19,24 @@
 //!
 //! In scope: genesis threshold verification, the entry/approval records, the
 //! §7.3 operation registry with pure apply functions, the six-component
-//! state-root record, and unknown-operation rejection. Out of scope (and
-//! deferred to later issues): authorization policy (#148), fork handling
-//! (#149), checkpoints/snapshots (#150), and any network/replica/storage code.
+//! state-root record, unknown-operation rejection, and (issue #148) the
+//! normative five-rule [`authz::validate_governance_entry`] authorization
+//! predicate. Out of scope (and deferred to later issues): fork handling
+//! (#149) — detecting two quorum-valid entries that share a predecessor,
+//! branch selection, and recovery-threshold signing — and
+//! checkpoints/snapshots (#150).
 
+pub mod authz;
 pub mod genesis;
 pub mod model;
 pub mod operation;
 pub mod records;
 pub mod state;
 
+pub use authz::{
+    validate_and_apply_governance_entry, validate_governance_entry, validated_genesis_state,
+    GovernanceTip, RejectionReason, ValidatedGovernanceState,
+};
 pub use genesis::{
     derive_community_id, genesis_config_csb, sign_genesis, verify_genesis, GenesisConfig,
     GenesisSignature, GENESIS_SCHEMA_VERSION,
@@ -45,8 +53,8 @@ pub use operation::{
 };
 pub use records::{
     approval_csb, approval_id, decode_entry_csb, entry_csb, entry_id, verify_approval_crypto,
-    verify_entry_crypto, verify_entry_full, GovernanceApproval, GovernanceApprovalBody,
-    GovernanceEntry, GovernanceEntryBody,
+    verify_entry_crypto, verify_entry_full, verify_governance_entry, GovernanceApproval,
+    GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody, VerifiedGovernanceEntry,
 };
 pub use state::{
     apply, apply_verified_entry, check_chain_link, component_root, compute_state_root,
