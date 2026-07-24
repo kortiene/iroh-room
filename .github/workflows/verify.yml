@@ -5,6 +5,14 @@ on:
   push:
     branches: ["main"]
 
+env:
+  # This job has no `target/` cache between runs, so the incremental
+  # compilation cache (`target/debug/incremental`) is pure overhead here: it
+  # buys no reuse and its multi-GB footprint contributed to exhausting the
+  # runner's disk mid-link (lld hit SIGBUS writing one of the later test
+  # binaries in scripts/verify.sh's `--all-targets --all-features` run).
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
