@@ -19,43 +19,56 @@
 //!
 //! In scope: genesis threshold verification, the entry/approval records, the
 //! §7.3 operation registry with pure apply functions, the six-component
-//! state-root record, unknown-operation rejection, and (issue #148) the
-//! normative five-rule [`authz::validate_governance_entry`] authorization
-//! predicate. Out of scope (and deferred to later issues): fork handling
-//! (#149) — detecting two quorum-valid entries that share a predecessor,
-//! branch selection, and recovery-threshold signing — and
-//! checkpoints/snapshots (#150).
+//! state-root record, unknown-operation rejection, the #148 normative
+//! five-rule [`authz::validate_governance_entry`] authorization predicate,
+//! and (issue #149) [`fork::detect_governance_fork`] detection +
+//! [`machine::GovernanceMachine`] fork-aware state machine with
+//! recovery-threshold `fork.resolve` authorization. Out of scope (and deferred
+//! to later issues): checkpoints/snapshots (#150), publication-certificate
+//! refusal (Phase C), and operator fork-recovery UX (#159).
 
 pub mod authz;
+pub mod fork;
 pub mod genesis;
+pub mod machine;
 pub mod model;
 pub mod operation;
 pub mod records;
 pub mod state;
 
 pub use authz::{
-    validate_and_apply_governance_entry, validate_governance_entry, validated_genesis_state,
-    GovernanceTip, RejectionReason, ValidatedGovernanceState,
+    validate_and_apply_governance_entry, validate_governance_candidate, validate_governance_entry,
+    validated_genesis_state, GovernanceTip, RejectionReason, ValidatedGovernanceCandidate,
+    ValidatedGovernanceState,
+};
+pub use fork::{
+    detect_governance_fork, detect_governance_forks, GovernanceBranchEvidence,
+    GovernanceForkEvidence,
 };
 pub use genesis::{
     derive_community_id, genesis_config_csb, sign_genesis, verify_genesis, GenesisConfig,
     GenesisSignature, GENESIS_SCHEMA_VERSION,
 };
+pub use machine::{
+    GovernanceForkAuditRecord, GovernanceForkAuditStatus, GovernanceForkedState, GovernanceMachine,
+    GovernanceMachineState, GovernanceObservation, LinearGovernanceState,
+};
 pub use model::{
-    AdministratorState, CommunityPolicy, DeviceRecord, DeviceStatus, ForkResolutionMarker,
-    MemberRecord, MemberStatus, RecoveryConfig, RecoveryState, ReplicaDescriptor, ReplicaRecord,
-    ReplicaStatus, Role, StreamPolicy, StreamRecord,
+    AdministratorState, CommunityPolicy, DeviceRecord, DeviceStatus, MemberRecord, MemberStatus,
+    RecoveryConfig, RecoveryState, ReplicaDescriptor, ReplicaRecord, ReplicaStatus,
+    ResolvedForkMarker, Role, StreamPolicy, StreamRecord,
 };
 pub use operation::{
-    AdminSet, DeviceGrant, DeviceRevoke, GovernanceOperationKind, GovernanceOperationPayload,
-    InviteRevoke, MemberGrant, MemberRevoke, MigrationAccept, PolicySet, RecoverySet, ReplicaSet,
-    StreamArchive, StreamCreate, StreamPolicySet,
+    AdminSet, DeviceGrant, DeviceRevoke, ForkResolve, GovernanceOperationKind,
+    GovernanceOperationPayload, InviteRevoke, MemberGrant, MemberRevoke, MigrationAccept,
+    PolicySet, RecoverySet, ReplicaSet, StreamArchive, StreamCreate, StreamPolicySet,
 };
 pub use records::{
     approval_csb, approval_id, approval_id_from_csb, decode_approval_csb, decode_entry_csb,
     entry_csb, entry_id, entry_id_from_csb, verify_approval_crypto, verify_entry_crypto,
-    verify_entry_full, verify_governance_entry, GovernanceApproval, GovernanceApprovalBody,
-    GovernanceEntry, GovernanceEntryBody, VerifiedGovernanceEntry,
+    verify_entry_full, verify_governance_entry, AuthenticatedGovernanceEvidence,
+    GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
+    VerifiedGovernanceApprovalEvidence, VerifiedGovernanceEntry,
 };
 pub use state::{
     apply, apply_verified_entry, check_chain_link, component_root, compute_state_root,
@@ -271,33 +284,30 @@ pub(super) fn read_byte_array_set(
     Ok(set)
 }
 
-pub(super) fn read_governance_id_pair(
+pub(super) fn read_governance_id_array(
     entries: &[(String, CborValue)],
     key: &str,
-) -> Result<[GovernanceId; 2], Reject> {
+) -> Result<Vec<GovernanceId>, Reject> {
     let arr = opt_field(entries, key)
         .and_then(CborValue::as_array)
         .ok_or(Reject::InvalidContent)?;
-    if arr.len() != 2 {
-        return Err(Reject::InvalidContent);
-    }
-    let mut out = [GovernanceId::from_bytes([0; LEN]); 2];
-    for (i, v) in arr.iter().enumerate() {
-        let bytes = v.as_bytes().ok_or(Reject::InvalidContent)?;
-        let b = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
-        out[i] = GovernanceId::from_bytes(b);
-    }
-    Ok(out)
+    arr.iter()
+        .map(|v| {
+            let bytes = v.as_bytes().ok_or(Reject::InvalidContent)?;
+            let arr = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
+            Ok(GovernanceId::from_bytes(arr))
+        })
+        .collect()
 }
 
 pub(super) fn read_marker_array(
     entries: &[(String, CborValue)],
     key: &str,
-) -> Result<Vec<model::ForkResolutionMarker>, Reject> {
+) -> Result<Vec<model::ResolvedForkMarker>, Reject> {
     let arr = opt_field(entries, key)
         .and_then(CborValue::as_array)
         .ok_or(Reject::InvalidContent)?;
     arr.iter()
-        .map(model::ForkResolutionMarker::from_canonical)
+        .map(model::ResolvedForkMarker::from_canonical)
         .collect()
 }

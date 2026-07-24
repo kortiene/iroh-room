@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cbor::CborValue;
 use crate::error::Reject;
-use crate::ids::{DeviceId, GovernanceId, PrincipalId, ReplicaId, StreamId};
+use crate::ids::{DeviceId, GovernanceId, PrincipalId, ReplicaId, StateRoot, StreamId};
 
 // ----------------------------------------------------------------------------
 // Enums (role + statuses). Encoded as canonical text strings.
@@ -323,35 +323,51 @@ impl StreamPolicy {
     }
 }
 
-/// A deterministic `fork.resolve` marker (spec §7.3 / D8). #147 only records
-/// the marker so the operation has a state-root-visible pure transition; #149
-/// owns branch selection and evidence interpretation.
+/// A deterministic state-visible `fork.resolve` marker (spec §6.6 / §7.3,
+/// issue #149). Committed under [`CommunityPolicy::fork_markers`] so a
+/// successful resolution is state-root-visible without carrying full audit
+/// evidence into the six-component root.
+///
+/// The marker commits to the resolution facts: every named competing branch
+/// head, the selected head, and the selected state root. It deliberately
+/// omits a `resolution_entry` field: that id is derived from the entry's CSB,
+/// which includes the post-marker state root, so including it here would
+/// create a self-referential derivation (spec §6.6). The resolution entry id
+/// is retained only in the outer audit record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForkResolutionMarker {
-    /// The conflicting entry-id pair (ascending order).
-    pub evidence: [GovernanceId; 2],
-    /// Opaque decision byte (interpretation is #149).
-    pub decision: u8,
+pub struct ResolvedForkMarker {
+    /// Every known competing branch head at resolution time, sorted ascending
+    /// by raw id (canonical representation only; sorted position is never
+    /// authorization — spec §5.6).
+    pub branch_heads: Vec<GovernanceId>,
+    /// The selected branch head (must occur exactly once in `branch_heads`).
+    pub selected_head: GovernanceId,
+    /// The already-validated state root for `selected_head`.
+    pub selected_state_root: StateRoot,
     /// Signed creation time (advisory; never a wall clock).
     pub created_at_ms: u64,
 }
 
-impl ForkResolutionMarker {
+impl ResolvedForkMarker {
     #[must_use]
     pub fn to_cbor(&self) -> CborValue {
         CborValue::Map(vec![
             (
-                "evidence".to_owned(),
+                "branch_heads".to_owned(),
                 CborValue::Array(
-                    self.evidence
+                    self.branch_heads
                         .iter()
                         .map(|id| CborValue::Bytes(id.as_bytes().to_vec()))
                         .collect(),
                 ),
             ),
             (
-                "decision".to_owned(),
-                CborValue::Uint(u64::from(self.decision)),
+                "selected_head".to_owned(),
+                CborValue::Bytes(self.selected_head.as_bytes().to_vec()),
+            ),
+            (
+                "selected_state_root".to_owned(),
+                CborValue::Bytes(self.selected_state_root.as_bytes().to_vec()),
             ),
             (
                 "created_at_ms".to_owned(),
@@ -360,24 +376,57 @@ impl ForkResolutionMarker {
         ])
     }
 
-    /// Decode from canonical CBOR, enforcing the closed schema (spec D8).
+    /// Decode from canonical CBOR, enforcing the closed schema and the
+    /// canonical branch-head invariants (sorted ascending, unique, at least
+    /// two, and `selected_head` present exactly once).
     ///
     /// # Errors
-    /// Returns [`Reject::InvalidContent`] if the value is not a closed-schema
-    /// map or a field has the wrong shape/width.
+    /// Returns [`Reject::InvalidContent`] for a non-closed schema, a malformed
+    /// field, or a non-canonical branch-head set.
     pub fn from_canonical(value: &CborValue) -> Result<Self, Reject> {
         let entries = value.as_map().ok_or(Reject::InvalidContent)?;
         super::reject_unknown_keys(
             entries,
-            &["evidence", "decision", "created_at_ms"],
+            &[
+                "branch_heads",
+                "selected_head",
+                "selected_state_root",
+                "created_at_ms",
+            ],
             Reject::InvalidContent,
         )?;
-        let evidence = super::read_governance_id_pair(entries, "evidence")?;
-        let decision = super::read_u8_field(entries, "decision")?;
+        let branch_heads = super::read_governance_id_array(entries, "branch_heads")?;
+        // Canonical invariants: at least two, sorted ascending, unique.
+        if branch_heads.len() < 2 {
+            return Err(Reject::InvalidContent);
+        }
+        let mut sorted = branch_heads.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted.len() != branch_heads.len() {
+            // Duplicates present.
+            return Err(Reject::InvalidContent);
+        }
+        if sorted != branch_heads {
+            // Not sorted ascending.
+            return Err(Reject::InvalidContent);
+        }
+        let selected_head = super::read_governance_field(entries, "selected_head")?;
+        // selected_head must occur exactly once in branch_heads.
+        if branch_heads
+            .iter()
+            .filter(|id| **id == selected_head)
+            .count()
+            != 1
+        {
+            return Err(Reject::InvalidContent);
+        }
+        let selected_state_root = super::read_state_root_field(entries, "selected_state_root")?;
         let created_at_ms = super::read_uint_field(entries, "created_at_ms")?;
         Ok(Self {
-            evidence,
-            decision,
+            branch_heads,
+            selected_head,
+            selected_state_root,
             created_at_ms,
         })
     }
@@ -392,7 +441,8 @@ pub struct CommunityPolicy {
     /// Revoked invite commitments (deterministic order via `BTreeSet`).
     pub revoked_invites: BTreeSet<[u8; 32]>,
     /// `fork.resolve` markers (canonicalized to sorted order at encode time).
-    pub fork_markers: Vec<ForkResolutionMarker>,
+    /// Append-only history of resolved forks (issue #149).
+    pub fork_markers: Vec<ResolvedForkMarker>,
     /// Accepted migration ids (deterministic order via `BTreeSet`).
     pub migrations: BTreeSet<[u8; 32]>,
 }
@@ -410,9 +460,10 @@ impl CommunityPolicy {
 
     #[must_use]
     pub fn to_cbor(&self) -> CborValue {
-        // Sort fork markers deterministically by evidence bytes.
+        // Sort fork markers deterministically by selected_head (canonical
+        // representation only; sorted position has no authorization meaning).
         let mut markers = self.fork_markers.clone();
-        markers.sort_by_key(|m| (*m.evidence[0].as_bytes(), *m.evidence[1].as_bytes()));
+        markers.sort_by_key(|m| *m.selected_head.as_bytes());
         CborValue::Map(vec![
             (
                 "revoked_invites".to_owned(),
@@ -425,7 +476,7 @@ impl CommunityPolicy {
             ),
             (
                 "fork_markers".to_owned(),
-                CborValue::Array(markers.iter().map(ForkResolutionMarker::to_cbor).collect()),
+                CborValue::Array(markers.iter().map(ResolvedForkMarker::to_cbor).collect()),
             ),
             (
                 "migrations".to_owned(),

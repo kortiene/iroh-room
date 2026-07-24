@@ -561,26 +561,41 @@ pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<Governan
     next.policy.fork_markers.extend(kept_forks);
     next.policy
         .fork_markers
-        .sort_by_key(|m| (*m.evidence[0].as_bytes(), *m.evidence[1].as_bytes()));
+        .sort_by_key(|m| *m.selected_head.as_bytes());
     Ok(next)
 }
 
-/// `fork.resolve`: record a deterministic marker under community policy only
-/// (spec D8). #149 owns branch selection and evidence interpretation.
+/// `fork.resolve`: record the deterministic resolution marker under community
+/// policy (spec §6.6 / §7.3 / issue #149).
+///
+/// This is the **pure state transition**: it appends a
+/// [`ResolvedForkMarker`] carrying the signed resolution facts (branch heads,
+/// selected head, selected root) to the append-only `fork_markers` set so the
+/// resolution is state-root-visible. The #149 fork-aware state machine
+/// performs the full recovery-threshold authorization, branch-set equality,
+/// and selected-state binding (§9) before invoking this transition; this
+/// function only folds the validated marker into state.
 ///
 /// # Errors
-/// Returns [`Reject::InvalidContent`] if the evidence pair is not an ascending
-/// pair of distinct ids.
+/// This transition is total over payloads that already passed
+/// [`super::operation::ForkResolve::from_canonical`] (closed-schema + canonical
+/// branch-head invariants); it does not fail.
 pub fn apply_fork_resolve(
     old: &GovernanceState,
-    p: &super::model::ForkResolutionMarker,
+    p: &super::operation::ForkResolve,
 ) -> Result<GovernanceState, Reject> {
-    // Evidence must be an ascending pair of distinct ids.
-    if p.evidence[0] >= p.evidence[1] {
-        return Err(Reject::InvalidContent);
-    }
     let mut next = old.clone();
-    next.policy.fork_markers.push(p.clone());
+    next.policy
+        .fork_markers
+        .push(super::model::ResolvedForkMarker {
+            branch_heads: p.branch_heads.clone(),
+            selected_head: p.selected_head,
+            selected_state_root: p.selected_state_root,
+            created_at_ms: p.created_at_ms,
+        });
+    next.policy
+        .fork_markers
+        .sort_by_key(|m| *m.selected_head.as_bytes());
     Ok(next)
 }
 
@@ -666,9 +681,7 @@ mod tests {
     use super::super::genesis::{
         derive_community_id, sign_genesis, verify_genesis, GENESIS_SCHEMA_VERSION,
     };
-    use super::super::model::{
-        ForkResolutionMarker, RecoveryConfig, ReplicaDescriptor, StreamPolicy,
-    };
+    use super::super::model::{RecoveryConfig, ReplicaDescriptor, StreamPolicy};
     use super::super::operation::GovernanceOperationKind;
     use super::super::records::{entry_csb, entry_id};
     use super::*;
@@ -1204,24 +1217,24 @@ mod tests {
 
     #[test]
     fn apply_fork_resolve_records_marker() {
+        use super::super::operation::ForkResolve;
+        use crate::ids::StateRoot;
         let s = state();
-        let marker = ForkResolutionMarker {
-            evidence: [
-                GovernanceId::from_bytes([1; N]),
-                GovernanceId::from_bytes([2; N]),
-            ],
-            decision: 1,
+        let branch_lo = GovernanceId::from_bytes([1; N]);
+        let branch_hi = GovernanceId::from_bytes([2; N]);
+        let payload = ForkResolve {
+            branch_heads: vec![branch_lo, branch_hi],
+            selected_head: branch_lo,
+            selected_state_root: StateRoot::from_bytes([0x33; N]),
             created_at_ms: 1_000,
         };
-        let next = apply_fork_resolve(&s, &marker).unwrap();
+        let next = apply_fork_resolve(&s, &payload).unwrap();
         assert_eq!(next.policy.fork_markers.len(), 1);
-        // Descending evidence pair rejects.
-        let bad = ForkResolutionMarker {
-            evidence: [marker.evidence[1], marker.evidence[0]],
-            decision: 1,
-            created_at_ms: 1_000,
-        };
-        assert!(apply_fork_resolve(&s, &bad).is_err());
+        assert_eq!(next.policy.fork_markers[0].selected_head, branch_lo);
+        assert_eq!(
+            next.policy.fork_markers[0].branch_heads,
+            vec![branch_lo, branch_hi]
+        );
     }
 
     #[test]

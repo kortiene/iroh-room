@@ -35,6 +35,125 @@ use crate::PrincipalId;
 use super::operation::GovernanceOperationPayload;
 use super::GENESIS_SCHEMA_VERSION;
 
+// ----------------------------------------------------------------------------
+// #149: authenticated evidence (exact CSB + detached signatures) retained
+// after successful verification so fork detection/audit can preserve signatures
+// without trusting caller reconstruction (spec §6.1).
+// ----------------------------------------------------------------------------
+
+/// Authenticated evidence for a single verified approval (issue #149 §6.1).
+///
+/// Preserves the exact received canonical signed bytes (CSB) and the detached
+/// Ed25519 signature that were verified by [`verify_approval_crypto`], so fork
+/// audit evidence can re-expose them without re-deriving bytes from the typed
+/// body. Construction occurs only inside [`verify_governance_entry`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedGovernanceApprovalEvidence {
+    body: GovernanceApprovalBody,
+    csb: Vec<u8>,
+    signature: Signature,
+}
+
+impl VerifiedGovernanceApprovalEvidence {
+    /// The verified approval body.
+    #[must_use]
+    pub fn body(&self) -> &GovernanceApprovalBody {
+        &self.body
+    }
+
+    /// The exact canonical signed bytes (CSB) this approval was verified over.
+    #[must_use]
+    pub fn csb(&self) -> &[u8] {
+        &self.csb
+    }
+
+    /// The detached Ed25519 signature over `domain::GOVERNANCE_APPROVAL || csb`.
+    #[must_use]
+    pub fn signature(&self) -> &Signature {
+        &self.signature
+    }
+}
+
+impl std::fmt::Debug for VerifiedGovernanceApprovalEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedGovernanceApprovalEvidence")
+            .field("body", &self.body)
+            .field("csb_len", &self.csb.len())
+            .field("signature", &self.signature)
+            .finish()
+    }
+}
+
+/// Authenticated evidence for a verified governance entry (issue #149 §6.1).
+///
+/// Bundles the exact-CSB-derived [`GovernanceId`], the typed body, the exact
+/// retained entry CSB, the entry signer + signature, and the verified approval
+/// evidence (each carrying its own exact CSB + signature). This is the
+/// append-only audit material fork detection and resolution audit consume; it
+/// is constructed only inside [`verify_governance_entry`] after every
+/// cryptographic and canonical-encoding check has passed, so unauthenticated
+/// bytes can never reach audit evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthenticatedGovernanceEvidence {
+    id: GovernanceId,
+    body: GovernanceEntryBody,
+    csb: Vec<u8>,
+    signer: PrincipalId,
+    signature: Signature,
+    approvals: Vec<VerifiedGovernanceApprovalEvidence>,
+}
+
+impl AuthenticatedGovernanceEvidence {
+    /// The exact-CSB-derived governance id (authenticated identity).
+    #[must_use]
+    pub fn id(&self) -> GovernanceId {
+        self.id
+    }
+
+    /// The verified entry body.
+    #[must_use]
+    pub fn body(&self) -> &GovernanceEntryBody {
+        &self.body
+    }
+
+    /// The exact canonical signed bytes (CSB) retained verbatim.
+    #[must_use]
+    pub fn csb(&self) -> &[u8] {
+        &self.csb
+    }
+
+    /// The verified entry signer.
+    #[must_use]
+    pub fn signer(&self) -> PrincipalId {
+        self.signer
+    }
+
+    /// The detached Ed25519 entry signature over `domain::GOVERNANCE_ENTRY || csb`.
+    #[must_use]
+    pub fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    /// The verified approval evidence, canonically sorted and duplicate-free.
+    #[must_use]
+    pub fn approvals(&self) -> &[VerifiedGovernanceApprovalEvidence] {
+        &self.approvals
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedGovernanceEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedGovernanceEvidence")
+            .field("id", &self.id)
+            .field("body", &self.body)
+            .field("csb_len", &self.csb.len())
+            .field("signer", &self.signer)
+            .field("signature", &self.signature)
+            .field("approvals_len", &self.approvals.len())
+            .finish()
+    }
+}
+
 /// The canonical governance-log entry body (spec §5.2).
 ///
 /// This is the post-genesis totally-ordered log record. `state_root` commits
@@ -587,11 +706,9 @@ pub fn verify_approval_crypto(
 /// must consume [`Self::id`] rather than re-deriving from the typed body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedGovernanceEntry {
-    /// The exact-CSB-derived governance id (authenticated identity).
-    id: GovernanceId,
-    body: GovernanceEntryBody,
-    signer: PrincipalId,
-    approvals: Vec<GovernanceApprovalBody>,
+    /// The full authenticated evidence bundle (exact CSB, signatures, and
+    /// verified approvals) retained for #149 fork detection/audit.
+    evidence: AuthenticatedGovernanceEvidence,
 }
 
 impl VerifiedGovernanceEntry {
@@ -600,25 +717,36 @@ impl VerifiedGovernanceEntry {
     /// crypto/round-trip success, so it is the authenticated identity.
     #[must_use]
     pub fn id(&self) -> GovernanceId {
-        self.id
+        self.evidence.id
     }
 
     /// The verified entry body.
     #[must_use]
     pub fn body(&self) -> &GovernanceEntryBody {
-        &self.body
+        &self.evidence.body
     }
 
     /// The verified entry signer.
     #[must_use]
     pub fn signer(&self) -> PrincipalId {
-        self.signer
+        self.evidence.signer
     }
 
-    /// The verified, canonically sorted, duplicate-free approval bodies.
+    /// The verified, canonically sorted, duplicate-free approval evidence.
+    /// Each entry carries its exact retained CSB and detached signature
+    /// (issue #149 §6.1) so fork audit preserves approval signatures without
+    /// trusting caller reconstruction.
     #[must_use]
-    pub fn approvals(&self) -> &[GovernanceApprovalBody] {
-        &self.approvals
+    pub fn approvals(&self) -> &[VerifiedGovernanceApprovalEvidence] {
+        &self.evidence.approvals
+    }
+
+    /// The full authenticated evidence bundle (exact entry CSB, entry
+    /// signature, and verified approval evidence) retained for #149 fork
+    /// detection and audit (spec §6.1).
+    #[must_use]
+    pub fn authenticated_evidence(&self) -> &AuthenticatedGovernanceEvidence {
+        &self.evidence
     }
 }
 
@@ -660,7 +788,7 @@ pub fn verify_governance_entry(entry: &GovernanceEntry) -> Result<VerifiedGovern
     });
 
     let mut seen = std::collections::BTreeSet::new();
-    let mut verified_approvals = Vec::with_capacity(approvals.len());
+    let mut approval_evidence = Vec::with_capacity(approvals.len());
     for approval in &approvals {
         let verified = verify_approval_crypto(approval)?;
         // Binding checks (spec §5.3): approval must reference this entry's
@@ -675,14 +803,22 @@ pub fn verify_governance_entry(entry: &GovernanceEntry) -> Result<VerifiedGovern
             // Duplicate approver for a single entry (spec D6 / §9).
             return Err(Reject::InvalidApproval);
         }
-        verified_approvals.push(verified);
+        // #149: retain the exact approval CSB + signature for audit evidence.
+        approval_evidence.push(VerifiedGovernanceApprovalEvidence {
+            body: verified,
+            csb: approval.csb().to_vec(),
+            signature: *approval.signature(),
+        });
     }
-    Ok(VerifiedGovernanceEntry {
+    let evidence = AuthenticatedGovernanceEvidence {
         id: verified_id,
         body,
+        csb: entry.csb().to_vec(),
         signer: entry.signer(),
-        approvals: verified_approvals,
-    })
+        signature: *entry.signature(),
+        approvals: approval_evidence,
+    };
+    Ok(VerifiedGovernanceEntry { evidence })
 }
 
 /// Compatibility wrapper over [`verify_governance_entry`] that returns only
@@ -694,7 +830,7 @@ pub fn verify_governance_entry(entry: &GovernanceEntry) -> Result<VerifiedGovern
 /// # Errors
 /// See [`verify_governance_entry`].
 pub fn verify_entry_full(entry: &GovernanceEntry) -> Result<GovernanceEntryBody, Reject> {
-    verify_governance_entry(entry).map(|verified| verified.body)
+    verify_governance_entry(entry).map(|verified| verified.body().clone())
 }
 
 #[allow(dead_code)]
@@ -1061,7 +1197,10 @@ mod tests {
         assert_eq!(verified.body(), &body);
         assert_eq!(verified.signer(), author.member_id());
         assert_eq!(verified.approvals().len(), 1);
-        assert_eq!(verified.approvals()[0].approver, approver.member_id());
+        assert_eq!(
+            verified.approvals()[0].body().approver,
+            approver.member_id()
+        );
 
         // The compatibility wrapper must agree exactly on the returned body.
         let compat_body = verify_entry_full(&entry).expect("verifies");
