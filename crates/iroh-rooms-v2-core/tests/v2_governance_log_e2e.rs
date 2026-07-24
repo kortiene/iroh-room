@@ -44,6 +44,14 @@
 //!    authorization boundary (not by crypto or root checks), and the D6
 //!    admin-set invariant (old quorum authorizes; new quorum effective only
 //!    post-commit) proven from wire bytes rather than in-process structs.
+//! 7. **Verbatim-CSB trust boundary (#178)** — a normalizing `admin.set`
+//!    (unsorted/duplicate `administrators` array) reconstructs from altered
+//!    wire bytes that decode to the same typed body, and is verified against
+//!    the *received* bytes: a signature valid only over the normalized bytes
+//!    is rejected as `BadSignature` before authorization/state application,
+//!    while an exact signature over the normalizing bytes is rejected
+//!    post-signature as `NonCanonicalEncoding`. Positive folds prove the
+//!    threaded next-link identity equals the exact wire-CSB-derived id.
 //!
 //! All keys are deterministic public test seeds (non-secret); no entropy,
 //! network, store, or real user data is involved. The crate stays pure: these
@@ -56,9 +64,9 @@ use iroh_rooms_v2_core::cbor::{self, CborValue};
 use iroh_rooms_v2_core::domain;
 use iroh_rooms_v2_core::governance::log::{
     apply, apply_verified_entry, check_chain_link, compute_state_root, decode_entry_csb,
-    derive_community_id, entry_csb, entry_id, genesis_config_csb, sign_genesis,
-    validate_and_apply_governance_entry, validated_genesis_state, verify_entry_full,
-    verify_genesis, verify_governance_entry, GenesisConfig, GovernanceApproval,
+    derive_community_id, entry_csb, entry_id, entry_id_from_csb, genesis_config_csb, sign_genesis,
+    validate_and_apply_governance_entry, validated_genesis_state, verify_entry_crypto,
+    verify_entry_full, verify_genesis, verify_governance_entry, GenesisConfig, GovernanceApproval,
     GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody, GovernanceOperationKind,
     GovernanceOperationPayload, GovernanceState, GovernanceTip, MemberStatus,
     ValidatedGovernanceState, GENESIS_SCHEMA_VERSION,
@@ -245,34 +253,41 @@ fn with_approval(
 
 /// The receiver: reconstruct a `GovernanceEntry` straight from the wire bytes,
 /// then run the full verification + fold pipeline. Returns the new state and
-/// the folded entry's id (the `prev` for the next link), or the typed `Reject`
-/// so callers can attach boundary context.
+/// the folded entry's exact-CSB id (the `prev` for the next link), or the
+/// typed `Reject` so callers can attach boundary context.
 fn receive_and_fold(
     old: &GovernanceState,
     wire: &WireEntry,
     expected_prev: Option<GovernanceId>,
     expected_seq: u64,
 ) -> Result<(GovernanceState, GovernanceId), Reject> {
-    // Canonical decode of the exact received CSB (the trust boundary).
-    let body = decode_entry_csb(&wire.csb)?;
-    // Reassemble the wire record exactly as a peer would.
-    let entry = GovernanceEntry {
-        body: body.clone(),
-        signer: PrincipalId::from_bytes(wire.signer),
-        signature: Signature::from_bytes(wire.sig),
-        approvals: wire.approvals.clone(),
-    };
-    // Full pipeline: entry crypto + approval sort/dedup/sig/binding verify.
-    let verified = verify_entry_full(&entry)?;
+    // Reassemble the wire record straight from the received bytes — the trust
+    // boundary. `from_received_csb` canonical-decodes the typed body and
+    // retains the supplied CSB byte-for-byte (issue #178).
+    let entry = GovernanceEntry::from_received_csb(
+        wire.csb.clone(),
+        PrincipalId::from_bytes(wire.signer),
+        Signature::from_bytes(wire.sig),
+        wire.approvals.clone(),
+    )?;
+    // Independent decode of the wire CSB, to cross-check the verified body
+    // against an honest receiver path (the construction decode and this
+    // decode must agree).
+    let wire_body = decode_entry_csb(&wire.csb)?;
+    // Full pipeline: entry crypto over retained CSB + approval sort/dedup/
+    // sig/binding verify. Use the verified wrapper so the next chain link
+    // binds to the authenticated exact-CSB identity (issue #178).
+    let verified = verify_governance_entry(&entry)?;
+    let body = verified.body();
     assert_eq!(
-        verified, body,
-        "verified body must equal the decoded wire body"
+        body, &wire_body,
+        "verified body must equal the independently decoded wire body"
     );
     // Chain invariant (spec D5): seq/prev link (contiguous seq, review thread #2).
-    check_chain_link(&verified, expected_prev, expected_seq)?;
+    check_chain_link(body, expected_prev, expected_seq)?;
     // Pure apply + declared-root recompute + compare (spec §7.3).
-    let new = apply_verified_entry(old, &verified)?;
-    Ok((new, entry_id(&verified)))
+    let new = apply_verified_entry(old, body)?;
+    Ok((new, verified.id()))
 }
 
 /// Sender + receiver for one entry: compute the declared root by applying the
@@ -808,6 +823,13 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
             "`{label}` must change the state root"
         );
         assert_eq!(new_id, entry_id(&body), "`{label}` entry id must recompute");
+        // The threaded identity must equal the exact-CSB id recomputed straight
+        // from the received wire bytes (#178), not just the body-derived id.
+        assert_eq!(
+            new_id,
+            entry_id_from_csb(&wire.csb),
+            "`{label}` threaded id must equal the exact wire-CSB-derived id"
+        );
     }
 }
 
@@ -839,13 +861,15 @@ fn receive_and_authorize(
     prev: &ValidatedGovernanceState,
     wire: &WireEntry,
 ) -> Result<ValidatedGovernanceState, Reject> {
-    let body = decode_entry_csb(&wire.csb)?;
-    let entry = GovernanceEntry {
-        body,
-        signer: PrincipalId::from_bytes(wire.signer),
-        signature: Signature::from_bytes(wire.sig),
-        approvals: wire.approvals.clone(),
-    };
+    // Reassemble the wire record straight from the received bytes — the trust
+    // boundary. `from_received_csb` retains the supplied CSB byte-for-byte
+    // (issue #178).
+    let entry = GovernanceEntry::from_received_csb(
+        wire.csb.clone(),
+        PrincipalId::from_bytes(wire.signer),
+        Signature::from_bytes(wire.sig),
+        wire.approvals.clone(),
+    )?;
     let verified = verify_governance_entry(&entry)?;
     validate_and_apply_governance_entry(prev, &verified)
 }
@@ -1078,5 +1102,322 @@ fn e2e_admin_set_transition_old_quorum_then_new_quorum_via_wire_bytes() {
         receive_and_authorize(&committed, &by_old_wire).err(),
         Some(Reject::InsufficientAuthorization),
         "principals removed from the admin set must not authorize further entries"
+    );
+}
+
+// ============================================================================
+// §9 Verbatim-CSB trust boundary (issue #178).
+// ============================================================================
+//
+// The record layer now retains the exact received CSB and verifies signatures
+// + identity over those bytes, never a re-serialization of the typed body (see
+// `GovernanceEntry::from_received_csb` / `verify_entry_crypto`). The trigger is
+// `admin.set`: typed decode sorts and deduplicates `administrators`, so a wire
+// record carrying `[B, A]` (or `[A, A, B]`) decodes to the same typed body as
+// `[A, B]` but is byte-distinct and hashes to a different `GovernanceId`.
+//
+// These e2e cases build the altered CSB directly from public APIs (never via
+// `entry_csb(decoded_body)`, which would re-derive the bytes under test) and
+// drive the full receiver path: `from_received_csb` → `verify_entry_crypto` →
+// `verify_governance_entry` → the non-authorizing `receive_and_fold` (#147) and
+// the authorizing `receive_and_authorize` (#148). They fence the pre-#178
+// weakness where a signature valid only over normalized bytes was accepted.
+
+/// Reorder the `payload.administrators` array inside an entry-body
+/// [`CborValue`] to `perm` (touching no other field), then deterministically
+/// encode it. Mirrors the private `records.rs` unit-test helper using only
+/// public APIs, so the bytes under test are never re-derived from the typed
+/// body.
+fn altered_admin_set_csb(body: &GovernanceEntryBody, perm: &[usize]) -> Vec<u8> {
+    let mut value = body.to_cbor();
+    if let CborValue::Map(ref mut entries) = value {
+        for (k, v) in entries.iter_mut() {
+            if k == "payload" {
+                if let CborValue::Map(ref mut payload_entries) = v {
+                    for (pk, pv) in payload_entries.iter_mut() {
+                        if pk == "administrators" {
+                            if let CborValue::Array(ref mut admins) = pv {
+                                let original = admins.clone();
+                                admins.clear();
+                                for &idx in perm {
+                                    admins.push(original[idx].clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cbor::encode(&value)
+}
+
+/// A valid `admin.set` entry body over a sorted unique two-admin set `[a, b]`
+/// (a < b), changing the genesis threshold 2 → 1 so the transition is
+/// state-root-visible. The `administrators` array normalizes during typed
+/// decode, so a permuted/duplicated re-encoding decodes to the same typed body
+/// — the #178 regression trigger.
+fn normalizing_admin_set_body(
+    genesis: &ValidatedGovernanceState,
+    a: PrincipalId,
+    b: PrincipalId,
+) -> GovernanceEntryBody {
+    let admin_set = GovernanceOperationPayload::AdminSet(AdminSet {
+        administrators: vec![a, b],
+        threshold: 1,
+    });
+    let declared = compute_state_root(&apply(genesis.state(), &admin_set).unwrap());
+    GovernanceEntryBody {
+        community_id: genesis.state().community_id,
+        seq: 1,
+        prev: None,
+        created_at_ms: 1_001,
+        kind: admin_set.kind(),
+        payload: admin_set,
+        state_root: declared,
+    }
+}
+
+/// The #178 regression fixture, built only from public APIs: a valid
+/// `admin.set` body, its canonical (normalized) CSB, and an *altered* received
+/// CSB whose permuted `administrators` array is valid deterministic CBOR that
+/// normalizes to the same typed body but is byte-distinct.
+struct NormalizingFixture {
+    body: GovernanceEntryBody,
+    normalized_csb: Vec<u8>,
+    received_csb: Vec<u8>,
+}
+
+fn normalizing_admin_set_fixture(genesis: &ValidatedGovernanceState) -> NormalizingFixture {
+    // Deterministic principals A < B (ed25519 public-key bytes are not
+    // seed-ordered; sort to guarantee A < B so the typed body is canonical).
+    let mut principals = [principal(0x01), principal(0x02)];
+    principals.sort();
+    let [a, b] = principals;
+    let body = normalizing_admin_set_body(genesis, a, b);
+    let normalized_csb = entry_csb(&body);
+    // Altered CSB: `administrators` permuted to `[B, A]` — valid deterministic
+    // CBOR that decodes to the same normalized typed body.
+    let received_csb = altered_admin_set_csb(&body, &[1, 0]);
+    NormalizingFixture {
+        body,
+        normalized_csb,
+        received_csb,
+    }
+}
+
+/// A record reconstructed from a *normalizing* received CSB (valid
+/// deterministic CBOR that decodes to the same typed body as the canonical
+/// encoding) but carrying a signature valid only over the *normalized* bytes
+/// must be rejected at the signature check — over the exact received bytes —
+/// before authorization or state application. Before #178 the verify path
+/// re-derived the CSB from the typed body and so accepted this forgery.
+///
+/// This drives both receiver pipelines (`receive_and_fold` / #147 and
+/// `receive_and_authorize` / #148) and proves: (a) the received bytes are
+/// retained verbatim by `from_received_csb`; (b) the rejection is `BadSignature`
+/// at entry crypto, before any approval binding or authorization work; (c) the
+/// predecessor state is left unchanged.
+#[test]
+fn e2e_normalizing_admin_set_with_normalized_only_signature_rejected_over_wire() {
+    let cfg = genesis_config();
+    let sigs = [
+        sign_genesis(&cfg, &key(ADMIN_A_SEED)),
+        sign_genesis(&cfg, &key(ADMIN_B_SEED)),
+    ];
+    let genesis = validated_genesis_state(&cfg, &sigs).expect("genesis threshold met");
+    let author = key(ADMIN_A_SEED);
+    let old_b = key(ADMIN_B_SEED);
+    let f = normalizing_admin_set_fixture(&genesis);
+
+    // The altered CSB must be byte-distinct from the normalized CSB, yet both
+    // must decode to the same normalized typed body, and their exact-CSB
+    // identities must differ.
+    assert_ne!(
+        f.received_csb, f.normalized_csb,
+        "altered CSB must differ from the normalized CSB"
+    );
+    assert_eq!(
+        decode_entry_csb(&f.received_csb).unwrap(),
+        decode_entry_csb(&f.normalized_csb).unwrap(),
+        "both CSBs must normalize to the same typed body"
+    );
+    assert_ne!(
+        entry_id_from_csb(&f.received_csb),
+        entry_id_from_csb(&f.normalized_csb),
+        "exact-CSB identities must differ"
+    );
+
+    // Seal the body (signing over the NORMALIZED CSB) and attach a valid
+    // approval bound to the normalized entry id — i.e. a record that *would*
+    // be fully authorized but for the byte-level signature boundary.
+    let mut wire = with_approval(seal(&f.body, &author), &f.body, &old_b);
+    // The signature is valid only over the normalized bytes; swap in the
+    // altered received bytes a forger would put on the wire.
+    wire.csb = f.received_csb.clone();
+
+    // (a) Verbatim retention: the receiver constructor keeps the exact bytes.
+    let entry = GovernanceEntry::from_received_csb(
+        wire.csb.clone(),
+        PrincipalId::from_bytes(wire.signer),
+        Signature::from_bytes(wire.sig),
+        wire.approvals.clone(),
+    )
+    .expect("altered CSB canonical-decodes");
+    assert_eq!(
+        entry.csb(),
+        wire.csb.as_slice(),
+        "from_received_csb must retain the exact received bytes (#178)"
+    );
+
+    // (b) Rejection is BadSignature at entry crypto, before any approval /
+    // binding / authorization work.
+    assert_eq!(
+        verify_entry_crypto(&entry).err(),
+        Some(Reject::BadSignature),
+        "a signature valid only over normalized bytes must not verify over the \
+         altered received bytes"
+    );
+    assert_eq!(
+        verify_governance_entry(&entry).err(),
+        Some(Reject::BadSignature),
+        "the full crypto pipeline must reject at the entry signature check, \
+         before approvals"
+    );
+
+    // Both receiver pipelines reject identically at the signature boundary —
+    // never reaching authorization or state application.
+    assert_eq!(
+        receive_and_fold(&genesis.state().clone(), &wire, None, 1).err(),
+        Some(Reject::BadSignature),
+        "the non-authorizing #147 pipeline must reject the forged record"
+    );
+    assert_eq!(
+        receive_and_authorize(&genesis, &wire).err(),
+        Some(Reject::BadSignature),
+        "the #148 authorization pipeline must reject before authorization"
+    );
+
+    // (c) The rejected attempt must not have mutated the accepted predecessor.
+    assert_eq!(genesis.tip(), GovernanceTip::Genesis);
+    assert_eq!(
+        genesis.committed_state_root(),
+        &compute_state_root(genesis.state())
+    );
+}
+
+/// An exact signature over a *normalizing* received CSB passes the signature
+/// check but must fail the post-signature semantic-canonicality round-trip,
+/// surfacing as `NonCanonicalEncoding` over the full receiver path. This
+/// preserves the verbatim decode/re-encode guarantee without inventing an
+/// impossible approval-normalization vector (spec §5.6).
+#[test]
+fn e2e_normalizing_admin_set_signed_over_exact_bytes_is_non_canonical_over_wire() {
+    let cfg = genesis_config();
+    let sigs = [
+        sign_genesis(&cfg, &key(ADMIN_A_SEED)),
+        sign_genesis(&cfg, &key(ADMIN_B_SEED)),
+    ];
+    let genesis = validated_genesis_state(&cfg, &sigs).expect("genesis threshold met");
+    let author = key(ADMIN_A_SEED);
+    let f = normalizing_admin_set_fixture(&genesis);
+
+    // A signature valid over the EXACT altered bytes — passes the signature
+    // check, then fails the post-signature round-trip.
+    let msg = domain::signing_message(domain::GOVERNANCE_ENTRY, &f.received_csb);
+    let exact_sig = *author.sign(&msg).as_bytes();
+    let wire = WireEntry {
+        csb: f.received_csb.clone(),
+        signer: *author.member_id().as_bytes(),
+        sig: exact_sig,
+        approvals: Vec::new(),
+    };
+
+    let entry = GovernanceEntry::from_received_csb(
+        wire.csb.clone(),
+        PrincipalId::from_bytes(wire.signer),
+        Signature::from_bytes(wire.sig),
+        wire.approvals.clone(),
+    )
+    .expect("altered CSB canonical-decodes");
+    assert_eq!(
+        entry.csb(),
+        f.received_csb.as_slice(),
+        "from_received_csb must retain the exact received bytes (#178)"
+    );
+    assert_eq!(
+        verify_entry_crypto(&entry).err(),
+        Some(Reject::NonCanonicalEncoding),
+        "an exact signature over semantically normalizing bytes must fail the \
+         post-signature round-trip"
+    );
+    assert_eq!(
+        verify_governance_entry(&entry).err(),
+        Some(Reject::NonCanonicalEncoding),
+        "the full crypto pipeline must reject after the signature check"
+    );
+    assert_eq!(
+        receive_and_fold(&genesis.state().clone(), &wire, None, 1).err(),
+        Some(Reject::NonCanonicalEncoding),
+        "the non-authorizing #147 pipeline must reject the normalizing record"
+    );
+    assert_eq!(
+        receive_and_authorize(&genesis, &wire).err(),
+        Some(Reject::NonCanonicalEncoding),
+        "the #148 authorization pipeline must reject the normalizing record"
+    );
+}
+
+/// Positive folds must thread the *exact wire-CSB-derived* identity as the
+/// next chain link (spec §8.3 item 6). A normalizing `admin.set` folds cleanly
+/// when its CSB is the canonical encoding (not a permuted forgery), and the
+/// returned `verified.id()` — used as the next entry's `prev` — equals
+/// `entry_id_from_csb` recomputed straight from the received wire bytes, not a
+/// body-derived identity.
+#[test]
+fn e2e_positive_fold_threads_exact_wire_csb_identity_as_next_link() {
+    let cfg = genesis_config();
+    let sigs = [
+        sign_genesis(&cfg, &key(ADMIN_A_SEED)),
+        sign_genesis(&cfg, &key(ADMIN_B_SEED)),
+    ];
+    let genesis = validated_genesis_state(&cfg, &sigs).expect("genesis threshold met");
+    let author = key(ADMIN_A_SEED);
+    let old_b = key(ADMIN_B_SEED);
+
+    // A canonical (non-altered) admin.set over a sorted unique set folds.
+    let mut principals = [principal(0x01), principal(0x02)];
+    principals.sort();
+    let [a, b] = principals;
+    let body = normalizing_admin_set_body(&genesis, a, b);
+    let wire = with_approval(seal(&body, &author), &body, &old_b);
+
+    // The identity a receiver derives from the verified record must equal the
+    // exact-CSB identity recomputed straight from the wire bytes — and the body
+    // is canonical, so the body-derived identity agrees too.
+    let expected_id = entry_id_from_csb(&wire.csb);
+    assert_eq!(
+        expected_id,
+        entry_id(&body),
+        "for a canonical body the exact-CSB and body-derived identities agree"
+    );
+
+    let (_next, folded_id) =
+        receive_and_fold(&genesis.state().clone(), &wire, None, 1).expect("canonical fold");
+    assert_eq!(
+        folded_id, expected_id,
+        "the threaded next-link identity must equal the exact wire-CSB-derived id (#178)"
+    );
+
+    // And the same identity survives the authorizing #148 pipeline's accepted
+    // tip — the value a subsequent entry's `prev` must bind to.
+    let committed = receive_and_authorize(&genesis, &wire).expect("authorized fold");
+    let committed_id = match committed.tip() {
+        GovernanceTip::Entry { id, .. } => id,
+        GovernanceTip::Genesis => unreachable!("a folded entry advances the tip"),
+    };
+    assert_eq!(
+        committed_id, expected_id,
+        "the accepted tip must carry the exact wire-CSB-derived id (#178)"
     );
 }

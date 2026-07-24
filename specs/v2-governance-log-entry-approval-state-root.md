@@ -275,40 +275,60 @@ pub struct GovernanceApprovalBody {
 }
 
 pub struct GovernanceApproval {
-    pub body: GovernanceApprovalBody,
-    pub signature: Signature,
+    body: GovernanceApprovalBody,
+    csb: Vec<u8>,
+    signature: Signature,
 }
 ```
 
+> **Amended by #178** — `GovernanceApproval` owns the **exact canonical signed
+> bytes (CSB)** it was constructed with alongside the typed body, mirroring
+> `crate::signed::Envelope`. The fields are private correlated state exposed
+> only through read-only accessors (`body()`, `csb()`, `signature()`); they
+> cannot be desynchronized through safe public APIs. A typed `new(body, secret)`
+> constructor encodes once and pins that vector; a trust-boundary
+> `from_received_csb(csb, signature)` constructor canonical-decodes the supplied
+> slice but retains it byte-for-byte. See `specs/v2-governance-records-verbatim-csb.md`.
+
 Verification:
 
-- `approval_id = BLAKE3(domain::GOVERNANCE_APPROVAL || canonical_cbor(body))` if an ID type is retained.
-- signature message is `domain::GOVERNANCE_APPROVAL || canonical_cbor(body)`.
-- `body.entry_id` must equal the enclosing entry ID.
+- approval sort hash is `BLAKE3(domain::GOVERNANCE_APPROVAL || csb)` computed over the **retained** CSB (`approval_id_from_csb`), not a re-encoding of the body.
+- the signature message is `domain::GOVERNANCE_APPROVAL || csb` over the **retained** CSB; it is checked **before** the typed body is re-encoded (post-signature re-encode byte-equality is the canonicality check).
+- `body.entry_id` must equal the enclosing entry's **exact-CSB-derived** ID.
 - `body.community_id` and `body.state_root` must equal the entry body's declared values.
-- approval signer/approver mismatch is `bad_signature` or `invalid_approval` depending on where detected.
+- approval signature failure (including an approver/signer mismatch) is `bad_signature`; an unbound or duplicate approval is `invalid_approval`.
 
 ### 5.4 `GovernanceEntry`
 
 ```rust
 pub struct GovernanceEntry {
-    pub body: GovernanceEntryBody,
-    pub signer: PrincipalId,
-    pub signature: Signature,
-    pub approvals: Vec<GovernanceApproval>,
+    body: GovernanceEntryBody,
+    csb: Vec<u8>,
+    signer: PrincipalId,
+    signature: Signature,
+    approvals: Vec<GovernanceApproval>,
 }
 ```
 
+> **Amended by #178** — like `GovernanceApproval`, `GovernanceEntry` owns the
+> **exact entry-body CSB** it was constructed with as private correlated state
+> (accessors `body()`, `csb()`, `signer()`, `signature()`, `approvals()`).
+> `new(body, secret, approvals)` encodes once and pins the vector it signs;
+> `from_received_csb(csb, signer, signature, approvals)` retains the supplied
+> wire/storage bytes verbatim. Signer, signature, and approvals remain outside
+> entry-body CSB. See `specs/v2-governance-records-verbatim-csb.md`.
+
 Verification pipeline:
 
-1. Decode exact CSB with `cbor::decode_canonical`.
-2. Reject unknown fields, non-canonical bytes, wrong byte widths, and unknown operation kinds.
-3. Recompute `GovernanceId` from the body CSB under `domain::GOVERNANCE_ENTRY`.
-4. Verify the entry signature over `domain::GOVERNANCE_ENTRY || body_csb`.
-5. Sort approvals canonically and reject duplicate approvers.
-6. Verify approval signatures and bindings to `community_id`, `entry_id`, and `state_root`.
-7. Apply the operation to `old_state` and recompute `state_root`; reject mismatch.
-8. Return the verified body plus sorted approvals for #148 to authorize.
+1. Canonical-decode the exact received bytes at construction (`cbor::decode_canonical`), forming the typed body.
+2. Reject unknown fields, non-canonical bytes, wrong byte widths, and unknown operation kinds (at construction).
+3. Verify the entry signature over `domain::GOVERNANCE_ENTRY || csb` using the **retained** CSB — never a re-serialization of the typed body.
+4. Require the typed body to re-encode to exactly the retained CSB (semantic-canonicality round-trip, post-signature); a body whose typed decode normalizes representation (e.g. an unsorted/duplicate `admin.set` `administrators` array) is rejected here as `non_canonical_encoding`.
+5. Derive the authenticated `GovernanceId` from the retained CSB under `domain::GOVERNANCE_ENTRY` (`entry_id_from_csb`).
+6. Sort approvals canonically by `(approver bytes, retained-CSB approval hash)` and reject duplicate approvers.
+7. Verify each approval signature over its retained CSB and its bindings to `community_id`, the exact-CSB entry ID, and `state_root`.
+8. Apply the operation to `old_state` and recompute `state_root`; reject mismatch.
+9. Return the verified body, signer, sorted approvals, and the exact-CSB identity (for #148 to authorize and for chain links to bind to).
 
 ---
 
@@ -493,7 +513,7 @@ No logging or metrics should be emitted from v2 core. Downstream runtime/CLI lay
 
 ### Security
 
-- Use deterministic canonical bytes as the trust boundary; never verify a signature over reserialized bytes.
+- Use deterministic canonical bytes as the trust boundary; never verify a signature over reserialized bytes. (#178 made this actually true for `GovernanceEntry`/`GovernanceApproval`: the records own the exact received CSB, and signatures/identity run over those bytes — see §5.3/§5.4 and `specs/v2-governance-records-verbatim-csb.md`.)
 - Domain-separate genesis, entry, approval, and state-root hashes with the frozen #146 domains.
 - Reject unknown operation kinds and unknown payload keys to avoid parser differentials.
 - Do not count duplicate approvals twice.
@@ -765,3 +785,32 @@ Authorization rules (#148), fork detection/branch choice beyond the single chain
 check (#149), and checkpoints/snapshots (#150) remain out of scope, as do any
 network/replica/storage code. `#147` only exposes the current `state_root` and the
 typed verified records those later layers will consume.
+
+### Amendment: verbatim-CSB trust boundary (#178, post-landing)
+
+#178 closed a trust-boundary weakness flagged in PR #177 review: the original #147
+verify path re-derived the CSB from the typed body before checking signatures and
+deriving identity, so a body whose typed decode **normalizes** representation (the
+`admin.set` `administrators` array is sorted and de-duplicated during decode) could be
+accepted over bytes that differ from what was actually signed / from the accepted
+`GovernanceId`. The correction, landed in `records.rs` + `authz.rs` + the e2e suite
+(spec `v2-governance-records-verbatim-csb.md`):
+
+- `GovernanceEntry` and `GovernanceApproval` now own the **exact CSB** they were
+  constructed with as private correlated state (mirroring `crate::signed::Envelope`),
+  exposed only through read-only accessors; body and CSB cannot be desynchronized after
+  construction.
+- Typed `new` constructors encode once and pin the vector they sign; trust-boundary
+  `from_received_csb` constructors retain the supplied wire/storage bytes byte-for-byte.
+- `verify_entry_crypto` / `verify_approval_crypto` verify the signature over the
+  **retained** CSB *before* re-encoding the typed body; the post-signature re-encode
+  equality is the semantic-canonicality check.
+- Identity is derived from the retained CSB via `entry_id_from_csb` /
+  `approval_id_from_csb`; `VerifiedGovernanceEntry::id()` exposes the authenticated
+  identity, which the #148 accepted-tip (`authz.rs`) and chain links now bind to.
+
+A normalizing `admin.set` carrying a signature valid only over the normalized bytes is
+rejected as `bad_signature`; an exact signature over the normalizing bytes is rejected
+post-signature as `non_canonical_encoding`. **No frozen wire byte, domain string, ID,
+signature, or state-root vector changed** — the regression is covered by unit tests in
+`records.rs` and the §9 verbatim-CSB e2e cases in `tests/v2_governance_log_e2e.rs`.

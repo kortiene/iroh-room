@@ -52,9 +52,10 @@ pub use operation::{
     StreamArchive, StreamCreate, StreamPolicySet,
 };
 pub use records::{
-    approval_csb, approval_id, decode_entry_csb, entry_csb, entry_id, verify_approval_crypto,
-    verify_entry_crypto, verify_entry_full, verify_governance_entry, GovernanceApproval,
-    GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody, VerifiedGovernanceEntry,
+    approval_csb, approval_id, approval_id_from_csb, decode_approval_csb, decode_entry_csb,
+    entry_csb, entry_id, entry_id_from_csb, verify_approval_crypto, verify_entry_crypto,
+    verify_entry_full, verify_governance_entry, GovernanceApproval, GovernanceApprovalBody,
+    GovernanceEntry, GovernanceEntryBody, VerifiedGovernanceEntry,
 };
 pub use state::{
     apply, apply_verified_entry, check_chain_link, component_root, compute_state_root,

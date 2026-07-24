@@ -37,7 +37,7 @@ use crate::ids::{GovernanceId, PrincipalId, StateRoot};
 
 use super::genesis::{verify_genesis, GenesisConfig, GenesisSignature};
 use super::model::AdministratorState;
-use super::records::{entry_id, VerifiedGovernanceEntry};
+use super::records::VerifiedGovernanceEntry;
 use super::state::{
     apply, check_chain_link, compute_state_root, verify_state_root, GovernanceState,
 };
@@ -265,7 +265,9 @@ pub fn validate_and_apply_governance_entry(
         committed_state_root: body.state_root,
         tip: GovernanceTip::Entry {
             seq: body.seq,
-            id: entry_id(body),
+            // Authenticated identity: the exact-CSB-derived entry id (issue
+            // #178), not a re-derivation from the typed body.
+            id: entry.id(),
         },
         state: candidate,
     })
@@ -279,7 +281,7 @@ mod tests {
         AdminSet, DeviceGrant, DeviceRevoke, GovernanceOperationPayload, MemberGrant,
     };
     use super::super::records::{
-        GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
+        entry_id, GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
         VerifiedGovernanceEntry,
     };
     use super::*;
@@ -381,7 +383,7 @@ mod tests {
             next.tip(),
             GovernanceTip::Entry {
                 seq: 1,
-                id: entry_id(entry.body()),
+                id: entry.id(),
             }
         );
         // Validation must not mutate the predecessor snapshot.
