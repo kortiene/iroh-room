@@ -216,6 +216,14 @@ impl VerifiedGovernanceEntry {
 }
 ```
 
+> **Amended by #178** — `VerifiedGovernanceEntry` additionally carries the
+> **exact-CSB-derived** `id: GovernanceId` (accessor `id()`), computed from the
+> retained entry CSB only after entry crypto/round-trip success so it is the
+> authenticated identity. `validate_and_apply_governance_entry` records it as the
+> accepted tip (`GovernanceTip::Entry { seq, id }`), and chain links therefore bind to
+> the authenticated identity rather than a re-derivation from the typed body. See
+> `specs/v2-governance-records-verbatim-csb.md`.
+
 Change the internals of `verify_entry_full` to call a new function:
 
 ```rust

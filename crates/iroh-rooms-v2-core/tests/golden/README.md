@@ -31,6 +31,20 @@ changing the frozen byte/hash expectations.
 
 ### Change log
 
+- **v4** — `#178` made the normative `governance::log` record wrappers
+  (`GovernanceEntry` / `GovernanceApproval`) own the **exact received canonical
+  signed bytes (CSB)** alongside the typed body, mirroring `crate::signed::Envelope`,
+  and verify signatures + identity over those retained bytes rather than a
+  re-serialization of the typed body (spec
+  `v2-governance-records-verbatim-csb.md`; amends #147 §5.3/§5.4). This closes the
+  trust-boundary gap where a body whose typed decode normalizes representation (an
+  unsorted/duplicate `admin.set` `administrators` array) could be accepted over bytes
+  that differ from what was signed. **No frozen bytes change** — the regression
+  coverage (a normalizing CSB with a normalized-only signature → `bad_signature`;
+  an exact signature over the normalizing bytes → `non_canonical_encoding`) lives in
+  the `records.rs` unit tests and the `tests/v2_governance_log_e2e.rs` §9 cases, not
+  in these fixture files. See `v2-governance-log-entry-approval-state-root.md`
+  §17 "Amendment: verbatim-CSB trust boundary".
 - **v3** — `#147` landed the normative v2 governance-log approval pipeline under
   `governance::log` (`verify_genesis` / `verify_entry_full`), which emits
   `Reject::InvalidApproval` for approvals not bound to their enclosing entry's
