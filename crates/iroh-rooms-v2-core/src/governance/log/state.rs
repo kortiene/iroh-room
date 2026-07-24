@@ -324,14 +324,34 @@ pub fn apply_member_revoke(
     Ok(next)
 }
 
-/// `device.grant`: add an active device to a member's sorted device set.
+/// `device.grant`: add an active device to a member's sorted device set
+/// (spec §4.4 / D7 device-binding validity, issue #148).
 ///
 /// # Errors
-/// Returns [`Reject::InvalidContent`] if the member is not present.
+/// Returns [`Reject::InvalidContent`] if:
+/// - the member is not present or is not [`MemberStatus::Active`];
+/// - the device id is already bound to *any* member in the old state
+///   (globally unique ownership) — this covers granting a device already
+///   bound to another member, granting an already-active device to the same
+///   member (no silent replace), and regranting a revoked device.
 pub fn apply_device_grant(
     old: &GovernanceState,
     p: &DeviceGrant,
 ) -> Result<GovernanceState, Reject> {
+    let member = old
+        .members
+        .get(&p.member_id)
+        .ok_or(Reject::InvalidContent)?;
+    if member.status != MemberStatus::Active {
+        return Err(Reject::InvalidContent);
+    }
+    if old
+        .members
+        .values()
+        .any(|m| m.devices.contains_key(&p.device_id))
+    {
+        return Err(Reject::InvalidContent);
+    }
     let mut next = old.clone();
     let member = next
         .members
@@ -347,14 +367,32 @@ pub fn apply_device_grant(
     Ok(next)
 }
 
-/// `device.revoke`: revoke a device (tombstoned).
+/// `device.revoke`: revoke a device (tombstoned) (spec §4.4 / D7 device-binding
+/// validity, issue #148).
 ///
 /// # Errors
-/// Returns [`Reject::InvalidContent`] if the member or device is not present.
+/// Returns [`Reject::InvalidContent`] if:
+/// - the member is not present or is not [`MemberStatus::Active`];
+/// - the device is absent, bound to another member (so absent under this
+///   member), or already [`DeviceStatus::Revoked`].
 pub fn apply_device_revoke(
     old: &GovernanceState,
     p: &DeviceRevoke,
 ) -> Result<GovernanceState, Reject> {
+    let member = old
+        .members
+        .get(&p.member_id)
+        .ok_or(Reject::InvalidContent)?;
+    if member.status != MemberStatus::Active {
+        return Err(Reject::InvalidContent);
+    }
+    let device = member
+        .devices
+        .get(&p.device_id)
+        .ok_or(Reject::InvalidContent)?;
+    if device.status != DeviceStatus::Active {
+        return Err(Reject::InvalidContent);
+    }
     let mut next = old.clone();
     let member = next
         .members
@@ -568,6 +606,16 @@ pub fn apply_migration_accept(
 
 /// Apply a verified entry's operation to `old`, recompute the state root, and
 /// compare to the entry's declared `state_root` (spec §7.3 / acceptance).
+///
+/// **Not an authorization boundary** (issue #148 §4.5): this only checks
+/// community/operation-validity/post-root agreement (rules 1's community
+/// check, 3, and 5 of the #148 five-rule predicate). It does not check the
+/// chain link (rule 2) or any signer/approval threshold (rule 4), so a
+/// cryptographically valid but *unauthorized* operation can still apply
+/// through this function. Normative callers must use
+/// [`super::authz::validate_governance_entry`] /
+/// [`super::authz::validate_and_apply_governance_entry`] instead; this
+/// low-level function remains only for source compatibility.
 ///
 /// # Errors
 /// - [`Reject::InvalidContent`] — `body.community_id` differs from
@@ -812,6 +860,188 @@ mod tests {
                 .unwrap()
                 .status,
             DeviceStatus::Revoked
+        );
+    }
+
+    // --- Device-binding validity (spec §4.4 / D7, issue #148) --------------
+
+    #[test]
+    fn apply_device_grant_rejects_absent_or_revoked_member() {
+        let s = state();
+        let dev = DeviceId::from_bytes([0xd1; N]);
+        // Absent member.
+        assert_eq!(
+            apply_device_grant(
+                &s,
+                &DeviceGrant {
+                    member_id: mid(0xee),
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+        // Revoked member.
+        let with_member = apply_member_grant(
+            &s,
+            &MemberGrant {
+                member_id: mid(0xc0),
+                role: Role::Member,
+            },
+        )
+        .unwrap();
+        let revoked_member = apply_member_revoke(
+            &with_member,
+            &MemberRevoke {
+                member_id: mid(0xc0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            apply_device_grant(
+                &revoked_member,
+                &DeviceGrant {
+                    member_id: mid(0xc0),
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+    }
+
+    #[test]
+    fn apply_device_grant_rejects_globally_duplicate_device_id() {
+        let s = state();
+        let admin = admin_key(0xa0).member_id();
+        let other_member = mid(0xc0);
+        let with_other = apply_member_grant(
+            &s,
+            &MemberGrant {
+                member_id: other_member,
+                role: Role::Member,
+            },
+        )
+        .unwrap();
+        let dev = DeviceId::from_bytes([0xd2; N]);
+        let with_device = apply_device_grant(
+            &with_other,
+            &DeviceGrant {
+                member_id: admin,
+                device_id: dev,
+            },
+        )
+        .unwrap();
+        // Cross-member duplicate: the device is already bound to `admin`.
+        assert_eq!(
+            apply_device_grant(
+                &with_device,
+                &DeviceGrant {
+                    member_id: other_member,
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+        // Same-member active duplicate: re-granting to the same owner.
+        assert_eq!(
+            apply_device_grant(
+                &with_device,
+                &DeviceGrant {
+                    member_id: admin,
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+        // Regranting a revoked device (even to the original owner) rejects.
+        let revoked = apply_device_revoke(
+            &with_device,
+            &DeviceRevoke {
+                member_id: admin,
+                device_id: dev,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            apply_device_grant(
+                &revoked,
+                &DeviceGrant {
+                    member_id: admin,
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+    }
+
+    #[test]
+    fn apply_device_revoke_rejects_absent_wrong_owner_or_already_revoked() {
+        let s = state();
+        let admin = admin_key(0xa0).member_id();
+        let dev = DeviceId::from_bytes([0xd3; N]);
+        let with_device = apply_device_grant(
+            &s,
+            &DeviceGrant {
+                member_id: admin,
+                device_id: dev,
+            },
+        )
+        .unwrap();
+        // Absent device.
+        assert_eq!(
+            apply_device_revoke(
+                &s,
+                &DeviceRevoke {
+                    member_id: admin,
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+        // Wrong owner (device is bound to `admin`, not this member).
+        let with_other = apply_member_grant(
+            &with_device,
+            &MemberGrant {
+                member_id: mid(0xc1),
+                role: Role::Member,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            apply_device_revoke(
+                &with_other,
+                &DeviceRevoke {
+                    member_id: mid(0xc1),
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
+        );
+        // Already-revoked device.
+        let revoked = apply_device_revoke(
+            &with_device,
+            &DeviceRevoke {
+                member_id: admin,
+                device_id: dev,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            apply_device_revoke(
+                &revoked,
+                &DeviceRevoke {
+                    member_id: admin,
+                    device_id: dev,
+                },
+            )
+            .err(),
+            Some(Reject::InvalidContent)
         );
     }
 

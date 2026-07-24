@@ -354,16 +354,52 @@ pub fn verify_approval_crypto(
     Ok(body)
 }
 
+/// A cryptographically verified governance entry (issue #148 D2).
+///
+/// Preserves the exact inputs the #148 authorization predicate needs — the
+/// verified signer and the verified, canonically sorted approval bodies —
+/// that [`verify_entry_full`] otherwise discards. Fields are private: the only
+/// way to construct one is [`verify_governance_entry`], so policy code can
+/// never be handed an "verified" identity that was not actually checked
+/// against a real Ed25519 signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGovernanceEntry {
+    body: GovernanceEntryBody,
+    signer: PrincipalId,
+    approvals: Vec<GovernanceApprovalBody>,
+}
+
+impl VerifiedGovernanceEntry {
+    /// The verified entry body.
+    #[must_use]
+    pub fn body(&self) -> &GovernanceEntryBody {
+        &self.body
+    }
+
+    /// The verified entry signer.
+    #[must_use]
+    pub fn signer(&self) -> PrincipalId {
+        self.signer
+    }
+
+    /// The verified, canonically sorted, duplicate-free approval bodies.
+    #[must_use]
+    pub fn approvals(&self) -> &[GovernanceApprovalBody] {
+        &self.approvals
+    }
+}
+
 /// Verify a full entry: body crypto, entry signature, approval sorting,
 /// duplicate-approver rejection, approval signatures, and approval bindings
-/// (spec §5.4 pipeline).
+/// (spec §5.4 pipeline), returning the verified signer and approval bodies
+/// alongside the body (issue #148 D2).
 ///
 /// # Errors
 /// - Any error from [`verify_entry_crypto`].
 /// - [`Reject::InvalidApproval`] — duplicate approver, an approval signature
 ///   fails, or an approval is not bound to the entry's `community_id`,
 ///   `entry_id`, or declared `state_root`.
-pub fn verify_entry_full(entry: &GovernanceEntry) -> Result<GovernanceEntryBody, Reject> {
+pub fn verify_governance_entry(entry: &GovernanceEntry) -> Result<VerifiedGovernanceEntry, Reject> {
     let body = verify_entry_crypto(entry)?;
     let expected_id = entry_id(&entry.body);
 
@@ -376,6 +412,7 @@ pub fn verify_entry_full(entry: &GovernanceEntry) -> Result<GovernanceEntryBody,
     });
 
     let mut seen = std::collections::BTreeSet::new();
+    let mut verified_approvals = Vec::with_capacity(approvals.len());
     for approval in &approvals {
         let verified = verify_approval_crypto(approval)?;
         // Binding checks (spec §5.3): approval must reference this entry + root.
@@ -389,8 +426,25 @@ pub fn verify_entry_full(entry: &GovernanceEntry) -> Result<GovernanceEntryBody,
             // Duplicate approver for a single entry (spec D6 / §9).
             return Err(Reject::InvalidApproval);
         }
+        verified_approvals.push(verified);
     }
-    Ok(body)
+    Ok(VerifiedGovernanceEntry {
+        body,
+        signer: entry.signer,
+        approvals: verified_approvals,
+    })
+}
+
+/// Compatibility wrapper over [`verify_governance_entry`] that returns only
+/// the verified body (pre-#148 signature). New callers should prefer
+/// [`verify_governance_entry`] plus the `log::authz` validation pipeline,
+/// which is the only path that can evaluate the #148 five-rule authorization
+/// predicate (the signer/approval set discarded here is required by rule 4).
+///
+/// # Errors
+/// See [`verify_governance_entry`].
+pub fn verify_entry_full(entry: &GovernanceEntry) -> Result<GovernanceEntryBody, Reject> {
+    verify_governance_entry(entry).map(|verified| verified.body)
 }
 
 #[allow(dead_code)]
@@ -647,5 +701,51 @@ mod tests {
             created_at_ms: 1,
         });
         assert_eq!(id.len(), LEN);
+    }
+
+    // --- #148 D2: verified-entry wrapper -----------------------------------
+
+    #[test]
+    fn verify_governance_entry_and_verify_entry_full_agree_on_body() {
+        let author = key(0xa0);
+        let approver = key(0xc0);
+        let body = sample_body();
+        let approval = GovernanceApproval::new(
+            GovernanceApprovalBody {
+                community_id: body.community_id,
+                entry_id: entry_id(&body),
+                state_root: body.state_root,
+                approver: approver.member_id(),
+                created_at_ms: 1_001,
+            },
+            &approver,
+        );
+        let entry = GovernanceEntry::new(body.clone(), &author, vec![approval]);
+
+        let verified = verify_governance_entry(&entry).expect("verifies");
+        assert_eq!(verified.body(), &body);
+        assert_eq!(verified.signer(), author.member_id());
+        assert_eq!(verified.approvals().len(), 1);
+        assert_eq!(verified.approvals()[0].approver, approver.member_id());
+
+        // The compatibility wrapper must agree exactly on the returned body.
+        let compat_body = verify_entry_full(&entry).expect("verifies");
+        assert_eq!(compat_body, *verified.body());
+    }
+
+    #[test]
+    fn verify_governance_entry_rejects_same_failures_as_verify_entry_full() {
+        let author = key(0xa0);
+        let other = key(0xa1);
+        let mut entry = GovernanceEntry::new(sample_body(), &author, Vec::new());
+        entry.signature = other.sign(&domain::signing_message(
+            domain::GOVERNANCE_ENTRY,
+            &entry_csb(&entry.body),
+        ));
+        assert_eq!(
+            verify_governance_entry(&entry).err(),
+            Some(Reject::BadSignature)
+        );
+        assert_eq!(verify_entry_full(&entry).err(), Some(Reject::BadSignature));
     }
 }

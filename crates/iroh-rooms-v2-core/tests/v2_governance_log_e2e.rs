@@ -1,14 +1,18 @@
-//! End-to-end coverage for the #147 v2 governance-log lifecycle across every
-//! trust boundary the pure core exposes (issue #147, spec
-//! `v2-governance-log-entry-approval-state-root.md` §7.1–§7.3 / §12).
+//! End-to-end coverage for the #147 v2 governance-log lifecycle, and the #148
+//! authorization boundary layered on top of it, across every trust boundary
+//! the pure core exposes (issues #147/#148, specs
+//! `v2-governance-log-entry-approval-state-root.md` §7.1–§7.3 / §12 and
+//! `v2-governance-authorization-rules.md` §7.4).
 //!
 //! The in-module unit tests in `governance/log/*` exercise each piece
-//! (`GenesisConfig`, each `apply_*`, `verify_entry_full`, `compute_state_root`)
-//! in isolation with in-memory structs. `v2_identifiers_e2e.rs` covers the
-//! frozen §6.3 *identifier* derivations, and `governance_state_machine.rs`
-//! covers the **candidate** (legacy `InitRoom`/`AddMember`) state machine.
-//! Neither drives the **normative #147 governance log** end to end through the
-//! real CBOR ↔ BLAKE3-id ↔ Ed25519 ↔ state-machine ↔ state-root boundaries.
+//! (`GenesisConfig`, each `apply_*`, `verify_entry_full`,
+//! `validate_governance_entry`, `compute_state_root`) in isolation with
+//! in-memory structs. `v2_identifiers_e2e.rs` covers the frozen §6.3
+//! *identifier* derivations, and `governance_state_machine.rs` covers the
+//! **candidate** (legacy `InitRoom`/`AddMember`) state machine. None of those
+//! drives the **normative #147/#148 governance log** end to end through the
+//! real CBOR ↔ BLAKE3-id ↔ Ed25519 ↔ authorization ↔ state-root boundaries,
+//! starting from nothing but raw wire bytes as a public-API consumer would.
 //!
 //! This file closes that gap. It models the complete receiver-side lifecycle a
 //! peer or store reconstruction would perform:
@@ -32,6 +36,14 @@
 //! 5. **Per-operation registry** — every one of the fourteen §7.3 operations
 //!    folds from wire bytes through the full pipeline with a state-root-visible
 //!    transition.
+//! 6. **Authorization boundary (#148 §7.4)** — the same wire-bytes receiver
+//!    pattern driven through `verify_governance_entry` +
+//!    `validate_and_apply_governance_entry` instead of the non-authorizing
+//!    `apply_verified_entry`: a multi-entry `ValidatedGovernanceState` chain,
+//!    a cryptographically valid but under-threshold entry rejected only by the
+//!    authorization boundary (not by crypto or root checks), and the D6
+//!    admin-set invariant (old quorum authorizes; new quorum effective only
+//!    post-commit) proven from wire bytes rather than in-process structs.
 //!
 //! All keys are deterministic public test seeds (non-secret); no entropy,
 //! network, store, or real user data is involved. The crate stays pure: these
@@ -44,10 +56,12 @@ use iroh_rooms_v2_core::cbor::{self, CborValue};
 use iroh_rooms_v2_core::domain;
 use iroh_rooms_v2_core::governance::log::{
     apply, apply_verified_entry, check_chain_link, compute_state_root, decode_entry_csb,
-    derive_community_id, entry_csb, entry_id, genesis_config_csb, sign_genesis, verify_entry_full,
-    verify_genesis, GenesisConfig, GovernanceApproval, GovernanceApprovalBody, GovernanceEntry,
-    GovernanceEntryBody, GovernanceOperationKind, GovernanceOperationPayload, GovernanceState,
-    MemberStatus, GENESIS_SCHEMA_VERSION,
+    derive_community_id, entry_csb, entry_id, genesis_config_csb, sign_genesis,
+    validate_and_apply_governance_entry, validated_genesis_state, verify_entry_full,
+    verify_genesis, verify_governance_entry, GenesisConfig, GovernanceApproval,
+    GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody, GovernanceOperationKind,
+    GovernanceOperationPayload, GovernanceState, GovernanceTip, MemberStatus,
+    ValidatedGovernanceState, GENESIS_SCHEMA_VERSION,
 };
 use iroh_rooms_v2_core::governance::log::{
     AdminSet, CommunityPolicy, DeviceGrant, DeviceRevoke, ForkResolutionMarker, InviteRevoke,
@@ -666,21 +680,19 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
             with_member.clone(),
         ),
         (
+            "device.grant",
+            GovernanceOperationPayload::DeviceGrant(DeviceGrant {
+                member_id: principal(MEMBER_SEED),
+                device_id: DeviceId::from_bytes([0x46; N]),
+            }),
+            with_member.clone(),
+        ),
+        (
             "device.revoke",
             GovernanceOperationPayload::DeviceRevoke(DeviceRevoke {
                 member_id: principal(MEMBER_SEED),
                 device_id: DeviceId::from_bytes([0x45; N]),
             }),
-            with_device.clone(),
-        ),
-        (
-            "device.revoke",
-            GovernanceOperationPayload::DeviceRevoke(
-                iroh_rooms_v2_core::governance::log::DeviceRevoke {
-                    member_id: principal(MEMBER_SEED),
-                    device_id: DeviceId::from_bytes([0x45; N]),
-                },
-            ),
             with_device.clone(),
         ),
         (
@@ -797,4 +809,274 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
         );
         assert_eq!(new_id, entry_id(&body), "`{label}` entry id must recompute");
     }
+}
+
+// ============================================================================
+// §8 Authorization-boundary e2e (issue #148): the accepted-state pipeline.
+// ============================================================================
+//
+// §§1-7 above drive every entry through `apply_verified_entry`, which folds
+// any cryptographically valid, root-consistent entry regardless of who signed
+// it (spec §7.3 — not an authorization boundary; see `verify_entry_full`'s doc
+// comment). This section instead drives the #148 receiver pipeline:
+//
+//   canonical decode → verify_governance_entry (crypto + approval bindings)
+//   → validate_and_apply_governance_entry (five-rule authorization) → commit
+//
+// against `ValidatedGovernanceState`, reconstructing every entry from raw wire
+// bytes exactly as `receive_and_fold` does above (a `WireEntry`, not an
+// in-memory `VerifiedGovernanceEntry`). This is the boundary the in-crate
+// `governance/log/authz.rs` unit/property tests do not cross: those build
+// verified entries in-process from typed bodies within the crate that defines
+// the (otherwise unforgeable) wrapper types, while here — from an external
+// integration-test crate using only the public API — a receiver only ever
+// starts from `Vec<u8>` CSB, a raw signer/signature, and raw approval records.
+
+/// The receiver: reconstruct a `GovernanceEntry` from wire bytes, then run it
+/// through the full #148 pipeline (crypto verify → five-rule authorize)
+/// against an accepted predecessor snapshot.
+fn receive_and_authorize(
+    prev: &ValidatedGovernanceState,
+    wire: &WireEntry,
+) -> Result<ValidatedGovernanceState, Reject> {
+    let body = decode_entry_csb(&wire.csb)?;
+    let entry = GovernanceEntry {
+        body,
+        signer: PrincipalId::from_bytes(wire.signer),
+        signature: Signature::from_bytes(wire.sig),
+        approvals: wire.approvals.clone(),
+    };
+    let verified = verify_governance_entry(&entry)?;
+    validate_and_apply_governance_entry(prev, &verified)
+}
+
+/// Sender + receiver for one *authorized* entry: compute the declared root,
+/// seal wire bytes signed by `author` with one approval per `approvers`, then
+/// receive + authorize against `prev`. Panics if the entry is not authorized —
+/// tests that want the rejection path call `receive_and_authorize` directly.
+fn fold_one_authorized(
+    prev: &ValidatedGovernanceState,
+    payload: &GovernanceOperationPayload,
+    author: &SigningKey,
+    approvers: &[&SigningKey],
+) -> ValidatedGovernanceState {
+    let (seq, prev_id) = match prev.tip() {
+        GovernanceTip::Genesis => (1u64, None),
+        GovernanceTip::Entry { seq, id } => (seq + 1, Some(id)),
+    };
+    let declared = compute_state_root(&apply(prev.state(), payload).expect("payload applies"));
+    let body = GovernanceEntryBody {
+        community_id: prev.state().community_id,
+        seq,
+        prev: prev_id,
+        created_at_ms: 1_000 + seq,
+        kind: payload.kind(),
+        payload: payload.clone(),
+        state_root: declared,
+    };
+    let mut wire = seal(&body, author);
+    for approver in approvers {
+        wire = with_approval(wire, &body, approver);
+    }
+    receive_and_authorize(prev, &wire).expect("authorized entry must fold")
+}
+
+/// A multi-entry chain, each entry reconstructed from wire bytes and carried
+/// through the full #148 authorization pipeline, produces the same accepted
+/// state a direct `apply` fold would — proving the accepted-state wrapper
+/// (`ValidatedGovernanceState`/`GovernanceTip`) threads correctly across
+/// several wire round trips, not just a single call.
+#[test]
+fn e2e_authorized_pipeline_folds_multi_entry_chain_from_wire_bytes() {
+    let cfg = genesis_config();
+    let sigs = [
+        sign_genesis(&cfg, &key(ADMIN_A_SEED)),
+        sign_genesis(&cfg, &key(ADMIN_B_SEED)),
+    ];
+    let genesis = validated_genesis_state(&cfg, &sigs).expect("genesis threshold met");
+    assert_eq!(genesis.tip(), GovernanceTip::Genesis);
+    let author = key(ADMIN_A_SEED);
+    let approver = key(ADMIN_B_SEED);
+
+    // Entry 1: member.grant, authorized by exactly the 2-of-3 old-admin quorum.
+    let grant = GovernanceOperationPayload::MemberGrant(MemberGrant {
+        member_id: principal(MEMBER_SEED),
+        role: Role::Member,
+    });
+    let after_grant = fold_one_authorized(&genesis, &grant, &author, &[&approver]);
+    assert!(after_grant
+        .state()
+        .members
+        .contains_key(&principal(MEMBER_SEED)));
+    assert!(matches!(
+        after_grant.tip(),
+        GovernanceTip::Entry { seq: 1, .. }
+    ));
+
+    // Entry 2: device.grant, chained off entry 1's accepted tip.
+    let dev = DeviceId::from_bytes([0xd2; N]);
+    let grant_dev = GovernanceOperationPayload::DeviceGrant(DeviceGrant {
+        member_id: principal(MEMBER_SEED),
+        device_id: dev,
+    });
+    let after_device = fold_one_authorized(&after_grant, &grant_dev, &author, &[&approver]);
+    assert!(after_device
+        .state()
+        .members
+        .get(&principal(MEMBER_SEED))
+        .unwrap()
+        .devices
+        .contains_key(&dev));
+    assert!(matches!(
+        after_device.tip(),
+        GovernanceTip::Entry { seq: 2, .. }
+    ));
+
+    // The accepted state root matches an independent direct-apply fold over
+    // the same two operations, so the wire round trip changed nothing material.
+    let mut direct = GovernanceState::from_genesis(&cfg, derive_community_id(&cfg));
+    direct = apply(&direct, &grant).unwrap();
+    direct = apply(&direct, &grant_dev).unwrap();
+    assert_eq!(
+        after_device.committed_state_root(),
+        &compute_state_root(&direct)
+    );
+
+    // The original genesis snapshot was never mutated by either fold.
+    assert_eq!(genesis.tip(), GovernanceTip::Genesis);
+}
+
+/// An entry that is cryptographically perfect — well-formed CSB, valid entry
+/// signature, correct declared root — but carries only one of the two
+/// required distinct old-admin signatures still folds successfully through
+/// the non-authorizing #147 `apply_verified_entry` pipeline. The #148
+/// authorization boundary must reject the same wire bytes, and must leave the
+/// accepted predecessor snapshot completely unchanged.
+#[test]
+fn e2e_insufficient_threshold_entry_rejected_by_full_wire_pipeline() {
+    let cfg = genesis_config();
+    let sigs = [
+        sign_genesis(&cfg, &key(ADMIN_A_SEED)),
+        sign_genesis(&cfg, &key(ADMIN_B_SEED)),
+    ];
+    let genesis = validated_genesis_state(&cfg, &sigs).expect("genesis threshold met");
+    let author = key(ADMIN_A_SEED); // one distinct old admin; threshold is 2
+
+    let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
+        member_id: principal(MEMBER_SEED),
+        role: Role::Member,
+    });
+    let declared = compute_state_root(&apply(genesis.state(), &payload).unwrap());
+    let body = GovernanceEntryBody {
+        community_id: genesis.state().community_id,
+        seq: 1,
+        prev: None,
+        created_at_ms: 1_001,
+        kind: payload.kind(),
+        payload,
+        state_root: declared,
+    };
+    // No approvals attached: only the signer counts, one short of threshold 2.
+    let wire = seal(&body, &author);
+
+    // Sanity: the non-authorizing #147 pipeline folds this record — the
+    // rejection below is specifically the #148 authorization boundary, not a
+    // crypto or root defect.
+    let (_folded, _id) = receive_and_fold(genesis.state(), &wire, None, 1)
+        .expect("cryptographically valid entry folds under the non-authorizing pipeline");
+
+    assert_eq!(
+        receive_and_authorize(&genesis, &wire).err(),
+        Some(Reject::InsufficientAuthorization),
+        "one-of-two old-admin signatures must not authorize the entry"
+    );
+
+    // The rejected attempt must not have mutated the accepted predecessor.
+    assert_eq!(genesis.tip(), GovernanceTip::Genesis);
+    assert_eq!(
+        genesis.committed_state_root(),
+        &compute_state_root(genesis.state())
+    );
+}
+
+/// The D6 admin-set invariant end to end over the wire: the old 2-of-3 quorum
+/// authorizes an `admin.set` that replaces the administrators with a single
+/// disjoint new admin; a wire-reconstructed entry signed only by that new
+/// admin cannot authorize the transition itself (it is not yet effective, and
+/// is an outsider to the old set); and once the transition is accepted, the
+/// new admin alone authorizes the next entry from wire bytes while the old
+/// quorum — no longer administrators — is rejected.
+#[test]
+fn e2e_admin_set_transition_old_quorum_then_new_quorum_via_wire_bytes() {
+    let cfg = genesis_config();
+    let sigs = [
+        sign_genesis(&cfg, &key(ADMIN_A_SEED)),
+        sign_genesis(&cfg, &key(ADMIN_B_SEED)),
+    ];
+    let genesis = validated_genesis_state(&cfg, &sigs).expect("genesis threshold met");
+    let old_a = key(ADMIN_A_SEED);
+    let old_b = key(ADMIN_B_SEED);
+    let new_admin = key(0xb5);
+
+    let admin_set = GovernanceOperationPayload::AdminSet(AdminSet {
+        administrators: vec![new_admin.member_id()],
+        threshold: 1,
+    });
+    let declared = compute_state_root(&apply(genesis.state(), &admin_set).unwrap());
+    let body = GovernanceEntryBody {
+        community_id: genesis.state().community_id,
+        seq: 1,
+        prev: None,
+        created_at_ms: 1_001,
+        kind: admin_set.kind(),
+        payload: admin_set,
+        state_root: declared,
+    };
+
+    // The new admin signing alone cannot authorize its own appointment: the
+    // proposed set is not yet effective and is an outsider to the old state.
+    let new_only_wire = seal(&body, &new_admin);
+    assert_eq!(
+        receive_and_authorize(&genesis, &new_only_wire).err(),
+        Some(Reject::InsufficientAuthorization)
+    );
+
+    // The old 2-of-3 quorum authorizes the same wire bytes.
+    let old_quorum_wire = with_approval(seal(&body, &old_a), &body, &old_b);
+    let committed = receive_and_authorize(&genesis, &old_quorum_wire)
+        .expect("old quorum authorizes admin.set over the wire");
+    assert_eq!(
+        committed.state().administrators.administrators,
+        vec![new_admin.member_id()]
+    );
+
+    // After commit, the new admin alone authorizes the next entry over the wire.
+    let next_payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
+        member_id: principal(0xc9),
+        role: Role::Member,
+    });
+    let after_next = fold_one_authorized(&committed, &next_payload, &new_admin, &[]);
+    assert!(after_next.state().members.contains_key(&principal(0xc9)));
+
+    // ...while the old (now-outsider) quorum cannot authorize a competing
+    // next entry against the same committed predecessor.
+    let next_declared = compute_state_root(&apply(committed.state(), &next_payload).unwrap());
+    let by_old_body = GovernanceEntryBody {
+        community_id: committed.state().community_id,
+        seq: 2,
+        prev: Some(match committed.tip() {
+            GovernanceTip::Entry { id, .. } => id,
+            GovernanceTip::Genesis => unreachable!("commit always advances the tip"),
+        }),
+        created_at_ms: 2_001,
+        kind: next_payload.kind(),
+        payload: next_payload,
+        state_root: next_declared,
+    };
+    let by_old_wire = with_approval(seal(&by_old_body, &old_a), &by_old_body, &old_b);
+    assert_eq!(
+        receive_and_authorize(&committed, &by_old_wire).err(),
+        Some(Reject::InsufficientAuthorization),
+        "principals removed from the admin set must not authorize further entries"
+    );
 }

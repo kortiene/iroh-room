@@ -55,3 +55,13 @@ unsafe_code = "forbid"
 all = "warn"
 pedantic = "warn"
 
+# `cargo test --workspace --all-targets --all-features` (scripts/verify.sh)
+# links dozens of integration-test binaries, each statically pulling in the
+# full iroh/quinn/rustls/tokio dependency tree. Full DWARF debug info made
+# `target/debug` exceed the CI runner's disk budget, so the linker (lld) hit
+# a SIGBUS mid-write on one of the later binaries. Line-tables-only debug
+# info still gives file:line backtraces on test panics but cuts per-binary
+# size dramatically, keeping the full workspace build inside CI's disk quota.
+[profile.dev]
+debug = "line-tables-only"
+
