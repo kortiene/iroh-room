@@ -5,15 +5,22 @@
 //! validates the RFC 8949 §4.2.1 core-deterministic profile **while parsing**.
 //!
 //! The supported value space is a **closed profile**: unsigned integers, byte
-//! strings, text strings, arrays, and text-keyed maps. Everything else —
-//! negative integers, tags, floats/simple values, indefinite-length items,
-//! non-text map keys — is rejected as [`CborError`]. The decoder additionally
-//! enforces shortest-form integers, definite lengths, strictly-ascending unique
-//! map keys, valid UTF-8, bounded nesting depth, and no trailing data.
+//! strings, text strings, arrays, text-keyed maps, and the single canonical
+//! simple value `null` (`0xf6`, required by the v2 content-event
+//! `prev_device_event` genesis predecessor — spec #152 §3.2). Everything else —
+//! negative integers, tags, floats, booleans, undefined, all other simple
+//! values, indefinite-length items, non-text map keys — is rejected as
+//! [`CborError`]. The decoder additionally enforces shortest-form integers,
+//! definite lengths, strictly-ascending unique map keys, valid UTF-8, bounded
+//! nesting depth, and no trailing data.
 //!
 //! A successful [`decode_canonical`] guarantees `encode(decode_canonical(b)) == b`,
 //! which is the canonical-bytes trust boundary every v2 signature/id/root hashes
 //! over.
+//!
+//! `null` is in the shared value space: a typed schema is responsible for
+//! rejecting it outside its permitted fields (only `prev_device_event` accepts
+//! it in #152).
 
 use core::fmt;
 
@@ -34,6 +41,10 @@ pub enum CborValue {
     Array(Vec<CborValue>),
     /// Map with text keys (major type 5), held in canonical key order.
     Map(Vec<(String, CborValue)>),
+    /// Canonical `null` (major type 7, `0xf6`). The only accepted simple value;
+    /// used by the v2 content-event `prev_device_event` genesis predecessor.
+    /// Typed schemas must reject it everywhere else (spec #152 §3.2).
+    Null,
 }
 
 /// A non-canonical, malformed, or out-of-profile CBOR encoding.
@@ -136,6 +147,9 @@ fn encode_into(value: &CborValue, out: &mut Vec<u8>) {
                 encode_into(v, out);
             }
         }
+        // Canonical `null` is the single byte `0xf6` (RFC 8949 §3.6; spec #152
+        // §3.2). No other simple value is in the profile.
+        CborValue::Null => out.push(0xf6),
     }
 }
 
@@ -223,6 +237,37 @@ impl Reader<'_> {
         let initial = self.read_u8()?;
         let major = initial >> 5;
         let info = initial & 0x1f;
+        // Major type 7 (simple values and floats) is handled explicitly so the
+        // integer shortest-form logic below never runs on float encodings and
+        // so only canonical `null` (`0xf6`) is admitted (spec #152 §3.2).
+        if major == 7 {
+            return match info {
+                // Immediate simple values 0..=23. Only 22 (`null`) is in-profile;
+                // 20 (false), 21 (true), 23 (undefined), and the rest reject.
+                0..=23 => Ok((major, u64::from(info))),
+                // One-byte simple value (e.g. `f8 16` is non-shortest `null`).
+                24 => {
+                    let _v = self.read_u8()?;
+                    Err(CborError::FloatOrSimple)
+                }
+                // Half/single/double floats — all out of profile.
+                25 => {
+                    let _ = self.take(2)?;
+                    Err(CborError::FloatOrSimple)
+                }
+                26 => {
+                    let _ = self.take(4)?;
+                    Err(CborError::FloatOrSimple)
+                }
+                27 => {
+                    let _ = self.take(8)?;
+                    Err(CborError::FloatOrSimple)
+                }
+                28..=30 => Err(CborError::ReservedAdditionalInfo),
+                // 31 = break code (indefinite-length terminator).
+                _ => Err(CborError::IndefiniteLength),
+            };
+        }
         let arg = match info {
             0..=23 => u64::from(info),
             24 => {
@@ -333,6 +378,13 @@ impl Reader<'_> {
                 Ok(CborValue::Map(entries))
             }
             6 => Err(CborError::Tag),
+            // Major type 7: only canonical `null` (info 22) is in-profile.
+            // Booleans (20/21), undefined (23), and any other value already
+            // rejected in `read_head`; here we accept only 22.
+            7 => match arg {
+                22 => Ok(CborValue::Null),
+                _ => Err(CborError::FloatOrSimple),
+            },
             _ => Err(CborError::FloatOrSimple),
         }
     }
@@ -429,6 +481,53 @@ mod tests {
         ] {
             assert!(decode_canonical(&hx(input)).is_err(), "input {input}");
         }
+    }
+
+    #[test]
+    fn canonical_null_round_trips() {
+        // Canonical `null` is the single byte 0xf6 (spec #152 §3.2).
+        assert_eq!(encode(&CborValue::Null), hx("f6"));
+        assert_eq!(decode_canonical(&hx("f6")).unwrap(), CborValue::Null);
+        // Round-trips inside an array/map.
+        let v = CborValue::Map(vec![("a".to_owned(), CborValue::Null)]);
+        let bytes = encode(&v);
+        assert_eq!(decode_canonical(&bytes).unwrap(), v);
+        assert_eq!(encode(&decode_canonical(&bytes).unwrap()), bytes);
+    }
+
+    #[test]
+    fn rejects_non_null_simple_values_and_floats() {
+        // Booleans, undefined, and other immediate simple values reject.
+        for input in ["f4", "f5", "f7", "f0", "f3"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::FloatOrSimple),
+                "input {input}"
+            );
+        }
+        // Non-shortest simple encoding `f8 16` (= null, but two bytes) rejects.
+        assert_eq!(
+            decode_canonical(&hx("f8 16")),
+            Err(CborError::FloatOrSimple)
+        );
+        // 1-byte simple value f8 20 (simple 32) rejects.
+        assert_eq!(
+            decode_canonical(&hx("f8 20")),
+            Err(CborError::FloatOrSimple)
+        );
+        // Floats: half (f9), single (fa), double (fb).
+        for input in ["f9 00 00", "fa 00 00 00 00", "fb 00 00 00 00 00 00 00 00"] {
+            assert_eq!(
+                decode_canonical(&hx(input)),
+                Err(CborError::FloatOrSimple),
+                "input {input}"
+            );
+        }
+        // Break code 0xff rejects as indefinite-length.
+        assert_eq!(
+            decode_canonical(&hx("ff")),
+            Err(CborError::IndefiniteLength)
+        );
     }
 
     #[test]

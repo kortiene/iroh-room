@@ -35,6 +35,24 @@ changing the frozen byte/hash expectations.
 
 ### Change log
 
+- **v5** — `#152` landed the normative #134 §9.2 `ContentEventBody`
+  (`content::body`) and the concrete exact-byte content-event envelope
+  (`content::event`: `ContentEvent` / `VerifiedContentEvent` /
+  `verify_content_event` / `seal_content_event` / `validate_device_chain_link`).
+  The frozen #153 content-event golden vector (`content-event-message-text-v1`)
+  is **deliberately preserved on the pre-#152 provisional schema** (now exposed
+  as the test-only `content::provisional::ProvisionalContentEventBody`); its
+  CSB/id/signature bytes are byte-identical to v4 and prove "unrelated golden
+  vectors do not drift". The normative §9.2 schema is a NEW, separate path with
+  its own focused tests; it is not dual-decodable as the provisional schema
+  (spec #152 D1: one normative v2 content wire schema). No frozen bytes change
+  in this bump; only a new normative path is added and the provisional type is
+  renamed/relocated. The shared canonical-CBOR codec gained the single canonical
+  `null` byte (`0xf6`) required by `prev_device_event`. The fixture-format
+  `schema` marker deliberately stays `iroh-rooms-v2-golden-vectors/v2`: these
+  change-log versions track landed protocol changes, and no bump to the
+  fixture-format schema is required because no frozen byte/hash/signature vector
+  changed in v3–v5.
 - **v4** — `#178` made the normative `governance::log` record wrappers
   (`GovernanceEntry` / `GovernanceApproval`) own the **exact received canonical
   signed bytes (CSB)** alongside the typed body, mirroring `crate::signed::Envelope`,
