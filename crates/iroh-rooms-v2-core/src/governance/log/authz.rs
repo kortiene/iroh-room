@@ -24,11 +24,16 @@
 //! [`validate_governance_entry`] never mutates `prev_state`.
 //!
 //! This module is pure: no wall-clock, network, store, async, logging, or
-//! randomness. Out of scope (deferred to #149): detecting two quorum-valid
-//! entries sharing a predecessor, branch selection, and recovery-threshold
-//! authorization (`fork.resolve` is authorized like every other ordinary
-//! operation, under the current admin threshold, until #149 replaces that
-//! rule deliberately).
+//! randomness.
+//!
+//! `fork.resolve` is deliberately rejected by the ordinary candidate
+//! validator ([`validate_governance_candidate`]) with
+//! [`Reject::InvalidForkResolution`]: a resolution is recovery-authorized,
+//! not administrator-authorized (spec §2.3). The fork-aware state machine
+//! ([`super::machine::GovernanceMachine`]) is the boundary that runs fork
+//! detection (§8) and the dedicated recovery validator (§9); the
+//! [`validate_and_apply_governance_entry`] helper here advances a single
+//! linear accepted tip and does not itself enforce fork state (spec §5.3).
 
 use std::collections::BTreeSet;
 
@@ -37,7 +42,8 @@ use crate::ids::{GovernanceId, PrincipalId, StateRoot};
 
 use super::genesis::{verify_genesis, GenesisConfig, GenesisSignature};
 use super::model::AdministratorState;
-use super::records::VerifiedGovernanceEntry;
+use super::operation::GovernanceOperationPayload;
+use super::records::{AuthenticatedGovernanceEvidence, VerifiedGovernanceEntry};
 use super::state::{
     apply, check_chain_link, compute_state_root, verify_state_root, GovernanceState,
 };
@@ -98,6 +104,93 @@ impl ValidatedGovernanceState {
     #[must_use]
     pub fn committed_state_root(&self) -> &StateRoot {
         &self.committed_state_root
+    }
+
+    /// Trusted constructor for sibling modules within `governance::log` (the
+    /// #149 fork-aware machine reconstructs a validated snapshot after a
+    /// recovery-authorized resolution). Not part of the public API: external
+    /// callers must obtain a snapshot via [`validated_genesis_state`] or
+    /// [`validate_and_apply_governance_entry`].
+    #[must_use]
+    pub(super) fn from_parts(
+        state: GovernanceState,
+        tip: GovernanceTip,
+        committed_state_root: StateRoot,
+    ) -> Self {
+        Self {
+            state,
+            tip,
+            committed_state_root,
+        }
+    }
+}
+
+/// An opaque, reusable proof that a [`VerifiedGovernanceEntry`] independently
+/// passes the #148 five-rule authorization predicate against a specific
+/// predecessor (issue #149 §6.2).
+///
+/// Carries the predecessor snapshot, the resulting accepted snapshot, and the
+/// full authenticated evidence (exact CSB + signatures) needed by fork
+/// detection and audit. Fields are private; the only construction paths are
+/// [`validate_governance_candidate`] (ordinary administrator threshold) and
+/// the dedicated `fork.resolve` recovery validator in
+/// [`super::machine`] (recovery threshold). A `fork.resolve` payload is
+/// rejected by the ordinary candidate validator — recovery authorization is
+/// not administrator authorization (spec §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedGovernanceCandidate {
+    predecessor: ValidatedGovernanceState,
+    resulting: ValidatedGovernanceState,
+    evidence: AuthenticatedGovernanceEvidence,
+}
+
+impl ValidatedGovernanceCandidate {
+    /// The predecessor snapshot this candidate was validated against.
+    #[must_use]
+    pub fn predecessor(&self) -> &ValidatedGovernanceState {
+        &self.predecessor
+    }
+
+    /// The resulting accepted snapshot (state + tip + committed root).
+    #[must_use]
+    pub fn resulting(&self) -> &ValidatedGovernanceState {
+        &self.resulting
+    }
+
+    /// The authenticated evidence for this candidate's entry.
+    #[must_use]
+    pub fn evidence(&self) -> &AuthenticatedGovernanceEvidence {
+        &self.evidence
+    }
+
+    /// The exact-CSB-derived entry id of this candidate's entry.
+    #[must_use]
+    pub fn entry_id(&self) -> GovernanceId {
+        self.evidence.id()
+    }
+
+    /// The candidate entry's community id.
+    #[must_use]
+    pub fn community_id(&self) -> crate::ids::CommunityId {
+        self.evidence.body().community_id
+    }
+
+    /// The candidate entry's sequence number.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.evidence.body().seq
+    }
+
+    /// The candidate entry's predecessor id (`None` only at `seq == 1`).
+    #[must_use]
+    pub fn prev(&self) -> Option<GovernanceId> {
+        self.evidence.body().prev
+    }
+
+    /// The resulting state root this candidate commits to.
+    #[must_use]
+    pub fn resulting_state_root(&self) -> StateRoot {
+        *self.resulting.committed_state_root()
     }
 }
 
@@ -168,7 +261,7 @@ fn verify_old_admin_threshold(
     let mut signers: BTreeSet<PrincipalId> = BTreeSet::new();
     signers.insert(entry.signer());
     for approval in entry.approvals() {
-        signers.insert(approval.approver);
+        signers.insert(approval.body().approver);
     }
 
     let distinct_old_admin_signers = signers.intersection(&admin_set).count();
@@ -185,18 +278,31 @@ fn verify_old_admin_threshold(
 }
 
 /// Evaluate the five rules in normative order and return the resulting
-/// candidate state (issue #148 D4). Shared by [`validate_governance_entry`]
-/// and [`validate_and_apply_governance_entry`] so the two can never disagree
-/// about what is authorized.
+/// candidate (issue #148 D4 / #149 §6.2). Shared by [`validate_governance_entry`]
+/// and [`validate_and_apply_governance_entry`] (both reimplemented over the
+/// opaque [`ValidatedGovernanceCandidate`]) so the ordinary path and the
+/// fork-aware path can never disagree about what is authorized.
 ///
-/// No state is committed before rule 5 succeeds; the returned candidate is
-/// never derived from `prev_state` being mutated.
+/// A `fork.resolve` payload is **not** an ordinary administrator-authorized
+/// operation (spec §2.3): it is rejected here with
+/// [`Reject::InvalidForkResolution`] so it can never pass through the ordinary
+/// admin-threshold gate. The dedicated recovery validator in
+/// [`super::machine`] is the only path that can authorize a resolution.
+///
+/// No state is committed before rule 5 succeeds; the returned candidate's
+/// resulting snapshot is never derived from `prev_state` being mutated.
 fn validate_candidate(
     prev_state: &ValidatedGovernanceState,
     entry: &VerifiedGovernanceEntry,
-) -> Result<GovernanceState, Reject> {
+) -> Result<ValidatedGovernanceCandidate, Reject> {
     let body = entry.body();
     let old = prev_state.state();
+
+    // `fork.resolve` must use the dedicated recovery validator, never the
+    // ordinary admin-threshold path (spec §2.3 / §6.2).
+    if matches!(body.payload, GovernanceOperationPayload::ForkResolve(_)) {
+        return Err(Reject::InvalidForkResolution);
+    }
 
     // Rule 1: predecessor validity — recomputed root must match the
     // committed root, and the candidate must target the same community.
@@ -216,16 +322,49 @@ fn validate_candidate(
 
     // Rule 3: the operation must be structurally/semantically valid when
     // applied to state n-1. `apply` never mutates `old` (clone-and-return).
-    let candidate = apply(old, &body.payload)?;
+    let candidate_state = apply(old, &body.payload)?;
 
     // Rule 4: a threshold of distinct *old*-state administrators signed.
     verify_old_admin_threshold(&old.administrators, entry)?;
 
     // Rule 5: the candidate's declared post-state root must match the
     // deterministic apply result.
-    verify_state_root(&candidate, &body.state_root)?;
+    verify_state_root(&candidate_state, &body.state_root)?;
 
-    Ok(candidate)
+    let resulting = ValidatedGovernanceState {
+        committed_state_root: body.state_root,
+        tip: GovernanceTip::Entry {
+            seq: body.seq,
+            // Authenticated identity: the exact-CSB-derived entry id (issue
+            // #178), not a re-derivation from the typed body.
+            id: entry.id(),
+        },
+        state: candidate_state,
+    };
+    Ok(ValidatedGovernanceCandidate {
+        predecessor: prev_state.clone(),
+        resulting,
+        evidence: entry.authenticated_evidence().clone(),
+    })
+}
+
+/// Validate `entry` against `prev_state` and return the opaque
+/// [`ValidatedGovernanceCandidate`] (issue #149 §6.2). The candidate bundles
+/// the predecessor snapshot, the resulting accepted snapshot, and the full
+/// authenticated evidence (exact CSB + signatures). Fork detection consumes
+/// the candidate rather than re-running partial checks.
+///
+/// Pure: never mutates or commits state.
+///
+/// # Errors
+/// - [`Reject::InvalidForkResolution`] — `entry` is a `fork.resolve` payload;
+///   resolutions must go through the dedicated recovery validator.
+/// - See the module-level rule table for every other rejection.
+pub fn validate_governance_candidate(
+    prev_state: &ValidatedGovernanceState,
+    entry: &VerifiedGovernanceEntry,
+) -> Result<ValidatedGovernanceCandidate, Reject> {
+    validate_candidate(prev_state, entry)
 }
 
 /// The #134 §7.4 five-rule authorization predicate (issue #148).
@@ -260,17 +399,7 @@ pub fn validate_and_apply_governance_entry(
     entry: &VerifiedGovernanceEntry,
 ) -> Result<ValidatedGovernanceState, RejectionReason> {
     let candidate = validate_candidate(prev_state, entry)?;
-    let body = entry.body();
-    Ok(ValidatedGovernanceState {
-        committed_state_root: body.state_root,
-        tip: GovernanceTip::Entry {
-            seq: body.seq,
-            // Authenticated identity: the exact-CSB-derived entry id (issue
-            // #178), not a re-derivation from the typed body.
-            id: entry.id(),
-        },
-        state: candidate,
-    })
+    Ok(candidate.resulting().clone())
 }
 
 #[cfg(test)]

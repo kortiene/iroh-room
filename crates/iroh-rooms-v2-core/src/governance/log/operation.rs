@@ -9,11 +9,10 @@
 
 use crate::cbor::CborValue;
 use crate::error::Reject;
-use crate::ids::{DeviceId, PrincipalId, StreamId};
+use crate::ids::{DeviceId, GovernanceId, PrincipalId, StateRoot, StreamId};
 
 use super::model::{
-    CommunityPolicy, ForkResolutionMarker, RecoveryConfig, ReplicaDescriptor, ReplicaStatus, Role,
-    StreamPolicy,
+    CommunityPolicy, RecoveryConfig, ReplicaDescriptor, ReplicaStatus, Role, StreamPolicy,
 };
 
 /// The closed set of §7.3 operation discriminants.
@@ -229,6 +228,89 @@ pub struct MigrationAccept {
     pub migration_id: [u8; 32],
 }
 
+/// `fork.resolve`: recovery-authorized resolution of a governance fork (spec
+/// §6.6 / #134 §7.5, issue #149).
+///
+/// The signed operation payload. Canonical rules (spec §6.6):
+/// - `branch_heads.len() >= 2`, sorted ascending by raw id, no duplicates;
+/// - `selected_head` occurs exactly once in `branch_heads`;
+/// - `created_at_ms` is signed advisory data, never checked against a clock.
+///
+/// Selection is always the explicit `selected_head` signed by at least `W`
+/// recovery principals. Lexical/timestamp/arrival order is never a tie-break
+/// (spec §5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkResolve {
+    /// Every known competing branch head, sorted ascending by raw id.
+    pub branch_heads: Vec<GovernanceId>,
+    /// The selected branch head (must be in `branch_heads`).
+    pub selected_head: GovernanceId,
+    /// The already-validated state root for `selected_head`.
+    pub selected_state_root: StateRoot,
+    /// Signed creation time (advisory; never a wall clock).
+    pub created_at_ms: u64,
+}
+
+impl ForkResolve {
+    #[must_use]
+    pub fn to_cbor(&self) -> CborValue {
+        CborValue::Map(vec![
+            (
+                "branch_heads".to_owned(),
+                CborValue::Array(
+                    self.branch_heads
+                        .iter()
+                        .map(|id| CborValue::Bytes(id.as_bytes().to_vec()))
+                        .collect(),
+                ),
+            ),
+            (
+                "selected_head".to_owned(),
+                CborValue::Bytes(self.selected_head.as_bytes().to_vec()),
+            ),
+            (
+                "selected_state_root".to_owned(),
+                CborValue::Bytes(self.selected_state_root.as_bytes().to_vec()),
+            ),
+            (
+                "created_at_ms".to_owned(),
+                CborValue::Uint(self.created_at_ms),
+            ),
+        ])
+    }
+
+    /// Decode + strictly validate a `fork.resolve` payload against the closed
+    /// schema and canonical branch-head invariants (spec §6.6 / §9 Rule 2).
+    ///
+    /// # Errors
+    /// Returns [`Reject::InvalidForkResolution`] for a non-closed schema or a
+    /// non-canonical branch-head set (fewer than two, unsorted, duplicate, or
+    /// `selected_head` not present exactly once).
+    pub fn from_canonical(value: &CborValue) -> Result<Self, Reject> {
+        let entries = value.as_map().ok_or(Reject::InvalidForkResolution)?;
+        super::reject_unknown_keys(
+            entries,
+            &[
+                "branch_heads",
+                "selected_head",
+                "selected_state_root",
+                "created_at_ms",
+            ],
+            Reject::InvalidForkResolution,
+        )?;
+        let (branch_heads, selected_head) =
+            super::read_canonical_branch_set(entries, Reject::InvalidForkResolution)?;
+        let selected_state_root = super::read_state_root_field(entries, "selected_state_root")?;
+        let created_at_ms = super::read_uint_field(entries, "created_at_ms")?;
+        Ok(Self {
+            branch_heads,
+            selected_head,
+            selected_state_root,
+            created_at_ms,
+        })
+    }
+}
+
 /// A typed sum over every registered operation payload (spec §6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GovernanceOperationPayload {
@@ -257,7 +339,7 @@ pub enum GovernanceOperationPayload {
     /// `policy.set`
     PolicySet(PolicySet),
     /// `fork.resolve`
-    ForkResolve(ForkResolutionMarker),
+    ForkResolve(ForkResolve),
     /// `migration.accept`
     MigrationAccept(MigrationAccept),
 }
@@ -520,7 +602,7 @@ impl GovernanceOperationPayload {
                 policy: CommunityPolicy::from_canonical(value)?,
             }),
             GovernanceOperationKind::ForkResolve => {
-                Self::ForkResolve(ForkResolutionMarker::from_canonical(value)?)
+                Self::ForkResolve(ForkResolve::from_canonical(value)?)
             }
             GovernanceOperationKind::MigrationAccept => {
                 super::reject_unknown_keys(entries, &["migration_id"], Reject::InvalidContent)?;
@@ -596,9 +678,9 @@ mod tests {
     #[test]
     fn every_payload_round_trips_through_canonical_cbor() {
         use super::super::model::{
-            CommunityPolicy, ForkResolutionMarker, RecoveryConfig, ReplicaDescriptor,
-            ReplicaStatus, Role, StreamPolicy,
+            CommunityPolicy, RecoveryConfig, ReplicaDescriptor, ReplicaStatus, Role, StreamPolicy,
         };
+        use super::ForkResolve;
         use crate::ids::{DeviceId, GovernanceId, ReplicaId, StreamId};
 
         let payloads = [
@@ -654,12 +736,14 @@ mod tests {
             GovernanceOperationPayload::PolicySet(PolicySet {
                 policy: CommunityPolicy::empty(),
             }),
-            GovernanceOperationPayload::ForkResolve(ForkResolutionMarker {
-                evidence: [
+            GovernanceOperationPayload::ForkResolve(ForkResolve {
+                branch_heads: [
                     GovernanceId::from_bytes([0x0e; LEN]),
                     GovernanceId::from_bytes([0x0f; LEN]),
-                ],
-                decision: 1,
+                ]
+                .to_vec(),
+                selected_head: GovernanceId::from_bytes([0x0e; LEN]),
+                selected_state_root: crate::ids::StateRoot::from_bytes([0xee; LEN]),
                 created_at_ms: 8,
             }),
             GovernanceOperationPayload::MigrationAccept(MigrationAccept {

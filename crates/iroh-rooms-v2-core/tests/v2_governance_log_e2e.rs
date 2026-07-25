@@ -72,10 +72,9 @@ use iroh_rooms_v2_core::governance::log::{
     ValidatedGovernanceState, GENESIS_SCHEMA_VERSION,
 };
 use iroh_rooms_v2_core::governance::log::{
-    AdminSet, CommunityPolicy, DeviceGrant, DeviceRevoke, ForkResolutionMarker, InviteRevoke,
-    MemberGrant, MemberRevoke, MigrationAccept, PolicySet, RecoveryConfig, RecoverySet,
-    ReplicaDescriptor, ReplicaSet, ReplicaStatus, Role, StreamArchive, StreamCreate, StreamPolicy,
-    StreamPolicySet,
+    AdminSet, CommunityPolicy, DeviceGrant, DeviceRevoke, ForkResolve, InviteRevoke, MemberGrant,
+    MemberRevoke, MigrationAccept, PolicySet, RecoveryConfig, RecoverySet, ReplicaDescriptor,
+    ReplicaSet, ReplicaStatus, Role, StreamArchive, StreamCreate, StreamPolicy, StreamPolicySet,
 };
 use iroh_rooms_v2_core::ids::{
     CommunityId, DeviceId, GovernanceId, PrincipalId, ReplicaId, StateRoot, StreamId, LEN as N,
@@ -781,12 +780,13 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
         ),
         (
             "fork.resolve",
-            GovernanceOperationPayload::ForkResolve(ForkResolutionMarker {
-                evidence: [
+            GovernanceOperationPayload::ForkResolve(ForkResolve {
+                branch_heads: vec![
                     GovernanceId::from_bytes([0x60; N]),
                     GovernanceId::from_bytes([0x61; N]),
                 ],
-                decision: 1,
+                selected_head: GovernanceId::from_bytes([0x60; N]),
+                selected_state_root: StateRoot::from_bytes([0xee; N]),
                 created_at_ms: 5_000,
             }),
             setup.clone(),
