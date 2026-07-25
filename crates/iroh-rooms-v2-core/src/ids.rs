@@ -370,8 +370,11 @@ impl StreamId {
 }
 
 impl EventId {
-    /// Derive an `EventId` from the canonical signed bytes (CSB) of a content
-    /// event record.
+    /// Derive an `EventId` from the exact canonical body bytes (CSB) of a
+    /// #134 §9.2 `ContentEventBody` (spec #152 §3.3). The input is the BODY CSB
+    /// — never the outer envelope/wrapper bytes, and never including the
+    /// Ed25519 signature (the signature is NOT part of the id preimage).
+    /// Computes `BLAKE3(CONTENT_EVENT || body_csb)`.
     #[must_use]
     pub fn from_content_event_csb(csb: &[u8]) -> Self {
         Self::from_bytes(blake3_domain(CONTENT_EVENT, csb))

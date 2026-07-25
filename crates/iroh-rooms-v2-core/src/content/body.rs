@@ -1,247 +1,471 @@
-//! The v2 `ContentEventBody` envelope (spec §9.2 / source:
-//! `content-and-moderation-event-schemas.md` §4 D2) and its signed-body impl.
+//! The normative #134 §9.2 `ContentEventBody` (issue #152).
 //!
-//! The envelope owns the `kind` discriminant, an optional per-kind body version
-//! (default 1), an optional `stream_id` (`bstr[16]`; absent ⇒ room default
-//! stream), and the kind-specific `body` map. Body-only validation (no blob
-//! fetch, no transport) lives in [`super::validate`].
+//! This is the single accepted v2 content wire schema. It replaces the
+//! provisional envelope preserved (test-only) in [`super::provisional`]. The
+//! body is one canonical-CBOR map of exactly twelve keys; every key is required,
+//! including `prev_device_event`, which uses explicit CBOR `null` for the first
+//! device event rather than omission (spec §3.1).
+//!
+//! The exact canonical bytes (`body_csb`) are the cryptographic trust boundary:
+//! the [`EventId`] is `BLAKE3(CONTENT_EVENT || body_csb)` and the Ed25519
+//! signature is over `CONTENT_EVENT || body_csb`, both computed over those exact
+//! bytes — never a re-serialization. The signature verifies under
+//! `body.device_id` (NOT `author_id`); that envelope + verification path lives
+//! in [`super::event`].
+//!
+//! This struct does NOT implement [`crate::signed::SignedBody`]: the signature
+//! verification key is an in-body field (`device_id`), not an out-of-body
+//! principal signer, so a concrete content path is used rather than weakening
+//! the generic trait (spec §6 API invariants).
 
-use crate::cbor::CborValue;
+use crate::cbor::{self, CborValue};
 use crate::content::registry::ContentKind;
-use crate::domain;
 use crate::error::Reject;
-use crate::ids::{ContentEventId, LEN};
-use crate::signed::{self, Envelope, SignedBody};
+use crate::ids::{CommunityId, DeviceId, EventId, PrincipalId, StreamId, LEN};
 
-/// Length in bytes of a short opaque id (`stream_id`, etc.); matches v1.
-pub const SHORT_ID_LEN: usize = 16;
+/// The v2 content-event body version. `v` MUST equal this value (spec §9.2 /
+/// §3.1). Any other value rejects as [`Reject::UnknownVersion`].
+pub const CONTENT_EVENT_VERSION: u64 = 2;
 
-/// The v2 content-kind body version this crate accepts (default when `version`
-/// is absent; source: §4 D2 / D5 sub-step 5c).
-pub const BODY_VERSION: u64 = 1;
+/// Maximum number of `references` entries on a content event (spec #152 §3.6).
+/// Validation accepts `0..=MAX_CONTENT_REFERENCES` and rejects any more.
+pub const MAX_CONTENT_REFERENCES: usize = 8;
 
-/// The v2 `ContentEventBody` envelope. The `body` is held as the decoded
-/// canonical CBOR value; per-kind strict validation happens in
-/// [`super::validate::validate_body`].
+/// The exact twelve wire keys of a `ContentEventBody` (spec §9.2). Used to close
+/// the top-level key set so an unknown key is rejected rather than ignored.
+pub const TOP_LEVEL_KEYS: &[&str] = &[
+    "v",
+    "community_id",
+    "stream_id",
+    "author_id",
+    "device_id",
+    "device_seq",
+    "prev_device_event",
+    "auth_hint_seq",
+    "created_at_ms",
+    "kind",
+    "references",
+    "content",
+];
+
+/// The normative #134 §9.2 content-event body: one canonical-CBOR map of exactly
+/// twelve keys. Every field is part of the signed/ID-bound trust boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentEventBody {
     /// Schema version (MUST be `2`).
-    pub schema_version: u64,
-    /// The room.
-    pub room_id: crate::ids::RoomId,
-    /// The signing author/principal.
-    pub author: crate::MemberId,
-    /// The registered content kind (§6.4 discriminant).
+    pub v: u64,
+    /// The community this event belongs to (32-byte `CommunityId`).
+    pub community_id: CommunityId,
+    /// The content stream this event belongs to (required 32-byte `StreamId`).
+    pub stream_id: StreamId,
+    /// The authoring principal identity (32-byte `PrincipalId`). An authorization
+    /// identity; NOT the signature verification key.
+    pub author_id: PrincipalId,
+    /// The device whose key signs this event (32-byte `DeviceId`). The ONLY key
+    /// used for signature verification.
+    pub device_id: DeviceId,
+    /// Per-`(community_id, device_id)` sequence; the first event is `0`.
+    pub device_seq: u64,
+    /// The predecessor event id, or `None` (canonical CBOR `null`) for the first
+    /// event (`device_seq == 0`).
+    pub prev_device_event: Option<EventId>,
+    /// Authorization hint cursor; strictly typed and signed, interpreted later.
+    pub auth_hint_seq: u64,
+    /// Creation timestamp (ms); signed data, not a trusted ordering input here.
+    pub created_at_ms: u64,
+    /// The registered content kind (closed registry; unknown rejects).
     pub kind: ContentKind,
-    /// Per-kind body version (default 1).
-    pub version: u64,
-    /// Optional stream scope (`bstr[16]`); absent ⇒ room default stream.
-    pub stream_id: Option<[u8; SHORT_ID_LEN]>,
-    /// The kind-specific body map (decoded canonical CBOR).
-    pub body: CborValue,
+    /// Ordered references; `0..=MAX_CONTENT_REFERENCES` exact-width `EventId`s.
+    /// Caller-provided order is preserved (it is part of the signed bytes/ID).
+    pub references: Vec<EventId>,
+    /// The kind-specific content map (decoded canonical CBOR).
+    pub content: CborValue,
 }
 
-impl SignedBody for ContentEventBody {
-    type Id = ContentEventId;
-    const SIGN_CONTEXT: &'static [u8] = domain::CONTENT_EVENT_SIGN;
-    const ID_CONTEXT: &'static [u8] = domain::CONTENT_EVENT_ID;
-
-    fn to_cbor(&self) -> CborValue {
-        let mut entries = vec![
+impl ContentEventBody {
+    /// Canonical-encode this body to the deterministic CBOR profile (a single
+    /// map of the twelve §9.2 keys, `prev_device_event` emitted as `null` when
+    /// `None`). Map keys are emitted in canonical order by the codec.
+    #[must_use]
+    pub fn to_cbor(&self) -> CborValue {
+        CborValue::Map(vec![
+            ("v".to_owned(), CborValue::Uint(self.v)),
             (
-                "schema_version".to_owned(),
-                CborValue::Uint(self.schema_version),
+                "community_id".to_owned(),
+                CborValue::Bytes(self.community_id.as_bytes().to_vec()),
             ),
             (
-                "room_id".to_owned(),
-                CborValue::Bytes(self.room_id.as_bytes().to_vec()),
+                "stream_id".to_owned(),
+                CborValue::Bytes(self.stream_id.as_bytes().to_vec()),
             ),
             (
-                "author".to_owned(),
-                CborValue::Bytes(self.author.as_bytes().to_vec()),
+                "author_id".to_owned(),
+                CborValue::Bytes(self.author_id.as_bytes().to_vec()),
+            ),
+            (
+                "device_id".to_owned(),
+                CborValue::Bytes(self.device_id.as_bytes().to_vec()),
+            ),
+            ("device_seq".to_owned(), CborValue::Uint(self.device_seq)),
+            (
+                "prev_device_event".to_owned(),
+                match &self.prev_device_event {
+                    Some(id) => CborValue::Bytes(id.as_bytes().to_vec()),
+                    None => CborValue::Null,
+                },
+            ),
+            (
+                "auth_hint_seq".to_owned(),
+                CborValue::Uint(self.auth_hint_seq),
+            ),
+            (
+                "created_at_ms".to_owned(),
+                CborValue::Uint(self.created_at_ms),
             ),
             (
                 "kind".to_owned(),
                 CborValue::Text(self.kind.as_str().to_owned()),
             ),
-            ("version".to_owned(), CborValue::Uint(self.version)),
-            ("body".to_owned(), self.body.clone()),
-        ];
-        if let Some(sid) = self.stream_id {
-            entries.push(("stream_id".to_owned(), CborValue::Bytes(sid.to_vec())));
-        }
-        CborValue::Map(entries)
+            (
+                "references".to_owned(),
+                CborValue::Array(
+                    self.references
+                        .iter()
+                        .map(|r| CborValue::Bytes(r.as_bytes().to_vec()))
+                        .collect(),
+                ),
+            ),
+            ("content".to_owned(), self.content.clone()),
+        ])
     }
 
-    fn from_canonical(value: &CborValue) -> Result<Self, Reject> {
+    /// Canonical-encode this body to its exact canonical signed bytes (CSB).
+    #[must_use]
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cbor())
+    }
+
+    /// Strictly decode + validate a canonically-decoded body value (spec §6.4).
+    ///
+    /// This performs the full strict top-level and kind-specific validation but
+    /// does NOT recompute an id or verify a signature (those live in
+    /// [`super::event`]). It is the body-decode half of the trust boundary.
+    ///
+    /// # Errors
+    /// - [`Reject::NonCanonicalEncoding`] — `value` is not a map (caller misuse;
+    ///   the wire decoder already rejects non-canonical CBOR).
+    /// - [`Reject::UnknownVersion`] — `v` is present and not `2`.
+    /// - [`Reject::UnknownContentKind`] — `kind` is not in the closed registry.
+    /// - [`Reject::InvalidContent`] — unknown/missing/wrong-type/wrong-width
+    ///   field, over-cap `references`, invalid intrinsic chain shape, or invalid
+    ///   kind-specific content.
+    pub fn from_canonical(value: &CborValue) -> Result<Self, Reject> {
         let entries = value.as_map().ok_or(Reject::NonCanonicalEncoding)?;
-        crate::governance::model::reject_unknown_keys(
-            entries,
-            &[
-                "schema_version",
-                "room_id",
-                "author",
-                "kind",
-                "version",
-                "body",
-                "stream_id",
-            ],
-        )?;
-        let schema_version = uint_field_local(entries, "schema_version")?;
-        if schema_version != crate::governance::model::SCHEMA_VERSION {
+        // Close the top-level key set: any key outside the twelve rejects.
+        reject_unknown_top_level_keys(entries)?;
+
+        let v = require_uint(entries, "v")?;
+        if v != CONTENT_EVENT_VERSION {
             return Err(Reject::UnknownVersion);
         }
-        let room_id = read_id_local(entries, "room_id")?;
-        let author = read_member_local(entries, "author")?;
-        // Kind check is the FIRST body-level check (§5 sub-step 5b): an unknown
-        // kind is rejected before any per-kind field parsing.
-        let kind = ContentKind::from_wire(text_field_local(entries, "kind")?)?;
-        let version = match signed::opt(entries, "version") {
-            Some(v) => v.as_uint().ok_or(Reject::NonCanonicalEncoding)?,
-            None => BODY_VERSION,
-        };
-        if version != BODY_VERSION {
+        let community_id = require_bstr32_id(entries, "community_id", CommunityId::from_bytes)?;
+        let stream_id = require_bstr32_id(entries, "stream_id", StreamId::from_bytes)?;
+        let author_id = require_bstr32_id(entries, "author_id", PrincipalId::from_bytes)?;
+        let device_id = require_bstr32_id(entries, "device_id", DeviceId::from_bytes)?;
+        let device_seq = require_uint(entries, "device_seq")?;
+        let prev_device_event = require_prev_device_event(entries, "prev_device_event")?;
+        let auth_hint_seq = require_uint(entries, "auth_hint_seq")?;
+        let created_at_ms = require_uint(entries, "created_at_ms")?;
+        // Kind check is the FIRST content-level check (§5 sub-step 5b): an
+        // unknown kind rejects before any per-kind field parsing.
+        let kind = ContentKind::from_wire(require_text(entries, "kind")?)?;
+        let references = require_references(entries, "references")?;
+        let content = require_content_map(entries, "content")?;
+
+        // Intrinsic per-body chain shape (spec §3.5): a genesis event
+        // (device_seq == 0) MUST carry a null predecessor; a successor MUST name
+        // one. This is a body invariant, independent of any supplied predecessor
+        // event data.
+        let prev_is_null = prev_device_event.is_none();
+        if device_seq == 0 {
+            if !prev_is_null {
+                return Err(Reject::InvalidContent);
+            }
+        } else if prev_is_null {
             return Err(Reject::InvalidContent);
         }
-        let stream_id = match signed::opt(entries, "stream_id") {
-            Some(v) => {
-                let bytes = v.as_bytes().ok_or(Reject::NonCanonicalEncoding)?;
-                let arr =
-                    <[u8; SHORT_ID_LEN]>::try_from(bytes).map_err(|_| Reject::InvalidContent)?;
-                Some(arr)
-            }
-            None => None,
-        };
-        let body = signed::field(entries, "body")
-            .filter(|v| v.as_map().is_some())
-            .ok_or(Reject::NonCanonicalEncoding)?
-            .clone();
-        Ok(Self {
-            schema_version,
-            room_id,
-            author,
-            kind,
-            version,
+
+        let body = Self {
+            v,
+            community_id,
             stream_id,
-            body,
-        })
+            author_id,
+            device_id,
+            device_seq,
+            prev_device_event,
+            auth_hint_seq,
+            created_at_ms,
+            kind,
+            references,
+            content: content.clone(),
+        };
+        // Kind-specific strict content validation.
+        super::validate::validate_content(body.kind, content, &body.author_id)?;
+        Ok(body)
     }
 
-    fn id_from_csb(csb: &[u8]) -> Self::Id {
-        ContentEventId::from_bytes(domain::blake3_domain(Self::ID_CONTEXT, csb))
+    /// Canonical-decode the exact `body_csb` bytes and strictly validate the
+    /// resulting body. Malformed/non-canonical bytes reject as
+    /// [`Reject::NonCanonicalEncoding`] before any schema check.
+    ///
+    /// # Errors
+    /// See [`cbor::decode_canonical`] and [`Self::from_canonical`].
+    pub fn decode_from_csb(csb: &[u8]) -> Result<Self, Reject> {
+        let value = cbor::decode_canonical(csb)?;
+        Self::from_canonical(&value)
     }
 }
 
-/// The parsed content body kind, pairing the discriminant with its decoded body.
-pub type ContentBodyKind = ContentKind;
+// ----------------------------------------------------------------------------
+// Strict typed field helpers (spec §6.4 / §3.1).
+//
+// Unlike the provisional helpers, these distinguish absent, wrong-type, and
+// wrong-width and map every schema error to `InvalidContent` (spec D5 mapping;
+// gap #4 in §2.2). `v` and `kind` retain their dedicated codes.
+// ----------------------------------------------------------------------------
 
-/// A signed content-event envelope.
-pub type SignedContentEvent = Envelope<ContentEventId>;
-
-/// Decode + verify a signed content event end-to-end, including body-only
-/// validation (spec D2 / #152).
-///
-/// # Errors
-/// See [`signed::verify_envelope`] and [`super::validate::validate_body`].
-pub fn decode_verified(env: &SignedContentEvent) -> Result<ContentEventBody, Reject> {
-    let body = signed::verify_envelope::<ContentEventBody>(env)?;
-    crate::content::validate::validate_body(&body)?;
-    Ok(body)
+/// Look up a required key, returning `InvalidContent` if absent.
+fn lookup<'a>(entries: &'a [(String, CborValue)], key: &str) -> Result<&'a CborValue, Reject> {
+    entries
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+        .ok_or(Reject::InvalidContent)
 }
 
-fn uint_field_local(entries: &[(String, CborValue)], key: &str) -> Result<u64, Reject> {
-    signed::field(entries, key)
-        .and_then(super::super::cbor::CborValue::as_uint)
-        .ok_or(Reject::NonCanonicalEncoding)
+fn require_uint(entries: &[(String, CborValue)], key: &str) -> Result<u64, Reject> {
+    lookup(entries, key)?
+        .as_uint()
+        .ok_or(Reject::InvalidContent)
 }
 
-fn text_field_local<'a>(entries: &'a [(String, CborValue)], key: &str) -> Result<&'a str, Reject> {
-    signed::field(entries, key)
-        .and_then(|v| v.as_text())
-        .ok_or(Reject::NonCanonicalEncoding)
+fn require_text<'a>(entries: &'a [(String, CborValue)], key: &str) -> Result<&'a str, Reject> {
+    lookup(entries, key)?
+        .as_text()
+        .ok_or(Reject::InvalidContent)
 }
 
-fn read_id_local(entries: &[(String, CborValue)], key: &str) -> Result<crate::ids::RoomId, Reject> {
-    let v = signed::field(entries, key).ok_or(Reject::NonCanonicalEncoding)?;
-    let bytes = v.as_bytes().ok_or(Reject::NonCanonicalEncoding)?;
-    let arr = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
-    Ok(crate::ids::RoomId::from_bytes(arr))
-}
-
-fn read_member_local(
+/// Read a required 32-byte identifier/key field. A present value of the wrong
+/// type or wrong width rejects as `InvalidContent`; an invalid Ed25519 point is
+/// not rejected here (it fails closed at signature verification).
+fn require_bstr32_id<T>(
     entries: &[(String, CborValue)],
     key: &str,
-) -> Result<crate::MemberId, Reject> {
-    let v = signed::field(entries, key).ok_or(Reject::NonCanonicalEncoding)?;
-    let bytes = v.as_bytes().ok_or(Reject::NonCanonicalEncoding)?;
-    let arr = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::NonCanonicalEncoding)?;
-    Ok(crate::MemberId::from_bytes(arr))
+    ctor: fn([u8; LEN]) -> T,
+) -> Result<T, Reject> {
+    let bytes = lookup(entries, key)?
+        .as_bytes()
+        .ok_or(Reject::InvalidContent)?;
+    let arr = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::InvalidContent)?;
+    Ok(ctor(arr))
+}
+
+/// Read `prev_device_event`: canonical `null` ⇒ `None`, otherwise an exact-width
+/// `EventId`. Any other type (or wrong width) rejects as `InvalidContent`.
+fn require_prev_device_event(
+    entries: &[(String, CborValue)],
+    key: &str,
+) -> Result<Option<EventId>, Reject> {
+    let v = lookup(entries, key)?;
+    match v {
+        CborValue::Null => Ok(None),
+        CborValue::Bytes(b) => {
+            let arr = <[u8; LEN]>::try_from(b.as_slice()).map_err(|_| Reject::InvalidContent)?;
+            Ok(Some(EventId::from_bytes(arr)))
+        }
+        // Any other type is a schema error.
+        _ => Err(Reject::InvalidContent),
+    }
+}
+
+/// Read the `references` array: zero through `MAX_CONTENT_REFERENCES` exact-width
+/// `EventId`s. A ninth element, a non-array, or a wrong-type/wrong-width entry
+/// rejects as `InvalidContent`. Caller-provided order is preserved (spec §3.6/D6).
+fn require_references(entries: &[(String, CborValue)], key: &str) -> Result<Vec<EventId>, Reject> {
+    let arr = lookup(entries, key)?
+        .as_array()
+        .ok_or(Reject::InvalidContent)?;
+    if arr.len() > MAX_CONTENT_REFERENCES {
+        return Err(Reject::InvalidContent);
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let bytes = item.as_bytes().ok_or(Reject::InvalidContent)?;
+        let id = <[u8; LEN]>::try_from(bytes).map_err(|_| Reject::InvalidContent)?;
+        out.push(EventId::from_bytes(id));
+    }
+    Ok(out)
+}
+
+/// Read the `content` field; it MUST be a map. Per-kind schema validation runs
+/// separately in [`super::validate::validate_content`].
+fn require_content_map<'a>(
+    entries: &'a [(String, CborValue)],
+    key: &str,
+) -> Result<&'a CborValue, Reject> {
+    let v = lookup(entries, key)?;
+    if v.as_map().is_none() {
+        return Err(Reject::InvalidContent);
+    }
+    Ok(v)
+}
+
+/// Reject any top-level key outside the twelve §9.2 keys (spec §3.1: no unknown
+/// field is ignored). This closes the map so signature-malleability via injected
+/// keys is impossible.
+fn reject_unknown_top_level_keys(entries: &[(String, CborValue)]) -> Result<(), Reject> {
+    for (k, _) in entries {
+        if !TOP_LEVEL_KEYS.contains(&k.as_str()) {
+            return Err(Reject::InvalidContent);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::RoomId;
-    use crate::keys::SigningKey;
 
-    fn text_body(body: &str) -> CborValue {
-        CborValue::Map(vec![("body".to_owned(), CborValue::Text(body.to_owned()))])
-    }
-
-    #[test]
-    fn content_event_seal_verify_round_trip() {
-        let key = SigningKey::from_seed(&[0x33; LEN]);
-        let body = ContentEventBody {
-            schema_version: 2,
-            room_id: RoomId::from_bytes([0x50; LEN]),
-            author: key.member_id(),
+    fn sample_body() -> ContentEventBody {
+        ContentEventBody {
+            v: CONTENT_EVENT_VERSION,
+            community_id: CommunityId::from_bytes([0x70; LEN]),
+            stream_id: StreamId::from_bytes([0x71; LEN]),
+            author_id: PrincipalId::from_bytes([0xa0; LEN]),
+            device_id: DeviceId::from_bytes([0xa0; LEN]),
+            device_seq: 0,
+            prev_device_event: None,
+            auth_hint_seq: 1,
+            created_at_ms: 1_000,
             kind: ContentKind::MessageText,
-            version: 1,
-            stream_id: None,
-            body: text_body("hello"),
-        };
-        let env = signed::seal(&body, &key);
-        let decoded = decode_verified(&env).expect("valid content event verifies");
-        assert_eq!(decoded, body);
+            references: Vec::new(),
+            content: CborValue::Map(vec![("body".to_owned(), CborValue::Text("hi".to_owned()))]),
+        }
+    }
+
+    fn id_with_byte(b: u8) -> EventId {
+        EventId::from_bytes([b; LEN])
     }
 
     #[test]
-    fn unknown_kind_rejected_at_envelope_decode() {
-        let key = SigningKey::from_seed(&[0x34; LEN]);
-        // Hand-build a body with an unknown kind via raw CBOR.
-        let raw = CborValue::Map(vec![
-            ("schema_version".to_owned(), CborValue::Uint(2)),
-            ("room_id".to_owned(), CborValue::Bytes(vec![0x50; LEN])),
-            (
-                "author".to_owned(),
-                CborValue::Bytes(key.member_id().as_bytes().to_vec()),
-            ),
-            (
-                "kind".to_owned(),
-                CborValue::Text("message.unknown".to_owned()),
-            ),
-            ("version".to_owned(), CborValue::Uint(1)),
-            ("body".to_owned(), CborValue::Map(vec![])),
-        ]);
-        let csb = crate::cbor::encode(&raw);
-        // Sign using a known context just to produce a verifiable signature shape;
-        // the kind check happens before any signature-domain concern at decode.
-        let sig = key.sign(&domain::signing_message(
-            ContentEventBody::SIGN_CONTEXT,
-            &csb,
+    fn round_trips_through_canonical_cbor() {
+        let body = sample_body();
+        let csb = body.encode_canonical();
+        let back = ContentEventBody::decode_from_csb(&csb).expect("round-trip");
+        assert_eq!(back, body);
+        // Exact-byte identity: re-encoding the decoded body reproduces the CSB.
+        assert_eq!(back.encode_canonical(), csb);
+    }
+
+    #[test]
+    fn genesis_uses_canonical_null_predecessor() {
+        let body = sample_body();
+        let csb = body.encode_canonical();
+        // The `prev_device_event` value must be the single canonical null byte.
+        let value = cbor::decode_canonical(&csb).unwrap();
+        assert!(matches!(
+            value.get("prev_device_event"),
+            Some(CborValue::Null)
         ));
-        let env = Envelope {
-            id: ContentEventId::from_bytes(domain::blake3_domain(
-                ContentEventBody::ID_CONTEXT,
-                &csb,
-            )),
-            signed: csb,
-            sig,
-            signer: key.member_id(),
-        };
+    }
+
+    #[test]
+    fn wrong_version_rejects() {
+        let mut body = sample_body();
+        body.v = 3;
         assert_eq!(
-            decode_verified(&env).err(),
-            Some(Reject::UnknownContentKind)
+            ContentEventBody::decode_from_csb(&body.encode_canonical()).err(),
+            Some(Reject::UnknownVersion)
+        );
+    }
+
+    #[test]
+    fn ninth_reference_rejects() {
+        let mut body = sample_body();
+        body.references = (0u8..9).map(id_with_byte).collect();
+        assert_eq!(
+            ContentEventBody::decode_from_csb(&body.encode_canonical()).err(),
+            Some(Reject::InvalidContent)
+        );
+        // Zero and eight references are accepted.
+        for n in [0usize, 8] {
+            let mut b = sample_body();
+            b.references = (0u8..).take(n).map(id_with_byte).collect();
+            assert!(
+                ContentEventBody::decode_from_csb(&b.encode_canonical()).is_ok(),
+                "{n} references must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn intrinsic_chain_shape_rejects_mismatch() {
+        // device_seq == 0 with a named predecessor rejects.
+        let mut body = sample_body();
+        body.prev_device_event = Some(EventId::from_bytes([0x99; LEN]));
+        assert_eq!(
+            ContentEventBody::decode_from_csb(&body.encode_canonical()).err(),
+            Some(Reject::InvalidContent)
+        );
+        // device_seq > 0 with a null predecessor rejects.
+        let mut body = sample_body();
+        body.device_seq = 1;
+        assert_eq!(
+            ContentEventBody::decode_from_csb(&body.encode_canonical()).err(),
+            Some(Reject::InvalidContent)
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_key_rejects() {
+        let mut value = sample_body().to_cbor();
+        if let CborValue::Map(ref mut entries) = value {
+            entries.push(("bogus".to_owned(), CborValue::Uint(1)));
+        }
+        let csb = cbor::encode(&value);
+        assert_eq!(
+            ContentEventBody::decode_from_csb(&csb).err(),
+            Some(Reject::InvalidContent)
+        );
+    }
+
+    #[test]
+    fn missing_required_key_rejects() {
+        let mut value = sample_body().to_cbor();
+        if let CborValue::Map(ref mut entries) = value {
+            entries.retain(|(k, _)| k != "created_at_ms");
+        }
+        let csb = cbor::encode(&value);
+        assert_eq!(
+            ContentEventBody::decode_from_csb(&csb).err(),
+            Some(Reject::InvalidContent)
+        );
+    }
+
+    #[test]
+    fn wrong_width_id_rejects() {
+        let mut value = sample_body().to_cbor();
+        if let CborValue::Map(ref mut entries) = value {
+            for (k, v) in entries.iter_mut() {
+                if k == "community_id" {
+                    *v = CborValue::Bytes(vec![0u8; LEN - 1]);
+                }
+            }
+        }
+        let csb = cbor::encode(&value);
+        assert_eq!(
+            ContentEventBody::decode_from_csb(&csb).err(),
+            Some(Reject::InvalidContent)
         );
     }
 }

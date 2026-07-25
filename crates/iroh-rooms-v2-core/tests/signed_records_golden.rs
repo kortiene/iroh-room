@@ -19,8 +19,13 @@
 #![allow(clippy::unwrap_used)]
 
 use iroh_rooms_v2_core::cbor::{self, CborValue};
-use iroh_rooms_v2_core::content::body::decode_verified as decode_content;
-use iroh_rooms_v2_core::content::{ContentEventBody, ContentKind};
+// The frozen #153 content-event vector pins the PROVISIONAL pre-#152 schema
+// (kept byte-stable in `content::provisional`). The normative #134 §9.2 schema
+// lives in `content::body`/`content::event` and is exercised by the #152
+// focused tests. See `golden/README.md` for the deliberate-versioning note.
+use iroh_rooms_v2_core::content::provisional::decode_verified as decode_content;
+use iroh_rooms_v2_core::content::provisional::ProvisionalContentEventBody as ContentEventBody;
+use iroh_rooms_v2_core::content::ContentKind;
 use iroh_rooms_v2_core::domain;
 use iroh_rooms_v2_core::governance::approval::decode_verified as decode_approval;
 use iroh_rooms_v2_core::governance::model::decode_verified as decode_entry;
