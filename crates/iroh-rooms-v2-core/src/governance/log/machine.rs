@@ -22,6 +22,7 @@
 //! §5.6); branch ids are sorted only for canonical representation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::error::Reject;
 use crate::ids::{CommunityId, GovernanceId, PrincipalId, StateRoot};
@@ -31,10 +32,10 @@ use super::authz::{
     ValidatedGovernanceState,
 };
 use super::fork::{GovernanceBranchEvidence, GovernanceForkEvidence};
-use super::model::{RecoveryConfig, ResolvedForkMarker};
-use super::operation::{GovernanceOperationKind, GovernanceOperationPayload};
+use super::model::RecoveryConfig;
+use super::operation::GovernanceOperationPayload;
 use super::records::{AuthenticatedGovernanceEvidence, VerifiedGovernanceEntry};
-use super::state::compute_state_root;
+use super::state::{apply_fork_resolve, compute_state_root};
 
 // ----------------------------------------------------------------------------
 // Lineage (spec §6.4). Pure in-memory protocol state used to resolve a common
@@ -48,8 +49,8 @@ use super::state::compute_state_root;
 struct LineageNode {
     seq: u64,
     prev: Option<GovernanceId>,
-    state: ValidatedGovernanceState,
-    evidence: AuthenticatedGovernanceEvidence,
+    state: Arc<ValidatedGovernanceState>,
+    evidence: Arc<AuthenticatedGovernanceEvidence>,
 }
 
 /// Retained validated ancestry sufficient to identify a common ancestor when
@@ -82,8 +83,8 @@ impl GovernanceLineage {
             LineageNode {
                 seq,
                 prev,
-                state,
-                evidence,
+                state: Arc::new(state),
+                evidence: Arc::new(evidence),
             },
         );
     }
@@ -92,48 +93,47 @@ impl GovernanceLineage {
         self.nodes.get(id)
     }
 
-    /// The ancestor chain of `tip`, inclusive, walking back to genesis:
-    /// `[tip, prev(tip), ..., <genesis cursor>]`. The genesis cursor appears as
-    /// `(None, &genesis)` at the tail.
-    fn ancestor_chain(&self, tip: GovernanceId) -> Vec<(Option<GovernanceId>, &LineageNode)> {
+    fn ancestor_ids(&self, tip: GovernanceId) -> Result<Vec<GovernanceId>, Reject> {
         let mut chain = Vec::new();
         let mut cur = Some(tip);
         while let Some(id) = cur {
-            match self.nodes.get(&id) {
-                Some(node) => {
-                    cur = node.prev;
-                    chain.push((Some(id), node));
-                }
-                None => break,
-            }
+            let node = self.nodes.get(&id).ok_or(Reject::MissingDependency)?;
+            chain.push(id);
+            cur = node.prev;
         }
-        chain
+        Ok(chain)
     }
 
-    /// Resolve the most recent common ancestor of two tips from the retained
-    /// lineage (spec §7 step 6). Returns its tip + committed state root. Falls
-    /// back to the genesis cursor when no deeper shared node exists.
-    fn common_ancestor(
+    fn common_ancestor_of(
         &self,
-        tip_a: GovernanceId,
-        tip_b: GovernanceId,
-    ) -> (GovernanceTip, StateRoot) {
-        // Collect a's ancestor ids (inclusive of tip_a).
-        let chain_a = self.ancestor_chain(tip_a);
-        let ids_a: BTreeSet<Option<GovernanceId>> = chain_a.iter().map(|(id, _)| *id).collect();
-        // Walk b from the tip backward; the first ancestor of b that is also an
-        // ancestor of a is the most recent common ancestor.
-        for (id, node) in self.ancestor_chain(tip_b) {
-            if ids_a.contains(&id) {
-                return match id {
-                    Some(_) => (node.state.tip(), *node.state.committed_state_root()),
-                    None => (self.genesis.tip(), *self.genesis.committed_state_root()),
-                };
+        heads: &BTreeSet<GovernanceId>,
+    ) -> Result<(GovernanceTip, StateRoot), Reject> {
+        let mut iter = heads.iter();
+        let first = *iter.next().ok_or(Reject::MissingDependency)?;
+        let first_chain = self.ancestor_ids(first)?;
+        let mut common: BTreeSet<GovernanceId> = first_chain.iter().copied().collect();
+        for head in iter {
+            let chain: BTreeSet<GovernanceId> = self.ancestor_ids(*head)?.into_iter().collect();
+            common = common.intersection(&chain).copied().collect();
+        }
+        for id in first_chain {
+            if common.contains(&id) {
+                let node = self.nodes.get(&id).ok_or(Reject::MissingDependency)?;
+                return Ok((node.state.tip(), *node.state.committed_state_root()));
             }
         }
-        // Both chains include the genesis cursor tail, so this is unreachable
-        // in practice; fall back to genesis defensively.
-        (self.genesis.tip(), *self.genesis.committed_state_root())
+        Ok((self.genesis.tip(), *self.genesis.committed_state_root()))
+    }
+
+    fn is_ancestor(&self, ancestor: GovernanceId, descendant: GovernanceId) -> bool {
+        let mut cur = Some(descendant);
+        while let Some(id) = cur {
+            if id == ancestor {
+                return true;
+            }
+            cur = self.nodes.get(&id).and_then(|node| node.prev);
+        }
+        false
     }
 }
 
@@ -291,8 +291,8 @@ pub enum GovernanceObservation {
         /// The new committed state root.
         state_root: StateRoot,
     },
-    /// A second authorization-valid branch was observed; the machine is now
-    /// `GovernanceForked`. Carries the typed fork evidence (spec §4.4).
+    /// A second authorization-valid branch was observed or an existing fork's
+    /// branch set was expanded. Carries the typed fork evidence (spec §4.4).
     ForkDetected {
         /// The canonical fork evidence (both competing records + approvals).
         evidence: GovernanceForkEvidence,
@@ -403,36 +403,33 @@ impl GovernanceMachine {
         &mut self,
         entry: &VerifiedGovernanceEntry,
     ) -> Result<GovernanceObservation, Reject> {
-        // Build the successor state WITHOUT mutating `self`; only assign on
-        // success. A failed observation (early `?` return) leaves `self`
-        // byte-for-byte unchanged (spec §5.2 item 5).
-        let (new_state, observation) = match &self.state {
+        let (replacement, observation) = match &mut self.state {
             GovernanceMachineState::Linear(linear) => Self::observe_linear(linear, entry)?,
             GovernanceMachineState::GovernanceForked(forked) => {
-                Self::observe_forked(forked, entry)?
+                let (state, observation) = Self::observe_forked(forked, entry)?;
+                (Some(state), observation)
             }
         };
-        self.state = new_state;
+        if let Some(state) = replacement {
+            self.state = state;
+        }
         Ok(observation)
     }
 
     fn observe_linear(
-        linear: &LinearGovernanceState,
+        linear: &mut LinearGovernanceState,
         entry: &VerifiedGovernanceEntry,
-    ) -> Result<(GovernanceMachineState, GovernanceObservation), Reject> {
+    ) -> Result<(Option<GovernanceMachineState>, GovernanceObservation), Reject> {
         let body = entry.body();
 
         // A fork.resolve while linear is unsolicited (spec §9 Rule 1).
-        if body.kind == GovernanceOperationKind::ForkResolve {
+        if matches!(body.payload, GovernanceOperationPayload::ForkResolve(_)) {
             return Err(Reject::InvalidForkResolution);
         }
 
         // Duplicate exact id? (spec §5.1 item 6 / §8.1 step 6).
         if linear.lineage.nodes.contains_key(&entry.id()) {
-            return Ok((
-                Self::clone_linear_state(linear),
-                GovernanceObservation::Duplicate { id: entry.id() },
-            ));
+            return Ok((None, GovernanceObservation::Duplicate { id: entry.id() }));
         }
 
         // Locate the declared predecessor (spec §8.1 step 2-3).
@@ -441,36 +438,25 @@ impl GovernanceMachine {
         // Validate against the declared predecessor (rules 1-5).
         let candidate = validate_governance_candidate(&predecessor, entry)?;
 
-        // Conflict detection: any retained entry at the same seq with a
-        // distinct id (same community) reveals a divergent authorized branch.
-        if let Some(conflict_id) =
-            conflicting_entry_at_seq(linear, candidate.seq(), entry.id(), body.community_id)
-        {
-            return Self::enter_forked_from_linear(linear, &candidate, conflict_id);
+        if candidate.predecessor().tip() != linear.accepted.tip() {
+            let (state, observation) = Self::enter_forked_from_linear(linear, &candidate)?;
+            return Ok((Some(state), observation));
         }
 
-        // Otherwise: linear advance.
         let new_accepted = candidate.resulting().clone();
-        let mut new_lineage = linear.lineage.clone();
-        new_lineage.insert(
+        let observation = GovernanceObservation::Advanced {
+            tip: new_accepted.tip(),
+            state_root: *new_accepted.committed_state_root(),
+        };
+        linear.lineage.insert(
             entry.id(),
             body.seq,
             body.prev,
             new_accepted.clone(),
             candidate.evidence().clone(),
         );
-        let observation = GovernanceObservation::Advanced {
-            tip: new_accepted.tip(),
-            state_root: *new_accepted.committed_state_root(),
-        };
-        Ok((
-            GovernanceMachineState::Linear(LinearGovernanceState {
-                accepted: new_accepted,
-                lineage: new_lineage,
-                audit: linear.audit.clone(),
-            }),
-            observation,
-        ))
+        linear.accepted = new_accepted;
+        Ok((None, observation))
     }
 
     fn observe_forked(
@@ -481,92 +467,134 @@ impl GovernanceMachine {
         // §5.3: every ordinary operation fails closed while forked. This gate
         // precedes ordinary admin quorum and operation application, so even a
         // malformed member.grant returns UnresolvedFork (spec §10).
-        if body.kind != GovernanceOperationKind::ForkResolve {
+        if !matches!(body.payload, GovernanceOperationPayload::ForkResolve(_)) {
             return Err(Reject::UnresolvedFork);
         }
         // §9: dedicated fork.resolve validation + commit.
         Self::validate_and_commit_resolution(forked, entry)
     }
 
-    /// Atomically enter `GovernanceForked` from a linear state given the new
-    /// candidate and the conflicting retained entry id (spec §8.1 step 7).
+    /// Validate and retain authenticated historical branch evidence while the
+    /// machine remains forked. This never authorizes a new governance decision.
+    ///
+    /// # Errors
+    /// Returns [`Reject::InvalidForkResolution`] for a resolution payload,
+    /// [`Reject::MissingDependency`] for an unknown predecessor, or any
+    /// ordinary authorization error for invalid branch evidence.
+    pub fn ingest_branch_evidence(
+        &mut self,
+        entry: &VerifiedGovernanceEntry,
+    ) -> Result<GovernanceObservation, Reject> {
+        let GovernanceMachineState::GovernanceForked(forked) = &self.state else {
+            return Err(Reject::UnresolvedFork);
+        };
+        if matches!(
+            entry.body().payload,
+            GovernanceOperationPayload::ForkResolve(_)
+        ) {
+            return Err(Reject::InvalidForkResolution);
+        }
+        if forked.lineage.nodes.contains_key(&entry.id()) {
+            return Ok(GovernanceObservation::Duplicate { id: entry.id() });
+        }
+        let predecessor =
+            predecessor_for_lineage(&forked.lineage, entry.body().prev, entry.body().seq)?;
+        let candidate = validate_governance_candidate(&predecessor, entry)?;
+        let mut lineage = forked.lineage.clone();
+        lineage.insert(
+            candidate.entry_id(),
+            candidate.seq(),
+            candidate.prev(),
+            candidate.resulting().clone(),
+            candidate.evidence().clone(),
+        );
+        let mut heads: BTreeSet<GovernanceId> = forked.branches.keys().copied().collect();
+        heads.insert(candidate.entry_id());
+        let next = Self::build_forked_state(lineage, &heads, forked.prior_audit.clone())?;
+        let evidence = next.evidence.clone();
+        self.state = GovernanceMachineState::GovernanceForked(next);
+        Ok(GovernanceObservation::ForkDetected { evidence })
+    }
+
+    /// Atomically enter `GovernanceForked` from a linear state given a new
+    /// divergent candidate (spec §8.1 step 7).
     fn enter_forked_from_linear(
         linear: &LinearGovernanceState,
         new_candidate: &ValidatedGovernanceCandidate,
-        conflict_id: GovernanceId,
     ) -> Result<(GovernanceMachineState, GovernanceObservation), Reject> {
-        let conflict_node = linear
-            .lineage
-            .get(&conflict_id)
-            .ok_or(Reject::MissingDependency)?;
-        let conflict_state = conflict_node.state.clone();
-        let conflict_evidence = conflict_node.evidence.clone();
-
-        // Resolve the common ancestor from the full lineage.
-        let (stable_tip, stable_root) = linear
-            .lineage
-            .common_ancestor(new_candidate.entry_id(), conflict_id);
-
-        let new_branch = GovernanceBranchEvidence {
-            head: new_candidate.entry_id(),
-            seq: new_candidate.seq(),
-            predecessor: new_candidate.prev(),
-            state_root: new_candidate.resulting_state_root(),
-            entry: new_candidate.evidence().clone(),
+        let GovernanceTip::Entry {
+            id: accepted_head, ..
+        } = linear.accepted.tip()
+        else {
+            return Err(Reject::MissingDependency);
         };
-        let conflict_branch = GovernanceBranchEvidence {
-            head: conflict_id,
-            seq: conflict_node.seq,
-            predecessor: conflict_node.prev,
-            state_root: *conflict_state.committed_state_root(),
-            entry: conflict_evidence,
-        };
-
-        let mut branches = vec![new_branch, conflict_branch];
-        branches.sort_by_key(|b| *b.head.as_bytes());
-        let evidence = GovernanceForkEvidence {
-            community_id: new_candidate.community_id(),
-            stable_tip,
-            stable_state_root: stable_root,
-            branches,
-        };
-
-        let mut branch_map: BTreeMap<GovernanceId, ValidatedGovernanceState> = BTreeMap::new();
-        branch_map.insert(new_candidate.entry_id(), new_candidate.resulting().clone());
-        branch_map.insert(conflict_id, conflict_state);
-
-        let mut new_lineage = linear.lineage.clone();
-        new_lineage.insert(
+        let mut lineage = linear.lineage.clone();
+        lineage.insert(
             new_candidate.entry_id(),
             new_candidate.seq(),
             new_candidate.prev(),
             new_candidate.resulting().clone(),
             new_candidate.evidence().clone(),
         );
-
-        let stable_state = match stable_tip {
-            GovernanceTip::Genesis => linear.lineage.genesis.clone(),
-            GovernanceTip::Entry { id, .. } => new_lineage
-                .get(&id)
-                .map_or_else(|| linear.lineage.genesis.clone(), |n| n.state.clone()),
-        };
-
-        let new_state = GovernanceMachineState::GovernanceForked(GovernanceForkedState {
-            stable: stable_state,
-            branches: branch_map,
-            evidence: evidence.clone(),
-            prior_audit: linear.audit.clone(),
-            lineage: new_lineage,
-        });
-        Ok((new_state, GovernanceObservation::ForkDetected { evidence }))
+        let heads = BTreeSet::from([accepted_head, new_candidate.entry_id()]);
+        let forked = Self::build_forked_state(lineage, &heads, linear.audit.clone())?;
+        let evidence = forked.evidence.clone();
+        Ok((
+            GovernanceMachineState::GovernanceForked(forked),
+            GovernanceObservation::ForkDetected { evidence },
+        ))
     }
 
-    /// Clone a linear state (used to return an unchanged state for `Duplicate`).
-    fn clone_linear_state(linear: &LinearGovernanceState) -> GovernanceMachineState {
-        GovernanceMachineState::Linear(LinearGovernanceState {
-            accepted: linear.accepted.clone(),
-            lineage: linear.lineage.clone(),
-            audit: linear.audit.clone(),
+    fn build_forked_state(
+        lineage: GovernanceLineage,
+        heads: &BTreeSet<GovernanceId>,
+        prior_audit: Vec<GovernanceForkAuditRecord>,
+    ) -> Result<GovernanceForkedState, Reject> {
+        let maximal_heads: BTreeSet<GovernanceId> = heads
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !heads
+                    .iter()
+                    .any(|other| candidate != other && lineage.is_ancestor(*candidate, *other))
+            })
+            .collect();
+        if maximal_heads.len() < 2 {
+            return Err(Reject::MissingDependency);
+        }
+        let (stable_tip, stable_state_root) = lineage.common_ancestor_of(&maximal_heads)?;
+        let stable = match stable_tip {
+            GovernanceTip::Genesis => lineage.genesis.clone(),
+            GovernanceTip::Entry { id, .. } => lineage
+                .get(&id)
+                .map(|node| node.state.as_ref().clone())
+                .ok_or(Reject::MissingDependency)?,
+        };
+        let mut branches = BTreeMap::new();
+        let mut evidence_branches = Vec::with_capacity(maximal_heads.len());
+        for head in &maximal_heads {
+            let node = lineage.get(head).ok_or(Reject::MissingDependency)?;
+            branches.insert(*head, node.state.as_ref().clone());
+            evidence_branches.push(GovernanceBranchEvidence {
+                head: *head,
+                seq: node.seq,
+                predecessor: node.prev,
+                state_root: *node.state.committed_state_root(),
+                entry: node.evidence.as_ref().clone(),
+            });
+        }
+        let evidence = GovernanceForkEvidence {
+            community_id: stable.state().community_id,
+            stable_tip,
+            stable_state_root,
+            branches: evidence_branches,
+        };
+        Ok(GovernanceForkedState {
+            stable,
+            branches,
+            evidence,
+            prior_audit,
+            lineage,
         })
     }
 
@@ -635,18 +663,7 @@ impl GovernanceMachine {
         // Rule 6: deterministic post-resolution root. Apply ONLY the resolution
         // marker to the selected branch state, then require the declared root
         // to match.
-        let marker = ResolvedForkMarker {
-            branch_heads: resolve.branch_heads.clone(),
-            selected_head: resolve.selected_head,
-            selected_state_root: resolve.selected_state_root,
-            created_at_ms: resolve.created_at_ms,
-        };
-        let mut resolved_state = selected_state.state().clone();
-        resolved_state.policy.fork_markers.push(marker);
-        resolved_state
-            .policy
-            .fork_markers
-            .sort_by_key(|m| *m.selected_head.as_bytes());
+        let resolved_state = apply_fork_resolve(selected_state.state(), resolve)?;
         let recomputed = compute_state_root(&resolved_state);
         if recomputed != body.state_root {
             return Err(Reject::StateRootMismatch);
@@ -772,52 +789,31 @@ fn predecessor_for(
     prev: Option<GovernanceId>,
     seq: u64,
 ) -> Result<ValidatedGovernanceState, Reject> {
+    predecessor_for_lineage(&linear.lineage, prev, seq)
+}
+
+fn predecessor_for_lineage(
+    lineage: &GovernanceLineage,
+    prev: Option<GovernanceId>,
+    seq: u64,
+) -> Result<ValidatedGovernanceState, Reject> {
     match prev {
         None => {
             if seq != 1 {
                 return Err(Reject::InvalidContent);
             }
-            // seq == 1 validates against the genesis root cursor.
-            Ok(linear.lineage.genesis.clone())
+            Ok(lineage.genesis.clone())
         }
         Some(prev_id) => {
             if seq == 1 {
                 return Err(Reject::InvalidContent);
             }
-            linear
-                .lineage
+            lineage
                 .get(&prev_id)
-                .map(|node| node.state.clone())
+                .map(|node| node.state.as_ref().clone())
                 .ok_or(Reject::MissingDependency)
         }
     }
-}
-
-/// Find a retained entry id at `seq` with an id distinct from `new_id` in
-/// `community` (a conflicting authorized branch) — the fork trigger.
-fn conflicting_entry_at_seq(
-    linear: &LinearGovernanceState,
-    seq: u64,
-    new_id: GovernanceId,
-    community: CommunityId,
-) -> Option<GovernanceId> {
-    // The current accepted tip, if at this seq with a distinct id.
-    if let GovernanceTip::Entry {
-        seq: tip_seq,
-        id: tip_id,
-    } = linear.accepted.tip()
-    {
-        if tip_seq == seq && tip_id != new_id && linear.accepted.state().community_id == community {
-            return Some(tip_id);
-        }
-    }
-    // Any retained lineage node at this seq with a distinct id in this community.
-    for (id, node) in &linear.lineage.nodes {
-        if node.seq == seq && *id != new_id && node.state.state().community_id == community {
-            return Some(*id);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -828,7 +824,7 @@ mod tests {
     use crate::governance::log::genesis::{sign_genesis, GenesisConfig, GENESIS_SCHEMA_VERSION};
     use crate::governance::log::model::{CommunityPolicy, RecoveryConfig, Role};
     use crate::governance::log::operation::{
-        ForkResolve, GovernanceOperationPayload, MemberGrant, MemberRevoke,
+        ForkResolve, GovernanceOperationPayload, MemberGrant, MemberRevoke, RecoverySet,
     };
     use crate::governance::log::records::{
         entry_id, GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
@@ -936,7 +932,7 @@ mod tests {
     fn resolve_entry(
         forked_state: &GovernanceForkedState,
         selected_head: GovernanceId,
-        branch_heads: Vec<GovernanceId>,
+        branch_heads: &[GovernanceId],
         signers: &[&SigningKey],
         created_at_ms: u64,
     ) -> VerifiedGovernanceEntry {
@@ -948,23 +944,17 @@ mod tests {
             GovernanceTip::Genesis => (1, None),
         };
         let payload = GovernanceOperationPayload::ForkResolve(ForkResolve {
-            branch_heads: branch_heads.clone(),
+            branch_heads: branch_heads.to_vec(),
             selected_head,
             selected_state_root: *selected.committed_state_root(),
             created_at_ms,
         });
-        let marker = ResolvedForkMarker {
-            branch_heads,
-            selected_head,
-            selected_state_root: *selected.committed_state_root(),
-            created_at_ms,
+        let state = match &payload {
+            GovernanceOperationPayload::ForkResolve(resolve) => {
+                apply_fork_resolve(selected.state(), resolve).expect("valid resolution payload")
+            }
+            _ => unreachable!(),
         };
-        let mut state = selected.state().clone();
-        state.policy.fork_markers.push(marker);
-        state
-            .policy
-            .fork_markers
-            .sort_by_key(|m| *m.selected_head.as_bytes());
         let declared = compute_state_root(&state);
         let body = GovernanceEntryBody {
             community_id: selected.state().community_id,
@@ -1117,7 +1107,7 @@ mod tests {
         linear.accepted = q1_candidate.resulting().clone();
 
         let (state, observation) =
-            GovernanceMachine::enter_forked_from_linear(&linear, &q2_candidate, q1.id())
+            GovernanceMachine::enter_forked_from_linear(&linear, &q2_candidate)
                 .expect("retained lineages prove the fork");
         let GovernanceMachineState::GovernanceForked(forked) = state else {
             panic!("expected GovernanceForked");
@@ -1132,6 +1122,92 @@ mod tests {
             heads
         });
         assert_eq!(forked.stable().tip(), GovernanceTip::Genesis);
+    }
+
+    #[test]
+    fn fork_below_non_genesis_uses_shared_predecessor_as_stable() {
+        let (mut machine, _) = genesis_machine(2);
+        let genesis = machine.accepted().unwrap().clone();
+        let mut replacement_keys = vec![principal(0xb0), principal(0xb1)];
+        replacement_keys.sort();
+        let recovery_update = verified_entry(
+            &genesis,
+            GovernanceOperationPayload::RecoverySet(RecoverySet {
+                recovery: RecoveryConfig {
+                    threshold: 2,
+                    recovery_keys: replacement_keys,
+                },
+            }),
+            &key(0xa0),
+            &[&key(0xa1)],
+        );
+        machine.observe(&recovery_update).unwrap();
+        let stable = machine.accepted().unwrap().clone();
+        let a = verified_entry(
+            &stable,
+            grant_payload(principal(0xc0)),
+            &key(0xa0),
+            &[&key(0xa1)],
+        );
+        let b = verified_entry(
+            &stable,
+            grant_payload(principal(0xc1)),
+            &key(0xa1),
+            &[&key(0xa2)],
+        );
+        machine.observe(&a).unwrap();
+        machine.observe(&b).unwrap();
+        assert_eq!(machine.forked().unwrap().stable().tip(), stable.tip());
+        let forked = machine.forked().unwrap().clone();
+        let heads = forked.head_ids();
+        let stale_authority =
+            resolve_entry(&forked, heads[0], &heads, &[&key(0xa3), &key(0xa4)], 1);
+        assert_eq!(
+            machine.observe(&stale_authority).unwrap_err(),
+            Reject::InsufficientAuthorization
+        );
+        let valid = resolve_entry(
+            machine.forked().unwrap(),
+            heads[0],
+            &heads,
+            &[&key(0xb0), &key(0xb1)],
+            2,
+        );
+        machine
+            .observe(&valid)
+            .expect("updated recovery keys resolve");
+    }
+
+    #[test]
+    fn late_fork_retains_current_accepted_descendant_head() {
+        let (mut machine, _) = genesis_machine(2);
+        let genesis = machine.accepted().unwrap().clone();
+        let a1 = verified_entry(
+            &genesis,
+            grant_payload(principal(0xc0)),
+            &key(0xa0),
+            &[&key(0xa1)],
+        );
+        machine.observe(&a1).unwrap();
+        let state_a1 = machine.accepted().unwrap().clone();
+        let a2 = verified_entry(
+            &state_a1,
+            grant_payload(principal(0xc1)),
+            &key(0xa0),
+            &[&key(0xa1)],
+        );
+        machine.observe(&a2).unwrap();
+        let b1 = verified_entry(
+            &genesis,
+            grant_payload(principal(0xd0)),
+            &key(0xa1),
+            &[&key(0xa2)],
+        );
+        machine.observe(&b1).unwrap();
+        let heads = machine.forked().unwrap().head_ids();
+        assert!(heads.contains(&a2.id()));
+        assert!(heads.contains(&b1.id()));
+        assert!(!heads.contains(&a1.id()));
     }
 
     // ========================================================================
@@ -1221,13 +1297,49 @@ mod tests {
         (machine, heads)
     }
 
+    fn forked_machine_three_way_w2() -> (GovernanceMachine, Vec<GovernanceId>) {
+        let (mut machine, _) = genesis_machine(2);
+        let genesis = machine.accepted().unwrap().clone();
+        let a = verified_entry(
+            &genesis,
+            grant_payload(principal(0xc0)),
+            &key(0xa0),
+            &[&key(0xa1)],
+        );
+        let b = verified_entry(
+            &genesis,
+            grant_payload(principal(0xc1)),
+            &key(0xa1),
+            &[&key(0xa2)],
+        );
+        let c = verified_entry(
+            &genesis,
+            grant_payload(principal(0xc2)),
+            &key(0xa2),
+            &[&key(0xa0)],
+        );
+        machine.observe(&a).unwrap();
+        machine.observe(&b).unwrap();
+        assert_eq!(machine.observe(&c).unwrap_err(), Reject::UnresolvedFork);
+        let observation = machine
+            .ingest_branch_evidence(&c)
+            .expect("historical branch evidence is retained");
+        assert!(matches!(
+            observation,
+            GovernanceObservation::ForkDetected { .. }
+        ));
+        let heads = machine.forked().unwrap().head_ids();
+        assert_eq!(heads.len(), 3);
+        (machine, heads)
+    }
+
     #[test]
     fn fork_resolve_with_w_minus_one_signatures_is_insufficient() {
         let (mut machine, heads) = forked_machine_w2();
         let forked = machine.forked().unwrap().clone();
         // W=2; supply only 1 eligible recovery signer (signer 0xa3, no
         // approvers). Must reject with InsufficientAuthorization.
-        let resolve = resolve_entry(&forked, heads[0], heads.to_vec(), &[&key(0xa3)], 1);
+        let resolve = resolve_entry(&forked, heads[0], &heads, &[&key(0xa3)], 1);
         let before_evidence = machine.forked().unwrap().evidence().clone();
         let before_stable = machine.forked().unwrap().stable().clone();
         let before_audit = machine.audit();
@@ -1244,13 +1356,7 @@ mod tests {
         let (mut machine, heads) = forked_machine_w2();
         let forked = machine.forked().unwrap().clone();
         // W=2; supply 2 eligible recovery signers (signer 0xa3 + approver 0xa4).
-        let resolve = resolve_entry(
-            &forked,
-            heads[0],
-            heads.to_vec(),
-            &[&key(0xa3), &key(0xa4)],
-            1,
-        );
+        let resolve = resolve_entry(&forked, heads[0], &heads, &[&key(0xa3), &key(0xa4)], 1);
         let obs = machine.observe(&resolve).expect("W resolves");
         assert!(matches!(obs, GovernanceObservation::Advanced { .. }));
         // Resolved → linear; the accepted tip is the resolution entry.
@@ -1280,7 +1386,7 @@ mod tests {
         let resolve = resolve_entry(
             &forked,
             heads[0],
-            heads.to_vec(),
+            &heads,
             &[&key(0xa3), &key(0xa4), &key(0xa5)],
             1,
         );
@@ -1334,13 +1440,7 @@ mod tests {
         // is explicit, not hash order).
         let forked = machine.forked().unwrap().clone();
         let larger = *heads.iter().max().unwrap();
-        let resolve_larger = resolve_entry(
-            &forked,
-            larger,
-            heads.to_vec(),
-            &[&key(0xa3), &key(0xa4)],
-            1,
-        );
+        let resolve_larger = resolve_entry(&forked, larger, &heads, &[&key(0xa3), &key(0xa4)], 1);
         machine
             .observe(&resolve_larger)
             .expect("larger head selectable");
@@ -1349,13 +1449,8 @@ mod tests {
         let (mut machine2, heads2) = forked_machine_w2();
         let forked2 = machine2.forked().unwrap().clone();
         let smaller = *heads2.iter().min().unwrap();
-        let resolve_smaller = resolve_entry(
-            &forked2,
-            smaller,
-            heads2.to_vec(),
-            &[&key(0xa3), &key(0xa4)],
-            2,
-        );
+        let resolve_smaller =
+            resolve_entry(&forked2, smaller, &heads2, &[&key(0xa3), &key(0xa4)], 2);
         machine2
             .observe(&resolve_smaller)
             .expect("smaller head selectable");
@@ -1400,13 +1495,7 @@ mod tests {
         assert_ne!(seen_entries[0].0, seen_entries[1].0);
 
         // Resolve with W recovery signers, selecting heads[0].
-        let resolve = resolve_entry(
-            &forked,
-            heads[0],
-            heads.to_vec(),
-            &[&key(0xa3), &key(0xa4)],
-            7,
-        );
+        let resolve = resolve_entry(&forked, heads[0], &heads, &[&key(0xa3), &key(0xa4)], 7);
         machine.observe(&resolve).expect("resolves");
 
         // After resolution: the audit record preserves BOTH branches' evidence
@@ -1495,24 +1584,19 @@ mod tests {
         let mut bad_heads = heads.to_vec();
         bad_heads.push(GovernanceId::from_bytes([0xee; N]));
         bad_heads.sort();
-        let resolve = resolve_entry(&forked, heads[0], bad_heads, &[&key(0xa3), &key(0xa4)], 1);
+        let resolve = resolve_entry(&forked, heads[0], &bad_heads, &[&key(0xa3), &key(0xa4)], 1);
         let err = machine.observe(&resolve).unwrap_err();
         assert_eq!(err, Reject::MissingDependency);
     }
 
     #[test]
     fn fork_resolve_omitting_known_head_is_invalid() {
-        let (mut machine, heads) = forked_machine_w2();
+        let (mut machine, heads) = forked_machine_three_way_w2();
         let forked = machine.forked().unwrap().clone();
-        // Declare only heads[0] + a filler unknown → MissingDependency fires
-        // before set-equality (the unknown is reported first). Use a known-but-
-        // omitted scenario: declare heads but swap one for an unknown so the
-        // set differs but all-declared-known fails first.
-        let mut omitted = heads.to_vec();
-        omitted[1] = GovernanceId::from_bytes([0xee; N]); // unknown replacement
-        let resolve = resolve_entry(&forked, heads[0], omitted, &[&key(0xa3), &key(0xa4)], 1);
+        let resolve = resolve_entry(&forked, heads[0], &heads[..2], &[&key(0xa3), &key(0xa4)], 1);
         let err = machine.observe(&resolve).unwrap_err();
-        assert_eq!(err, Reject::MissingDependency);
+        assert_eq!(err, Reject::InvalidForkResolution);
+        assert_eq!(machine.forked().unwrap().head_ids(), heads);
     }
 
     #[test]
@@ -1550,18 +1634,12 @@ mod tests {
             selected_state_root: *selected.committed_state_root(),
             created_at_ms: 1,
         });
-        let marker = ResolvedForkMarker {
-            branch_heads: heads.to_vec(),
-            selected_head: heads[0],
-            selected_state_root: *selected.committed_state_root(),
-            created_at_ms: 1,
+        let state = match &payload {
+            GovernanceOperationPayload::ForkResolve(resolve) => {
+                apply_fork_resolve(selected.state(), resolve).expect("valid resolution payload")
+            }
+            _ => unreachable!(),
         };
-        let mut state = selected.state().clone();
-        state.policy.fork_markers.push(marker);
-        state
-            .policy
-            .fork_markers
-            .sort_by_key(|m| *m.selected_head.as_bytes());
         let declared = compute_state_root(&state);
         let body = GovernanceEntryBody {
             community_id: selected.state().community_id,
@@ -1664,13 +1742,7 @@ mod tests {
         let forked0 = machine0.forked().unwrap().clone();
         let mut heads0 = [a0.id(), b0.id()];
         heads0.sort();
-        let resolve0 = resolve_entry(
-            &forked0,
-            heads0[0],
-            heads0.to_vec(),
-            &[&key(0xa3), &key(0xa4)],
-            1,
-        );
+        let resolve0 = resolve_entry(&forked0, heads0[0], &heads0, &[&key(0xa3), &key(0xa4)], 1);
         let err = machine0.observe(&resolve0).unwrap_err();
         assert_eq!(err, Reject::InsufficientAuthorization);
     }
@@ -1684,13 +1756,7 @@ mod tests {
         let (mut machine, heads) = forked_machine_w2();
         let forked = machine.forked().unwrap().clone();
         // Two admins sign (not recovery keys).
-        let resolve = resolve_entry(
-            &forked,
-            heads[0],
-            heads.to_vec(),
-            &[&key(0xa0), &key(0xa1)],
-            1,
-        );
+        let resolve = resolve_entry(&forked, heads[0], &heads, &[&key(0xa0), &key(0xa1)], 1);
         let err = machine.observe(&resolve).unwrap_err();
         assert_eq!(err, Reject::InsufficientAuthorization);
     }
@@ -1703,17 +1769,8 @@ mod tests {
         let (mut machine, heads) = forked_machine_w2();
         let forked = machine.forked().unwrap().clone();
         // 0xa3 signs and also approves itself → still 1 distinct eligible.
-        let resolve = resolve_entry(
-            &forked,
-            heads[0],
-            heads.to_vec(),
-            &[&key(0xa3), &key(0xa3)],
-            1,
-        );
-        let err = machine.observe(&resolve);
-        // Note: duplicate approver is rejected at record construction
-        // (InvalidApproval) — so this surfaces as a verification error before
-        // reaching the machine. Either way, it must NOT authorize.
-        assert!(err.is_err(), "double-presenting signer must not authorize");
+        let resolve = resolve_entry(&forked, heads[0], &heads, &[&key(0xa3), &key(0xa3)], 1);
+        let err = machine.observe(&resolve).unwrap_err();
+        assert_eq!(err, Reject::InsufficientAuthorization);
     }
 }

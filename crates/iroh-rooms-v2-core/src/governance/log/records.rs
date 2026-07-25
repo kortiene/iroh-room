@@ -645,6 +645,9 @@ impl GovernanceEntry {
 ///   `entry.signer()` against the retained CSB.
 /// - [`Reject::NonCanonicalEncoding`] — typed re-encoding of the body
 ///   differs from the retained CSB (semantic canonicality).
+/// - Any strict body-decode error from [`decode_entry_csb`].
+/// - [`Reject::InvalidContent`] — the declared operation kind does not match
+///   the typed payload variant.
 pub fn verify_entry_crypto(entry: &GovernanceEntry) -> Result<GovernanceEntryBody, Reject> {
     let received = entry.csb();
     // Step 1: signature over the exact retained CSB (issue #178). No
@@ -658,7 +661,14 @@ pub fn verify_entry_crypto(entry: &GovernanceEntry) -> Result<GovernanceEntryBod
     if reencoded.as_slice() != received {
         return Err(Reject::NonCanonicalEncoding);
     }
-    Ok(entry.body().clone())
+    if entry.body().kind != entry.body().payload.kind() {
+        return Err(Reject::InvalidContent);
+    }
+    let decoded = decode_entry_csb(received)?;
+    if &decoded != entry.body() {
+        return Err(Reject::NonCanonicalEncoding);
+    }
+    Ok(decoded)
 }
 
 /// Verify an approval's signature over its **retained** canonical signed
@@ -841,7 +851,7 @@ fn _version_marker() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::model::Role;
-    use super::super::operation::{GovernanceOperationKind, MemberGrant};
+    use super::super::operation::{ForkResolve, GovernanceOperationKind, MemberGrant};
     use super::*;
     use crate::ids::ReplicaId;
     use crate::keys::SigningKey;
@@ -916,6 +926,42 @@ mod tests {
         // exact-CSB identity matches the typed-body identity (issue #178).
         assert_eq!(entry.csb(), entry_csb(entry.body()));
         assert_eq!(entry_id_from_csb(entry.csb()), entry_id(entry.body()));
+    }
+
+    #[test]
+    fn typed_kind_payload_mismatch_is_rejected() {
+        let mut body = sample_body();
+        let selected = GovernanceId::from_bytes([0x01; LEN]);
+        body.payload = GovernanceOperationPayload::ForkResolve(ForkResolve {
+            branch_heads: vec![selected, GovernanceId::from_bytes([0x02; LEN])],
+            selected_head: selected,
+            selected_state_root: StateRoot::from_bytes([0x44; LEN]),
+            created_at_ms: 2_000,
+        });
+        let entry = GovernanceEntry::new(body, &key(0xa0), Vec::new());
+        assert_eq!(
+            verify_governance_entry(&entry).err(),
+            Some(Reject::InvalidContent)
+        );
+    }
+
+    #[test]
+    fn locally_built_noncanonical_fork_resolve_is_rejected() {
+        let mut body = sample_body();
+        let low = GovernanceId::from_bytes([0x01; LEN]);
+        let high = GovernanceId::from_bytes([0x02; LEN]);
+        body.kind = GovernanceOperationKind::ForkResolve;
+        body.payload = GovernanceOperationPayload::ForkResolve(ForkResolve {
+            branch_heads: vec![high, low],
+            selected_head: low,
+            selected_state_root: StateRoot::from_bytes([0x44; LEN]),
+            created_at_ms: 2_000,
+        });
+        let entry = GovernanceEntry::new(body, &key(0xa0), Vec::new());
+        assert_eq!(
+            verify_governance_entry(&entry).err(),
+            Some(Reject::InvalidForkResolution)
+        );
     }
 
     #[test]

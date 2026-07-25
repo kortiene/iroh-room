@@ -561,7 +561,7 @@ pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<Governan
     next.policy.fork_markers.extend(kept_forks);
     next.policy
         .fork_markers
-        .sort_by_key(|m| *m.selected_head.as_bytes());
+        .sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
     Ok(next)
 }
 
@@ -595,7 +595,7 @@ pub fn apply_fork_resolve(
         });
     next.policy
         .fork_markers
-        .sort_by_key(|m| *m.selected_head.as_bytes());
+        .sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
     Ok(next)
 }
 

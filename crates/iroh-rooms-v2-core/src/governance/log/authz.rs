@@ -42,7 +42,7 @@ use crate::ids::{GovernanceId, PrincipalId, StateRoot};
 
 use super::genesis::{verify_genesis, GenesisConfig, GenesisSignature};
 use super::model::AdministratorState;
-use super::operation::GovernanceOperationKind;
+use super::operation::GovernanceOperationPayload;
 use super::records::{AuthenticatedGovernanceEvidence, VerifiedGovernanceEntry};
 use super::state::{
     apply, check_chain_link, compute_state_root, verify_state_root, GovernanceState,
@@ -300,7 +300,7 @@ fn validate_candidate(
 
     // `fork.resolve` must use the dedicated recovery validator, never the
     // ordinary admin-threshold path (spec §2.3 / §6.2).
-    if body.kind == GovernanceOperationKind::ForkResolve {
+    if matches!(body.payload, GovernanceOperationPayload::ForkResolve(_)) {
         return Err(Reject::InvalidForkResolution);
     }
 

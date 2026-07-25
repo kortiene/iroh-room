@@ -76,7 +76,7 @@ validate_and_apply_governance_entry(
 
 An ordinary candidate is valid only after checking the predecessor root/community, exact chain link, operation semantics, `W` distinct old administrators, and declared post-state root. Authorization reads the old state. The accepted-state wrapper is opaque but carries only one tip and no competing history.
 
-#148 intentionally treats the placeholder `fork.resolve` as an ordinary administrator-authorized operation. #149 must replace that behavior at the fork-aware boundary: a resolution is recovery-authorized, not administrator-authorized.
+Issue `#148` intentionally treats the placeholder `fork.resolve` as an ordinary administrator-authorized operation. #149 must replace that behavior at the fork-aware boundary: a resolution is recovery-authorized, not administrator-authorized.
 
 ### 2.4 Existing typed errors
 
@@ -1121,7 +1121,7 @@ None of these questions permits lexical, timestamp, or arrival-order auto-resolu
 
 ## 19. Implementation notes (post-landing)
 
-#149 landed exactly as designed in §5–§11. The new modules
+Issue `#149` landed exactly as designed in §5–§11. The new modules
 `governance/log/fork.rs` (the pure detection predicate + branch/fork evidence)
 and `governance/log/machine.rs` (the `GovernanceMachine` state machine, the
 `GovernanceLineage`, the recovery-threshold counter, the seven-rule

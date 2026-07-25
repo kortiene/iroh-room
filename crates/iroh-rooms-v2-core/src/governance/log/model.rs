@@ -395,32 +395,8 @@ impl ResolvedForkMarker {
             ],
             Reject::InvalidContent,
         )?;
-        let branch_heads = super::read_governance_id_array(entries, "branch_heads")?;
-        // Canonical invariants: at least two, sorted ascending, unique.
-        if branch_heads.len() < 2 {
-            return Err(Reject::InvalidContent);
-        }
-        let mut sorted = branch_heads.clone();
-        sorted.sort();
-        sorted.dedup();
-        if sorted.len() != branch_heads.len() {
-            // Duplicates present.
-            return Err(Reject::InvalidContent);
-        }
-        if sorted != branch_heads {
-            // Not sorted ascending.
-            return Err(Reject::InvalidContent);
-        }
-        let selected_head = super::read_governance_field(entries, "selected_head")?;
-        // selected_head must occur exactly once in branch_heads.
-        if branch_heads
-            .iter()
-            .filter(|id| **id == selected_head)
-            .count()
-            != 1
-        {
-            return Err(Reject::InvalidContent);
-        }
+        let (branch_heads, selected_head) =
+            super::read_canonical_branch_set(entries, Reject::InvalidContent)?;
         let selected_state_root = super::read_state_root_field(entries, "selected_state_root")?;
         let created_at_ms = super::read_uint_field(entries, "created_at_ms")?;
         Ok(Self {
@@ -460,10 +436,8 @@ impl CommunityPolicy {
 
     #[must_use]
     pub fn to_cbor(&self) -> CborValue {
-        // Sort fork markers deterministically by selected_head (canonical
-        // representation only; sorted position has no authorization meaning).
         let mut markers = self.fork_markers.clone();
-        markers.sort_by_key(|m| *m.selected_head.as_bytes());
+        markers.sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
         CborValue::Map(vec![
             (
                 "revoked_invites".to_owned(),
@@ -676,6 +650,28 @@ mod tests {
     fn role_round_trip() {
         assert_eq!(Role::parse("admin").unwrap(), Role::Admin);
         assert_eq!(Role::parse("bogus").err(), Some(Reject::InvalidContent));
+    }
+
+    #[test]
+    fn community_policy_marker_encoding_is_permutation_independent() {
+        let selected = GovernanceId::from_bytes([1; LEN]);
+        let marker_a = ResolvedForkMarker {
+            branch_heads: vec![selected, GovernanceId::from_bytes([2; LEN])],
+            selected_head: selected,
+            selected_state_root: StateRoot::from_bytes([3; LEN]),
+            created_at_ms: 10,
+        };
+        let marker_b = ResolvedForkMarker {
+            branch_heads: vec![selected, GovernanceId::from_bytes([4; LEN])],
+            selected_head: selected,
+            selected_state_root: StateRoot::from_bytes([5; LEN]),
+            created_at_ms: 20,
+        };
+        let mut first = CommunityPolicy::empty();
+        first.fork_markers = vec![marker_a.clone(), marker_b.clone()];
+        let mut second = CommunityPolicy::empty();
+        second.fork_markers = vec![marker_b, marker_a];
+        assert_eq!(first.to_cbor(), second.to_cbor());
     }
 
     #[test]

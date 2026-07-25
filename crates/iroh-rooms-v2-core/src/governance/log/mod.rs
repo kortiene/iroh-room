@@ -300,6 +300,32 @@ pub(super) fn read_governance_id_array(
         .collect()
 }
 
+pub(super) fn read_canonical_branch_set(
+    entries: &[(String, CborValue)],
+    reject: Reject,
+) -> Result<(Vec<GovernanceId>, GovernanceId), Reject> {
+    let branch_heads = read_governance_id_array(entries, "branch_heads")?;
+    if branch_heads.len() < 2 {
+        return Err(reject);
+    }
+    let mut sorted = branch_heads.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != branch_heads.len() || sorted != branch_heads {
+        return Err(reject);
+    }
+    let selected_head = read_governance_field(entries, "selected_head")?;
+    if branch_heads
+        .iter()
+        .filter(|id| **id == selected_head)
+        .count()
+        != 1
+    {
+        return Err(reject);
+    }
+    Ok((branch_heads, selected_head))
+}
+
 pub(super) fn read_marker_array(
     entries: &[(String, CborValue)],
     key: &str,

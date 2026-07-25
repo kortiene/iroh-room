@@ -214,22 +214,16 @@ pub fn detect_governance_forks<'a>(
             let mut branches: Vec<GovernanceBranchEvidence> =
                 seq_group.iter().map(|c| branch_from_candidate(c)).collect();
             branches.sort_by_key(|b| *b.head.as_bytes());
-            // Resolve the common ancestor across all of them via the first
-            // pair that yields one; if none can, the predicate cannot prove
-            // ancestry from the supplied set.
-            let mut common: Option<(GovernanceTip, StateRoot)> = None;
-            for i in 0..seq_group.len() {
-                for j in (i + 1)..seq_group.len() {
-                    if let Some(c) = common_ancestor_from_candidates(seq_group[i], seq_group[j]) {
-                        common = Some(c);
-                        break;
-                    }
-                }
-                if common.is_some() {
-                    break;
-                }
+            let predecessor_tip = seq_group[0].predecessor().tip();
+            if !seq_group
+                .iter()
+                .all(|candidate| candidate.predecessor().tip() == predecessor_tip)
+            {
+                return Err(Reject::MissingDependency);
             }
-            let (stable_tip, stable_state_root) = common.ok_or(Reject::MissingDependency)?;
+            let (stable_tip, stable_state_root) =
+                common_ancestor_from_candidates(seq_group[0], seq_group[1])
+                    .ok_or(Reject::MissingDependency)?;
             return Ok(Some(GovernanceForkEvidence {
                 community_id: group[0].community_id(),
                 stable_tip,
@@ -255,7 +249,7 @@ mod tests {
         entry_id, GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
         VerifiedGovernanceEntry,
     };
-    use crate::ids::{CommunityId, GovernanceId, PrincipalId, StateRoot, LEN as N};
+    use crate::ids::{PrincipalId, LEN as N};
     use crate::keys::SigningKey;
 
     fn key(seed: u8) -> SigningKey {
@@ -503,6 +497,22 @@ mod tests {
     }
 
     #[test]
+    fn set_form_requires_an_ancestor_common_to_every_branch() {
+        let genesis = genesis_state();
+        let parent_a = candidate(&genesis, principal(0xd0), &key(0xa0), &[&key(0xa1)]);
+        let parent_b = candidate(&genesis, principal(0xd1), &key(0xa1), &[&key(0xa2)]);
+        let left_parent = parent_a.resulting().clone();
+        let right_parent = parent_b.resulting().clone();
+        let a = candidate(&left_parent, principal(0xe0), &key(0xa0), &[&key(0xa1)]);
+        let b = candidate(&left_parent, principal(0xe1), &key(0xa1), &[&key(0xa2)]);
+        let c = candidate(&right_parent, principal(0xe2), &key(0xa2), &[&key(0xa0)]);
+        assert_eq!(
+            detect_governance_forks([&a, &b, &c]),
+            Err(Reject::MissingDependency)
+        );
+    }
+
+    #[test]
     fn set_form_dedupes_identical_ids() {
         let genesis = genesis_state();
         let a = candidate(&genesis, principal(0xc0), &key(0xa0), &[&key(0xa1)]);
@@ -519,10 +529,5 @@ mod tests {
         assert!(detect_governance_forks(std::slice::from_ref(&a))
             .unwrap()
             .is_none());
-        // Suppress unused warning for StateRoot/CommunityId/GovernanceId in
-        // this test module's import set.
-        let _ = CommunityId::from_bytes([0; N]);
-        let _ = GovernanceId::from_bytes([0; N]);
-        let _ = StateRoot::from_bytes([0; N]);
     }
 }

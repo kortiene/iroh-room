@@ -298,25 +298,8 @@ impl ForkResolve {
             ],
             Reject::InvalidForkResolution,
         )?;
-        let branch_heads = super::read_governance_id_array(entries, "branch_heads")?;
-        if branch_heads.len() < 2 {
-            return Err(Reject::InvalidForkResolution);
-        }
-        let mut sorted = branch_heads.clone();
-        sorted.sort();
-        sorted.dedup();
-        if sorted.len() != branch_heads.len() || sorted != branch_heads {
-            return Err(Reject::InvalidForkResolution);
-        }
-        let selected_head = super::read_governance_field(entries, "selected_head")?;
-        if branch_heads
-            .iter()
-            .filter(|id| **id == selected_head)
-            .count()
-            != 1
-        {
-            return Err(Reject::InvalidForkResolution);
-        }
+        let (branch_heads, selected_head) =
+            super::read_canonical_branch_set(entries, Reject::InvalidForkResolution)?;
         let selected_state_root = super::read_state_root_field(entries, "selected_state_root")?;
         let created_at_ms = super::read_uint_field(entries, "created_at_ms")?;
         Ok(Self {
