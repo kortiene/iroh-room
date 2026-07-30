@@ -4,7 +4,7 @@
 # initial-rust-sdk-surface.md` for the design rationale.
 [package]
 name = "iroh-rooms"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -26,9 +26,12 @@ workspace = true
 default = []
 # The online runtime tier (spec D3/D4): transport, sync engine, local store,
 # blob serve/fetch, live-pipe forwarding. Off by default so a default-features
-# consumer cannot even name an experimental type. Enables the gossip overlay so
-# the experimental online surface uses the same cap/topology pairing as the CLI.
-experimental = ["dep:iroh-rooms-net", "iroh-rooms-net/gossip_overlay", "iroh-rooms-core/sync", "dep:iroh"]
+# consumer cannot even name an experimental type. Does NOT enable the gossip
+# overlay, matching the shipped CLI: the overlay implies the 5 -> 40 cap raise,
+# whose Phase C gate is unmet (see the `iroh-rooms-net` dep comment in
+# `crates/iroh-rooms-cli/Cargo.toml`). A consumer that wants the overlay opts in
+# explicitly via `iroh-rooms-net/gossip_overlay`.
+experimental = ["dep:iroh-rooms-net", "iroh-rooms-core/sync", "dep:iroh"]
 # Diagnostic-only forwarding seam. A consumer must opt in explicitly; the
 # normal `experimental` and `full` features keep direct-capable networking.
 relay-only-test = ["experimental", "iroh-rooms-net/relay-only-test"]

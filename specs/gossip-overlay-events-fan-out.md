@@ -613,6 +613,30 @@ Run the existing test suites unchanged and green:
    rows, with the same cascade/connectedness/delivery rubric.
 4. The AC passes iff: no cascade at 1 event/s, connectedness >95%, delivery >95% at every N.
 
+> **Status 2026-07-30: the AC FAILS.** The matrix was run through the committed
+> harness for the first time (`crates/spike-N40/results/results-gossip.md`).
+> N=40 idle forms its bounded topology, but every load leg — 1 and 5 events/s,
+> at N=5 as well as N=40 — cascades on `connectedness_below_95pct_for_10s` +
+> `delivery_below_95pct_for_2_windows`, logging `gossip.mesh.spawn_failed`
+> ("timed out waiting to join the room events gossip topic") against the 5 s
+> `GOSSIP_JOIN_TIMEOUT`. A full-mesh control at N=5 / 1 event/s on the same
+> binary delivers 60/60 with no cascade, so the collapse is specific to the
+> gossip path. The figures that originally accompanied the Phase C cap raise
+> came from an uncommitted seed-only override and do not reproduce; N=10 and
+> N=20 were never run at all.
+>
+> Consequence: Phase C is **held back** in v0.1.0-rc.4 — the shipped CLI and
+> SDK no longer enable `gossip_overlay`, so binaries keep the full-mesh
+> topology and `MAX_ACTIVE_MEMBERS = 5`. Two things must be settled before it
+> returns: (a) whether the collapse is harness fidelity — loopback lacks the
+> address-discovery service the gossip dialer needs, which D1 already cites as
+> the reason Events delivery is dual-path — or a real defect in the overlay;
+> and (b) a Phase B re-run covering N=10/20/40 that actually passes the AC
+> above. Two harness defects block a literal re-run and must be fixed first:
+> the documented single-invocation matrix aborts after row 1 because
+> consecutive rows overlap ports, and the fixed ports sit inside the kernel
+> ephemeral range.
+
 ### Step 8 — Phase C: cap raise (only after Step 7 passes)
 
 1. Add `large_rooms` feature to `crates/iroh-rooms-core/Cargo.toml`; under the feature, set

@@ -7,6 +7,153 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+## 0.1.0-rc.4 - 2026-07-30
+
+- Landed a **bounded gossip overlay for `Events` fan-out** and a feature-gated
+  40-member ceiling, but **kept both out of the shipped binaries** (issues #171
+  and #173, `iroh-rooms-net` / `iroh-rooms-core`). The shipped CLI and this
+  façade's `experimental` feature no longer enable `gossip_overlay`, so this
+  release's runtime topology and active-member ceiling are **unchanged from
+  rc.3**: full mesh, `MAX_ACTIVE_MEMBERS = 5`. The reason is the project's own
+  gate. `specs/gossip-overlay-events-fan-out.md` Step 8 raises the cap "only
+  after Step 7 passes", and Step 7's acceptance criterion is "no cascade at
+  1 event/s, connectedness >95%, delivery >95% at every N". Re-running the
+  matrix through the committed spike-N40 harness measures the opposite — a
+  cascade at 1 event/s with both figures under 95%, at N=5 as well as N=40
+  (`crates/spike-N40/results/results-gossip.md`). The overlay code stays
+  compiled, tested under `--all-features`, and available to a consumer that
+  opts in explicitly via `iroh-rooms-net/gossip_overlay`; it is simply not what
+  a shipped binary runs. What the overlay does, for when it is re-enabled:
+  `Shared::route` broadcasts `SyncMessage::Events` on a
+  deterministic per-room `iroh-gossip` topic among admitted device keys whenever
+  a mesh is installed for the room; every pull/query variant stays on the
+  point-to-point per-peer queue, which relies on the per-link FIFO that gossip's
+  epidemic delivery does not provide. Delivery is deliberately **dual-path** —
+  an `Events` frame still lands on the destination peer's outbound queue when a
+  live writer exists, and the engine's `event_id` G-set dedup makes the doubled
+  delivery idempotent. The structural reject-before-bytes admission guarantee is
+  preserved: `GossipProtocolHandler` gates `GOSSIP_ALPN` with the same
+  `Arc<dyn Admission>` instance as the event plane and closes before the inner
+  gossip handler runs (threat-model row T26). `PeerManager::desired_seeds` bounds
+  each node to `GOSSIP_BOOTSTRAP_SEEDS` warm links instead of `N - 1`, and
+  `MAX_ACTIVE_MEMBERS` moves 5 → 40 behind the `large_rooms` core feature, valid
+  **only** when paired with `iroh-rooms-net/gossip_overlay`; a `const` assertion
+  in `iroh-rooms-net` pins the pairing at compile time (no-gossip builds must see
+  5, gossip builds must see 40), so a mismatched cap/topology build cannot link.
+  That assertion is what makes holding the overlay back a safe one-line change
+  rather than a risky one. No wire-format, canonical-CBOR, signature,
+  membership-fold, authorization, or `SQLite` schema change; `GOSSIP_ALPN` is an
+  additional ALPN, not a change to `EVENT_ALPN`, and it is not registered at all
+  in a build without the feature. **Upgrade note — mixed rc.3/rc.4 rooms:**
+  because the shipped topology and ceiling are unchanged, rc.3 and rc.4 peers
+  interoperate normally and no coordinated upgrade is required. Members may
+  upgrade one at a time.
+- Stopped fanning out live events to unproven provisional dialers (issue #121,
+  `iroh-rooms-net`): this closes the residual rc.3 shipped alongside the #112
+  capability-proof gate. An unproven provisional dialer reaching `Connected` no
+  longer enters the engine's peer set — its `engine.on_connect` is deferred until
+  its capability proof verifies or its accepted join upgrades it to a member — so
+  until then the engine never fans newly accepted events out to it, never
+  advertises the admin tip or heads to it, and never pulls from it. Previously
+  history was gated but chat published **while** an uninvited dialer stayed
+  connected during an open `room tail --accept-joins` window was still pushed to
+  it. Both orderings are handled: a proof processed first marks the device proven
+  so the `Connected` transition handshakes immediately, and a `Connected`
+  processed first parks the peer in the pump's deferred set, flushed on proof
+  verification and on join upgrade, dropped on disconnect. The e2e regression
+  seeds a worst-case attacker with a stale copy of the room log (so any leaked
+  push would fold cleanly and be visible) and asserts it receives nothing, with a
+  proven invitee connected alongside as positive control.
+- Guarded link teardown with a per-device **connection generation** (issue #126,
+  `iroh-rooms-net`): per-device provisional/proven marks, outbound writers, and
+  peer-table state were mutated by per-connection accept/dial tasks carrying no
+  link identity, so a superseded link's late close clobbered its successor. On a
+  double-connect this was a join-bootstrap **gate bypass** — an unproven
+  provisional dialer holding `conn1` opens `conn2` and closes `conn1`, whose
+  `clear_provisional` races the pump between clearing the mark and unregistering
+  `conn1`'s writer, leaving `conn2` live but no longer marked provisional and
+  therefore served un-gated. Each registered link is now stamped with a monotonic
+  per-device generation (`Shared::register_link`) and teardown is a
+  compare-and-swap (`Shared::teardown_if_current`) that clears state only while
+  the link is still the device's current generation; the bump and the provisional
+  mark are set in one critical section under the generations lock. Generations
+  are never reset or pruned per device, so an ABA stamp reuse cannot let a
+  long-superseded teardown clobber a same-numbered successor. The manager's
+  deauthorize path keeps its unconditional unregister — a forced roster teardown
+  is correct regardless of generation.
+- Stopped stale dial loops from stomping live links (issue #136,
+  `iroh-rooms-net`): after a peer rebinds to a new UDP port under the same device
+  key, the remote's stale-address dial loop redials the dead address indefinitely,
+  and its unguarded backoff-tick writes overwrote the peer-table entry of a device
+  whose newer **inbound** link was alive and carrying data — observed as a peer
+  reading connected with path `none` for minutes while data flowed. #126 guarded
+  established-link teardown but left four non-terminal dial-loop paths unguarded
+  (top-of-iteration `Connecting`, the `AdmitProvisional` backoff, the
+  `Established::Failed` stream-open error, and the primary defect, the
+  failed-connect `set_offline(Unreachable)`). New `Shared::set_offline_if_no_link`
+  / `set_connecting_if_no_link` perform check-and-set under the same generations
+  lock `register_link` takes, reading liveness from the per-device outbound-queue
+  map, so a concurrent link registration fully serializes against the guard. The
+  audit calls on the failed-connect and `Established::Failed` arms are gated on
+  the guard's return so no spurious offline audit fires while a live link carries
+  data; the two terminal `Unauthorized` paths stay unguarded as deliberate
+  terminal states.
+- Retried failed store inserts instead of losing accepted events (issue #119,
+  `iroh-rooms-core`): `store_and_fanout` logged and returned when `store.insert`
+  failed, but the membership fold had already committed the `Accepted` verdict, so
+  fold and store disagreed for the rest of the session and later descendants
+  persisted above a permanently missing parent. The accepted `ValidatedEvent` is
+  now queued and retried once per `on_tick`; a landed retry runs the full deferred
+  accept bookkeeping through the new `apply_insert_outcome` shared with the direct
+  path, and the store's insert-time lamport propagation re-places descendants
+  stored above the hole, healing it locally with no peer involved. Nothing is
+  fanned out or fed to subscribers until the event is actually servable. The retry
+  is bounded on both axes (`store_retry_attempts` per event and
+  `max_store_retry_total` queued events, both validated non-zero); exhaustion or
+  overflow abandons the event with a logged, counted drop and a CRITICAL
+  `store_degraded` `TrustDecision` that survives restart.
+- Made three silent anti-amplification cliffs observable (`iroh-rooms-core`):
+  exceeding `max_backfill_depth`, `max_parked_total`, or
+  `max_unconfirmed_tip_attempts` permanently lost events or weakened a security
+  property while every connectivity signal still read healthy — a measurement
+  caught a node stranded 773.6 s reporting `peers=24, accepted=0` with flat RSS
+  and nothing to point an operator at it. Each now records a CRITICAL
+  `TrustDecision` on the same path #119 uses for `store_degraded`:
+  `backfill_depth_exceeded` (a chain gap deeper than the chase bound, thereafter
+  unrecoverable through backfill), `park_overflow` (oldest-first eviction of a
+  parked frame), and `admin_tip_expired` — the most serious, because clearing the
+  suspicion unconditionally on reaching zero attempts was a fail-**open** of the
+  removal-sensitive access gate; it also bumps a new `suspect_tip_expired`
+  counter. **No constant value changed** — raising these bounds would move the
+  cliff rather than remove it. The two hot, floodable paths latch their CRITICAL
+  record to the first occurrence per session and let the counter carry ongoing
+  volume, so a fabricated deep chain or park flood cannot turn the audit sink into
+  its own denial of service; the per-event log line still names every dropped id.
+  All three codes round-trip `trust_row_to_decision`, so they survive a restart.
+- Recorded capability-proof outcomes in the CLI's local audit sink (issue #122,
+  `iroh-rooms-cli`): #112 added `bootstrap_capability_proven` /
+  `bootstrap_capability_rejected` as default-no-op `AuditSink` hooks overridden
+  only by `TracingAudit`, and the CLI installs no tracing subscriber — so in the
+  shipped binary a proof accept or reject produced no audit record at all, when a
+  *rejected* proof (someone probing an open join window with a bad or replayed
+  invite secret) is exactly what the local trail exists for. `LocalAudit` now
+  overrides both hooks with `join.bootstrap.capability_proven` /
+  `join.bootstrap.capability_rejected` ndjson lines in the established
+  `{ts_ms, event, peer}` shape carrying the public peer id only — never any part
+  of the proof — with a line-contract test asserting no `invite_id` or secret
+  appears in any spelling. `StderrAudit` renders the reject as the established
+  `warning[<code>]:` line and the accept as an informational note.
+- Enforced the active-member ceiling in the fold and made anti-entropy adaptive
+  (issue #137, `iroh-rooms-core` / `iroh-rooms-net`): the documented ceiling was
+  previously unenforced, so an oversized room silently collapsed rather than
+  failing closed. The fold now returns a `room_full` reject — the 15th rejection
+  reason, with error taxonomy and conformance tests updated — when a
+  not-currently-active subject joins a room already at `MAX_ACTIVE_MEMBERS`, and
+  sync anti-entropy ticks became adaptive so a converged mesh quiesces. This
+  entry's original frame-count-bounded event-plane queues were superseded within
+  this same unreleased window by the byte-bounded queues below (issue #141), and
+  its `MAX_ACTIVE_MEMBERS = 5` ceiling by the gossip-backed 40 above (issue #173);
+  the `room_full` reject and the adaptive tick are what reach rc.4.
 - Converted the v1 event-plane queues from frame-count-bounded to
   **byte-bounded priority queues** (issue #141, `iroh-rooms-net` + a CLI
   diagnostic wording pass): the inbound sink and the per-peer outbound queue
@@ -75,8 +222,9 @@ where feasible); the **experimental** tier may change on any release.
   `iroh-rooms-core` / `iroh-rooms-net` / `iroh-rooms-cli`): no-gossip/full-mesh
   builds keep the original hard `MAX_ACTIVE_MEMBERS = 5` cap and its
   `RejectReason::RoomFull` reject, while the `large_rooms` core feature raises
-  the cap to 40 only when paired with `iroh-rooms-net/gossip_overlay` (enabled by
-  the CLI and the experimental SDK). The re-exported `MembershipSnapshot` gains
+  the cap to 40 only when paired with `iroh-rooms-net/gossip_overlay` — which
+  the shipped CLI and the experimental SDK do **not** enable in this release, so
+  shipped binaries observe the cap of 5. The re-exported `MembershipSnapshot` gains
   two additive, side-effect-free methods — `active_member_limit() -> usize`
   (returns the compiled `MAX_ACTIVE_MEMBERS`) and
   `active_member_headroom() -> usize` (`limit.saturating_sub(active_count)`) —

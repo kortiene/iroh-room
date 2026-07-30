@@ -68,6 +68,14 @@ release-noted together with its mixed-version behavior, including any convergenc
 whether a coordinated upgrade is required (precedents: PR #111 and issue #113, both of which
 shipped mandatory-upgrade notes because mixed-version rooms degrade past a size threshold).
 
+A change that would trip this rule may also be held back rather than release-noted. v0.1.0-rc.4
+did exactly that: the gossip `Events` overlay and the paired 5 -> 40 active-member ceiling raise
+(issues #171 and #173) are compiled but not enabled in shipped binaries, so that candidate makes
+no `SyncMessage`-semantics or topology change at all and needs no coordinated upgrade. Whenever
+the overlay is enabled for a shipped build, the mixed-version note becomes mandatory: a peer
+built without the raised cap hard-rejects the sixth `member.joined` with `RoomFull` and its
+membership projection diverges permanently.
+
 Allowed without schema bump:
 
 - New tests.

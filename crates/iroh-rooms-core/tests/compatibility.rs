@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use iroh_rooms_core::event::{
     build_agent_status, build_file_shared, build_member_invited, build_member_joined,
     build_message_text, build_pipe_closed, build_pipe_opened, build_room_created, capability_hash,
-    validate_wire_bytes, DeviceBinding, EventId, EventType, HashRef, IdentityKey, RoomId,
+    validate_wire_bytes, Content, DeviceBinding, EventId, EventType, HashRef, IdentityKey, RoomId,
     SignedEvent, SigningKey, ValidatedEvent, ValidationContext, WireEvent,
 };
 use iroh_rooms_core::membership::{Role, RoomMembership, Status};
@@ -20,6 +20,28 @@ use rusqlite::{params, Connection};
 
 const EVENTS_FIXTURE: &str = include_str!("fixtures/v1/events.txt");
 const V1_STORE_SCHEMA: &str = include_str!("fixtures/v1/store_v1_schema.sql");
+const V1_EVENTS_PATH: &str = "fixtures/v1/events.txt";
+
+/// Previous-candidate (v0.1.0-rc.3) data-continuity fixture — P0.7.
+///
+/// These bytes were written by the *published* rc.3 binary driving the
+/// documented CLI flow, not regenerated from fixed seeds, so there is
+/// deliberately no `*_matches_regenerated_source` oracle for them: the rc.3
+/// keys were random and the fixture file is the only artifact.
+const RC3_EVENTS_FIXTURE: &str = include_str!("fixtures/rc3/events.txt");
+const RC3_STORE_SCHEMA: &str = include_str!("fixtures/rc3/store_rc3_schema.sql");
+const RC3_EVENTS_PATH: &str = "fixtures/rc3/events.txt";
+
+/// `(label, lamport, admin_seq)` exactly as the rc.3 binary recorded them in its
+/// own `rooms.db` derived cache. The current store must re-derive these values
+/// unchanged, otherwise an rc.3 -> rc.4 upgrade would silently reorder history.
+const RC3_DERIVED_CACHE: [(&str, u64, u64); 5] = [
+    ("E_CREATE", 0, 0),
+    ("E_MESSAGE_1", 1, 1),
+    ("E_MESSAGE_2", 2, 2),
+    ("E_MESSAGE_3", 3, 3),
+    ("E_INVITE_BOB", 4, 4),
+];
 
 const T0: u64 = 1_750_000_000_000;
 const ROOM_NONCE: [u8; 16] = [
@@ -295,9 +317,9 @@ fn generated_v1_fixture_source() -> Vec<GeneratedFixtureRecord> {
     ]
 }
 
-fn parse_raw_event_fixture() -> Vec<RawFixtureRecord> {
+fn parse_raw_event_fixture(fixture: &str, path: &str) -> Vec<RawFixtureRecord> {
     let mut records = Vec::new();
-    for (line_idx, line) in EVENTS_FIXTURE.lines().enumerate() {
+    for (line_idx, line) in fixture.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -307,15 +329,11 @@ fn parse_raw_event_fixture() -> Vec<RawFixtureRecord> {
         assert_eq!(
             columns.len(),
             4,
-            "fixtures/v1/events.txt:{} must use label|event_type|event_id|wire_hex",
+            "{path}:{} must use label|event_type|event_id|wire_hex",
             line_idx + 1
         );
-        let wire = hex::decode(columns[3]).unwrap_or_else(|err| {
-            panic!(
-                "fixtures/v1/events.txt:{} has invalid wire hex: {err}",
-                line_idx + 1
-            )
-        });
+        let wire = hex::decode(columns[3])
+            .unwrap_or_else(|err| panic!("{path}:{} has invalid wire hex: {err}", line_idx + 1));
         records.push(RawFixtureRecord {
             line: line_idx + 1,
             label: columns[0].to_owned(),
@@ -326,59 +344,67 @@ fn parse_raw_event_fixture() -> Vec<RawFixtureRecord> {
     }
     assert!(
         !records.is_empty(),
-        "fixtures/v1/events.txt must contain at least one event"
+        "{path} must contain at least one event"
     );
     records
 }
 
-fn decode_fixture_records() -> Vec<FixtureRecord> {
-    parse_raw_event_fixture()
+/// Read the `# room_id=<named>` header a fixture file declares about itself.
+fn fixture_header_room_id(fixture: &str, path: &str) -> RoomId {
+    let raw = fixture
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# room_id=").map(str::to_owned))
+        .unwrap_or_else(|| panic!("{path} must declare a `# room_id=` header"));
+    raw.parse()
+        .unwrap_or_else(|err| panic!("{path} has an unparseable room_id header: {err}"))
+}
+
+fn decode_fixture_records_from(fixture: &str, path: &str, room: RoomId) -> Vec<FixtureRecord> {
+    parse_raw_event_fixture(fixture, path)
         .into_iter()
         .map(|raw| {
             let wire = WireEvent::decode(&raw.wire).unwrap_or_else(|err| {
                 panic!(
-                    "fixtures/v1/events.txt:{} ({}) does not decode as WireEvent: {err:?}",
+                    "{path}:{} ({}) does not decode as WireEvent: {err:?}",
                     raw.line, raw.label
                 )
             });
             let event = SignedEvent::decode(&wire.signed).unwrap_or_else(|err| {
                 panic!(
-                    "fixtures/v1/events.txt:{} ({}) signed bytes do not decode: {err:?}",
+                    "{path}:{} ({}) signed bytes do not decode: {err:?}",
                     raw.line, raw.label
                 )
             });
-            let validated = validate_wire_bytes(&raw.wire, &ValidationContext::for_room(room_id()))
+            let validated = validate_wire_bytes(&raw.wire, &ValidationContext::for_room(room))
                 .unwrap_or_else(|err| {
                     panic!(
-                        "fixtures/v1/events.txt:{} ({}) fails stateless validation: {err:?}",
+                        "{path}:{} ({}) fails stateless validation: {err:?}",
                         raw.line, raw.label
                     )
                 });
             assert_eq!(
-                event.room_id,
-                room_id(),
-                "fixtures/v1/events.txt:{} ({}) must belong to the v1 fixture room",
-                raw.line,
-                raw.label
+                event.room_id, room,
+                "{path}:{} ({}) must belong to the fixture room",
+                raw.line, raw.label
             );
             assert_eq!(
                 validated.wire.to_bytes(),
                 raw.wire,
-                "fixtures/v1/events.txt:{} ({}) must preserve wire bytes exactly",
+                "{path}:{} ({}) must preserve wire bytes exactly",
                 raw.line,
                 raw.label
             );
             assert_eq!(
                 validated.event_id.to_named_string(),
                 raw.event_id,
-                "fixtures/v1/events.txt:{} ({}) event_id must match BLAKE3(wire.signed)",
+                "{path}:{} ({}) event_id must match BLAKE3(wire.signed)",
                 raw.line,
                 raw.label
             );
             assert_eq!(
                 validated.event.event_type.as_str(),
                 raw.event_type,
-                "fixtures/v1/events.txt:{} ({}) event_type must match decoded event",
+                "{path}:{} ({}) event_type must match decoded event",
                 raw.line,
                 raw.label
             );
@@ -391,6 +417,27 @@ fn decode_fixture_records() -> Vec<FixtureRecord> {
             }
         })
         .collect()
+}
+
+fn decode_fixture_records() -> Vec<FixtureRecord> {
+    decode_fixture_records_from(EVENTS_FIXTURE, V1_EVENTS_PATH, room_id())
+}
+
+fn rc3_room_id() -> RoomId {
+    fixture_header_room_id(RC3_EVENTS_FIXTURE, RC3_EVENTS_PATH)
+}
+
+fn decode_rc3_fixture_records() -> Vec<FixtureRecord> {
+    decode_fixture_records_from(RC3_EVENTS_FIXTURE, RC3_EVENTS_PATH, rc3_room_id())
+}
+
+/// The rc.3 room's single immutable admin: the genesis `room.created` signer.
+fn rc3_admin_id(records: &[FixtureRecord]) -> IdentityKey {
+    let genesis = records
+        .iter()
+        .find(|record| record.validated.event.event_type == EventType::RoomCreated)
+        .expect("rc.3 fixture must contain room.created");
+    genesis.validated.event.sender_id
 }
 
 fn validated_events(records: &[FixtureRecord]) -> Vec<ValidatedEvent> {
@@ -495,7 +542,7 @@ fn v1_sqlite_fixture_migrates_to_current_schema_and_rebuilds() {
         let conn = Connection::open(&db_path).expect("open v1 db");
         conn.execute_batch(V1_STORE_SCHEMA)
             .expect("apply v1 schema");
-        insert_v1_fixture_rows(&conn, &records);
+        insert_fixture_rows(&conn, &records, alice_id());
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read v1 user_version");
@@ -572,6 +619,175 @@ fn v1_fixture_file_matches_regenerated_source() {
 }
 
 #[test]
+fn rc3_wire_fixture_decodes_validates_and_folds_current_snapshot() {
+    let records = decode_rc3_fixture_records();
+    let labels_and_types: Vec<_> = records
+        .iter()
+        .map(|record| (record.label.as_str(), record.event_type.as_str()))
+        .collect();
+    assert_eq!(
+        labels_and_types,
+        [
+            ("E_CREATE", "room.created"),
+            ("E_MESSAGE_1", "message.text"),
+            ("E_MESSAGE_2", "message.text"),
+            ("E_MESSAGE_3", "message.text"),
+            ("E_INVITE_BOB", "member.invited"),
+        ]
+    );
+
+    let admin = rc3_admin_id(&records);
+    let membership = RoomMembership::from_events(rc3_room_id(), validated_events(&records));
+    let snapshot = membership.snapshot();
+    assert_eq!(snapshot.status(&admin), Some(Status::Active));
+    assert_eq!(snapshot.role(&admin), Some(Role::Admin));
+    assert_eq!(
+        snapshot.active_members().count(),
+        1,
+        "rc.3 fixture room has exactly one active member (the admin)"
+    );
+
+    // The invitee never redeemed the ticket, so rc.3 history must still project
+    // as Invited under the current membership fold — not Active, not dropped.
+    let invited = records
+        .iter()
+        .find(|record| record.label == "E_INVITE_BOB")
+        .and_then(|record| match &record.validated.event.content {
+            Content::MemberInvited(content) => Some(content.invitee_key),
+            _ => None,
+        })
+        .expect("rc.3 fixture must contain member.invited");
+    assert_ne!(invited, admin, "the invitee is not the admin");
+    assert_eq!(snapshot.status(&invited), Some(Status::Invited));
+    assert_eq!(snapshot.role(&invited), Some(Role::Member));
+}
+
+#[test]
+fn rc3_wire_fixture_imports_into_current_store_byte_for_byte() {
+    let records = decode_rc3_fixture_records();
+    let mut store = EventStore::open_in_memory().expect("open in-memory store");
+    let stats = store
+        .insert_all(&validated_events(&records))
+        .expect("insert rc.3 fixture");
+    assert_eq!(stats.inserted, records.len() as u64);
+    assert_eq!(stats.duplicate, 0);
+    assert_eq!(
+        store.count(&rc3_room_id()).expect("count room"),
+        records.len() as u64
+    );
+
+    for record in &records {
+        let stored = store
+            .get(&record.validated.event_id)
+            .expect("store get")
+            .unwrap_or_else(|| panic!("missing stored event {}", record.label));
+        assert_eq!(stored.event_id.to_named_string(), record.event_id);
+        assert_eq!(stored.event_type.as_str(), record.event_type);
+        assert_eq!(stored.wire.to_bytes(), record.wire);
+    }
+
+    for (ty, expected) in [
+        (EventType::RoomCreated, 1),
+        (EventType::MessageText, 3),
+        (EventType::MemberInvited, 1),
+    ] {
+        assert_eq!(
+            store
+                .by_type(&rc3_room_id(), ty)
+                .unwrap_or_else(|err| panic!("by_type({}) failed: {err}", ty.as_str()))
+                .len(),
+            expected,
+            "{} count must remain compatible",
+            ty.as_str()
+        );
+    }
+
+    let tail = store
+        .room_tail(&rc3_room_id(), fixture_limit(records.len()))
+        .expect("room tail");
+    assert_eq!(tail.len(), records.len());
+}
+
+#[test]
+fn rc3_sqlite_fixture_opens_under_current_schema_without_migration() {
+    let records = decode_rc3_fixture_records();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("iroh-rooms-rc3-fixture.sqlite");
+
+    {
+        let conn = Connection::open(&db_path).expect("open rc.3 db");
+        conn.execute_batch(RC3_STORE_SCHEMA)
+            .expect("apply rc.3 schema");
+        let derived = insert_fixture_rows(&conn, &records, rc3_admin_id(&records));
+
+        // rc.3 already shipped schema v2 with the sync-cache tables present.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read rc.3 user_version");
+        assert_eq!(version, 2, "rc.3 stores are already schema v2");
+        assert_eq!(
+            count_v2_tables(&conn),
+            5,
+            "rc.3 fixture must start WITH the v2 sync-cache tables"
+        );
+
+        // The derived cache the current code computes must equal what rc.3 wrote.
+        let expected: Vec<_> = RC3_DERIVED_CACHE
+            .iter()
+            .map(|(label, lamport, admin_seq)| {
+                ((*label).to_owned(), Some(*lamport), Some(*admin_seq))
+            })
+            .collect();
+        assert_eq!(
+            derived, expected,
+            "current code must re-derive rc.3's recorded (lamport, admin_seq) cache"
+        );
+    }
+
+    {
+        let mut store = EventStore::open(&db_path).expect("open rc.3 fixture under current schema");
+        assert_eq!(
+            store.count(&rc3_room_id()).expect("count rc.3 room"),
+            records.len() as u64
+        );
+        assert_eq!(
+            store
+                .room_tail(&rc3_room_id(), fixture_limit(records.len()))
+                .expect("rc.3 room tail")
+                .len(),
+            records.len()
+        );
+        store.rebuild().expect("rebuild rc.3 fixture");
+        assert_eq!(
+            store
+                .room_tail(&rc3_room_id(), fixture_limit(records.len()))
+                .expect("rebuilt rc.3 room tail")
+                .len(),
+            records.len()
+        );
+    }
+
+    let conn = Connection::open(&db_path).expect("reopen rc.3 db");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read rc.3 user_version after open");
+    assert_eq!(
+        version, 2,
+        "opening rc.3 data must not bump user_version (no rc.3 -> rc.4 migration)"
+    );
+    for table in [
+        "sync_state",
+        "sync_backfill_tokens",
+        "sync_parked",
+        "sync_parked_missing",
+        "trust_decisions",
+    ] {
+        assert_table_exists_empty(&conn, table);
+    }
+    assert_fixture_wires_preserved(&conn, &records);
+}
+
+#[test]
 #[ignore = "fixture regeneration utility; run explicitly with --ignored --nocapture"]
 fn zzz_harvest_v1_fixture() {
     println!("# Iroh Rooms v1 compatibility event fixture");
@@ -588,10 +804,17 @@ fn zzz_harvest_v1_fixture() {
     }
 }
 
-fn insert_v1_fixture_rows(conn: &Connection, records: &[FixtureRecord]) {
+/// Seed a fixture's rows into an already-created legacy schema, deriving the
+/// `(lamport, admin_seq)` cache the way the store does. Returns the derived
+/// pairs per label so callers can pin them against a recorded candidate.
+fn insert_fixture_rows(
+    conn: &Connection,
+    records: &[FixtureRecord],
+    admin: IdentityKey,
+) -> Vec<(String, Option<u64>, Option<u64>)> {
     let mut lamports: BTreeMap<EventId, u64> = BTreeMap::new();
     let mut admin_seqs: BTreeMap<EventId, u64> = BTreeMap::new();
-    let admin = alice_id();
+    let mut derived = Vec::new();
 
     for record in records {
         let event = &record.validated.event;
@@ -643,7 +866,10 @@ fn insert_v1_fixture_rows(conn: &Connection, records: &[FixtureRecord]) {
         if let Some(value) = admin_seq {
             admin_seqs.insert(record.validated.event_id, value);
         }
+        derived.push((record.label.clone(), lamport, admin_seq));
     }
+
+    derived
 }
 
 fn derived_lamport(
