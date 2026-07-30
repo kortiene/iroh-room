@@ -10,7 +10,7 @@ rust-version.workspace = true
 # re-exported from the SDK in this phase. Runtime/store/network crates may wire to
 # it through separate, later issues.
 publish = false
-description = "Pure v2 crypto core: canonical CBOR, BLAKE3/Ed25519 identifiers, governance state machine, fork detection, Merkle map. No network, no store, no async."
+description = "Pure v2 crypto core: canonical CBOR, BLAKE3/Ed25519 identifiers, governance state machine, fork detection, sorted Merkle map. No network, no store, no async."
 
 [lib]
 path = "src/lib.rs"
@@ -37,6 +37,10 @@ zeroize = "1"
 # `generate()` parameter-free so the public surface is not coupled to a rand
 # version. Dev vectors use seed-derived keys (`from_seed`), never `generate()`.
 getrandom = "0.4"
+
+[[bench]]
+name = "member_merkle"
+harness = false
 
 [dev-dependencies]
 # Deterministic seed-derived test keys (spec §11 / §12: vectors use non-secret

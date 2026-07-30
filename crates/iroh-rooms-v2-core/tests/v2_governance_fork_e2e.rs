@@ -44,7 +44,7 @@
 
 use iroh_rooms_v2_core::domain;
 use iroh_rooms_v2_core::governance::log::{
-    apply, compute_state_root, entry_csb, entry_id, verify_governance_entry,
+    apply_entry, compute_state_root, entry_csb, entry_id, verify_governance_entry,
     AuthenticatedGovernanceEvidence, CommunityPolicy, ForkResolve, RecoveryConfig,
     VerifiedGovernanceEntry,
 };
@@ -60,6 +60,7 @@ use iroh_rooms_v2_core::governance::log::{
 };
 use iroh_rooms_v2_core::ids::{GovernanceId, PrincipalId, LEN as N};
 use iroh_rooms_v2_core::keys::{verify, Signature, SigningKey, SIGNATURE_LEN};
+use iroh_rooms_v2_core::member::{MemberMapProjection, ProjectionUpdate};
 use iroh_rooms_v2_core::Reject;
 
 // ============================================================================
@@ -204,10 +205,12 @@ fn grant_verified(
 ) -> VerifiedGovernanceEntry {
     let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: member,
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let (seq, prev_id) = next_link(prev);
-    let declared = compute_state_root(&apply(prev.state(), &payload).expect("payload applies"));
+    let declared =
+        compute_state_root(&apply_entry(prev.state(), seq, &payload).expect("payload applies"));
     let body = GovernanceEntryBody {
         community_id: prev.state().community_id,
         seq,
@@ -264,6 +267,7 @@ fn resolve_verified(
         created_at_ms,
     };
     let mut resolved_state = selected.state().clone();
+    resolved_state.accepted_seq = seq;
     resolved_state.policy.fork_markers.push(marker);
     resolved_state
         .policy
@@ -445,6 +449,8 @@ fn e2e_fork_resolve_w_minus_one_rejected_and_w_resolves_over_wire() {
     let forked = machine.forked().expect("forked").clone();
     let resolve_w1 = resolve_verified(&forked, heads[0], heads.to_vec(), &[&key(RECOV_R_SEED)], 1);
 
+    let projection_prior = machine.forked().expect("forked").projection_prior().clone();
+    let mut projection = MemberMapProjection::from_validated_state(&projection_prior).unwrap();
     let before_evidence = machine.forked().expect("forked").evidence().clone();
     let before_stable = machine.forked().expect("forked").stable().clone();
     let before_audit = machine.audit();
@@ -466,10 +472,24 @@ fn e2e_fork_resolve_w_minus_one_rejected_and_w_resolves_over_wire() {
         &[&key(RECOV_R_SEED), &key(RECOV_S_SEED)],
         2,
     );
-    let obs = machine.observe(&resolve_w).expect("W resolves the fork");
+    let (obs, transition) = machine
+        .observe_committed(&resolve_w)
+        .expect("W resolves the fork");
     assert!(
         is_advanced(&obs),
         "a successful resolution advances the tip"
+    );
+    let transition = transition.expect("resolution emits a committed transition");
+    let projection_update = projection.apply_committed(&transition).unwrap();
+    assert!(matches!(
+        projection_update,
+        ProjectionUpdate::Synchronized { .. }
+    ));
+    assert_eq!(
+        projection.root(),
+        MemberMapProjection::from_validated_state(transition.next())
+            .unwrap()
+            .root()
     );
 
     // Resolved → linear; the accepted tip is the exact-CSB id of the

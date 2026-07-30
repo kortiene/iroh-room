@@ -46,7 +46,8 @@
 //! - **OQ-4 (state root):** the state root commits to accepted governance state
 //!   *and* unresolved fork evidence (spec §11: "commits to all state that affects
 //!   authorization").
-//! - **OQ-7 (Merkle map):** the sparse BLAKE3 Merkle map of spec D7.
+//! - **OQ-7 (Merkle map):** the #134 §8.2 raw-identity-sorted BLAKE3 tree;
+//!   legacy sparse vectors remain isolated under `member::legacy`.
 //! - **OQ-8 (content registry):** the registry in the sibling spec
 //!   `content-and-moderation-event-schemas.md` §4 D1 (named as the nearest local
 //!   planning input by spec D8 / §14 assumption 4).

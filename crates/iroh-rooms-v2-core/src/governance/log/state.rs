@@ -22,8 +22,8 @@ use super::model::{
 };
 use super::operation::{
     AdminSet, DeviceGrant, DeviceRevoke, GovernanceOperationPayload, InviteRevoke, MemberGrant,
-    MemberRevoke, MigrationAccept, PolicySet, RecoverySet, ReplicaSet, StreamArchive, StreamCreate,
-    StreamPolicySet,
+    MemberRevoke, MemberRoleSet, MigrationAccept, PolicySet, RecoverySet, ReplicaSet,
+    StreamArchive, StreamCreate, StreamPolicySet,
 };
 use super::records::GovernanceEntryBody;
 
@@ -37,6 +37,8 @@ use super::records::GovernanceEntryBody;
 pub struct GovernanceState {
     /// The community this state belongs to.
     pub community_id: CommunityId,
+    /// The most recently accepted post-genesis governance sequence.
+    pub accepted_seq: u64,
     /// §7.1 component 1: administrators + threshold.
     pub administrators: AdministratorState,
     /// §7.1 component 2: recovery configuration.
@@ -63,9 +65,12 @@ impl GovernanceState {
                 *admin,
                 MemberRecord {
                     member_id: *admin,
-                    role: Role::Admin,
+                    roles: vec![Role::Admin],
                     status: MemberStatus::Active,
                     devices: BTreeMap::new(),
+                    grant_seq: 0,
+                    revoke_seq: None,
+                    profile: None,
                 },
             );
         }
@@ -81,6 +86,7 @@ impl GovernanceState {
         }
         Self {
             community_id,
+            accepted_seq: 0,
             administrators: AdministratorState {
                 administrators: config.administrators.clone(),
                 threshold: config.admin_threshold,
@@ -100,6 +106,7 @@ impl GovernanceState {
     pub fn empty(community_id: CommunityId) -> Self {
         Self {
             community_id,
+            accepted_seq: 0,
             administrators: AdministratorState {
                 administrators: Vec::new(),
                 threshold: 0,
@@ -197,8 +204,11 @@ fn replicas_component(state: &GovernanceState) -> CborValue {
     )
 }
 
-fn members_devices_roles_component(state: &GovernanceState) -> CborValue {
-    CborValue::Array(state.members.values().map(MemberRecord::to_cbor).collect())
+fn members_devices_roles_root(state: &GovernanceState) -> [u8; 32] {
+    // Total computation: never panics on arbitrary public `GovernanceState`
+    // values (whose public fields admit states that fail projection invariants),
+    // and is byte-identical to the validating projection's root for valid states.
+    *crate::member::projected::MemberMapProjection::root_from_governance_state(state).as_bytes()
 }
 
 fn stream_manifest_component(state: &GovernanceState) -> CborValue {
@@ -216,10 +226,7 @@ pub fn governance_state_root_record(state: &GovernanceState) -> GovernanceStateR
         administrators_root: component_root("administrators", &administrators_component(state)),
         recovery_root: component_root("recovery", &recovery_component(state)),
         replicas_root: component_root("replicas", &replicas_component(state)),
-        members_devices_roles_root: component_root(
-            "members_devices_roles",
-            &members_devices_roles_component(state),
-        ),
+        members_devices_roles_root: members_devices_roles_root(state),
         stream_manifest_root: component_root("stream_manifest", &stream_manifest_component(state)),
         community_policy_root: component_root(
             "community_policy",
@@ -266,44 +273,88 @@ pub fn apply(
     old: &GovernanceState,
     op: &GovernanceOperationPayload,
 ) -> Result<GovernanceState, Reject> {
-    match op {
-        GovernanceOperationPayload::MemberGrant(p) => apply_member_grant(old, p),
-        GovernanceOperationPayload::MemberRevoke(p) => apply_member_revoke(old, p),
-        GovernanceOperationPayload::DeviceGrant(p) => apply_device_grant(old, p),
-        GovernanceOperationPayload::DeviceRevoke(p) => apply_device_revoke(old, p),
-        GovernanceOperationPayload::AdminSet(p) => apply_admin_set(old, p),
-        GovernanceOperationPayload::RecoverySet(p) => apply_recovery_set(old, p),
-        GovernanceOperationPayload::ReplicaSet(p) => apply_replica_set(old, p),
-        GovernanceOperationPayload::StreamCreate(p) => apply_stream_create(old, p),
-        GovernanceOperationPayload::StreamPolicySet(p) => apply_stream_policy_set(old, p),
-        GovernanceOperationPayload::StreamArchive(p) => apply_stream_archive(old, p),
-        GovernanceOperationPayload::InviteRevoke(p) => apply_invite_revoke(old, p),
-        GovernanceOperationPayload::PolicySet(p) => apply_policy_set(old, p),
-        GovernanceOperationPayload::ForkResolve(p) => apply_fork_resolve(old, p),
-        GovernanceOperationPayload::MigrationAccept(p) => apply_migration_accept(old, p),
-    }
+    let seq = old
+        .accepted_seq
+        .checked_add(1)
+        .ok_or(Reject::InvalidContent)?;
+    apply_entry(old, seq, op)
 }
 
-/// `member.grant`: insert or reactivate a member; set role (spec §6.3).
+/// Apply a typed operation at its authenticated governance sequence.
 ///
 /// # Errors
-/// This transition is total over structurally valid payloads; it does not fail.
+/// Returns [`Reject::InvalidContent`] unless `seq` is exactly the sequence after
+/// `old.accepted_seq`, or when the operation transition itself is invalid.
+pub fn apply_entry(
+    old: &GovernanceState,
+    seq: u64,
+    op: &GovernanceOperationPayload,
+) -> Result<GovernanceState, Reject> {
+    if old.accepted_seq.checked_add(1) != Some(seq) {
+        return Err(Reject::InvalidContent);
+    }
+    let mut next = match op {
+        GovernanceOperationPayload::MemberGrant(p) => apply_member_grant_at(old, p, seq),
+        GovernanceOperationPayload::MemberRevoke(p) => apply_member_revoke_at(old, p, seq),
+        GovernanceOperationPayload::MemberRoleSet(p) => apply_member_role_set_at(old, p),
+        GovernanceOperationPayload::DeviceGrant(p) => apply_device_grant_at(old, p),
+        GovernanceOperationPayload::DeviceRevoke(p) => apply_device_revoke_at(old, p),
+        GovernanceOperationPayload::AdminSet(p) => apply_admin_set_at(old, p),
+        GovernanceOperationPayload::RecoverySet(p) => Ok(apply_recovery_set_at(old, p)),
+        GovernanceOperationPayload::ReplicaSet(p) => Ok(apply_replica_set_at(old, p)),
+        GovernanceOperationPayload::StreamCreate(p) => apply_stream_create_at(old, p),
+        GovernanceOperationPayload::StreamPolicySet(p) => apply_stream_policy_set_at(old, p),
+        GovernanceOperationPayload::StreamArchive(p) => apply_stream_archive_at(old, p),
+        GovernanceOperationPayload::InviteRevoke(p) => Ok(apply_invite_revoke_at(old, p)),
+        GovernanceOperationPayload::PolicySet(p) => Ok(apply_policy_set_at(old, p)),
+        GovernanceOperationPayload::ForkResolve(p) => Ok(apply_fork_resolve_at(old, p)),
+        GovernanceOperationPayload::MigrationAccept(p) => apply_migration_accept_at(old, p),
+    }?;
+    next.accepted_seq = seq;
+    Ok(next)
+}
+
+/// `member.grant`: insert or reactivate a member; replace roles/profile (spec §7.3).
+///
+/// # Errors
+/// Returns [`Reject::InvalidContent`] for an empty, unsorted, or duplicate role set.
 pub fn apply_member_grant(
     old: &GovernanceState,
     p: &MemberGrant,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::MemberGrant(p.clone()))
+}
+
+fn apply_member_grant_at(
+    old: &GovernanceState,
+    p: &MemberGrant,
+    seq: u64,
+) -> Result<GovernanceState, Reject> {
+    if p.roles.is_empty()
+        || p.roles
+            .windows(2)
+            .any(|window| window[0].as_str() >= window[1].as_str())
+    {
+        return Err(Reject::InvalidContent);
+    }
     let mut next = old.clone();
     next.members
         .entry(p.member_id)
         .and_modify(|m| {
-            m.role = p.role;
+            m.roles.clone_from(&p.roles);
             m.status = MemberStatus::Active;
+            m.grant_seq = seq;
+            m.revoke_seq = None;
+            m.profile.clone_from(&p.profile);
         })
         .or_insert_with(|| MemberRecord {
             member_id: p.member_id,
-            role: p.role,
+            roles: p.roles.clone(),
             status: MemberStatus::Active,
             devices: BTreeMap::new(),
+            grant_seq: seq,
+            revoke_seq: None,
+            profile: p.profile.clone(),
         });
     Ok(next)
 }
@@ -316,11 +367,60 @@ pub fn apply_member_revoke(
     old: &GovernanceState,
     p: &MemberRevoke,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::MemberRevoke(p.clone()))
+}
+
+fn apply_member_revoke_at(
+    old: &GovernanceState,
+    p: &MemberRevoke,
+    seq: u64,
+) -> Result<GovernanceState, Reject> {
     let mut next = old.clone();
     match next.members.get_mut(&p.member_id) {
-        Some(m) => m.status = MemberStatus::Revoked,
-        None => return Err(Reject::InvalidContent),
+        Some(m) if m.status == MemberStatus::Active => {
+            m.status = MemberStatus::Revoked;
+            m.revoke_seq = Some(seq);
+            for device in m.devices.values_mut() {
+                device.status = DeviceStatus::Revoked;
+            }
+        }
+        Some(_) | None => return Err(Reject::InvalidContent),
     }
+    Ok(next)
+}
+
+/// `member.role_set`: replace an active member's canonical role set.
+///
+/// # Errors
+/// Returns [`Reject::InvalidContent`] for an absent/revoked member or an empty,
+/// unsorted, or duplicate role set.
+pub fn apply_member_role_set(
+    old: &GovernanceState,
+    p: &MemberRoleSet,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::MemberRoleSet(p.clone()))
+}
+
+fn apply_member_role_set_at(
+    old: &GovernanceState,
+    p: &MemberRoleSet,
+) -> Result<GovernanceState, Reject> {
+    if p.roles.is_empty()
+        || p.roles
+            .windows(2)
+            .any(|window| window[0].as_str() >= window[1].as_str())
+    {
+        return Err(Reject::InvalidContent);
+    }
+    let mut next = old.clone();
+    let member = next
+        .members
+        .get_mut(&p.member_id)
+        .ok_or(Reject::InvalidContent)?;
+    if member.status != MemberStatus::Active {
+        return Err(Reject::InvalidContent);
+    }
+    member.roles.clone_from(&p.roles);
     Ok(next)
 }
 
@@ -335,6 +435,13 @@ pub fn apply_member_revoke(
 ///   bound to another member, granting an already-active device to the same
 ///   member (no silent replace), and regranting a revoked device.
 pub fn apply_device_grant(
+    old: &GovernanceState,
+    p: &DeviceGrant,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::DeviceGrant(p.clone()))
+}
+
+fn apply_device_grant_at(
     old: &GovernanceState,
     p: &DeviceGrant,
 ) -> Result<GovernanceState, Reject> {
@@ -362,6 +469,7 @@ pub fn apply_device_grant(
         DeviceRecord {
             device_id: p.device_id,
             status: DeviceStatus::Active,
+            binding: p.binding.clone(),
         },
     );
     Ok(next)
@@ -376,6 +484,13 @@ pub fn apply_device_grant(
 /// - the device is absent, bound to another member (so absent under this
 ///   member), or already [`DeviceStatus::Revoked`].
 pub fn apply_device_revoke(
+    old: &GovernanceState,
+    p: &DeviceRevoke,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::DeviceRevoke(p.clone()))
+}
+
+fn apply_device_revoke_at(
     old: &GovernanceState,
     p: &DeviceRevoke,
 ) -> Result<GovernanceState, Reject> {
@@ -413,6 +528,10 @@ pub fn apply_device_revoke(
 /// unsorted, contains duplicates, or the threshold is outside
 /// `1..=administrators.len()`.
 pub fn apply_admin_set(old: &GovernanceState, p: &AdminSet) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::AdminSet(p.clone()))
+}
+
+fn apply_admin_set_at(old: &GovernanceState, p: &AdminSet) -> Result<GovernanceState, Reject> {
     if p.administrators.is_empty() {
         return Err(Reject::InvalidContent);
     }
@@ -446,11 +565,15 @@ pub fn apply_recovery_set(
     old: &GovernanceState,
     p: &RecoverySet,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::RecoverySet(p.clone()))
+}
+
+fn apply_recovery_set_at(old: &GovernanceState, p: &RecoverySet) -> GovernanceState {
     let mut next = old.clone();
     let mut cfg = p.recovery.clone();
     cfg.canonicalize();
     next.recovery = RecoveryState { config: cfg };
-    Ok(next)
+    next
 }
 
 /// `replica.set`: upsert / disable a replica record (sorted by `ReplicaId`).
@@ -458,6 +581,10 @@ pub fn apply_recovery_set(
 /// # Errors
 /// This transition is total over structurally valid payloads; it does not fail.
 pub fn apply_replica_set(old: &GovernanceState, p: &ReplicaSet) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::ReplicaSet(p.clone()))
+}
+
+fn apply_replica_set_at(old: &GovernanceState, p: &ReplicaSet) -> GovernanceState {
     let mut next = old.clone();
     next.replicas.insert(
         p.replica.replica_id,
@@ -466,7 +593,7 @@ pub fn apply_replica_set(old: &GovernanceState, p: &ReplicaSet) -> Result<Govern
             status: p.status,
         },
     );
-    Ok(next)
+    next
 }
 
 /// `stream.create`: insert a new active stream (duplicate id rejected).
@@ -474,6 +601,13 @@ pub fn apply_replica_set(old: &GovernanceState, p: &ReplicaSet) -> Result<Govern
 /// # Errors
 /// Returns [`Reject::InvalidContent`] if `stream_id` already exists.
 pub fn apply_stream_create(
+    old: &GovernanceState,
+    p: &StreamCreate,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::StreamCreate(p.clone()))
+}
+
+fn apply_stream_create_at(
     old: &GovernanceState,
     p: &StreamCreate,
 ) -> Result<GovernanceState, Reject> {
@@ -501,6 +635,13 @@ pub fn apply_stream_policy_set(
     old: &GovernanceState,
     p: &StreamPolicySet,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::StreamPolicySet(p.clone()))
+}
+
+fn apply_stream_policy_set_at(
+    old: &GovernanceState,
+    p: &StreamPolicySet,
+) -> Result<GovernanceState, Reject> {
     let mut next = old.clone();
     let stream = next
         .streams
@@ -515,6 +656,13 @@ pub fn apply_stream_policy_set(
 /// # Errors
 /// Returns [`Reject::InvalidContent`] if the stream does not exist.
 pub fn apply_stream_archive(
+    old: &GovernanceState,
+    p: &StreamArchive,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::StreamArchive(p.clone()))
+}
+
+fn apply_stream_archive_at(
     old: &GovernanceState,
     p: &StreamArchive,
 ) -> Result<GovernanceState, Reject> {
@@ -535,9 +683,13 @@ pub fn apply_invite_revoke(
     old: &GovernanceState,
     p: &InviteRevoke,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::InviteRevoke(p.clone()))
+}
+
+fn apply_invite_revoke_at(old: &GovernanceState, p: &InviteRevoke) -> GovernanceState {
     let mut next = old.clone();
     next.policy.revoked_invites.insert(p.invite_id);
-    Ok(next)
+    next
 }
 
 /// `policy.set`: replace the community policy (canonicalized).
@@ -551,6 +703,10 @@ pub fn apply_invite_revoke(
 /// # Errors
 /// This transition is total over structurally valid payloads; it does not fail.
 pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::PolicySet(p.clone()))
+}
+
+fn apply_policy_set_at(old: &GovernanceState, p: &PolicySet) -> GovernanceState {
     let mut next = old.clone();
     let kept_invites = next.policy.revoked_invites.clone();
     let kept_migrations = next.policy.migrations.clone();
@@ -562,7 +718,7 @@ pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<Governan
     next.policy
         .fork_markers
         .sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
-    Ok(next)
+    next
 }
 
 /// `fork.resolve`: record the deterministic resolution marker under community
@@ -584,6 +740,13 @@ pub fn apply_fork_resolve(
     old: &GovernanceState,
     p: &super::operation::ForkResolve,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::ForkResolve(p.clone()))
+}
+
+fn apply_fork_resolve_at(
+    old: &GovernanceState,
+    p: &super::operation::ForkResolve,
+) -> GovernanceState {
     let mut next = old.clone();
     next.policy
         .fork_markers
@@ -596,7 +759,7 @@ pub fn apply_fork_resolve(
     next.policy
         .fork_markers
         .sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
-    Ok(next)
+    next
 }
 
 /// `migration.accept`: record a migration acceptance marker (duplicate
@@ -605,6 +768,13 @@ pub fn apply_fork_resolve(
 /// # Errors
 /// Returns [`Reject::InvalidContent`] if the migration id was already accepted.
 pub fn apply_migration_accept(
+    old: &GovernanceState,
+    p: &MigrationAccept,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::MigrationAccept(p.clone()))
+}
+
+fn apply_migration_accept_at(
     old: &GovernanceState,
     p: &MigrationAccept,
 ) -> Result<GovernanceState, Reject> {
@@ -644,7 +814,7 @@ pub fn apply_verified_entry(
     if body.community_id != old.community_id {
         return Err(Reject::InvalidContent);
     }
-    let new = apply(old, &body.payload)?;
+    let new = apply_entry(old, body.seq, &body.payload)?;
     verify_state_root(&new, &body.state_root)?;
     Ok(new)
 }
@@ -743,7 +913,8 @@ mod tests {
             &s,
             &MemberGrant {
                 member_id: mid(0xc0),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
@@ -762,7 +933,8 @@ mod tests {
             kind: GovernanceOperationKind::MemberGrant,
             payload: GovernanceOperationPayload::MemberGrant(MemberGrant {
                 member_id: mid(0xc0),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             }),
             state_root: StateRoot::from_bytes([0xff; N]), // wrong root
         };
@@ -787,13 +959,116 @@ mod tests {
             &s,
             &MemberGrant {
                 member_id: mid(0xc0),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
         let m = next.members.get(&mid(0xc0)).unwrap();
-        assert_eq!(m.role, Role::Member);
+        assert_eq!(m.roles, vec![Role::Member]);
         assert_eq!(m.status, MemberStatus::Active);
+        assert_eq!(m.grant_seq, 1);
+        assert_eq!(m.revoke_seq, None);
+        assert_eq!(next.accepted_seq, 1);
+    }
+
+    #[test]
+    fn apply_entry_enforces_sequence_and_preserves_regrant_metadata() {
+        let s = state();
+        let member_id = mid(0xc0);
+        let granted = apply_entry(
+            &s,
+            1,
+            &GovernanceOperationPayload::MemberGrant(MemberGrant {
+                member_id,
+                roles: vec![Role::Member],
+                profile: None,
+            }),
+        )
+        .unwrap();
+        let dev = DeviceId::from_bytes([0xd0; N]);
+        let with_device = apply_entry(
+            &granted,
+            2,
+            &GovernanceOperationPayload::DeviceGrant(DeviceGrant {
+                member_id,
+                device_id: dev,
+                binding: Vec::new(),
+            }),
+        )
+        .unwrap();
+        let revoked = apply_entry(
+            &with_device,
+            3,
+            &GovernanceOperationPayload::MemberRevoke(MemberRevoke { member_id }),
+        )
+        .unwrap();
+        assert_eq!(revoked.members[&member_id].revoke_seq, Some(3));
+        assert_eq!(
+            apply_entry(
+                &revoked,
+                5,
+                &GovernanceOperationPayload::MemberGrant(MemberGrant {
+                    member_id,
+                    roles: vec![Role::Agent],
+                    profile: None,
+                }),
+            ),
+            Err(Reject::InvalidContent)
+        );
+        let regranted = apply_entry(
+            &revoked,
+            4,
+            &GovernanceOperationPayload::MemberGrant(MemberGrant {
+                member_id,
+                roles: vec![Role::Agent],
+                profile: None,
+            }),
+        )
+        .unwrap();
+        let member = &regranted.members[&member_id];
+        assert_eq!(member.roles, vec![Role::Agent]);
+        assert_eq!(member.grant_seq, 4);
+        assert_eq!(member.revoke_seq, None);
+        assert_eq!(member.devices[&dev].status, DeviceStatus::Revoked);
+    }
+
+    #[test]
+    fn apply_member_role_set_replaces_canonical_roles() {
+        let s = state();
+        let member_id = mid(0xc0);
+        let granted = apply_member_grant(
+            &s,
+            &MemberGrant {
+                member_id,
+                roles: vec![Role::Member],
+                profile: None,
+            },
+        )
+        .unwrap();
+        let next = apply_member_role_set(
+            &granted,
+            &MemberRoleSet {
+                member_id,
+                roles: vec![Role::Admin, Role::Agent],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next.members[&member_id].roles,
+            vec![Role::Admin, Role::Agent]
+        );
+        assert_eq!(next.members[&member_id].grant_seq, 1);
+        assert_eq!(
+            apply_member_role_set(
+                &granted,
+                &MemberRoleSet {
+                    member_id,
+                    roles: vec![Role::Agent, Role::Admin],
+                },
+            ),
+            Err(Reject::InvalidContent)
+        );
     }
 
     #[test]
@@ -803,7 +1078,8 @@ mod tests {
             &s,
             &MemberGrant {
                 member_id: mid(0xc0),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
@@ -817,6 +1093,15 @@ mod tests {
         assert_eq!(
             next.members.get(&mid(0xc0)).unwrap().status,
             MemberStatus::Revoked
+        );
+        assert_eq!(
+            apply_member_revoke(
+                &next,
+                &MemberRevoke {
+                    member_id: mid(0xc0)
+                }
+            ),
+            Err(Reject::InvalidContent)
         );
         // Revoking a non-existent member rejects.
         assert_eq!(
@@ -832,6 +1117,70 @@ mod tests {
     }
 
     #[test]
+    fn standalone_helpers_advance_accepted_seq_consistently() {
+        // Chaining the public standalone helpers must advance `accepted_seq` on
+        // every entry, not only member.grant/member.revoke. grant (1) ->
+        // device.grant (2) -> member.revoke (3) must record revoke_seq = 3.
+        let s = state();
+        let member_id = mid(0xc0);
+        let dev = DeviceId::from_bytes([0xd0; N]);
+        let granted = apply_member_grant(
+            &s,
+            &MemberGrant {
+                member_id,
+                roles: vec![Role::Member],
+                profile: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(granted.accepted_seq, 1);
+        let with_device = apply_device_grant(
+            &granted,
+            &DeviceGrant {
+                member_id,
+                device_id: dev,
+                binding: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with_device.accepted_seq, 2,
+            "device.grant must advance the cursor"
+        );
+        let revoked = apply_member_revoke(&with_device, &MemberRevoke { member_id }).unwrap();
+        assert_eq!(revoked.accepted_seq, 3);
+        assert_eq!(
+            revoked.members[&member_id].revoke_seq,
+            Some(3),
+            "revoke must be recorded at the correct entry sequence"
+        );
+    }
+
+    #[test]
+    fn compute_state_root_is_total_for_public_states() {
+        // `GovernanceState`/`MemberRecord` expose public fields, so callers can
+        // construct states that fail projection invariants (here: an active
+        // member with no roles). `compute_state_root` must not panic on them.
+        let mut s = GovernanceState::empty(state().community_id);
+        s.members.insert(
+            mid(0xc0),
+            MemberRecord {
+                member_id: mid(0xc0),
+                roles: Vec::new(),
+                status: MemberStatus::Active,
+                devices: BTreeMap::new(),
+                grant_seq: 0,
+                revoke_seq: None,
+                profile: None,
+            },
+        );
+        // Must not panic; produces a deterministic root.
+        let r1 = compute_state_root(&s);
+        let r2 = compute_state_root(&s);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
     fn apply_device_grant_and_revoke() {
         let s = state();
         let admin = admin_key(0xa0).member_id();
@@ -841,6 +1190,7 @@ mod tests {
             &DeviceGrant {
                 member_id: admin,
                 device_id: dev,
+                binding: Vec::new(),
             },
         )
         .unwrap();
@@ -889,6 +1239,7 @@ mod tests {
                 &DeviceGrant {
                     member_id: mid(0xee),
                     device_id: dev,
+                    binding: Vec::new(),
                 },
             )
             .err(),
@@ -899,7 +1250,8 @@ mod tests {
             &s,
             &MemberGrant {
                 member_id: mid(0xc0),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
@@ -916,6 +1268,7 @@ mod tests {
                 &DeviceGrant {
                     member_id: mid(0xc0),
                     device_id: dev,
+                    binding: Vec::new(),
                 },
             )
             .err(),
@@ -932,7 +1285,8 @@ mod tests {
             &s,
             &MemberGrant {
                 member_id: other_member,
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
@@ -942,6 +1296,7 @@ mod tests {
             &DeviceGrant {
                 member_id: admin,
                 device_id: dev,
+                binding: Vec::new(),
             },
         )
         .unwrap();
@@ -952,6 +1307,7 @@ mod tests {
                 &DeviceGrant {
                     member_id: other_member,
                     device_id: dev,
+                    binding: Vec::new(),
                 },
             )
             .err(),
@@ -964,6 +1320,7 @@ mod tests {
                 &DeviceGrant {
                     member_id: admin,
                     device_id: dev,
+                    binding: Vec::new(),
                 },
             )
             .err(),
@@ -984,6 +1341,7 @@ mod tests {
                 &DeviceGrant {
                     member_id: admin,
                     device_id: dev,
+                    binding: Vec::new(),
                 },
             )
             .err(),
@@ -1001,6 +1359,7 @@ mod tests {
             &DeviceGrant {
                 member_id: admin,
                 device_id: dev,
+                binding: Vec::new(),
             },
         )
         .unwrap();
@@ -1021,7 +1380,8 @@ mod tests {
             &with_device,
             &MemberGrant {
                 member_id: mid(0xc1),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
@@ -1308,7 +1668,8 @@ mod tests {
         let s = state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: mid(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let new = apply(&s, &payload).unwrap();
         let declared = compute_state_root(&new);
@@ -1337,7 +1698,8 @@ mod tests {
         let s = state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: mid(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         assert!(apply(&s, &payload).is_ok());
     }
@@ -1358,9 +1720,9 @@ mod tests {
         assert_eq!(
             compute_state_root(&s).as_bytes(),
             &[
-                0xdb, 0x7b, 0xc9, 0xca, 0x74, 0x58, 0xc1, 0x72, 0x73, 0x3f, 0x3a, 0x04, 0x20, 0x08,
-                0xc0, 0x1f, 0x8b, 0x1f, 0xe0, 0x00, 0x43, 0xc0, 0xc6, 0x9c, 0x04, 0xa1, 0xc4, 0x28,
-                0xb9, 0x09, 0x82, 0xe8,
+                0x71, 0xe5, 0x1c, 0x90, 0x64, 0x04, 0x3a, 0x3b, 0x1d, 0x3c, 0x98, 0x8c, 0x5f, 0x8f,
+                0x8e, 0xb7, 0x2a, 0x8d, 0xd2, 0xd9, 0x98, 0x6c, 0xbb, 0x2c, 0xda, 0x74, 0xca, 0xaa,
+                0xe6, 0xcd, 0x16, 0x36,
             ],
             "post-genesis state root drifted; a hash/domain/encoding/order \
              change would break wire compatibility"
@@ -1374,16 +1736,17 @@ mod tests {
             &s,
             &MemberGrant {
                 member_id: mid(0xc0),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
         assert_eq!(
             compute_state_root(&new).as_bytes(),
             &[
-                0x6d, 0x91, 0xd0, 0xed, 0xb2, 0xbe, 0xa4, 0x8f, 0x70, 0x68, 0xa9, 0xa3, 0xf0, 0x9f,
-                0xc5, 0xaa, 0x9d, 0x02, 0xf4, 0x05, 0xbf, 0xd3, 0x44, 0x8c, 0x84, 0x3c, 0xa1, 0xbe,
-                0x19, 0xe3, 0x2f, 0x2c,
+                0x92, 0x59, 0xed, 0x2a, 0x93, 0x72, 0xc5, 0x4a, 0x8a, 0xa6, 0xb8, 0x20, 0x79, 0x74,
+                0x9f, 0x5c, 0x11, 0x7d, 0x4e, 0x5d, 0xfd, 0x8f, 0xc4, 0x4e, 0xb1, 0x49, 0x5d, 0x58,
+                0x03, 0xad, 0xf6, 0x31,
             ],
             "genesis→member.grant state root drifted from the golden vector"
         );
@@ -1434,7 +1797,8 @@ mod tests {
             &base,
             &MemberGrant {
                 member_id: mid(0xc1),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             },
         )
         .unwrap();
@@ -1520,7 +1884,8 @@ mod tests {
         let s = state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: mid(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let first = GovernanceEntryBody {
             community_id: s.community_id,
@@ -1584,7 +1949,8 @@ mod tests {
         let s = state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: mid(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let new = apply(&s, &payload).unwrap();
         let body = GovernanceEntryBody {
@@ -1611,7 +1977,8 @@ mod tests {
         let s = state();
         let grant = MemberGrant {
             member_id: mid(0xd1),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         };
         let a = apply_member_grant(&s, &grant).unwrap();
         let b = apply_member_grant(&s, &grant).unwrap();

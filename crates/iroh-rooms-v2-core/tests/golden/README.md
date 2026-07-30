@@ -1,7 +1,7 @@
 # v2 Golden Vectors — Frozen Interoperability Fixtures
 
 This directory holds the **frozen** golden-vector fixtures for the v2 crypto core.
-There are two fixture sets, both frozen under the same change discipline:
+There are three fixture sets, all frozen under the same change discipline:
 
 - `v2-signed-records.json` — every signed record and domain-separated hash boundary
   produced by `iroh-rooms-v2-core` (issue #153, spec `v2-signed-record-golden-vectors.md`,
@@ -10,6 +10,10 @@ There are two fixture sets, both frozen under the same change discipline:
   `#134 §6.2` frozen domain-separation strings, plus one golden non-canonical CBOR
   negative vector (issue #146, spec `v2-identifiers-domain-separation.md`, refs
   #134 §6.2 / §6.3 / §6.4). Driven by `../identifiers.rs`.
+- `v2-member-merkle.json` — the #151 §8.1/§8.2 member-record and sorted-tree
+  vectors for 0, 1, 2, 3, and 10,000 leaves. Driven by
+  `../member_sorted_merkle.rs`; release timing uses
+  `cargo bench -p iroh-rooms-v2-core --bench member_merkle`.
 
 ## These vectors are FROZEN
 

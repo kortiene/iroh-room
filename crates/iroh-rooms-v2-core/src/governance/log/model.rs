@@ -561,6 +561,8 @@ pub struct DeviceRecord {
     pub device_id: DeviceId,
     /// The device's current status.
     pub status: DeviceStatus,
+    /// Canonical device-binding metadata committed by the member projection.
+    pub binding: Vec<u8>,
 }
 
 impl DeviceRecord {
@@ -572,6 +574,7 @@ impl DeviceRecord {
                 CborValue::Bytes(self.device_id.as_bytes().to_vec()),
             ),
             ("status".to_owned(), self.status.to_cbor()),
+            ("binding".to_owned(), CborValue::Bytes(self.binding.clone())),
         ])
     }
 }
@@ -581,29 +584,49 @@ impl DeviceRecord {
 pub struct MemberRecord {
     /// The principal identity.
     pub member_id: PrincipalId,
-    /// The member's role.
-    pub role: Role,
+    /// The member's canonical role set.
+    pub roles: Vec<Role>,
     /// The member's status.
     pub status: MemberStatus,
     /// Devices bound to this member (deterministic `BTreeMap` order).
     pub devices: BTreeMap<DeviceId, DeviceRecord>,
+    /// Sequence of the genesis grant or most recent regrant.
+    pub grant_seq: u64,
+    /// Sequence of revocation, present exactly while revoked.
+    pub revoke_seq: Option<u64>,
+    /// Optional opaque profile reference; it has no authorization meaning.
+    pub profile: Option<Vec<u8>>,
 }
 
 impl MemberRecord {
     #[must_use]
     pub fn to_cbor(&self) -> CborValue {
-        CborValue::Map(vec![
+        let mut roles = self.roles.clone();
+        roles.sort_by_key(Role::as_str);
+        roles.dedup();
+        let mut entries = vec![
             (
                 "member_id".to_owned(),
                 CborValue::Bytes(self.member_id.as_bytes().to_vec()),
             ),
-            ("role".to_owned(), self.role.to_cbor()),
+            (
+                "roles".to_owned(),
+                CborValue::Array(roles.iter().map(Role::to_cbor).collect()),
+            ),
             ("status".to_owned(), self.status.to_cbor()),
             (
                 "devices".to_owned(),
                 CborValue::Array(self.devices.values().map(DeviceRecord::to_cbor).collect()),
             ),
-        ])
+            ("grant_seq".to_owned(), CborValue::Uint(self.grant_seq)),
+        ];
+        if let Some(revoke_seq) = self.revoke_seq {
+            entries.push(("revoke_seq".to_owned(), CborValue::Uint(revoke_seq)));
+        }
+        if let Some(profile) = &self.profile {
+            entries.push(("profile".to_owned(), CborValue::Bytes(profile.clone())));
+        }
+        CborValue::Map(entries)
     }
 }
 

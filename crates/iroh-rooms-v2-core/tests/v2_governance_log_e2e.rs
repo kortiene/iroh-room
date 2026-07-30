@@ -33,7 +33,7 @@
 //!    wire-decode boundary (not silently ignored, §7.3), and a declared-root
 //!    mismatch is rejected through the full `apply_verified_entry` pipeline
 //!    (§7.3), as is a foreign-community entry (§6.4 isolation).
-//! 5. **Per-operation registry** — every one of the fourteen §7.3 operations
+//! 5. **Per-operation registry** — every one of the fifteen §7.3 operations
 //!    folds from wire bytes through the full pipeline with a state-root-visible
 //!    transition.
 //! 6. **Authorization boundary (#148 §7.4)** — the same wire-bytes receiver
@@ -63,18 +63,19 @@
 use iroh_rooms_v2_core::cbor::{self, CborValue};
 use iroh_rooms_v2_core::domain;
 use iroh_rooms_v2_core::governance::log::{
-    apply, apply_verified_entry, check_chain_link, compute_state_root, decode_entry_csb,
-    derive_community_id, entry_csb, entry_id, entry_id_from_csb, genesis_config_csb, sign_genesis,
-    validate_and_apply_governance_entry, validated_genesis_state, verify_entry_crypto,
-    verify_entry_full, verify_genesis, verify_governance_entry, GenesisConfig, GovernanceApproval,
-    GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody, GovernanceOperationKind,
-    GovernanceOperationPayload, GovernanceState, GovernanceTip, MemberStatus,
-    ValidatedGovernanceState, GENESIS_SCHEMA_VERSION,
+    apply, apply_entry, apply_verified_entry, check_chain_link, compute_state_root,
+    decode_entry_csb, derive_community_id, entry_csb, entry_id, entry_id_from_csb,
+    genesis_config_csb, sign_genesis, validate_and_apply_governance_entry, validated_genesis_state,
+    verify_entry_crypto, verify_entry_full, verify_genesis, verify_governance_entry, GenesisConfig,
+    GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
+    GovernanceOperationKind, GovernanceOperationPayload, GovernanceState, GovernanceTip,
+    MemberStatus, ValidatedGovernanceState, GENESIS_SCHEMA_VERSION,
 };
 use iroh_rooms_v2_core::governance::log::{
     AdminSet, CommunityPolicy, DeviceGrant, DeviceRevoke, ForkResolve, InviteRevoke, MemberGrant,
-    MemberRevoke, MigrationAccept, PolicySet, RecoveryConfig, RecoverySet, ReplicaDescriptor,
-    ReplicaSet, ReplicaStatus, Role, StreamArchive, StreamCreate, StreamPolicy, StreamPolicySet,
+    MemberRevoke, MemberRoleSet, MigrationAccept, PolicySet, RecoveryConfig, RecoverySet,
+    ReplicaDescriptor, ReplicaSet, ReplicaStatus, Role, StreamArchive, StreamCreate, StreamPolicy,
+    StreamPolicySet,
 };
 use iroh_rooms_v2_core::ids::{
     CommunityId, DeviceId, GovernanceId, PrincipalId, ReplicaId, StateRoot, StreamId, LEN as N,
@@ -303,7 +304,7 @@ fn fold_one(
     cid: CommunityId,
 ) -> (GovernanceState, GovernanceId) {
     // Sender computes the declared root by applying the op to the prior state.
-    let applied = apply(old, payload).expect("payload applies to prior state");
+    let applied = apply_entry(old, seq, payload).expect("payload applies to prior state");
     let declared = compute_state_root(&applied);
     let body = GovernanceEntryBody {
         community_id: cid,
@@ -345,7 +346,8 @@ fn e2e_full_governance_log_fold_from_wire_bytes() {
     // Entry 1: member.grant — component 4 (members/devices/roles).
     let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(MEMBER_SEED),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let (next, prev1) = fold_one(&state, &payload, 1, None, &author, &approver, cid);
     assert!(next.members.contains_key(&principal(MEMBER_SEED)));
@@ -356,6 +358,7 @@ fn e2e_full_governance_log_fold_from_wire_bytes() {
     let payload = GovernanceOperationPayload::DeviceGrant(DeviceGrant {
         member_id: principal(MEMBER_SEED),
         device_id: dev,
+        binding: Vec::new(),
     });
     let (next, prev2) = fold_one(&state, &payload, 2, Some(prev1), &author, &approver, cid);
     assert!(next
@@ -430,11 +433,13 @@ fn e2e_final_state_root_is_byte_pinned() {
     let steps: [GovernanceOperationPayload; 5] = [
         GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(MEMBER_SEED),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         }),
         GovernanceOperationPayload::DeviceGrant(DeviceGrant {
             member_id: principal(MEMBER_SEED),
             device_id: DeviceId::from_bytes([0xd0; N]),
+            binding: Vec::new(),
         }),
         GovernanceOperationPayload::StreamCreate(StreamCreate {
             stream_id: StreamId::from_bytes([0x22; N]),
@@ -459,9 +464,9 @@ fn e2e_final_state_root_is_byte_pinned() {
     assert_eq!(
         compute_state_root(&state).as_bytes(),
         &[
-            0xc4, 0xc1, 0xef, 0x22, 0xab, 0xa8, 0x4f, 0x05, 0x9c, 0x8f, 0xe0, 0x3a, 0x9e, 0x60,
-            0x59, 0xc1, 0x53, 0x4d, 0xaa, 0x1c, 0x24, 0x07, 0x59, 0x64, 0xd1, 0x2c, 0x6b, 0xfc,
-            0xca, 0xd6, 0x0f, 0xab,
+            0x10, 0x3d, 0x5c, 0x8a, 0xc5, 0x1e, 0x75, 0x4f, 0xd7, 0x32, 0x01, 0x4c, 0xa6, 0xed,
+            0xe1, 0x36, 0x24, 0x10, 0xf0, 0x43, 0xeb, 0x1b, 0xde, 0x4b, 0x2c, 0x1d, 0x55, 0x03,
+            0xc9, 0x87, 0xa5, 0x72,
         ],
         "final state root drifted from the golden vector; recompute and update \
          this constant deliberately"
@@ -487,7 +492,8 @@ fn e2e_unknown_operation_kind_rejected_at_decode_boundary() {
     // Build a well-formed entry body CSB, then inject a bogus `kind`.
     let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(MEMBER_SEED),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let applied = apply(&state, &payload).unwrap();
     let mut value = GovernanceEntryBody {
@@ -548,7 +554,8 @@ fn e2e_declared_state_root_mismatch_rejected_in_fold() {
 
     let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(MEMBER_SEED),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     // A body signed over a deliberately-wrong declared root. The signature is
     // valid for THIS body (root included in the signed CSB), so the entry
@@ -604,7 +611,8 @@ fn e2e_foreign_community_entry_rejected_in_fold() {
 
     let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(MEMBER_SEED),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let correct_root = compute_state_root(&apply(&state, &payload).unwrap());
     let body = GovernanceEntryBody {
@@ -636,7 +644,7 @@ fn e2e_foreign_community_entry_rejected_in_fold() {
 /// transition. This is the acceptance item "each §7.3 operation has a pure
 /// apply function", proven across the full wire↔verify↔apply↔root boundary
 /// rather than via an in-memory `apply_*` call.
-#[allow(clippy::too_many_lines)] // one case per §7.3 operation (14 total)
+#[allow(clippy::too_many_lines)] // one case per §7.3 operation (15 total)
 #[test]
 fn e2e_every_registered_operation_folds_from_wire_bytes() {
     let cfg = genesis_config();
@@ -649,7 +657,8 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
         &setup,
         &GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(MEMBER_SEED),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         }),
     )
     .unwrap();
@@ -658,6 +667,7 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
         &GovernanceOperationPayload::DeviceGrant(DeviceGrant {
             member_id: principal(MEMBER_SEED),
             device_id: DeviceId::from_bytes([0x45; N]),
+            binding: Vec::new(),
         }),
     )
     .unwrap();
@@ -677,12 +687,13 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
 
     // Each (label, payload, prior-state) triple; the prior state is chosen so
     // the transition is structurally valid AND materially changes the root.
-    let cases: [(&str, GovernanceOperationPayload, GovernanceState); 14] = [
+    let cases: [(&str, GovernanceOperationPayload, GovernanceState); 15] = [
         (
             "member.grant",
             GovernanceOperationPayload::MemberGrant(MemberGrant {
                 member_id: principal(0x31),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             }),
             setup.clone(),
         ),
@@ -694,10 +705,19 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
             with_member.clone(),
         ),
         (
+            "member.role_set",
+            GovernanceOperationPayload::MemberRoleSet(MemberRoleSet {
+                member_id: principal(MEMBER_SEED),
+                roles: vec![Role::Agent, Role::Member],
+            }),
+            with_member.clone(),
+        ),
+        (
             "device.grant",
             GovernanceOperationPayload::DeviceGrant(DeviceGrant {
                 member_id: principal(MEMBER_SEED),
                 device_id: DeviceId::from_bytes([0x46; N]),
+                binding: Vec::new(),
             }),
             with_member.clone(),
         ),
@@ -799,21 +819,27 @@ fn e2e_every_registered_operation_folds_from_wire_bytes() {
             setup.clone(),
         ),
     ];
-    assert_eq!(cases.len(), 14, "§7.3 freezes exactly 14 operations");
+    assert_eq!(cases.len(), 15, "§7.3 freezes exactly 15 operations");
 
     for (label, payload, prior) in cases {
-        let declared_root = compute_state_root(&apply(&prior, &payload).unwrap());
+        let seq = prior.accepted_seq.checked_add(1).unwrap();
+        let declared_root = compute_state_root(&apply_entry(&prior, seq, &payload).unwrap());
+        let expected_prev = if seq == 1 {
+            None
+        } else {
+            Some(GovernanceId::from_bytes([0x80; N]))
+        };
         let body = GovernanceEntryBody {
             community_id: cid,
-            seq: 1,
-            prev: None,
+            seq,
+            prev: expected_prev,
             created_at_ms: 9_000,
             kind: payload.kind(),
             payload: payload.clone(),
             state_root: declared_root,
         };
         let wire = with_approval(seal(&body, &author), &body, &approver);
-        let (new_state, new_id) = receive_and_fold(&prior, &wire, None, 1)
+        let (new_state, new_id) = receive_and_fold(&prior, &wire, expected_prev, seq)
             .unwrap_or_else(|e| panic!("fold failed for `{label}`: {e:?}"));
         // The transition must be state-root-visible (no silent no-op), and the
         // folded entry id must recompute from the wire CSB.
@@ -925,7 +951,8 @@ fn e2e_authorized_pipeline_folds_multi_entry_chain_from_wire_bytes() {
     // Entry 1: member.grant, authorized by exactly the 2-of-3 old-admin quorum.
     let grant = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(MEMBER_SEED),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let after_grant = fold_one_authorized(&genesis, &grant, &author, &[&approver]);
     assert!(after_grant
@@ -942,6 +969,7 @@ fn e2e_authorized_pipeline_folds_multi_entry_chain_from_wire_bytes() {
     let grant_dev = GovernanceOperationPayload::DeviceGrant(DeviceGrant {
         member_id: principal(MEMBER_SEED),
         device_id: dev,
+        binding: Vec::new(),
     });
     let after_device = fold_one_authorized(&after_grant, &grant_dev, &author, &[&approver]);
     assert!(after_device
@@ -988,7 +1016,8 @@ fn e2e_insufficient_threshold_entry_rejected_by_full_wire_pipeline() {
 
     let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(MEMBER_SEED),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let declared = compute_state_root(&apply(genesis.state(), &payload).unwrap());
     let body = GovernanceEntryBody {
@@ -1077,7 +1106,8 @@ fn e2e_admin_set_transition_old_quorum_then_new_quorum_via_wire_bytes() {
     // After commit, the new admin alone authorizes the next entry over the wire.
     let next_payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
         member_id: principal(0xc9),
-        role: Role::Member,
+        roles: vec![Role::Member],
+        profile: None,
     });
     let after_next = fold_one_authorized(&committed, &next_payload, &new_admin, &[]);
     assert!(after_next.state().members.contains_key(&principal(0xc9)));

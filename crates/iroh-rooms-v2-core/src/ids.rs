@@ -147,7 +147,7 @@ named_hash_newtype! {
     StateRoot
 }
 named_hash_newtype! {
-    /// A sparse Merkle-map root (#151).
+    /// A deterministic Merkle-tree root (#151).
     MerkleRoot
 }
 

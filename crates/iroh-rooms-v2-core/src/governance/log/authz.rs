@@ -45,8 +45,11 @@ use super::model::AdministratorState;
 use super::operation::GovernanceOperationPayload;
 use super::records::{AuthenticatedGovernanceEvidence, VerifiedGovernanceEntry};
 use super::state::{
-    apply, check_chain_link, compute_state_root, verify_state_root, GovernanceState,
+    apply_entry, check_chain_link, compute_state_root, verify_state_root, GovernanceState,
 };
+
+#[cfg(test)]
+use super::state::apply;
 
 /// Public alias for the stable rejection taxonomy (issue #148: no new public
 /// error variant is needed; the existing [`Reject`] codes already cover every
@@ -322,7 +325,7 @@ fn validate_candidate(
 
     // Rule 3: the operation must be structurally/semantically valid when
     // applied to state n-1. `apply` never mutates `old` (clone-and-return).
-    let candidate_state = apply(old, &body.payload)?;
+    let candidate_state = apply_entry(old, body.seq, &body.payload)?;
 
     // Rule 4: a threshold of distinct *old*-state administrators signed.
     verify_old_admin_threshold(&old.administrators, entry)?;
@@ -482,7 +485,8 @@ mod tests {
     fn valid_member_grant_entry(prev: &ValidatedGovernanceState) -> VerifiedGovernanceEntry {
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -548,7 +552,8 @@ mod tests {
         let prev = genesis_state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -578,7 +583,8 @@ mod tests {
 
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc1),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(committed.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -627,7 +633,8 @@ mod tests {
         let prev = genesis_state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -652,7 +659,8 @@ mod tests {
         let prev = genesis_state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let body = GovernanceEntryBody {
             community_id: prev.state().community_id,
@@ -681,7 +689,8 @@ mod tests {
         // A superset (all three old admins) also accepts.
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc1),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -705,7 +714,8 @@ mod tests {
         let outsider = key(0xee);
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -727,7 +737,8 @@ mod tests {
         let outsider = key(0xee);
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -752,7 +763,8 @@ mod tests {
         let prev = genesis_state();
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -788,7 +800,8 @@ mod tests {
         };
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(at_max.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -849,7 +862,8 @@ mod tests {
         // Now the *new* admin alone can authorize the next ordinary entry...
         let next_payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc9),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let next_declared = compute_state_root(&apply(committed.state(), &next_payload).unwrap());
         let next_body = GovernanceEntryBody {
@@ -889,7 +903,8 @@ mod tests {
         };
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = compute_state_root(&apply(zero_threshold.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -918,6 +933,7 @@ mod tests {
         let payload = GovernanceOperationPayload::DeviceGrant(DeviceGrant {
             member_id: principal(0xc0),
             device_id: DeviceId::from_bytes([0xd0; N]),
+            binding: Vec::new(),
         });
         let body = GovernanceEntryBody {
             community_id: prev.state().community_id,
@@ -939,6 +955,7 @@ mod tests {
         let payload = GovernanceOperationPayload::DeviceGrant(DeviceGrant {
             member_id: admin,
             device_id: DeviceId::from_bytes([0xd1; N]),
+            binding: Vec::new(),
         });
         let declared = compute_state_root(&apply(prev.state(), &payload).unwrap());
         let body = GovernanceEntryBody {
@@ -1043,7 +1060,8 @@ mod tests {
     ) -> VerifiedGovernanceEntry {
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: member,
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         match admin_signers.split_first() {
             Some((first, rest)) => {
@@ -1156,7 +1174,8 @@ mod tests {
             // After commit, the new quorum authorizes the next ordinary entry...
             let grant = GovernanceOperationPayload::MemberGrant(MemberGrant {
                 member_id: principal(0xc9),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             });
             let by_new = next_entry(&committed, grant.clone(), new_refs[0], &new_refs[1..wn]);
             prop_assert!(validate_governance_entry(&committed, &by_new).is_ok());
@@ -1192,7 +1211,8 @@ mod tests {
                     &prev,
                     GovernanceOperationPayload::MemberGrant(MemberGrant {
                         member_id: plain,
-                        role: Role::Member,
+                        roles: vec![Role::Member],
+                        profile: None,
                     }),
                     admin0,
                     &[],
@@ -1214,6 +1234,7 @@ mod tests {
                     GovernanceOperationPayload::DeviceGrant(DeviceGrant {
                         member_id: owner,
                         device_id: dev,
+                        binding: Vec::new(),
                     }),
                     admin0,
                     &[],
@@ -1240,6 +1261,7 @@ mod tests {
                 GovernanceOperationPayload::DeviceGrant(DeviceGrant {
                     member_id: absent,
                     device_id: dev,
+                    binding: Vec::new(),
                 }),
                 admin0,
                 &[],
@@ -1255,6 +1277,7 @@ mod tests {
                 GovernanceOperationPayload::DeviceGrant(DeviceGrant {
                     member_id: owner,
                     device_id: dev,
+                    binding: Vec::new(),
                 }),
                 admin0,
                 &[],
@@ -1271,6 +1294,7 @@ mod tests {
                 GovernanceOperationPayload::DeviceGrant(DeviceGrant {
                     member_id: wrong_owner,
                     device_id: dev,
+                    binding: Vec::new(),
                 }),
                 admin0,
                 &[],
