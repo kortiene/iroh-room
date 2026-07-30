@@ -3,16 +3,23 @@
 //!
 //! Validation is strict and closed: unknown keys, missing required keys, wrong
 //! types, over-cap values, bad enums, and disallowed empty strings all reject
-//! with [`crate::Reject::InvalidContent`]. Cross-field rules against the envelope
-//! author (the `sender_id`) are enforced statelessly (spec §5 sub-steps 5e–5g);
-//! stateful checks (causal existence, role) are deferred to the authorization
-//! layer and are out of scope here.
+//! with [`crate::Reject::InvalidContent`]. A present optional field of the wrong
+//! type is rejected, never treated as absent (spec #152 §2.2 gap #3 / §8 step 3).
+//! Cross-field rules against the author identity are enforced statelessly (spec
+//! §5 sub-steps 5e–5g); stateful checks (causal existence, role) are deferred to
+//! the authorization layer and are out of scope here.
+//!
+//! Two entry points share one per-kind core:
+//! - [`validate_body`] validates the provisional envelope's inner body (kept for
+//!   the frozen #153 golden vectors).
+//! - [`validate_content`] validates the normative #134 §9.2 body's `content` map
+//!   against its `kind` and `author_id`.
 
 use crate::cbor::CborValue;
-use crate::content::body::ContentEventBody;
+use crate::content::provisional::ProvisionalContentEventBody;
 use crate::content::registry::ContentKind;
 use crate::error::Reject;
-use crate::ids::LEN;
+use crate::ids::{MemberId, LEN};
 
 // --- Reused v1 caps (spec §4 D8 + source §2 constants) ----------------------
 /// Max UTF-8 bytes of a `message.text` / `message.edited` body.
@@ -41,24 +48,48 @@ pub const MAX_MOD_REASON_BYTES: usize = 1_024;
 /// Max evidence refs in a moderation event.
 pub const MAX_EVIDENCE_REFS: usize = 16;
 
-/// Strictly validate a decoded content body (spec #152). Dispatches by kind.
+/// Strictly validate the provisional envelope's inner body (spec #152
+/// provisional path; kept for the frozen #153 golden vectors). Dispatches by
+/// kind against `body.body` using `body.author` for stateless cross-field rules.
 ///
 /// # Errors
-/// Returns [`crate::Reject::InvalidContent`] for any schema violation, and
-/// [`crate::Reject::UnknownContentKind`] is impossible here (the envelope
-/// already rejected unknown kinds).
-pub fn validate_body(body: &ContentEventBody) -> Result<(), Reject> {
-    let entries = body.body.as_map().ok_or(Reject::InvalidContent)?;
+/// Returns [`crate::Reject::InvalidContent`] for any schema violation.
+pub fn validate_body(body: &ProvisionalContentEventBody) -> Result<(), Reject> {
+    validate_kind(body.kind, &body.body, &body.author)
+}
+
+/// Strictly validate the normative #134 §9.2 body's `content` map against its
+/// `kind` and `author_id` (spec #152). Used by the normative content-event body
+/// decode (see [`super::body::ContentEventBody::from_canonical`]).
+///
+/// # Errors
+/// Returns [`crate::Reject::InvalidContent`] for any schema violation.
+pub fn validate_content(
+    kind: ContentKind,
+    content: &CborValue,
+    author_id: &MemberId,
+) -> Result<(), Reject> {
+    validate_kind(kind, content, author_id)
+}
+
+/// The shared per-kind dispatch: validate the kind-specific content map entries,
+/// enforcing exact known-key closure, required fields, types, caps, and enums.
+fn validate_kind(
+    kind: ContentKind,
+    content: &CborValue,
+    author_id: &MemberId,
+) -> Result<(), Reject> {
+    let entries = content.as_map().ok_or(Reject::InvalidContent)?;
     let mut fields = Fields::new(entries);
-    match body.kind {
+    match kind {
         ContentKind::MessageText => validate_message_text(&mut fields),
         ContentKind::MessageReaction => validate_message_reaction(&mut fields),
         ContentKind::MessageEdited => validate_message_edited(&mut fields),
         ContentKind::FileShared => validate_file_shared(&mut fields),
         ContentKind::AgentStatus => validate_agent_status(&mut fields),
-        ContentKind::ModerationBlock => validate_moderation_block(body, &mut fields),
-        ContentKind::ModerationReport => validate_moderation_report(body, &mut fields),
-        ContentKind::ModerationRemove => validate_moderation_remove(body, &mut fields),
+        ContentKind::ModerationBlock => validate_moderation_block(author_id, &mut fields),
+        ContentKind::ModerationReport => validate_moderation_report(author_id, &mut fields),
+        ContentKind::ModerationRemove => validate_moderation_remove(author_id, &mut fields),
     }?;
     fields.finish()
 }
@@ -82,12 +113,15 @@ impl<'a> Fields<'a> {
     fn get(&mut self, key: &str) -> Option<&'a CborValue> {
         let v = self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v);
         if v.is_some() {
-            self.seen.insert(
-                self.entries
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map_or("", |(k, _)| k.as_str()),
-            );
+            // `self.entries` is `&'a [...]` (Copy), so iterating it borrows the
+            // slice data with lifetime `'a`, not `self`; the shared ref can
+            // therefore be stored in `seen` (which is also keyed on `'a`).
+            let key_str = self
+                .entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .map_or("", |(k, _)| k.as_str());
+            self.seen.insert(key_str);
         }
         v
     }
@@ -100,7 +134,7 @@ impl<'a> Fields<'a> {
 
     fn require_uint(&mut self, key: &str) -> Result<u64, Reject> {
         self.get(key)
-            .and_then(super::super::cbor::CborValue::as_uint)
+            .and_then(CborValue::as_uint)
             .ok_or(Reject::InvalidContent)
     }
 
@@ -110,17 +144,37 @@ impl<'a> Fields<'a> {
             .ok_or(Reject::InvalidContent)
     }
 
-    fn opt_text(&mut self, key: &str) -> Option<&'a str> {
-        self.get(key).and_then(|v| v.as_text())
+    /// Read an optional text field. A present value of the wrong type is
+    /// rejected (spec #152 §2.2 gap #3); an absent key yields `None`.
+    fn opt_text(&mut self, key: &str) -> Result<Option<&'a str>, Reject> {
+        match self.get(key) {
+            Some(v) => v.as_text().map(Some).ok_or(Reject::InvalidContent),
+            None => Ok(None),
+        }
     }
 
-    fn opt_uint(&mut self, key: &str) -> Option<u64> {
-        self.get(key)
-            .and_then(super::super::cbor::CborValue::as_uint)
+    /// Read an optional uint field; a present wrong-typed value rejects.
+    fn opt_uint(&mut self, key: &str) -> Result<Option<u64>, Reject> {
+        match self.get(key) {
+            Some(v) => v.as_uint().map(Some).ok_or(Reject::InvalidContent),
+            None => Ok(None),
+        }
     }
 
-    fn opt_bytes(&mut self, key: &str) -> Option<&'a [u8]> {
-        self.get(key).and_then(|v| v.as_bytes())
+    /// Read an optional byte-string field; a present wrong-typed value rejects.
+    fn opt_bytes(&mut self, key: &str) -> Result<Option<&'a [u8]>, Reject> {
+        match self.get(key) {
+            Some(v) => v.as_bytes().map(Some).ok_or(Reject::InvalidContent),
+            None => Ok(None),
+        }
+    }
+
+    /// Read an optional array field; a present wrong-typed value rejects.
+    fn opt_array(&mut self, key: &str) -> Result<Option<&'a [CborValue]>, Reject> {
+        match self.get(key) {
+            Some(v) => v.as_array().map(Some).ok_or(Reject::InvalidContent),
+            None => Ok(None),
+        }
     }
 
     /// Reject if any key was not consumed (unknown key → reject, never ignore).
@@ -178,19 +232,19 @@ fn validate_message_text(f: &mut Fields<'_>) -> Result<(), Reject> {
     if body.len() > MAX_MESSAGE_BODY_BYTES {
         return Err(Reject::InvalidContent);
     }
-    if let Some(fmt) = f.opt_text("format") {
+    if let Some(fmt) = f.opt_text("format")? {
         require_enum(fmt, &["plain", "markdown"])?;
     }
-    if let Some(reply) = f.opt_bytes("in_reply_to") {
+    if let Some(reply) = f.opt_bytes("in_reply_to")? {
         let _ = require_fixed::<LEN>(reply)?;
     }
-    if let Some(mentions) = f.get("mentions").and_then(|v| v.as_array()) {
+    if let Some(mentions) = f.opt_array("mentions")? {
         require_bstr_array_cap(mentions, MAX_MENTIONS)?;
         for m in mentions {
             let _ = require_fixed::<LEN>(m.as_bytes().ok_or(Reject::InvalidContent)?)?;
         }
     }
-    if let Some(thread) = f.opt_bytes("thread_id") {
+    if let Some(thread) = f.opt_bytes("thread_id")? {
         let _ = require_fixed::<16>(thread)?;
     }
     Ok(())
@@ -200,7 +254,7 @@ fn validate_message_reaction(f: &mut Fields<'_>) -> Result<(), Reject> {
     let _ = require_fixed::<LEN>(f.require_bytes("target")?)?;
     let emoji = f.require_text("emoji")?;
     require_text_cap(emoji, MAX_REACTION_EMOJI_BYTES)?;
-    if let Some(op) = f.opt_text("op") {
+    if let Some(op) = f.opt_text("op")? {
         require_enum(op, &["add", "remove"])?;
     }
     Ok(())
@@ -212,7 +266,7 @@ fn validate_message_edited(f: &mut Fields<'_>) -> Result<(), Reject> {
     if new_body.len() > MAX_MESSAGE_BODY_BYTES {
         return Err(Reject::InvalidContent);
     }
-    if let Some(fmt) = f.opt_text("format") {
+    if let Some(fmt) = f.opt_text("format")? {
         require_enum(fmt, &["plain", "markdown"])?;
     }
     Ok(())
@@ -231,10 +285,10 @@ fn validate_file_shared(f: &mut Fields<'_>) -> Result<(), Reject> {
         return Err(Reject::InvalidContent);
     }
     let _ = require_fixed::<LEN>(f.require_bytes("blob_hash")?)?;
-    if let Some(bf) = f.opt_text("blob_format") {
+    if let Some(bf) = f.opt_text("blob_format")? {
         require_enum(bf, &["raw", "hash_seq"])?;
     }
-    if let Some(providers) = f.get("providers").and_then(|v| v.as_array()) {
+    if let Some(providers) = f.opt_array("providers")? {
         require_bstr_array_cap(providers, MAX_FILE_PROVIDERS)?;
         for p in providers {
             let _ = require_fixed::<LEN>(p.as_bytes().ok_or(Reject::InvalidContent)?)?;
@@ -246,18 +300,18 @@ fn validate_file_shared(f: &mut Fields<'_>) -> Result<(), Reject> {
 fn validate_agent_status(f: &mut Fields<'_>) -> Result<(), Reject> {
     let status = f.require_text("status")?;
     require_text_cap(status, MAX_STATUS_LABEL_BYTES)?;
-    if let Some(msg) = f.opt_text("message") {
+    if let Some(msg) = f.opt_text("message")? {
         if msg.len() > MAX_STATUS_MESSAGE_BYTES {
             return Err(Reject::InvalidContent);
         }
     }
-    if let Some(arts) = f.get("related_artifact_ids").and_then(|v| v.as_array()) {
+    if let Some(arts) = f.opt_array("related_artifact_ids")? {
         require_bstr_array_cap(arts, MAX_ARTIFACT_REFS)?;
         for a in arts {
             let _ = require_fixed::<16>(a.as_bytes().ok_or(Reject::InvalidContent)?)?;
         }
     }
-    if let Some(pct) = f.opt_uint("progress_pct") {
+    if let Some(pct) = f.opt_uint("progress_pct")? {
         if pct > 100 {
             return Err(Reject::InvalidContent);
         }
@@ -265,33 +319,31 @@ fn validate_agent_status(f: &mut Fields<'_>) -> Result<(), Reject> {
     Ok(())
 }
 
-fn validate_moderation_block(body: &ContentEventBody, f: &mut Fields<'_>) -> Result<(), Reject> {
-    validate_stream_scope(body, f)?;
+fn validate_moderation_block(author_id: &MemberId, f: &mut Fields<'_>) -> Result<(), Reject> {
+    validate_stream_scope(f)?;
     let subject = f.require_bytes("subject")?;
     let _ = require_fixed::<LEN>(subject)?;
     let blocked_by = f.require_bytes("blocked_by")?;
     let _ = require_fixed::<LEN>(blocked_by)?;
     // Cross-field: blocked_by == author; subject != author (spec §5 5e).
-    if blocked_by != body.author.as_bytes().as_slice()
-        || subject == body.author.as_bytes().as_slice()
-    {
+    if blocked_by != author_id.as_bytes().as_slice() || subject == author_id.as_bytes().as_slice() {
         return Err(Reject::InvalidContent);
     }
     let scope = f.require_text("scope")?;
     require_enum(scope, &["stream", "room"])?;
-    check_scope_stream_consistency(body, scope)?;
+    check_scope_stream_consistency(f, scope)?;
     validate_evidence_triple(f)?;
-    if let Some(_exp) = f.opt_uint("expires_at") {
+    if let Some(_exp) = f.opt_uint("expires_at")? {
         // Stateless: presence + uint only; expiry semantics are deferred.
     }
     Ok(())
 }
 
-fn validate_moderation_report(body: &ContentEventBody, f: &mut Fields<'_>) -> Result<(), Reject> {
-    validate_stream_scope(body, f)?;
+fn validate_moderation_report(author_id: &MemberId, f: &mut Fields<'_>) -> Result<(), Reject> {
+    validate_stream_scope(f)?;
     let subject = f.require_bytes("subject")?;
     let _ = require_fixed::<LEN>(subject)?;
-    if let Some(target) = f.opt_bytes("target_event") {
+    if let Some(target) = f.opt_bytes("target_event")? {
         let _ = require_fixed::<LEN>(target)?;
     }
     let category = f.require_text("category")?;
@@ -301,53 +353,49 @@ fn validate_moderation_report(body: &ContentEventBody, f: &mut Fields<'_>) -> Re
     )?;
     let reported_by = f.require_bytes("reported_by")?;
     let _ = require_fixed::<LEN>(reported_by)?;
-    if reported_by != body.author.as_bytes().as_slice() {
+    if reported_by != author_id.as_bytes().as_slice() {
         return Err(Reject::InvalidContent);
     }
     validate_evidence_triple(f)?;
     Ok(())
 }
 
-fn validate_moderation_remove(body: &ContentEventBody, f: &mut Fields<'_>) -> Result<(), Reject> {
-    validate_stream_scope(body, f)?;
+fn validate_moderation_remove(author_id: &MemberId, f: &mut Fields<'_>) -> Result<(), Reject> {
+    validate_stream_scope(f)?;
     let target = f.require_bytes("target_event")?;
     let _ = require_fixed::<LEN>(target)?;
     let removed_by = f.require_bytes("removed_by")?;
     let _ = require_fixed::<LEN>(removed_by)?;
-    if removed_by != body.author.as_bytes().as_slice() {
+    if removed_by != author_id.as_bytes().as_slice() {
         return Err(Reject::InvalidContent);
     }
     validate_evidence_triple(f)?;
     Ok(())
 }
 
-/// Validate a moderation `stream_id` field (stateless: present ⇒ `bstr[16]`;
-/// the scope/room bidirectional check happens in the kind validator).
-fn validate_stream_scope(body: &ContentEventBody, f: &mut Fields<'_>) -> Result<(), Reject> {
-    if let Some(sid) = f.opt_bytes("stream_id") {
+/// Validate a moderation `stream_id` field within the content map (stateless:
+/// present ⇒ `bstr[16]`). The normative §9.2 body carries a separate required
+/// top-level 32-byte `stream_id`; this per-kind field is the moderation
+/// stream-scope selector and is validated only for width here.
+fn validate_stream_scope(f: &mut Fields<'_>) -> Result<(), Reject> {
+    if let Some(sid) = f.opt_bytes("stream_id")? {
         let _ = require_fixed::<16>(sid)?;
-        // If both the envelope and body carry a stream_id, they must be identical
-        // (spec §5 sub-step 5g).
-        if let Some(env_sid) = body.stream_id {
-            if sid != env_sid.as_slice() {
-                return Err(Reject::InvalidContent);
-            }
-        }
     }
     Ok(())
 }
 
-/// `scope == room` ⇒ `stream_id` absent; `scope == stream` ⇒ `stream_id` present
-/// (spec §5 sub-step 5f, both directions).
-fn check_scope_stream_consistency(body: &ContentEventBody, scope: &str) -> Result<(), Reject> {
+/// `scope == room` ⇒ content-map `stream_id` absent; `scope == stream` ⇒ present
+/// (spec §5 sub-step 5f, both directions), against the per-kind content map.
+fn check_scope_stream_consistency(f: &mut Fields<'_>, scope: &str) -> Result<(), Reject> {
+    let has_stream_id = f.entries.iter().any(|(k, _)| k == "stream_id");
     match scope {
         "room" => {
-            if f_has(body, "stream_id") {
+            if has_stream_id {
                 return Err(Reject::InvalidContent);
             }
         }
         "stream" => {
-            if !f_has(body, "stream_id") {
+            if !has_stream_id {
                 return Err(Reject::InvalidContent);
             }
         }
@@ -356,20 +404,16 @@ fn check_scope_stream_consistency(body: &ContentEventBody, scope: &str) -> Resul
     Ok(())
 }
 
-fn f_has(body: &ContentEventBody, key: &str) -> bool {
-    body.body.get(key).is_some()
-}
-
 /// Validate the shared audit-evidence triple: `reason` (≤ cap),
 /// `evidence_events` (`bstr[32]` ≤ cap), `evidence_blobs` (`bstr[32]` ≤ cap).
 fn validate_evidence_triple(f: &mut Fields<'_>) -> Result<(), Reject> {
-    if let Some(reason) = f.opt_text("reason") {
+    if let Some(reason) = f.opt_text("reason")? {
         if reason.len() > MAX_MOD_REASON_BYTES {
             return Err(Reject::InvalidContent);
         }
     }
     for key in ["evidence_events", "evidence_blobs"] {
-        if let Some(arr) = f.get(key).and_then(|v| v.as_array()) {
+        if let Some(arr) = f.opt_array(key)? {
             require_bstr_array_cap(arr, MAX_EVIDENCE_REFS)?;
             for item in arr {
                 let _ = require_fixed::<LEN>(item.as_bytes().ok_or(Reject::InvalidContent)?)?;
@@ -400,7 +444,7 @@ fn is_well_formed_mime(mime: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::body::ContentEventBody;
+    use crate::content::provisional::ProvisionalContentEventBody;
     use crate::ids::RoomId;
     use crate::keys::SigningKey;
     use crate::MemberId;
@@ -414,14 +458,14 @@ mod tests {
         )
     }
 
-    // A tiny helper to build a content body with a kind + raw body map.
+    // A tiny helper to build a provisional content body with a kind + raw body map.
     fn body(
         kind: ContentKind,
         author: MemberId,
         room: RoomId,
         entries: Vec<(String, CborValue)>,
-    ) -> ContentEventBody {
-        ContentEventBody {
+    ) -> ProvisionalContentEventBody {
+        ProvisionalContentEventBody {
             schema_version: 2,
             room_id: room,
             author,
@@ -526,7 +570,7 @@ mod tests {
     #[test]
     fn moderation_block_scope_room_with_stream_id_rejected() {
         let (_, a, r) = author();
-        let mut b = body(
+        let b = body(
             ContentKind::ModerationBlock,
             a,
             r,
@@ -537,7 +581,6 @@ mod tests {
                 ("stream_id".into(), CborValue::Bytes(vec![0u8; 16])),
             ],
         );
-        b.stream_id = Some([0u8; 16]);
         assert_eq!(validate_body(&b).err(), Some(Reject::InvalidContent));
     }
 
@@ -577,6 +620,23 @@ mod tests {
                     CborValue::Bytes(a.as_bytes().to_vec()),
                 ),
                 ("evidence_events".into(), CborValue::Array(too_many)),
+            ],
+        );
+        assert_eq!(validate_body(&b).err(), Some(Reject::InvalidContent));
+    }
+
+    #[test]
+    fn present_wrong_typed_optional_rejected() {
+        // A present `format` with a non-text value must reject (spec §2.2 gap #3),
+        // not be silently treated as absent.
+        let (_, a, r) = author();
+        let b = body(
+            ContentKind::MessageText,
+            a,
+            r,
+            vec![
+                ("body".into(), CborValue::Text("hi".into())),
+                ("format".into(), CborValue::Uint(7)),
             ],
         );
         assert_eq!(validate_body(&b).err(), Some(Reject::InvalidContent));

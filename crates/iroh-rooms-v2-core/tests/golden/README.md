@@ -11,9 +11,9 @@ There are three fixture sets, all frozen under the same change discipline:
   negative vector (issue #146, spec `v2-identifiers-domain-separation.md`, refs
   #134 §6.2 / §6.3 / §6.4). Driven by `../identifiers.rs`.
 - `v2-member-merkle.json` — the #151 §8.1/§8.2 member-record and sorted-tree
-  vectors for 0, 1, 2, 3, and 10,000 leaves. Driven by
-  `../member_sorted_merkle.rs`; release timing uses
-  `cargo bench -p iroh-rooms-v2-core --bench member_merkle`.
+  vectors for 0, 1, 2, 3, and 10,000 leaves, plus the #153 frozen
+  inclusion-proof fixtures. Driven by `../member_sorted_merkle.rs`; release
+  timing uses `cargo bench -p iroh-rooms-v2-core --bench member_merkle`.
 
 ## These vectors are FROZEN
 
@@ -35,6 +35,38 @@ changing the frozen byte/hash expectations.
 
 ### Change log
 
+- **v6** — `#153` closed the last frozen-vector gap for the member Merkle map:
+  byte-exact **inclusion-proof fixtures** were missing (spec §4 D7 / §8 Step 12
+  require "pin ... inclusion proof ... in vectors"; proofs were exercised only
+  behaviourally before). Added three hand-derived, independently-reproducible
+  canonical-CBOR inclusion proofs to `v2-member-merkle.json` (a leaf sibling on
+  each side; a two-step path exercising both sides + odd-node promotion; and a
+  node-hash sibling produced by trailing-leaf promotion), driven by the new
+  `frozen_inclusion_proofs_match_independently_derived_structure` test in
+  `member_sorted_merkle.rs`. Sibling hashes are `member_leaf_hash` of the
+  already-frozen canonical records (cross-checked: `leaf_hash(1)` == the 1-leaf
+  root; `node(leaf1,leaf2)` == the 2-leaf root). **No frozen root or leaf hash
+  changes** — v6 only adds proof fixtures composed of already-frozen hashes.
+  Exclusion remains expressed as absence-of-proof + rebound-proof rejection (no
+  separate byte fixture).
+- **v5** — `#152` landed the normative #134 §9.2 `ContentEventBody`
+  (`content::body`) and the concrete exact-byte content-event envelope
+  (`content::event`: `ContentEvent` / `VerifiedContentEvent` /
+  `verify_content_event` / `seal_content_event` / `validate_device_chain_link`).
+  The frozen #153 content-event golden vector (`content-event-message-text-v1`)
+  is **deliberately preserved on the pre-#152 provisional schema** (now exposed
+  as the test-only `content::provisional::ProvisionalContentEventBody`); its
+  CSB/id/signature bytes are byte-identical to v4 and prove "unrelated golden
+  vectors do not drift". The normative §9.2 schema is a NEW, separate path with
+  its own focused tests; it is not dual-decodable as the provisional schema
+  (spec #152 D1: one normative v2 content wire schema). No frozen bytes change
+  in this bump; only a new normative path is added and the provisional type is
+  renamed/relocated. The shared canonical-CBOR codec gained the single canonical
+  `null` byte (`0xf6`) required by `prev_device_event`. The fixture-format
+  `schema` marker deliberately stays `iroh-rooms-v2-golden-vectors/v2`: these
+  change-log versions track landed protocol changes, and no bump to the
+  fixture-format schema is required because no frozen byte/hash/signature vector
+  changed in v3–v5.
 - **v4** — `#178` made the normative `governance::log` record wrappers
   (`GovernanceEntry` / `GovernanceApproval`) own the **exact received canonical
   signed bytes (CSB)** alongside the typed body, mirroring `crate::signed::Envelope`,

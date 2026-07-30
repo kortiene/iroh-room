@@ -501,10 +501,14 @@ impl GovernanceMachine {
                     _ => None,
                 };
                 let (state, observation) = Self::observe_forked(forked, entry)?;
-                let next = match &state {
-                    GovernanceMachineState::Linear(linear) => linear.accepted.clone(),
-                    GovernanceMachineState::GovernanceForked(_) => unreachable!(),
+                // observe_forked returns Ok only with a Linear state (a
+                // successful fork.resolve commits to a new linear tip). A
+                // Forked variant here would be an internal invariant regression;
+                // fail closed with a typed Reject rather than panic (audit L1).
+                let GovernanceMachineState::Linear(linear) = &state else {
+                    return Err(Reject::InvalidContent);
                 };
+                let next = linear.accepted.clone();
                 let transition = Some(CommittedGovernanceTransition {
                     prior,
                     next,

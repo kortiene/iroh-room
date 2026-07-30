@@ -116,6 +116,25 @@ pub fn verify(
         .map_err(|_| SignatureError)
 }
 
+/// Verify a detached Ed25519 signature under a device public key, using strict
+/// verification (rejects non-canonical signatures and small-order points). This
+/// is the device-key verification entry point used by the #152 content-event
+/// path, where the verification key is the in-body `device_id` rather than an
+/// out-of-body principal signer (spec #152 §3.4 / D3).
+///
+/// # Errors
+/// Returns [`SignatureError`] if the key is not a valid point (e.g. exact-width
+/// bytes that are not a valid Ed25519 point) or the signature does not verify.
+pub fn verify_device(
+    device: &DeviceId,
+    message: &[u8],
+    signature: &Signature,
+) -> Result<(), SignatureError> {
+    let vk = VerifyingKey::from_bytes(device.as_bytes()).map_err(|_| SignatureError)?;
+    vk.verify_strict(message, &signature.to_dalek())
+        .map_err(|_| SignatureError)
+}
+
 /// A secret Ed25519 signing key. Its public half is exposed as a [`MemberId`]
 /// (principal identity) and, optionally, a [`DeviceId`].
 pub struct SigningKey {

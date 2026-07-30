@@ -32,7 +32,8 @@
 #![allow(clippy::unwrap_used)]
 
 use iroh_rooms_v2_core::cbor::CborValue;
-use iroh_rooms_v2_core::content::{validate_body, ContentEventBody, ContentKind};
+use iroh_rooms_v2_core::content::provisional::ProvisionalContentEventBody as ContentEventBody;
+use iroh_rooms_v2_core::content::{validate_body, ContentKind};
 use iroh_rooms_v2_core::governance::{
     authorize_content_body, authorize_governance_entry, entry_id, validate_against_state,
     CheckpointBody, ForkResolutionBody, ForkResolveAction, GovernanceAction, GovernanceEntryBody,
@@ -284,7 +285,7 @@ fn content_authorization_tracks_membership_lifecycle() {
         body: CborValue::Map(vec![("body".to_owned(), CborValue::Text("hi".to_owned()))]),
     };
     let env_x = signed::seal(&text, &member_x);
-    let decoded_x = iroh_rooms_v2_core::content::body::decode_verified(&env_x).unwrap();
+    let decoded_x = iroh_rooms_v2_core::content::provisional::decode_verified(&env_x).unwrap();
     validate_body(&decoded_x).unwrap();
     authorize_content_body(state, &member_x.member_id()).expect("active member is authorized");
 
@@ -301,7 +302,7 @@ fn content_authorization_tracks_membership_lifecycle() {
         },
         &member_y,
     );
-    iroh_rooms_v2_core::content::body::decode_verified(&env_y).unwrap();
+    iroh_rooms_v2_core::content::provisional::decode_verified(&env_y).unwrap();
     assert_eq!(
         authorize_content_body(state, &member_y.member_id()).err(),
         Some(Reject::InsufficientAuthorization),
