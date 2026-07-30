@@ -1167,7 +1167,7 @@ const COVERED_CODES: &[&str] = &[
     "wrong_domain", // blocked
     "missing_dependency",
     "insufficient_authorization",
-    "invalid_approval", // blocked
+    "invalid_approval", // active since #147 (negative_invalid_approval)
     "fork_detected",
     "unresolved_fork",
     "invalid_fork_resolution",
