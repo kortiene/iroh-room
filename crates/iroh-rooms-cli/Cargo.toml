@@ -27,9 +27,16 @@ workspace = true
 iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # The shipping QUIC event-transport carrier (IR-0005): `room send` and
 # `room tail` bring up a `Node` over it to push/receive `message.text` frames.
-# The CLI enables `gossip_overlay` so the raised active-member cap rides the
-# bounded gossip topology instead of the no-gossip full-mesh path.
-iroh-rooms-net = { path = "../iroh-rooms-net", features = ["gossip_overlay"] }
+# `gossip_overlay` is deliberately NOT enabled here. It pulls in
+# `iroh-rooms-core/large_rooms` (the 5 -> 40 active-member cap), and the
+# spec's Phase C gate — `specs/gossip-overlay-events-fan-out.md` Step 8, "only
+# after Step 7 passes" — is not met: the Phase B acceptance criterion is "no
+# cascade at 1 event/s, connectedness >95%, delivery >95% at every N", and the
+# committed spike-N40 harness measures a cascade at 1 event/s with both figures
+# under 95% (`crates/spike-N40/results/results-gossip.md`). Until that AC
+# genuinely passes, the shipped CLI keeps the full-mesh topology and the cap of
+# 5. The overlay stays compiled and tested under `--all-features`.
+iroh-rooms-net = { path = "../iroh-rooms-net" }
 # The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
 # (spec AC2). The offline authoring path imports stable items through here
 # instead of `iroh-rooms-core` directly; `experimental` is enabled so the

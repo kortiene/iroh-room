@@ -7,9 +7,22 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
-- Added a **bounded gossip overlay for `Events` fan-out** and raised the
-  active-member ceiling to 40 (issues #171 and #173, `iroh-rooms-net` /
-  `iroh-rooms-core`). `Shared::route` now broadcasts `SyncMessage::Events` on a
+- Landed a **bounded gossip overlay for `Events` fan-out** and a feature-gated
+  40-member ceiling, but **kept both out of the shipped binaries** (issues #171
+  and #173, `iroh-rooms-net` / `iroh-rooms-core`). The shipped CLI and this
+  façade's `experimental` feature no longer enable `gossip_overlay`, so this
+  release's runtime topology and active-member ceiling are **unchanged from
+  rc.3**: full mesh, `MAX_ACTIVE_MEMBERS = 5`. The reason is the project's own
+  gate. `specs/gossip-overlay-events-fan-out.md` Step 8 raises the cap "only
+  after Step 7 passes", and Step 7's acceptance criterion is "no cascade at
+  1 event/s, connectedness >95%, delivery >95% at every N". Re-running the
+  matrix through the committed spike-N40 harness measures the opposite — a
+  cascade at 1 event/s with both figures under 95%, at N=5 as well as N=40
+  (`crates/spike-N40/results/results-gossip.md`). The overlay code stays
+  compiled, tested under `--all-features`, and available to a consumer that
+  opts in explicitly via `iroh-rooms-net/gossip_overlay`; it is simply not what
+  a shipped binary runs. What the overlay does, for when it is re-enabled:
+  `Shared::route` broadcasts `SyncMessage::Events` on a
   deterministic per-room `iroh-gossip` topic among admitted device keys whenever
   a mesh is installed for the room; every pull/query variant stays on the
   point-to-point per-peer queue, which relies on the per-link FIFO that gossip's
@@ -20,30 +33,19 @@ where feasible); the **experimental** tier may change on any release.
   preserved: `GossipProtocolHandler` gates `GOSSIP_ALPN` with the same
   `Arc<dyn Admission>` instance as the event plane and closes before the inner
   gossip handler runs (threat-model row T26). `PeerManager::desired_seeds` bounds
-  each node to `GOSSIP_BOOTSTRAP_SEEDS` warm links instead of `N - 1`, which is
-  what makes the cap raise safe — full-mesh N=40 crashed the QUIC layer at 1560
-  concurrent connections, where the overlay holds ~6 links per node (see
-  `crates/spike-N40/results/results-gossip.md` for the measured matrix and its
-  loopback-only caveats). `MAX_ACTIVE_MEMBERS` accordingly moves 5 → 40 behind
-  the `large_rooms` core feature, valid **only** when paired with
-  `iroh-rooms-net/gossip_overlay`; a `const` assertion in `iroh-rooms-net` pins
-  the pairing at compile time (no-gossip builds must see 5, gossip builds must
-  see 40), so a mismatched cap/topology build cannot link. Both features are
-  default-off on their own crates but **on** in the shipped CLI and in this
-  façade's `experimental` feature, so shipped binaries run the overlay at cap 40.
-  No wire-format, canonical-CBOR, signature, membership-fold, authorization, or
-  `SQLite` schema change; `GOSSIP_ALPN` is an additional ALPN, not a change to
-  `EVENT_ALPN`. **Upgrade note — mixed rc.3/rc.4 rooms:** rc.3 peers have
-  neither the overlay nor the raised cap. In a room that stays at **five or
-  fewer** active members the two interoperate: the dual-path fan-out still
-  delivers `Events` over the point-to-point queue an rc.3 peer understands, and
-  no pull/query path changed. In a room **grown past five** active members, an
-  rc.3 peer's fold hard-rejects the sixth `member.joined` with
-  `RejectReason::RoomFull` and its membership projection then diverges
-  permanently from the rc.4 peers — events authored by members it never admitted
-  fail authorization against its own view. **A coordinated whole-room upgrade to
-  rc.4 is required before growing a room beyond five active members**; rooms held
-  at five or fewer may upgrade peer by peer.
+  each node to `GOSSIP_BOOTSTRAP_SEEDS` warm links instead of `N - 1`, and
+  `MAX_ACTIVE_MEMBERS` moves 5 → 40 behind the `large_rooms` core feature, valid
+  **only** when paired with `iroh-rooms-net/gossip_overlay`; a `const` assertion
+  in `iroh-rooms-net` pins the pairing at compile time (no-gossip builds must see
+  5, gossip builds must see 40), so a mismatched cap/topology build cannot link.
+  That assertion is what makes holding the overlay back a safe one-line change
+  rather than a risky one. No wire-format, canonical-CBOR, signature,
+  membership-fold, authorization, or `SQLite` schema change; `GOSSIP_ALPN` is an
+  additional ALPN, not a change to `EVENT_ALPN`, and it is not registered at all
+  in a build without the feature. **Upgrade note — mixed rc.3/rc.4 rooms:**
+  because the shipped topology and ceiling are unchanged, rc.3 and rc.4 peers
+  interoperate normally and no coordinated upgrade is required. Members may
+  upgrade one at a time.
 - Stopped fanning out live events to unproven provisional dialers (issue #121,
   `iroh-rooms-net`): this closes the residual rc.3 shipped alongside the #112
   capability-proof gate. An unproven provisional dialer reaching `Connected` no
@@ -218,8 +220,9 @@ where feasible); the **experimental** tier may change on any release.
   `iroh-rooms-core` / `iroh-rooms-net` / `iroh-rooms-cli`): no-gossip/full-mesh
   builds keep the original hard `MAX_ACTIVE_MEMBERS = 5` cap and its
   `RejectReason::RoomFull` reject, while the `large_rooms` core feature raises
-  the cap to 40 only when paired with `iroh-rooms-net/gossip_overlay` (enabled by
-  the CLI and the experimental SDK). The re-exported `MembershipSnapshot` gains
+  the cap to 40 only when paired with `iroh-rooms-net/gossip_overlay` — which
+  the shipped CLI and the experimental SDK do **not** enable in this release, so
+  shipped binaries observe the cap of 5. The re-exported `MembershipSnapshot` gains
   two additive, side-effect-free methods — `active_member_limit() -> usize`
   (returns the compiled `MAX_ACTIVE_MEMBERS`) and
   `active_member_headroom() -> usize` (`limit.saturating_sub(active_count)`) —
