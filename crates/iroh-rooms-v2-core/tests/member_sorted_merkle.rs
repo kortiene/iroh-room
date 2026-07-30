@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use iroh_rooms_v2_core::cbor::{decode_canonical, encode};
+use iroh_rooms_v2_core::cbor::{decode_canonical, encode, CborValue};
 use iroh_rooms_v2_core::ids::{PrincipalId, LEN};
 use iroh_rooms_v2_core::member::projected::{
     MemberMapProjection, ProjectedMemberRecord, ProjectedStatus, RoleLabel,
@@ -810,4 +810,43 @@ fn fixture_carries_frozen_markers_and_mirrors_constants() {
             "frozen hex {hex_value} is in the Rust test constants but missing from the JSON fixture"
         );
     }
+}
+
+// ============================================================================
+// #160 / #134 §14 + §22.2 v2-core gate: the 10,000-member governance snapshot
+// MUST stay under 5 MiB (excluding optional profile blobs), or v2.0 would need
+// proof-carrying light-client mode (#134 §25 #6). This measures the
+// uncompressed member-map snapshot — a canonical-CBOR array of the sorted
+// projected records, the dominant component of the §7.6 snapshot blob a new
+// client fetches. The exact snapshot framing is frozen by #161; the per-record
+// size (and thus this verdict) is stable regardless of final framing.
+// ============================================================================
+
+#[test]
+fn ten_thousand_member_snapshot_under_five_mib_gate() {
+    const FIVE_MIB: usize = 5 * 1024 * 1024;
+    let records: Vec<ProjectedMemberRecord> = (0..10_000u64).map(record).collect();
+    // Payload = the 10k canonical record bytes (the content a client receives).
+    let payload: usize = records.iter().map(|r| r.canonical_bytes().len()).sum();
+    // Full framed snapshot = a canonical-CBOR array of the sorted records.
+    let values: Vec<CborValue> = records
+        .iter()
+        .map(|r| decode_canonical(&r.canonical_bytes()).expect("record is canonical"))
+        .collect();
+    let snapshot = encode(&CborValue::Array(values));
+    eprintln!(
+        "ten_thousand_member_snapshot: members={} payload_bytes={} snapshot_bytes={} ({} MiB) per_record_bytes={} five_mib={} fits={}",
+        records.len(),
+        payload,
+        snapshot.len(),
+        snapshot.len() / (1024 * 1024),
+        payload / records.len(),
+        FIVE_MIB,
+        snapshot.len() < FIVE_MIB,
+    );
+    assert!(
+        snapshot.len() < FIVE_MIB,
+        "10k member snapshot is {} bytes (> 5 MiB gate): v2.0 would need proof-carrying light-client mode (#134 §25 #6 / #160)",
+        snapshot.len(),
+    );
 }
