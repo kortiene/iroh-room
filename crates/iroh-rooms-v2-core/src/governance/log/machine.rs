@@ -35,7 +35,7 @@ use super::fork::{GovernanceBranchEvidence, GovernanceForkEvidence};
 use super::model::RecoveryConfig;
 use super::operation::GovernanceOperationPayload;
 use super::records::{AuthenticatedGovernanceEvidence, VerifiedGovernanceEntry};
-use super::state::{apply_fork_resolve, compute_state_root};
+use super::state::{apply_entry, compute_state_root};
 
 // ----------------------------------------------------------------------------
 // Lineage (spec §6.4). Pure in-memory protocol state used to resolve a common
@@ -225,6 +225,7 @@ impl LinearGovernanceState {
 #[derive(Debug, Clone)]
 pub struct GovernanceForkedState {
     pub(super) stable: ValidatedGovernanceState,
+    pub(super) projection_prior: ValidatedGovernanceState,
     pub(super) branches: BTreeMap<GovernanceId, ValidatedGovernanceState>,
     pub(super) evidence: GovernanceForkEvidence,
     pub(super) prior_audit: Vec<GovernanceForkAuditRecord>,
@@ -236,6 +237,12 @@ impl GovernanceForkedState {
     #[must_use]
     pub fn stable(&self) -> &ValidatedGovernanceState {
         &self.stable
+    }
+
+    /// The last materialized linear snapshot visible before fork detection.
+    #[must_use]
+    pub fn projection_prior(&self) -> &ValidatedGovernanceState {
+        &self.projection_prior
     }
 
     /// The known branch head ids (canonical ascending order).
@@ -302,6 +309,58 @@ pub enum GovernanceObservation {
         /// The known entry id.
         id: GovernanceId,
     },
+}
+
+/// The kind of an accepted machine commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommittedGovernanceTransitionKind {
+    /// A normal extension of the accepted linear tip.
+    LinearAdvance,
+    /// A recovery-authorized selection and synchronization of a fork branch.
+    ForkResolution,
+}
+
+/// An opaque transition emitted only after the machine atomically commits an
+/// accepted state change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedGovernanceTransition {
+    prior: ValidatedGovernanceState,
+    next: ValidatedGovernanceState,
+    kind: CommittedGovernanceTransitionKind,
+    entry: AuthenticatedGovernanceEvidence,
+    selected: Option<ValidatedGovernanceState>,
+}
+
+impl CommittedGovernanceTransition {
+    /// The last materialized linear snapshot before this commit.
+    #[must_use]
+    pub fn prior(&self) -> &ValidatedGovernanceState {
+        &self.prior
+    }
+
+    /// The newly accepted snapshot after this commit.
+    #[must_use]
+    pub fn next(&self) -> &ValidatedGovernanceState {
+        &self.next
+    }
+
+    /// The committed transition kind.
+    #[must_use]
+    pub fn kind(&self) -> CommittedGovernanceTransitionKind {
+        self.kind
+    }
+
+    /// The authenticated entry whose commit produced this transition.
+    #[must_use]
+    pub fn entry(&self) -> &AuthenticatedGovernanceEvidence {
+        &self.entry
+    }
+
+    /// The selected branch snapshot for a fork resolution.
+    #[must_use]
+    pub fn selected(&self) -> Option<&ValidatedGovernanceState> {
+        self.selected.as_ref()
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -403,17 +462,63 @@ impl GovernanceMachine {
         &mut self,
         entry: &VerifiedGovernanceEntry,
     ) -> Result<GovernanceObservation, Reject> {
-        let (replacement, observation) = match &mut self.state {
-            GovernanceMachineState::Linear(linear) => Self::observe_linear(linear, entry)?,
+        self.observe_committed(entry)
+            .map(|(observation, _)| observation)
+    }
+
+    /// Observe an entry and return its observation plus a machine-issued commit
+    /// transition when and only when an accepted linear state actually advances.
+    ///
+    /// # Errors
+    /// Returns the same rejection reasons as [`Self::observe`].
+    pub fn observe_committed(
+        &mut self,
+        entry: &VerifiedGovernanceEntry,
+    ) -> Result<(GovernanceObservation, Option<CommittedGovernanceTransition>), Reject> {
+        let (replacement, observation, transition) = match &mut self.state {
+            GovernanceMachineState::Linear(linear) => {
+                let prior = linear.accepted.clone();
+                let (replacement, observation) = Self::observe_linear(linear, entry)?;
+                let transition = if matches!(observation, GovernanceObservation::Advanced { .. }) {
+                    Some(CommittedGovernanceTransition {
+                        prior,
+                        next: linear.accepted.clone(),
+                        kind: CommittedGovernanceTransitionKind::LinearAdvance,
+                        entry: entry.authenticated_evidence().clone(),
+                        selected: None,
+                    })
+                } else {
+                    None
+                };
+                (replacement, observation, transition)
+            }
             GovernanceMachineState::GovernanceForked(forked) => {
+                let prior = forked.projection_prior.clone();
+                let selected = match &entry.body().payload {
+                    GovernanceOperationPayload::ForkResolve(resolve) => {
+                        forked.branches.get(&resolve.selected_head).cloned()
+                    }
+                    _ => None,
+                };
                 let (state, observation) = Self::observe_forked(forked, entry)?;
-                (Some(state), observation)
+                let next = match &state {
+                    GovernanceMachineState::Linear(linear) => linear.accepted.clone(),
+                    GovernanceMachineState::GovernanceForked(_) => unreachable!(),
+                };
+                let transition = Some(CommittedGovernanceTransition {
+                    prior,
+                    next,
+                    kind: CommittedGovernanceTransitionKind::ForkResolution,
+                    entry: entry.authenticated_evidence().clone(),
+                    selected,
+                });
+                (Some(state), observation, transition)
             }
         };
         if let Some(state) = replacement {
             self.state = state;
         }
-        Ok(observation)
+        Ok((observation, transition))
     }
 
     fn observe_linear(
@@ -510,7 +615,12 @@ impl GovernanceMachine {
         );
         let mut heads: BTreeSet<GovernanceId> = forked.branches.keys().copied().collect();
         heads.insert(candidate.entry_id());
-        let next = Self::build_forked_state(lineage, &heads, forked.prior_audit.clone())?;
+        let next = Self::build_forked_state(
+            lineage,
+            &heads,
+            forked.prior_audit.clone(),
+            forked.projection_prior.clone(),
+        )?;
         let evidence = next.evidence.clone();
         self.state = GovernanceMachineState::GovernanceForked(next);
         Ok(GovernanceObservation::ForkDetected { evidence })
@@ -537,7 +647,12 @@ impl GovernanceMachine {
             new_candidate.evidence().clone(),
         );
         let heads = BTreeSet::from([accepted_head, new_candidate.entry_id()]);
-        let forked = Self::build_forked_state(lineage, &heads, linear.audit.clone())?;
+        let forked = Self::build_forked_state(
+            lineage,
+            &heads,
+            linear.audit.clone(),
+            linear.accepted.clone(),
+        )?;
         let evidence = forked.evidence.clone();
         Ok((
             GovernanceMachineState::GovernanceForked(forked),
@@ -549,6 +664,7 @@ impl GovernanceMachine {
         lineage: GovernanceLineage,
         heads: &BTreeSet<GovernanceId>,
         prior_audit: Vec<GovernanceForkAuditRecord>,
+        projection_prior: ValidatedGovernanceState,
     ) -> Result<GovernanceForkedState, Reject> {
         let maximal_heads: BTreeSet<GovernanceId> = heads
             .iter()
@@ -591,6 +707,7 @@ impl GovernanceMachine {
         };
         Ok(GovernanceForkedState {
             stable,
+            projection_prior,
             branches,
             evidence,
             prior_audit,
@@ -663,7 +780,7 @@ impl GovernanceMachine {
         // Rule 6: deterministic post-resolution root. Apply ONLY the resolution
         // marker to the selected branch state, then require the declared root
         // to match.
-        let resolved_state = apply_fork_resolve(selected_state.state(), resolve)?;
+        let resolved_state = apply_entry(selected_state.state(), body.seq, &body.payload)?;
         let recomputed = compute_state_root(&resolved_state);
         if recomputed != body.state_root {
             return Err(Reject::StateRootMismatch);
@@ -829,7 +946,7 @@ mod tests {
     use crate::governance::log::records::{
         entry_id, GovernanceApproval, GovernanceApprovalBody, GovernanceEntry, GovernanceEntryBody,
     };
-    use crate::governance::log::state::{apply, compute_state_root};
+    use crate::governance::log::state::{apply_fork_resolve, compute_state_root};
     use crate::ids::{GovernanceId, PrincipalId, StateRoot, LEN as N};
     use crate::keys::{verify, SigningKey};
 
@@ -883,7 +1000,7 @@ mod tests {
             GovernanceTip::Genesis => (1u64, None),
             GovernanceTip::Entry { seq, id } => (seq + 1, Some(id)),
         };
-        let declared = match apply(prev.state(), &payload) {
+        let declared = match super::super::state::apply_entry(prev.state(), seq, &payload) {
             Ok(s) => compute_state_root(&s),
             Err(_) => StateRoot::from_bytes([0; N]),
         };
@@ -918,7 +1035,8 @@ mod tests {
     fn grant_payload(member: PrincipalId) -> GovernanceOperationPayload {
         GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: member,
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         })
     }
 
@@ -1357,10 +1475,20 @@ mod tests {
         let forked = machine.forked().unwrap().clone();
         // W=2; supply 2 eligible recovery signers (signer 0xa3 + approver 0xa4).
         let resolve = resolve_entry(&forked, heads[0], &heads, &[&key(0xa3), &key(0xa4)], 1);
-        let obs = machine.observe(&resolve).expect("W resolves");
+        let projection_prior = forked.projection_prior.clone();
+        let selected = forked.branch(&heads[0]).unwrap().clone();
+        let (obs, transition) = machine.observe_committed(&resolve).expect("W resolves");
         assert!(matches!(obs, GovernanceObservation::Advanced { .. }));
+        let transition = transition.expect("resolution emits committed transition");
+        assert_eq!(transition.prior(), &projection_prior);
+        assert_eq!(transition.selected(), Some(&selected));
+        assert_eq!(
+            transition.kind(),
+            CommittedGovernanceTransitionKind::ForkResolution
+        );
         // Resolved → linear; the accepted tip is the resolution entry.
         let accepted = machine.accepted().expect("linear after resolve");
+        assert_eq!(transition.next(), accepted);
         match accepted.tip() {
             GovernanceTip::Entry { id, .. } => assert_eq!(id, resolve.id()),
             GovernanceTip::Genesis => panic!("resolved tip must be an entry"),
@@ -1694,10 +1822,18 @@ mod tests {
             &key(0xa0),
             &[&key(0xa1)],
         );
-        machine.observe(&a).unwrap();
-        // Re-observe the exact same entry → Duplicate, not a fork.
-        let obs = machine.observe(&a).expect("duplicate observed");
+        let (obs, transition) = machine.observe_committed(&a).unwrap();
+        assert!(matches!(obs, GovernanceObservation::Advanced { .. }));
+        let transition = transition.expect("advance emits committed transition");
+        assert_eq!(transition.prior(), &genesis);
+        assert_eq!(transition.next(), machine.accepted().unwrap());
+        assert_eq!(
+            transition.kind(),
+            CommittedGovernanceTransitionKind::LinearAdvance
+        );
+        let (obs, transition) = machine.observe_committed(&a).expect("duplicate observed");
         assert!(matches!(obs, GovernanceObservation::Duplicate { .. }));
+        assert!(transition.is_none());
         assert!(machine.accepted().is_some());
     }
 

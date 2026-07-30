@@ -50,8 +50,9 @@ pub use genesis::{
     GenesisSignature, GENESIS_SCHEMA_VERSION,
 };
 pub use machine::{
-    GovernanceForkAuditRecord, GovernanceForkAuditStatus, GovernanceForkedState, GovernanceMachine,
-    GovernanceMachineState, GovernanceObservation, LinearGovernanceState,
+    CommittedGovernanceTransition, CommittedGovernanceTransitionKind, GovernanceForkAuditRecord,
+    GovernanceForkAuditStatus, GovernanceForkedState, GovernanceMachine, GovernanceMachineState,
+    GovernanceObservation, LinearGovernanceState,
 };
 pub use model::{
     AdministratorState, CommunityPolicy, DeviceRecord, DeviceStatus, MemberRecord, MemberStatus,
@@ -60,8 +61,9 @@ pub use model::{
 };
 pub use operation::{
     AdminSet, DeviceGrant, DeviceRevoke, ForkResolve, GovernanceOperationKind,
-    GovernanceOperationPayload, InviteRevoke, MemberGrant, MemberRevoke, MigrationAccept,
-    PolicySet, RecoverySet, ReplicaSet, StreamArchive, StreamCreate, StreamPolicySet,
+    GovernanceOperationPayload, InviteRevoke, MemberGrant, MemberRevoke, MemberRoleSet,
+    MigrationAccept, PolicySet, RecoverySet, ReplicaSet, StreamArchive, StreamCreate,
+    StreamPolicySet,
 };
 pub use records::{
     approval_csb, approval_id, approval_id_from_csb, decode_approval_csb, decode_entry_csb,
@@ -71,7 +73,7 @@ pub use records::{
     VerifiedGovernanceApprovalEvidence, VerifiedGovernanceEntry,
 };
 pub use state::{
-    apply, apply_verified_entry, check_chain_link, component_root, compute_state_root,
+    apply, apply_entry, apply_verified_entry, check_chain_link, component_root, compute_state_root,
     governance_state_root_record, verify_state_root, GovernanceState, GovernanceStateRootRecord,
     COMPONENT_LABELS,
 };

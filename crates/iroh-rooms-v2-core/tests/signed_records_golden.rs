@@ -35,8 +35,8 @@ use iroh_rooms_v2_core::ids::{
 };
 use iroh_rooms_v2_core::keys::Signature;
 use iroh_rooms_v2_core::keys::SigningKey;
+use iroh_rooms_v2_core::member::legacy::project;
 use iroh_rooms_v2_core::member::merkle::{leaf_hash, map_key, value_hash};
-use iroh_rooms_v2_core::member::project;
 use iroh_rooms_v2_core::signed::{self, Envelope, SignedBody};
 use iroh_rooms_v2_core::Reject;
 
@@ -992,7 +992,8 @@ fn negative_invalid_approval() {
         kind: GovernanceOperationKind::MemberGrant,
         payload: GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: MemberId::from_bytes([0xc0; LEN]),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         }),
         state_root: iroh_rooms_v2_core::ids::StateRoot::from_bytes([0x33; LEN]),
     };
@@ -1062,7 +1063,7 @@ fn negative_snapshot_hash_mismatch() {
 #[test]
 fn negative_invalid_merkle_proof() {
     // Corrupt one sibling hash in an otherwise-valid inclusion proof.
-    let mut map = iroh_rooms_v2_core::member::MerkleMap::new();
+    let mut map = iroh_rooms_v2_core::member::legacy::MerkleMap::new();
     map.insert_value(b"alice", &CborValue::Uint(1));
     let root = map.root();
     let mut proof = map.prove_inclusion(b"alice").expect("leaf is set");

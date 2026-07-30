@@ -294,7 +294,8 @@ mod tests {
     ) -> VerifiedGovernanceEntry {
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: member,
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let (seq, prev_id) = match prev.tip() {
             GovernanceTip::Genesis => (1u64, None),
@@ -405,7 +406,8 @@ mod tests {
         // grant payload → same resulting root, distinct entry id.
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: principal(0xc0),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let declared = crate::governance::log::state::compute_state_root(
             &crate::governance::log::state::apply(genesis.state(), &payload).unwrap(),

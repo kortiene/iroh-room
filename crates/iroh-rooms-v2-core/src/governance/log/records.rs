@@ -870,7 +870,8 @@ mod tests {
             kind: GovernanceOperationKind::MemberGrant,
             payload: GovernanceOperationPayload::MemberGrant(MemberGrant {
                 member_id: PrincipalId::from_bytes([0xc0; LEN]),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             }),
             state_root: StateRoot::from_bytes([0x33; LEN]),
         }

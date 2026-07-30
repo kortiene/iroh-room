@@ -40,7 +40,7 @@ use iroh_rooms_v2_core::governance::{
 };
 use iroh_rooms_v2_core::ids::{DeviceId, GovernanceEntryId, MemberId, RoomId, LEN};
 use iroh_rooms_v2_core::keys::SigningKey;
-use iroh_rooms_v2_core::member::project;
+use iroh_rooms_v2_core::member::legacy::project;
 use iroh_rooms_v2_core::signed::{self, Envelope};
 use iroh_rooms_v2_core::Reject;
 

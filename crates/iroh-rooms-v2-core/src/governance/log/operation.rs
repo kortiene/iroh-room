@@ -1,6 +1,6 @@
 //! The closed #134 §7.3 governance-operation registry (issue #147).
 //!
-//! Exactly fourteen operations are registered. Unknown wire strings are
+//! Exactly fifteen operations are registered. Unknown wire strings are
 //! rejected with [`Reject::UnknownRecordKind`] (never silently ignored), and
 //! every payload is decoded through a closed schema (unknown keys →
 //! [`Reject::InvalidContent`]). Each payload struct round-trips through
@@ -22,6 +22,8 @@ pub enum GovernanceOperationKind {
     MemberGrant,
     /// `member.revoke`
     MemberRevoke,
+    /// `member.role_set`
+    MemberRoleSet,
     /// `device.grant`
     DeviceGrant,
     /// `device.revoke`
@@ -53,6 +55,7 @@ impl GovernanceOperationKind {
     pub const ALL: &[Self] = &[
         Self::MemberGrant,
         Self::MemberRevoke,
+        Self::MemberRoleSet,
         Self::DeviceGrant,
         Self::DeviceRevoke,
         Self::AdminSet,
@@ -73,6 +76,7 @@ impl GovernanceOperationKind {
         match self {
             Self::MemberGrant => "member.grant",
             Self::MemberRevoke => "member.revoke",
+            Self::MemberRoleSet => "member.role_set",
             Self::DeviceGrant => "device.grant",
             Self::DeviceRevoke => "device.revoke",
             Self::AdminSet => "admin.set",
@@ -98,6 +102,7 @@ impl GovernanceOperationKind {
         match s {
             "member.grant" => Ok(Self::MemberGrant),
             "member.revoke" => Ok(Self::MemberRevoke),
+            "member.role_set" => Ok(Self::MemberRoleSet),
             "device.grant" => Ok(Self::DeviceGrant),
             "device.revoke" => Ok(Self::DeviceRevoke),
             "admin.set" => Ok(Self::AdminSet),
@@ -119,13 +124,15 @@ impl GovernanceOperationKind {
 // Payload structs (spec §6.3 apply table).
 // ----------------------------------------------------------------------------
 
-/// `member.grant`: insert/reactivate a member with a role.
+/// `member.grant`: insert/reactivate a member with roles and an optional profile reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberGrant {
     /// The member to grant.
     pub member_id: PrincipalId,
-    /// The granted role.
-    pub role: Role,
+    /// Canonical sorted, duplicate-free granted role set.
+    pub roles: Vec<Role>,
+    /// Optional opaque profile reference with no authorization meaning.
+    pub profile: Option<Vec<u8>>,
 }
 
 /// `member.revoke`: mark a member revoked.
@@ -135,6 +142,15 @@ pub struct MemberRevoke {
     pub member_id: PrincipalId,
 }
 
+/// `member.role_set`: replace an active member's role set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRoleSet {
+    /// The member whose roles are replaced.
+    pub member_id: PrincipalId,
+    /// Canonical sorted, duplicate-free role set.
+    pub roles: Vec<Role>,
+}
+
 /// `device.grant`: add a device to a member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceGrant {
@@ -142,6 +158,8 @@ pub struct DeviceGrant {
     pub member_id: PrincipalId,
     /// The device to grant.
     pub device_id: DeviceId,
+    /// Opaque canonical binding metadata.
+    pub binding: Vec<u8>,
 }
 
 /// `device.revoke`: revoke a device.
@@ -318,6 +336,8 @@ pub enum GovernanceOperationPayload {
     MemberGrant(MemberGrant),
     /// `member.revoke`
     MemberRevoke(MemberRevoke),
+    /// `member.role_set`
+    MemberRoleSet(MemberRoleSet),
     /// `device.grant`
     DeviceGrant(DeviceGrant),
     /// `device.revoke`
@@ -344,6 +364,18 @@ pub enum GovernanceOperationPayload {
     MigrationAccept(MigrationAccept),
 }
 
+fn validate_roles(roles: &[Role]) -> Result<(), Reject> {
+    if roles.is_empty()
+        || roles
+            .windows(2)
+            .any(|window| window[0].as_str() >= window[1].as_str())
+    {
+        Err(Reject::InvalidContent)
+    } else {
+        Ok(())
+    }
+}
+
 impl GovernanceOperationPayload {
     /// The discriminant of this payload.
     #[must_use]
@@ -351,6 +383,7 @@ impl GovernanceOperationPayload {
         match self {
             Self::MemberGrant(_) => GovernanceOperationKind::MemberGrant,
             Self::MemberRevoke(_) => GovernanceOperationKind::MemberRevoke,
+            Self::MemberRoleSet(_) => GovernanceOperationKind::MemberRoleSet,
             Self::DeviceGrant(_) => GovernanceOperationKind::DeviceGrant,
             Self::DeviceRevoke(_) => GovernanceOperationKind::DeviceRevoke,
             Self::AdminSet(_) => GovernanceOperationKind::AdminSet,
@@ -369,19 +402,39 @@ impl GovernanceOperationPayload {
     /// Canonical-CBOR encode this payload (the nested `payload` field of a
     /// [`super::records::GovernanceEntryBody`]).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_cbor(&self) -> CborValue {
         match self {
-            Self::MemberGrant(p) => CborValue::Map(vec![
-                (
-                    "member_id".to_owned(),
-                    CborValue::Bytes(p.member_id.as_bytes().to_vec()),
-                ),
-                ("role".to_owned(), p.role.to_cbor()),
-            ]),
+            Self::MemberGrant(p) => {
+                let mut entries = vec![
+                    (
+                        "member_id".to_owned(),
+                        CborValue::Bytes(p.member_id.as_bytes().to_vec()),
+                    ),
+                    (
+                        "roles".to_owned(),
+                        CborValue::Array(p.roles.iter().map(Role::to_cbor).collect()),
+                    ),
+                ];
+                if let Some(profile) = &p.profile {
+                    entries.push(("profile".to_owned(), CborValue::Bytes(profile.clone())));
+                }
+                CborValue::Map(entries)
+            }
             Self::MemberRevoke(p) => CborValue::Map(vec![(
                 "member_id".to_owned(),
                 CborValue::Bytes(p.member_id.as_bytes().to_vec()),
             )]),
+            Self::MemberRoleSet(p) => CborValue::Map(vec![
+                (
+                    "member_id".to_owned(),
+                    CborValue::Bytes(p.member_id.as_bytes().to_vec()),
+                ),
+                (
+                    "roles".to_owned(),
+                    CborValue::Array(p.roles.iter().map(Role::to_cbor).collect()),
+                ),
+            ]),
             Self::DeviceGrant(p) => CborValue::Map(vec![
                 (
                     "member_id".to_owned(),
@@ -391,6 +444,7 @@ impl GovernanceOperationPayload {
                     "device_id".to_owned(),
                     CborValue::Bytes(p.device_id.as_bytes().to_vec()),
                 ),
+                ("binding".to_owned(), CborValue::Bytes(p.binding.clone())),
             ]),
             Self::DeviceRevoke(p) => CborValue::Map(vec![
                 (
@@ -476,12 +530,35 @@ impl GovernanceOperationPayload {
             GovernanceOperationKind::MemberGrant => {
                 super::reject_unknown_keys(
                     entries,
-                    &["member_id", "role"],
+                    &["member_id", "roles", "profile"],
                     Reject::InvalidContent,
                 )?;
+                let roles_value =
+                    super::opt_field(entries, "roles").ok_or(Reject::InvalidContent)?;
+                let roles = roles_value
+                    .as_array()
+                    .ok_or(Reject::InvalidContent)?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_text()
+                            .ok_or(Reject::InvalidContent)
+                            .and_then(Role::parse)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                validate_roles(&roles)?;
+                let profile = super::opt_field(entries, "profile")
+                    .map(|value| {
+                        value
+                            .as_bytes()
+                            .map(<[u8]>::to_vec)
+                            .ok_or(Reject::InvalidContent)
+                    })
+                    .transpose()?;
                 Self::MemberGrant(MemberGrant {
                     member_id: super::read_principal_field(entries, "member_id")?,
-                    role: Role::parse(super::read_text_field(entries, "role")?)?,
+                    roles,
+                    profile,
                 })
             }
             GovernanceOperationKind::MemberRevoke => {
@@ -490,15 +567,40 @@ impl GovernanceOperationPayload {
                     member_id: super::read_principal_field(entries, "member_id")?,
                 })
             }
+            GovernanceOperationKind::MemberRoleSet => {
+                super::reject_unknown_keys(
+                    entries,
+                    &["member_id", "roles"],
+                    Reject::InvalidContent,
+                )?;
+                let roles_value =
+                    super::opt_field(entries, "roles").ok_or(Reject::InvalidContent)?;
+                let roles_array = roles_value.as_array().ok_or(Reject::InvalidContent)?;
+                let roles = roles_array
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_text()
+                            .ok_or(Reject::InvalidContent)
+                            .and_then(Role::parse)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                validate_roles(&roles)?;
+                Self::MemberRoleSet(MemberRoleSet {
+                    member_id: super::read_principal_field(entries, "member_id")?,
+                    roles,
+                })
+            }
             GovernanceOperationKind::DeviceGrant => {
                 super::reject_unknown_keys(
                     entries,
-                    &["member_id", "device_id"],
+                    &["member_id", "device_id", "binding"],
                     Reject::InvalidContent,
                 )?;
                 Self::DeviceGrant(DeviceGrant {
                     member_id: super::read_principal_field(entries, "member_id")?,
                     device_id: super::read_device_field(entries, "device_id")?,
+                    binding: super::read_bytes_field(entries, "binding")?.to_vec(),
                 })
             }
             GovernanceOperationKind::DeviceRevoke => {
@@ -620,11 +722,11 @@ mod tests {
     use crate::ids::LEN;
 
     #[test]
-    fn registry_has_exactly_fourteen_operations() {
+    fn registry_has_exactly_fifteen_operations() {
         assert_eq!(
             GovernanceOperationKind::ALL.len(),
-            14,
-            "§7.3 freezes exactly 14 ops"
+            15,
+            "§7.3 freezes exactly 15 ops"
         );
     }
 
@@ -686,14 +788,20 @@ mod tests {
         let payloads = [
             GovernanceOperationPayload::MemberGrant(MemberGrant {
                 member_id: PrincipalId::from_bytes([0x01; LEN]),
-                role: Role::Member,
+                roles: vec![Role::Member],
+                profile: None,
             }),
             GovernanceOperationPayload::MemberRevoke(MemberRevoke {
                 member_id: PrincipalId::from_bytes([0x02; LEN]),
             }),
+            GovernanceOperationPayload::MemberRoleSet(MemberRoleSet {
+                member_id: PrincipalId::from_bytes([0x02; LEN]),
+                roles: vec![Role::Admin, Role::Agent, Role::Member],
+            }),
             GovernanceOperationPayload::DeviceGrant(DeviceGrant {
                 member_id: PrincipalId::from_bytes([0x03; LEN]),
                 device_id: DeviceId::from_bytes([0x04; LEN]),
+                binding: vec![0xaa],
             }),
             GovernanceOperationPayload::DeviceRevoke(DeviceRevoke {
                 member_id: PrincipalId::from_bytes([0x05; LEN]),
@@ -825,7 +933,8 @@ mod tests {
         // Encode a MemberGrant, then attempt to decode it as MemberRevoke.
         let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
             member_id: PrincipalId::from_bytes([1; LEN]),
-            role: Role::Member,
+            roles: vec![Role::Member],
+            profile: None,
         });
         let cbor = payload.to_cbor();
         assert!(GovernanceOperationPayload::from_canonical(
