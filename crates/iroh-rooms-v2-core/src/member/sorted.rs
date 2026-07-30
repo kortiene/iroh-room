@@ -185,6 +185,29 @@ fn reduce_levels(level: &[Hash]) -> Hash {
     current[0]
 }
 
+/// Compute the §8.2 root directly from `(identity, canonical_record_bytes)`
+/// pairs without re-validating the records. Sorts by raw identity-key bytes,
+/// hashes each leaf with `member_leaf_hash`, and reduces with the unchanged
+/// odd-node promotion rule. Byte-identical to [`rebuild_root`] for records
+/// that already validate; total (never fails) for arbitrary canonical bytes.
+/// Used by the governance state-root computation, which must stay total and
+/// must not panic on arbitrary public [`crate::governance::log::GovernanceState`].
+pub(crate) fn root_from_canonical<'a, I>(records: I) -> Hash
+where
+    I: IntoIterator<Item = (&'a PrincipalId, &'a [u8])>,
+{
+    let mut keyed: Vec<(PrincipalId, Hash)> = records
+        .into_iter()
+        .map(|(id, canon)| (*id, member_leaf_hash(canon)))
+        .collect();
+    keyed.sort_by_key(|(id, _)| *id);
+    // Duplicate identities cannot occur for a keyed map (each id is unique);
+    // retain the last so the reduction stays total on adversarial inputs.
+    keyed.dedup_by_key(|(id, _)| *id);
+    let hashes: Vec<Hash> = keyed.iter().map(|(_, h)| *h).collect();
+    reduce_levels(&hashes)
+}
+
 // ----------------------------------------------------------------------------
 // Inclusion proofs (spec §3.5 / D8).
 // ----------------------------------------------------------------------------

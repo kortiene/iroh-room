@@ -224,6 +224,9 @@ impl ProjectedMemberRecord {
     /// Returns [`Reject::InvalidContent`] when:
     /// - an active member has an empty role set;
     /// - `revoke_seq` is present while status is active, or absent while revoked;
+    /// - `revoke_seq` is not strictly greater than `grant_seq` (a revoke is
+    ///   always a later governance entry than the grant/regrant it tombstones,
+    ///   so `revoke_seq == grant_seq` is unreachable and rejected);
     /// - roles are duplicate/unsorted;
     /// - active devices are duplicate (by `device_id`) or unsorted.
     pub fn validate(&self) -> Result<(), Reject> {
@@ -250,7 +253,7 @@ impl ProjectedMemberRecord {
             (ProjectedStatus::Active, Some(_)) | (ProjectedStatus::Revoked, None) => {
                 return Err(Reject::InvalidContent);
             }
-            (ProjectedStatus::Revoked, Some(seq)) if seq < self.grant_seq => {
+            (ProjectedStatus::Revoked, Some(seq)) if seq <= self.grant_seq => {
                 return Err(Reject::InvalidContent);
             }
             _ => {}
@@ -374,6 +377,14 @@ fn field_uint(entries: &[(String, CborValue)], key: &str) -> Result<u64, Reject>
         .ok_or(Reject::NonCanonicalEncoding)
 }
 
+/// Build a sorted, deduplicated role set from a governance role list.
+fn clone_roles(roles: &[crate::governance::log::model::Role]) -> Vec<RoleLabel> {
+    let mut out: Vec<RoleLabel> = roles.iter().map(|r| RoleLabel::new(r.as_str())).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn is_sorted_unique(roles: &[RoleLabel]) -> bool {
     let mut set: BTreeSet<&str> = BTreeSet::new();
     let mut prev: Option<&str> = None;
@@ -391,9 +402,9 @@ fn is_sorted_unique(roles: &[RoleLabel]) -> bool {
     true
 }
 
-fn project_governance_member(
+fn project_governance_member_unchecked(
     member: &crate::governance::log::MemberRecord,
-) -> Result<ProjectedMemberRecord, Reject> {
+) -> ProjectedMemberRecord {
     let status = match member.status {
         crate::governance::log::MemberStatus::Active => ProjectedStatus::Active,
         crate::governance::log::MemberStatus::Revoked => ProjectedStatus::Revoked,
@@ -410,7 +421,7 @@ fn project_governance_member(
             binding: device.binding.clone(),
         })
         .collect();
-    let record = ProjectedMemberRecord {
+    ProjectedMemberRecord {
         member_id: member.member_id,
         status,
         roles,
@@ -418,9 +429,21 @@ fn project_governance_member(
         grant_seq: member.grant_seq,
         revoke_seq: member.revoke_seq,
         profile: member.profile.clone(),
-    };
+    }
+}
+
+fn project_governance_member(
+    member: &crate::governance::log::MemberRecord,
+) -> Result<ProjectedMemberRecord, Reject> {
+    let record = project_governance_member_unchecked(member);
     record.validate()?;
     Ok(record)
+}
+
+/// Canonical bytes for a governance member without enforcing projection
+/// invariants (used by the total governance state-root computation).
+fn project_governance_member_canonical(member: &crate::governance::log::MemberRecord) -> Vec<u8> {
+    project_governance_member_unchecked(member).canonical_bytes()
 }
 
 // ----------------------------------------------------------------------------
@@ -537,6 +560,25 @@ impl MemberMapProjection {
         Self::from_records(records)
     }
 
+    /// The §8.2 member-map root for a governance state, computed total-ly from
+    /// each member's canonical record bytes without requiring the state to
+    /// satisfy projection invariants. For states that do satisfy those
+    /// invariants this is byte-identical to [`Self::from_governance_state`]
+    /// followed by [`Self::root`]. This is used by the governance state-root
+    /// computation, which must be total and must not panic on arbitrary public
+    /// [`GovernanceState`] values (whose public fields admit states that fail
+    /// projection validation).
+    pub(crate) fn root_from_governance_state(state: &GovernanceState) -> crate::ids::MerkleRoot {
+        let canonical: Vec<(&PrincipalId, Vec<u8>)> = state
+            .members
+            .iter()
+            .map(|(member_id, member)| (member_id, project_governance_member_canonical(member)))
+            .collect();
+        crate::ids::MerkleRoot::from_bytes(super::sorted::root_from_canonical(
+            canonical.iter().map(|(id, bytes)| (*id, bytes.as_slice())),
+        ))
+    }
+
     /// Apply a transition emitted after the fork-aware governance machine has
     /// atomically committed it.
     ///
@@ -552,7 +594,6 @@ impl MemberMapProjection {
         if transition.prior().state().community_id != expected_community
             || transition.next().state().community_id != expected_community
             || self.cursor != Some(transition.prior().tip())
-            || self.root() != Self::from_governance_state(transition.prior().state())?.root()
         {
             return Err(Reject::InvalidContent);
         }
@@ -560,50 +601,41 @@ impl MemberMapProjection {
         let mut candidate = self.clone();
         let update = match transition.kind() {
             CommittedGovernanceTransitionKind::LinearAdvance => {
-                let prior_members = &transition.prior().state().members;
-                let next_members = &transition.next().state().members;
-                let changed: Vec<PrincipalId> = prior_members
-                    .keys()
-                    .chain(next_members.keys())
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .filter(|member_id| prior_members.get(member_id) != next_members.get(member_id))
-                    .collect();
-                if changed.len() > 1 {
-                    return Err(Reject::InvalidContent);
-                }
+                // The transition is machine-validated: `next` was produced from
+                // `prior` by applying exactly this authenticated entry, and both
+                // snapshots carry machine-recomputed committed roots. Derive the
+                // member effect from the typed payload only — never by rebuilding
+                // either side's full projection (the cached-tree incremental path).
+                let payload = &transition.entry().body().payload;
+                let seq = transition.entry().body().seq;
                 let old_root = candidate.root();
-                let update = if let Some(member_id) = changed.first().copied() {
-                    let record = next_members
-                        .get(&member_id)
-                        .map(project_governance_member)
-                        .transpose()?;
-                    match (candidate.records.contains_key(&member_id), record) {
-                        (false, Some(record)) => candidate.insert_new(record)?,
-                        (true, Some(record)) => candidate.replace_existing(record)?,
-                        (true, None) => {
-                            candidate.remove_existing(&member_id)?;
+                let member_effect = candidate.apply_member_payload(payload, seq)?;
+                let update = match member_effect {
+                    Some(member_id) => {
+                        // Postcondition cross-check, paid only when the member set
+                        // actually changed (the honest O(n) cost of validating the
+                        // committed root — never paid for unrelated operations).
+                        let next_root = Self::root_from_governance_state(transition.next().state());
+                        if candidate.root() != next_root {
+                            return Err(Reject::InvalidContent);
                         }
-                        (false, None) => return Err(Reject::InvalidContent),
+                        ProjectionUpdate::Updated {
+                            member_id,
+                            old_root,
+                            new_root: candidate.root(),
+                        }
                     }
-                    ProjectionUpdate::Updated {
-                        member_id,
-                        old_root,
-                        new_root: candidate.root(),
-                    }
-                } else {
-                    ProjectionUpdate::Unchanged
+                    // Non-member payload: the member root provably cannot change, so
+                    // no rebuild or re-hash is performed at all (O(1)).
+                    None => ProjectionUpdate::Unchanged,
                 };
-                if candidate.root()
-                    != Self::from_governance_state(transition.next().state())?.root()
-                {
-                    return Err(Reject::InvalidContent);
-                }
                 candidate.cursor = Some(transition.next().tip());
                 update
             }
             CommittedGovernanceTransitionKind::ForkResolution => {
+                // A cross-branch resolution genuinely re-selects member lineage; a
+                // rebuild from the selected snapshot is unavoidable (and happens once
+                // per resolution, not once per entry).
                 let replacement = Self::from_validated_state(transition.next())?;
                 let changed_members = candidate
                     .records
@@ -627,6 +659,111 @@ impl MemberMapProjection {
         };
         *self = candidate;
         Ok(update)
+    }
+
+    /// Apply the member effect of one machine-validated governance payload
+    /// incrementally to this projection (mirroring the corresponding
+    /// `governance::log::state::apply_*_at` transitions), and return the affected
+    /// member id for member-affecting payloads, `None` otherwise.
+    ///
+    /// This never rebuilds the projection: it updates exactly one leaf through
+    /// the cached-tree path. `seq` is the authenticated entry sequence.
+    fn apply_member_payload(
+        &mut self,
+        payload: &crate::governance::log::GovernanceOperationPayload,
+        seq: u64,
+    ) -> Result<Option<PrincipalId>, Reject> {
+        use crate::governance::log::GovernanceOperationPayload as Op;
+        match payload {
+            Op::MemberGrant(p) => self.apply_member_grant_payload(p, seq),
+            Op::MemberRevoke(p) => {
+                let mut record = self.active_record_mut(p.member_id)?;
+                record.status = ProjectedStatus::Revoked;
+                record.revoke_seq = Some(seq);
+                // Revocation tombstones all active device bindings.
+                record.active_devices.clear();
+                self.store_record(record).map(|()| Some(p.member_id))
+            }
+            Op::MemberRoleSet(p) => {
+                let mut record = self.active_record_mut(p.member_id)?;
+                record.roles = clone_roles(&p.roles);
+                self.store_record(record).map(|()| Some(p.member_id))
+            }
+            Op::DeviceGrant(p) => {
+                let mut record = self.active_record_mut(p.member_id)?;
+                record.active_devices.push(ActiveDevice {
+                    device_id: p.device_id,
+                    binding: p.binding.clone(),
+                });
+                record.active_devices.sort_by_key(|d| d.device_id);
+                self.store_record(record).map(|()| Some(p.member_id))
+            }
+            Op::DeviceRevoke(p) => {
+                let mut record = self.active_record_mut(p.member_id)?;
+                record.active_devices.retain(|d| d.device_id != p.device_id);
+                self.store_record(record).map(|()| Some(p.member_id))
+            }
+            // Non-member payload: no member-map effect.
+            _ => Ok(None),
+        }
+    }
+
+    /// `member.grant`/`member.grant`-regrant effect (mirrors
+    /// `state::apply_member_grant_at`): replace roles/status/profile, set
+    /// `grant_seq`, clear `revoke_seq`; device bindings preserved on regrant.
+    fn apply_member_grant_payload(
+        &mut self,
+        p: &crate::governance::log::MemberGrant,
+        seq: u64,
+    ) -> Result<Option<PrincipalId>, Reject> {
+        let roles = clone_roles(&p.roles);
+        let record = match self.records.get(&p.member_id) {
+            Some(existing) => {
+                let mut r = existing.clone();
+                r.roles = roles;
+                r.status = ProjectedStatus::Active;
+                r.grant_seq = seq;
+                r.revoke_seq = None;
+                r.profile.clone_from(&p.profile);
+                r
+            }
+            None => ProjectedMemberRecord {
+                member_id: p.member_id,
+                status: ProjectedStatus::Active,
+                roles,
+                active_devices: Vec::new(),
+                grant_seq: seq,
+                revoke_seq: None,
+                profile: p.profile.clone(),
+            },
+        };
+        record.validate()?;
+        if self.records.contains_key(&p.member_id) {
+            self.replace_existing(record)?;
+        } else {
+            self.insert_new(record)?;
+        }
+        Ok(Some(p.member_id))
+    }
+
+    /// Clone an active member record for in-place mutation, rejecting absent or
+    /// revoked members (the precondition of every member/device sub-transition).
+    fn active_record_mut(&self, member_id: PrincipalId) -> Result<ProjectedMemberRecord, Reject> {
+        let record = self
+            .records
+            .get(&member_id)
+            .cloned()
+            .ok_or(Reject::InvalidContent)?;
+        if record.status != ProjectedStatus::Active {
+            return Err(Reject::InvalidContent);
+        }
+        Ok(record)
+    }
+
+    /// Validate and store a mutated record incrementally (value replacement).
+    fn store_record(&mut self, record: ProjectedMemberRecord) -> Result<(), Reject> {
+        record.validate()?;
+        self.replace_existing(record)
     }
 
     /// The committed Merkle root.
@@ -780,7 +917,7 @@ mod tests {
     use crate::governance::log::{
         sign_genesis, validated_genesis_state, GovernanceApproval, GovernanceEntry,
         GovernanceEntryBody, GovernanceMachine, GovernanceOperationPayload, MemberGrant,
-        RecoveryConfig, GENESIS_SCHEMA_VERSION,
+        MemberRevoke, RecoveryConfig, GENESIS_SCHEMA_VERSION,
     };
     use crate::keys::SigningKey;
 
@@ -816,17 +953,30 @@ mod tests {
         previous: &ValidatedGovernanceState,
         member_id: PrincipalId,
     ) -> crate::governance::log::VerifiedGovernanceEntry {
+        verified_entry(
+            previous,
+            GovernanceOperationPayload::MemberGrant(MemberGrant {
+                member_id,
+                roles: vec![Role::Member],
+                profile: None,
+            }),
+        )
+    }
+
+    fn verified_entry(
+        previous: &ValidatedGovernanceState,
+        payload: GovernanceOperationPayload,
+    ) -> crate::governance::log::VerifiedGovernanceEntry {
         let admin = signing_key(0xa0);
-        let payload = GovernanceOperationPayload::MemberGrant(MemberGrant {
-            member_id,
-            roles: vec![Role::Member],
-            profile: None,
-        });
-        let next = crate::governance::log::apply_entry(previous.state(), 1, &payload).unwrap();
+        let (seq, prev) = match previous.tip() {
+            GovernanceTip::Genesis => (1, None),
+            GovernanceTip::Entry { seq, id } => (seq + 1, Some(id)),
+        };
+        let next = crate::governance::log::apply_entry(previous.state(), seq, &payload).unwrap();
         let body = GovernanceEntryBody {
             community_id: previous.state().community_id,
-            seq: 1,
-            prev: None,
+            seq,
+            prev,
             created_at_ms: 2,
             kind: payload.kind(),
             payload,
@@ -972,5 +1122,67 @@ mod tests {
             Err(Reject::InvalidContent)
         );
         assert_eq!(projection.root(), before);
+    }
+
+    #[test]
+    fn revoked_record_rejects_equal_grant_and_revoke_seq() {
+        // A revoke is always a strictly later entry than the grant/regrant it
+        // tombstones; `revoke_seq == grant_seq` is unreachable and must reject.
+        let mut r = active(0x01);
+        r.status = ProjectedStatus::Revoked;
+        r.revoke_seq = Some(r.grant_seq);
+        assert_eq!(r.validate(), Err(Reject::InvalidContent));
+        r.revoke_seq = Some(r.grant_seq + 1);
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn grant_device_revoke_lifecycle_updates_projection_incrementally() {
+        // Drive grant -> device.grant -> revoke through the committed-machine
+        // path. Each step must match a from-scratch rebuild, proving the
+        // incremental commit path stays byte-identical without doing full
+        // rebuilds per step.
+        let genesis = committed_genesis();
+        let mut machine = GovernanceMachine::from_genesis(genesis.clone());
+        let mut projection = MemberMapProjection::from_validated_state(&genesis).unwrap();
+        let member_id = id(0xc0);
+        let device_id = DeviceId::from_bytes([0xd0; LEN]);
+
+        let mut accepted = genesis.clone();
+        let payloads = [
+            GovernanceOperationPayload::MemberGrant(MemberGrant {
+                member_id,
+                roles: vec![Role::Member],
+                profile: None,
+            }),
+            GovernanceOperationPayload::DeviceGrant(crate::governance::log::DeviceGrant {
+                member_id,
+                device_id,
+                binding: vec![1, 2, 3],
+            }),
+            GovernanceOperationPayload::MemberRevoke(MemberRevoke { member_id }),
+        ];
+        for payload in payloads {
+            let entry = verified_entry(&accepted, payload);
+            let (_, transition) = machine.observe_committed(&entry).unwrap();
+            let transition = transition.unwrap();
+            let expected = MemberMapProjection::from_validated_state(transition.next()).unwrap();
+            projection.apply_committed(&transition).unwrap();
+            assert_eq!(
+                projection.root(),
+                expected.root(),
+                "incremental commit drifted from a from-scratch rebuild"
+            );
+            accepted = transition.next().clone();
+        }
+
+        // Final state after grant (seq 1) -> device.grant (seq 2) -> revoke
+        // (seq 3): grant_seq preserved, revoke_seq recorded, member tombstoned,
+        // and the device binding cleared.
+        let record = projection.get(&member_id).unwrap();
+        assert_eq!(record.grant_seq, 1);
+        assert_eq!(record.revoke_seq, Some(3));
+        assert_eq!(record.status, ProjectedStatus::Revoked);
+        assert!(record.active_devices.is_empty());
     }
 }

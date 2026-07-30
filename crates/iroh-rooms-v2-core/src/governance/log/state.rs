@@ -205,10 +205,10 @@ fn replicas_component(state: &GovernanceState) -> CborValue {
 }
 
 fn members_devices_roles_root(state: &GovernanceState) -> [u8; 32] {
-    *crate::member::projected::MemberMapProjection::from_governance_state(state)
-        .expect("governance state maintains valid member records")
-        .root()
-        .as_bytes()
+    // Total computation: never panics on arbitrary public `GovernanceState`
+    // values (whose public fields admit states that fail projection invariants),
+    // and is byte-identical to the validating projection's root for valid states.
+    *crate::member::projected::MemberMapProjection::root_from_governance_state(state).as_bytes()
 }
 
 fn stream_manifest_component(state: &GovernanceState) -> CborValue {
@@ -296,19 +296,19 @@ pub fn apply_entry(
     let mut next = match op {
         GovernanceOperationPayload::MemberGrant(p) => apply_member_grant_at(old, p, seq),
         GovernanceOperationPayload::MemberRevoke(p) => apply_member_revoke_at(old, p, seq),
-        GovernanceOperationPayload::MemberRoleSet(p) => apply_member_role_set(old, p),
-        GovernanceOperationPayload::DeviceGrant(p) => apply_device_grant(old, p),
-        GovernanceOperationPayload::DeviceRevoke(p) => apply_device_revoke(old, p),
-        GovernanceOperationPayload::AdminSet(p) => apply_admin_set(old, p),
-        GovernanceOperationPayload::RecoverySet(p) => apply_recovery_set(old, p),
-        GovernanceOperationPayload::ReplicaSet(p) => apply_replica_set(old, p),
-        GovernanceOperationPayload::StreamCreate(p) => apply_stream_create(old, p),
-        GovernanceOperationPayload::StreamPolicySet(p) => apply_stream_policy_set(old, p),
-        GovernanceOperationPayload::StreamArchive(p) => apply_stream_archive(old, p),
-        GovernanceOperationPayload::InviteRevoke(p) => apply_invite_revoke(old, p),
-        GovernanceOperationPayload::PolicySet(p) => apply_policy_set(old, p),
-        GovernanceOperationPayload::ForkResolve(p) => apply_fork_resolve(old, p),
-        GovernanceOperationPayload::MigrationAccept(p) => apply_migration_accept(old, p),
+        GovernanceOperationPayload::MemberRoleSet(p) => apply_member_role_set_at(old, p),
+        GovernanceOperationPayload::DeviceGrant(p) => apply_device_grant_at(old, p),
+        GovernanceOperationPayload::DeviceRevoke(p) => apply_device_revoke_at(old, p),
+        GovernanceOperationPayload::AdminSet(p) => apply_admin_set_at(old, p),
+        GovernanceOperationPayload::RecoverySet(p) => Ok(apply_recovery_set_at(old, p)),
+        GovernanceOperationPayload::ReplicaSet(p) => Ok(apply_replica_set_at(old, p)),
+        GovernanceOperationPayload::StreamCreate(p) => apply_stream_create_at(old, p),
+        GovernanceOperationPayload::StreamPolicySet(p) => apply_stream_policy_set_at(old, p),
+        GovernanceOperationPayload::StreamArchive(p) => apply_stream_archive_at(old, p),
+        GovernanceOperationPayload::InviteRevoke(p) => Ok(apply_invite_revoke_at(old, p)),
+        GovernanceOperationPayload::PolicySet(p) => Ok(apply_policy_set_at(old, p)),
+        GovernanceOperationPayload::ForkResolve(p) => Ok(apply_fork_resolve_at(old, p)),
+        GovernanceOperationPayload::MigrationAccept(p) => apply_migration_accept_at(old, p),
     }?;
     next.accepted_seq = seq;
     Ok(next)
@@ -322,13 +322,7 @@ pub fn apply_member_grant(
     old: &GovernanceState,
     p: &MemberGrant,
 ) -> Result<GovernanceState, Reject> {
-    let seq = old
-        .accepted_seq
-        .checked_add(1)
-        .ok_or(Reject::InvalidContent)?;
-    let mut next = apply_member_grant_at(old, p, seq)?;
-    next.accepted_seq = seq;
-    Ok(next)
+    apply(old, &GovernanceOperationPayload::MemberGrant(p.clone()))
 }
 
 fn apply_member_grant_at(
@@ -373,13 +367,7 @@ pub fn apply_member_revoke(
     old: &GovernanceState,
     p: &MemberRevoke,
 ) -> Result<GovernanceState, Reject> {
-    let seq = old
-        .accepted_seq
-        .checked_add(1)
-        .ok_or(Reject::InvalidContent)?;
-    let mut next = apply_member_revoke_at(old, p, seq)?;
-    next.accepted_seq = seq;
-    Ok(next)
+    apply(old, &GovernanceOperationPayload::MemberRevoke(p.clone()))
 }
 
 fn apply_member_revoke_at(
@@ -407,6 +395,13 @@ fn apply_member_revoke_at(
 /// Returns [`Reject::InvalidContent`] for an absent/revoked member or an empty,
 /// unsorted, or duplicate role set.
 pub fn apply_member_role_set(
+    old: &GovernanceState,
+    p: &MemberRoleSet,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::MemberRoleSet(p.clone()))
+}
+
+fn apply_member_role_set_at(
     old: &GovernanceState,
     p: &MemberRoleSet,
 ) -> Result<GovernanceState, Reject> {
@@ -440,6 +435,13 @@ pub fn apply_member_role_set(
 ///   bound to another member, granting an already-active device to the same
 ///   member (no silent replace), and regranting a revoked device.
 pub fn apply_device_grant(
+    old: &GovernanceState,
+    p: &DeviceGrant,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::DeviceGrant(p.clone()))
+}
+
+fn apply_device_grant_at(
     old: &GovernanceState,
     p: &DeviceGrant,
 ) -> Result<GovernanceState, Reject> {
@@ -485,6 +487,13 @@ pub fn apply_device_revoke(
     old: &GovernanceState,
     p: &DeviceRevoke,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::DeviceRevoke(p.clone()))
+}
+
+fn apply_device_revoke_at(
+    old: &GovernanceState,
+    p: &DeviceRevoke,
+) -> Result<GovernanceState, Reject> {
     let member = old
         .members
         .get(&p.member_id)
@@ -519,6 +528,10 @@ pub fn apply_device_revoke(
 /// unsorted, contains duplicates, or the threshold is outside
 /// `1..=administrators.len()`.
 pub fn apply_admin_set(old: &GovernanceState, p: &AdminSet) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::AdminSet(p.clone()))
+}
+
+fn apply_admin_set_at(old: &GovernanceState, p: &AdminSet) -> Result<GovernanceState, Reject> {
     if p.administrators.is_empty() {
         return Err(Reject::InvalidContent);
     }
@@ -552,11 +565,15 @@ pub fn apply_recovery_set(
     old: &GovernanceState,
     p: &RecoverySet,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::RecoverySet(p.clone()))
+}
+
+fn apply_recovery_set_at(old: &GovernanceState, p: &RecoverySet) -> GovernanceState {
     let mut next = old.clone();
     let mut cfg = p.recovery.clone();
     cfg.canonicalize();
     next.recovery = RecoveryState { config: cfg };
-    Ok(next)
+    next
 }
 
 /// `replica.set`: upsert / disable a replica record (sorted by `ReplicaId`).
@@ -564,6 +581,10 @@ pub fn apply_recovery_set(
 /// # Errors
 /// This transition is total over structurally valid payloads; it does not fail.
 pub fn apply_replica_set(old: &GovernanceState, p: &ReplicaSet) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::ReplicaSet(p.clone()))
+}
+
+fn apply_replica_set_at(old: &GovernanceState, p: &ReplicaSet) -> GovernanceState {
     let mut next = old.clone();
     next.replicas.insert(
         p.replica.replica_id,
@@ -572,7 +593,7 @@ pub fn apply_replica_set(old: &GovernanceState, p: &ReplicaSet) -> Result<Govern
             status: p.status,
         },
     );
-    Ok(next)
+    next
 }
 
 /// `stream.create`: insert a new active stream (duplicate id rejected).
@@ -580,6 +601,13 @@ pub fn apply_replica_set(old: &GovernanceState, p: &ReplicaSet) -> Result<Govern
 /// # Errors
 /// Returns [`Reject::InvalidContent`] if `stream_id` already exists.
 pub fn apply_stream_create(
+    old: &GovernanceState,
+    p: &StreamCreate,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::StreamCreate(p.clone()))
+}
+
+fn apply_stream_create_at(
     old: &GovernanceState,
     p: &StreamCreate,
 ) -> Result<GovernanceState, Reject> {
@@ -607,6 +635,13 @@ pub fn apply_stream_policy_set(
     old: &GovernanceState,
     p: &StreamPolicySet,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::StreamPolicySet(p.clone()))
+}
+
+fn apply_stream_policy_set_at(
+    old: &GovernanceState,
+    p: &StreamPolicySet,
+) -> Result<GovernanceState, Reject> {
     let mut next = old.clone();
     let stream = next
         .streams
@@ -621,6 +656,13 @@ pub fn apply_stream_policy_set(
 /// # Errors
 /// Returns [`Reject::InvalidContent`] if the stream does not exist.
 pub fn apply_stream_archive(
+    old: &GovernanceState,
+    p: &StreamArchive,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::StreamArchive(p.clone()))
+}
+
+fn apply_stream_archive_at(
     old: &GovernanceState,
     p: &StreamArchive,
 ) -> Result<GovernanceState, Reject> {
@@ -641,9 +683,13 @@ pub fn apply_invite_revoke(
     old: &GovernanceState,
     p: &InviteRevoke,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::InviteRevoke(p.clone()))
+}
+
+fn apply_invite_revoke_at(old: &GovernanceState, p: &InviteRevoke) -> GovernanceState {
     let mut next = old.clone();
     next.policy.revoked_invites.insert(p.invite_id);
-    Ok(next)
+    next
 }
 
 /// `policy.set`: replace the community policy (canonicalized).
@@ -657,6 +703,10 @@ pub fn apply_invite_revoke(
 /// # Errors
 /// This transition is total over structurally valid payloads; it does not fail.
 pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::PolicySet(p.clone()))
+}
+
+fn apply_policy_set_at(old: &GovernanceState, p: &PolicySet) -> GovernanceState {
     let mut next = old.clone();
     let kept_invites = next.policy.revoked_invites.clone();
     let kept_migrations = next.policy.migrations.clone();
@@ -668,7 +718,7 @@ pub fn apply_policy_set(old: &GovernanceState, p: &PolicySet) -> Result<Governan
     next.policy
         .fork_markers
         .sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
-    Ok(next)
+    next
 }
 
 /// `fork.resolve`: record the deterministic resolution marker under community
@@ -690,11 +740,14 @@ pub fn apply_fork_resolve(
     old: &GovernanceState,
     p: &super::operation::ForkResolve,
 ) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::ForkResolve(p.clone()))
+}
+
+fn apply_fork_resolve_at(
+    old: &GovernanceState,
+    p: &super::operation::ForkResolve,
+) -> GovernanceState {
     let mut next = old.clone();
-    next.accepted_seq = old
-        .accepted_seq
-        .checked_add(1)
-        .ok_or(Reject::InvalidContent)?;
     next.policy
         .fork_markers
         .push(super::model::ResolvedForkMarker {
@@ -706,7 +759,7 @@ pub fn apply_fork_resolve(
     next.policy
         .fork_markers
         .sort_by_cached_key(|marker| crate::cbor::encode(&marker.to_cbor()));
-    Ok(next)
+    next
 }
 
 /// `migration.accept`: record a migration acceptance marker (duplicate
@@ -715,6 +768,13 @@ pub fn apply_fork_resolve(
 /// # Errors
 /// Returns [`Reject::InvalidContent`] if the migration id was already accepted.
 pub fn apply_migration_accept(
+    old: &GovernanceState,
+    p: &MigrationAccept,
+) -> Result<GovernanceState, Reject> {
+    apply(old, &GovernanceOperationPayload::MigrationAccept(p.clone()))
+}
+
+fn apply_migration_accept_at(
     old: &GovernanceState,
     p: &MigrationAccept,
 ) -> Result<GovernanceState, Reject> {
@@ -1054,6 +1114,70 @@ mod tests {
             .err(),
             Some(Reject::InvalidContent)
         );
+    }
+
+    #[test]
+    fn standalone_helpers_advance_accepted_seq_consistently() {
+        // Chaining the public standalone helpers must advance `accepted_seq` on
+        // every entry, not only member.grant/member.revoke. grant (1) ->
+        // device.grant (2) -> member.revoke (3) must record revoke_seq = 3.
+        let s = state();
+        let member_id = mid(0xc0);
+        let dev = DeviceId::from_bytes([0xd0; N]);
+        let granted = apply_member_grant(
+            &s,
+            &MemberGrant {
+                member_id,
+                roles: vec![Role::Member],
+                profile: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(granted.accepted_seq, 1);
+        let with_device = apply_device_grant(
+            &granted,
+            &DeviceGrant {
+                member_id,
+                device_id: dev,
+                binding: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with_device.accepted_seq, 2,
+            "device.grant must advance the cursor"
+        );
+        let revoked = apply_member_revoke(&with_device, &MemberRevoke { member_id }).unwrap();
+        assert_eq!(revoked.accepted_seq, 3);
+        assert_eq!(
+            revoked.members[&member_id].revoke_seq,
+            Some(3),
+            "revoke must be recorded at the correct entry sequence"
+        );
+    }
+
+    #[test]
+    fn compute_state_root_is_total_for_public_states() {
+        // `GovernanceState`/`MemberRecord` expose public fields, so callers can
+        // construct states that fail projection invariants (here: an active
+        // member with no roles). `compute_state_root` must not panic on them.
+        let mut s = GovernanceState::empty(state().community_id);
+        s.members.insert(
+            mid(0xc0),
+            MemberRecord {
+                member_id: mid(0xc0),
+                roles: Vec::new(),
+                status: MemberStatus::Active,
+                devices: BTreeMap::new(),
+                grant_seq: 0,
+                revoke_seq: None,
+                profile: None,
+            },
+        );
+        // Must not panic; produces a deterministic root.
+        let r1 = compute_state_root(&s);
+        let r2 = compute_state_root(&s);
+        assert_eq!(r1, r2);
     }
 
     #[test]
