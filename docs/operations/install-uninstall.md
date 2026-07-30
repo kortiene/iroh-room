@@ -90,10 +90,18 @@ Before installing a new Production Beta candidate:
 
 ```bash
 export IROH_ROOMS_HOME="${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}"
-tar -C "$(dirname "$IROH_ROOMS_HOME")" \
-  -czf "iroh-rooms-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" \
-  "$(basename "$IROH_ROOMS_HOME")"
+# Written to the current working directory. The archive contains
+# identity.secret, so create it owner-only — a default umask would leave it
+# group- and world-readable.
+( umask 077
+  tar -C "$(dirname "$IROH_ROOMS_HOME")" \
+    -czf "iroh-rooms-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" \
+    "$(basename "$IROH_ROOMS_HOME")" )
 ```
+
+Note the archive lands in the directory you ran the command from, and its name
+carries a timestamp — record the exact filename; the restore and rollback steps
+need it.
 
 Do not attach this backup to public issues. It may contain private identities,
 room logs, blob bytes, and audit events.
@@ -137,9 +145,13 @@ rm -f "$HOME/.local/bin/iroh-rooms"
 install -m 0755 <PREVIOUS_IROH_ROOMS_BINARY> "$HOME/.local/bin/iroh-rooms"
 
 # Restore data only if the release notes require it or the old binary cannot
-# read the upgraded store.
-rm -rf "$IROH_ROOMS_HOME"
+# read the upgraded store. Move the current directory aside rather than
+# deleting it: if the backup turns out to be bad or incomplete, deleting first
+# destroys the only remaining copy.
+mv "$IROH_ROOMS_HOME" "$IROH_ROOMS_HOME.before-rollback"
 tar -xzf <PRE_UPGRADE_BACKUP>.tar.gz -C "$(dirname "$IROH_ROOMS_HOME")"
+# Once the rolled-back binary reads the restored data correctly, remove
+# "$IROH_ROOMS_HOME.before-rollback".
 
 iroh-rooms --version
 iroh-rooms identity show

@@ -122,12 +122,18 @@ Example local backup:
 ```bash
 export IROH_ROOMS_HOME="$HOME/.local/share/iroh-rooms"
 mkdir -p "$HOME/iroh-rooms-backups"
-tar -czf "$HOME/iroh-rooms-backups/iroh-rooms-$(date +%Y%m%d-%H%M%S).tar.gz" \
-  -C "$(dirname "$IROH_ROOMS_HOME")" \
-  "$(basename "$IROH_ROOMS_HOME")"
+# The archive contains identity.secret. The data directory enforces 0700 and
+# identity.secret 0600, but a default umask writes the archive itself 0644 or
+# 0664 — group- and world-readable. Create it owner-only.
+( umask 077
+  tar -czf "$HOME/iroh-rooms-backups/iroh-rooms-$(date +%Y%m%d-%H%M%S).tar.gz" \
+    -C "$(dirname "$IROH_ROOMS_HOME")" \
+    "$(basename "$IROH_ROOMS_HOME")" )
 ```
 
-This archive is sensitive. Encrypt it before moving it to shared storage.
+This archive is sensitive: it carries `identity.secret` in plaintext, so it is
+as good as the identity itself. Keep it owner-only at rest and encrypt it
+before moving it to shared storage.
 
 ## Restore Policy
 
@@ -148,9 +154,12 @@ Example:
 
 ```bash
 export IROH_ROOMS_HOME="$HOME/.local/share/iroh-rooms"
+# Name the archive you actually created above — the backup commands stamp the
+# filename with a timestamp, so there is no fixed `iroh-rooms-backup.tar.gz`.
+BACKUP="$HOME/iroh-rooms-backups/iroh-rooms-<YYYYMMDD-HHMMSS>.tar.gz"
 mv "$IROH_ROOMS_HOME" "$IROH_ROOMS_HOME.before-restore"
 mkdir -p "$(dirname "$IROH_ROOMS_HOME")"
-tar -xzf ./iroh-rooms-backup.tar.gz -C "$(dirname "$IROH_ROOMS_HOME")"
+tar -xzf "$BACKUP" -C "$(dirname "$IROH_ROOMS_HOME")"
 iroh-rooms identity show
 ```
 
