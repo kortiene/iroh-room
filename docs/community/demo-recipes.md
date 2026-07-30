@@ -3,15 +3,17 @@
 These recipes are for the first builder cohort. They intentionally use explicit
 data directories so participants do not mix beta data with personal state.
 
-Supported binary artifact for `v0.1.0-rc.3`: `x86_64-apple-darwin`. Other
-builders can build from source.
+Supported binary artifacts for `v0.1.0-rc.4`: `x86_64-apple-darwin`,
+`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
+`aarch64-unknown-linux-gnu`, each built on a native runner and checksummed. Any
+other platform builds from source.
 
-Linux x86_64 builders should use the exact release tag rather than `main`. The
+Source builders should use the exact release tag rather than `main`. The
 shipping dependency graph requires Rust 1.85 or newer in practice; RC1 was built
 with Rust 1.96.0.
 
 ```bash
-git clone --branch v0.1.0-rc.3 --depth 1 \
+git clone --branch v0.1.0-rc.4 --depth 1 \
   https://github.com/kortiene/iroh-room.git
 cd iroh-room
 cargo build --locked --release -p iroh-rooms-cli
@@ -19,7 +21,7 @@ export PATH="$PWD/target/release:$PATH"
 iroh-rooms --version
 ```
 
-Expected: `iroh-rooms 0.1.0-rc.3`. Do not continue with a different version.
+Expected: `iroh-rooms 0.1.0-rc.4`. Do not continue with a different version.
 
 Before running any recipe:
 
@@ -30,7 +32,7 @@ iroh-rooms --version
 Expected:
 
 ```text
-iroh-rooms 0.1.0-rc.3
+iroh-rooms 0.1.0-rc.4
 ```
 
 ## Safety Rules

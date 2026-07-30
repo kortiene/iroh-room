@@ -7,6 +7,8 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+## 0.1.0-rc.4 - 2026-07-30
+
 - Landed a **bounded gossip overlay for `Events` fan-out** and a feature-gated
   40-member ceiling, but **kept both out of the shipped binaries** (issues #171
   and #173, `iroh-rooms-net` / `iroh-rooms-core`). The shipped CLI and this
