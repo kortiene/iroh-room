@@ -180,6 +180,34 @@ Production GA should add artifact signing. Production Beta can proceed with
 checksums only if the release notes say artifacts are checksummed but not
 cryptographically signed by the project.
 
+## Downstream Source Pins (Qualification Tags)
+
+A downstream consumer sometimes needs a fix that has landed on `main` but is not
+yet in any release candidate, and pins this repository by exact git revision
+rather than by tag. That is permitted, and it is **not** a release: such a
+revision has no gate evidence, no release notes, no sign-off, and no support
+commitment.
+
+When it happens, the pin must be made visible rather than left as a bare SHA in
+someone else's `Cargo.toml`:
+
+- Tag the pinned revision `qualification/<consumer>-<consumer-version>-<short-sha>`
+  and push the tag, so the revision is not garbage-collected and is greppable
+  from this repo.
+- Record the consumer, the revision, and the reason for the pin in the release
+  notes of the **next** candidate that contains the same fixes.
+- Migrate the consumer to that candidate once it is tagged, and retire the pin.
+  A qualification tag is a bridge to the next candidate, never a destination.
+
+A qualification tag must never be referenced by this project's own docs, install
+instructions, or cohort material as an installable version.
+
+Outstanding pins:
+
+| Tag | Revision | Consumer | Status |
+| --- | --- | --- | --- |
+| `qualification/jeliya-v0.6.1-a5d98b70` | `a5d98b70` (rc.3 + 24 commits) | `jeliya` v0.6.1, which pins `iroh-rooms` by git rev with `features = ["experimental"]` | To migrate to `v0.1.0-rc.4`. The pin predates the #137 room-ceiling/backpressure fix, the #122 audit fix, and all of #136/#141-#144/#171/#173 |
+
 ## Installation And Uninstallation
 
 The concrete runbook is `docs/operations/install-uninstall.md`.

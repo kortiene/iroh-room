@@ -66,7 +66,11 @@ Sync-message semantics (the `SyncMessage` control plane: `have` claims, response
 windows) are network runtime behavior: a change may ship without a protocol bump, but it MUST be
 release-noted together with its mixed-version behavior, including any convergence degradation and
 whether a coordinated upgrade is required (precedents: PR #111 and issue #113, both of which
-shipped mandatory-upgrade notes because mixed-version rooms degrade past a size threshold).
+shipped mandatory-upgrade notes because mixed-version rooms degrade past a size threshold; and
+v0.1.0-rc.4, whose gossip `Events` overlay plus 5 -> 40 active-member ceiling raise (issues #171
+and #173) is release-noted as interoperable at five or fewer active members and requiring a
+coordinated whole-room upgrade past that, because an older peer's fold hard-rejects the sixth
+join and diverges permanently).
 
 Allowed without schema bump:
 
