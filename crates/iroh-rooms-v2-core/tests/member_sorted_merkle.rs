@@ -26,8 +26,8 @@ use iroh_rooms_v2_core::member::projected::{
     MemberMapProjection, ProjectedMemberRecord, ProjectedStatus, RoleLabel,
 };
 use iroh_rooms_v2_core::member::sorted::{
-    member_leaf_hash, merkle_node_hash, rebuild_root, verify_inclusion, InclusionProof, ProofStep,
-    SiblingSide, SortedMerkleMap, MAX_LEVELS,
+    decode_inclusion_proof, member_leaf_hash, merkle_node_hash, rebuild_root, verify_inclusion,
+    InclusionProof, ProofStep, SiblingSide, SortedMerkleMap, MAX_LEVELS,
 };
 use iroh_rooms_v2_core::Reject;
 use proptest::prelude::*;
@@ -634,6 +634,156 @@ fn add_then_remove_restores_prior_root() {
 // mirrors every frozen hex value (spec §5 Step 8 mirror discipline).
 // ============================================================================
 
+// ============================================================================
+// §8 Frozen inclusion-proof vectors (spec #153 / §4 D7 / §8 Step 12: "pin
+// inclusion proof in vectors"). The expected proofs are HAND-DERIVED from the
+// frozen canonical records — sibling hashes are `member_leaf_hash` of the
+// frozen canonical bytes, and sides/indices come from the tree arithmetic — so
+// they are an independent reproduction (any BLAKE3 tool over the frozen domain
+// reproduces the sibling hashes), NOT a value read back from `prove()`.
+//
+// Sibling-hash cross-checks: leaf_hash(1) == ONE_LEAF_ROOT_HEX (a one-leaf tree
+// is the leaf promoted unchanged) and node(leaf1,leaf2) == TWO_LEAF_ROOT_HEX;
+// both are already frozen above. The two leaf hashes below are
+// member_leaf_hash(CANON_COUNTERn_HEX).
+// ============================================================================
+const LEAFHASH2_HEX: &str = "72273a50dfcd43d093c6f8dfb2e45abddf0434879814f5e3b71bcf82ee04fdef";
+const LEAFHASH3_HEX: &str = "6e6605f02a41c087b8a1ee549b788bf63fae1094687ba68bf1ae080cef23af82";
+
+// Frozen canonical-CBOR inclusion proofs (D8 schema `{"leaf_count","leaf_index",
+// "siblings":[{side,hash}]}`, map keys in canonical sorted order).
+// 2-leaf tree {1,2}, prove counter=2 (index 1): one Left leaf sibling.
+const PROOF_TWO_C2_HEX: &str = "a3687369626c696e677381a2646861736858206ecdad13ec133fa2d026b5ed88e2cab04054d3415226e2b145b55540e9609d226473696465646c6566746a6c6561665f636f756e74026a6c6561665f696e64657801";
+// 3-leaf tree {1,2,3}, prove counter=2 (index 1): [Left leaf(1), Right leaf(3)].
+const PROOF_THREE_C2_HEX: &str = "a3687369626c696e677382a2646861736858206ecdad13ec133fa2d026b5ed88e2cab04054d3415226e2b145b55540e9609d226473696465646c656674a2646861736858206e6605f02a41c087b8a1ee549b788bf63fae1094687ba68bf1ae080cef23af8264736964656572696768746a6c6561665f636f756e74036a6c6561665f696e64657801";
+// 3-leaf tree {1,2,3}, prove counter=3 (index 2): one Left NODE sibling — the
+// trailing leaf 3 is promoted unchanged, so its level-1 sibling is
+// node(leaf1,leaf2) = the 2-leaf root.
+const PROOF_THREE_C3_HEX: &str = "a3687369626c696e677381a26468617368582072be3ac1b430ccfe99a237fa470d202017c5a46a335463038ba2252611bfbbf56473696465646c6566746a6c6561665f636f756e74036a6c6561665f696e64657802";
+
+fn frozen_two_leaf_map() -> SortedMerkleMap {
+    let mut map = SortedMerkleMap::new();
+    map.insert_new(id_from_counter(1), hx(CANON_COUNTER1_HEX))
+        .unwrap();
+    map.insert_new(id_from_counter(2), hx(CANON_COUNTER2_HEX))
+        .unwrap();
+    map
+}
+
+fn frozen_three_leaf_map() -> SortedMerkleMap {
+    let mut map = SortedMerkleMap::new();
+    map.insert_new(id_from_counter(1), hx(CANON_COUNTER1_HEX))
+        .unwrap();
+    map.insert_new(id_from_counter(2), hx(CANON_COUNTER2_HEX))
+        .unwrap();
+    map.insert_new(id_from_counter(3), hx(CANON_COUNTER3_HEX))
+        .unwrap();
+    map
+}
+
+fn assert_frozen_inclusion_proof(
+    map: &SortedMerkleMap,
+    proven_id: PrincipalId,
+    proven_canon_hex: &str,
+    root_hex: &str,
+    expected: &InclusionProof,
+    proof_hex: &str,
+) {
+    assert_eq!(hex::encode(map.root().as_bytes()), root_hex);
+    assert_eq!(
+        &map.prove(&proven_id).unwrap(),
+        expected,
+        "prove() must match the hand-derived structure"
+    );
+    assert_eq!(hex::encode(expected.canonical_bytes()), proof_hex);
+    assert_eq!(&decode_inclusion_proof(&hx(proof_hex)).unwrap(), expected);
+    verify_inclusion(&map.root(), &proven_id, &hx(proven_canon_hex), expected)
+        .expect("frozen inclusion proof verifies against the frozen root");
+}
+
+#[test]
+fn frozen_inclusion_proofs_match_independently_derived_structure() {
+    // Sibling hashes are member_leaf_hash of the frozen canonical records — an
+    // independent reproduction (any BLAKE3 tool over the frozen domain
+    // reproduces these), not a value read back from `prove()`.
+    let leafhash1 = member_leaf_hash(&hx(CANON_COUNTER1_HEX));
+    let leafhash2 = member_leaf_hash(&hx(CANON_COUNTER2_HEX));
+    let leafhash3 = member_leaf_hash(&hx(CANON_COUNTER3_HEX));
+    assert_eq!(hex::encode(leafhash1), ONE_LEAF_ROOT_HEX);
+    assert_eq!(hex::encode(leafhash2), LEAFHASH2_HEX);
+    assert_eq!(hex::encode(leafhash3), LEAFHASH3_HEX);
+
+    // 2-leaf tree {1,2}, prove counter=2 (index 1): one Left leaf sibling.
+    let expected_two_c2 = InclusionProof {
+        leaf_count: 2,
+        leaf_index: 1,
+        siblings: vec![ProofStep {
+            side: SiblingSide::Left,
+            hash: leafhash1,
+        }],
+    };
+    assert_frozen_inclusion_proof(
+        &frozen_two_leaf_map(),
+        id_from_counter(2),
+        CANON_COUNTER2_HEX,
+        TWO_LEAF_ROOT_HEX,
+        &expected_two_c2,
+        PROOF_TWO_C2_HEX,
+    );
+
+    // 3-leaf tree {1,2,3}, prove counter=2 (index 1): [Left leaf(1), Right leaf(3)].
+    let expected_three_c2 = InclusionProof {
+        leaf_count: 3,
+        leaf_index: 1,
+        siblings: vec![
+            ProofStep {
+                side: SiblingSide::Left,
+                hash: leafhash1,
+            },
+            ProofStep {
+                side: SiblingSide::Right,
+                hash: leafhash3,
+            },
+        ],
+    };
+    assert_frozen_inclusion_proof(
+        &frozen_three_leaf_map(),
+        id_from_counter(2),
+        CANON_COUNTER2_HEX,
+        THREE_LEAF_ROOT_HEX,
+        &expected_three_c2,
+        PROOF_THREE_C2_HEX,
+    );
+
+    // 3-leaf tree {1,2,3}, prove counter=3 (index 2): one Left NODE sibling.
+    // Trailing leaf 3 is promoted unchanged, so at level 1 its sibling is
+    // node(leaf1,leaf2) — which equals the 2-leaf root (independently frozen).
+    let three = frozen_three_leaf_map();
+    let node01 = merkle_node_hash(&leafhash1, &leafhash2);
+    assert_eq!(hex::encode(node01), TWO_LEAF_ROOT_HEX);
+    let expected_three_c3 = InclusionProof {
+        leaf_count: 3,
+        leaf_index: 2,
+        siblings: vec![ProofStep {
+            side: SiblingSide::Left,
+            hash: node01,
+        }],
+    };
+    assert_frozen_inclusion_proof(
+        &three,
+        id_from_counter(3),
+        CANON_COUNTER3_HEX,
+        THREE_LEAF_ROOT_HEX,
+        &expected_three_c3,
+        PROOF_THREE_C3_HEX,
+    );
+
+    // Exclusion semantics: an absent identity yields no proof (the v2 member map
+    // expresses exclusion as absence-of-proof + rebound-proof rejection, not a
+    // separate exclusion fixture — see `rebound_proof_for_absent_identity_rejects`).
+    assert!(frozen_two_leaf_map().prove(&id_from_counter(99)).is_none());
+}
+
 #[test]
 fn fixture_carries_frozen_markers_and_mirrors_constants() {
     assert!(GOLDEN_JSON.contains("\"schema\": \"iroh-room-v2-member-merkle/v1\""));
@@ -649,6 +799,11 @@ fn fixture_carries_frozen_markers_and_mirrors_constants() {
         CANON_COUNTER1_HEX,
         CANON_COUNTER2_HEX,
         CANON_COUNTER3_HEX,
+        LEAFHASH2_HEX,
+        LEAFHASH3_HEX,
+        PROOF_TWO_C2_HEX,
+        PROOF_THREE_C2_HEX,
+        PROOF_THREE_C3_HEX,
     ] {
         assert!(
             GOLDEN_JSON.contains(hex_value),

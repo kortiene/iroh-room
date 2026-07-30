@@ -136,11 +136,71 @@
     "oracle_agreement": "The SortedMerkleMap incremental index and the D6 rebuild_root oracle agree byte-for-byte on the 10,000-leaf root (asserted at fixture-generation time).",
     "build_time_note": "Build time is hardware/profile-dependent and reported only by a dedicated release benchmark (#160 extends reporting). It is NOT a normal-CI assertion (spec §3.6 #57)."
   },
+  "inclusion_proofs": {
+    "issue": "#153",
+    "spec": "v2-crypto-core-crate.md §4 D7 / §8 Step 12 require inclusion-proof fixtures to be byte-pinned.",
+    "schema_marker": {
+      "schema": "iroh-room-v2-member-merkle/v1",
+      "frozen": true,
+      "requires_schema_bump_on_change": true
+    },
+    "independent_derivation": "Each expected proof is HAND-DERIVED: sibling hashes are member_leaf_hash of the frozen canonical records above (reproducible with any BLAKE3 tool over the frozen iroh-room-v2/member-leaf domain), and sides/indices follow from the sorted-tree arithmetic — they are NOT read back from prove(). Cross-checks: leaf_hash(1) == the 1-leaf root; node(leaf1,leaf2) == the 2-leaf root (both already frozen). Exclusion is expressed as absence-of-proof for a non-member (prove() returns None) plus rebound-proof rejection, not as a separate byte fixture; see tests/member_sorted_merkle.rs::rebound_proof_for_absent_identity_rejects.",
+    "vectors": [
+      {
+        "name": "inclusion-proof-two-leaf-counter2-v1",
+        "leaf_count": 2,
+        "leaf_index": 1,
+        "proven_counter": 2,
+        "proven_member_id_hex": "0000000000000002000000000000000000000000000000000000000000000000",
+        "proven_canonical_hex": "a565726f6c657381666d656d6265726673746174757366616374697665696772616e745f73657103696d656d6265725f6964582000000000000000020000000000000000000000000000000000000000000000006e6163746976655f6465766963657380",
+        "root_hex": "72be3ac1b430ccfe99a237fa470d202017c5a46a335463038ba2252611bfbbf5",
+        "siblings": [
+          { "side": "left", "hash_hex": "6ecdad13ec133fa2d026b5ed88e2cab04054d3415226e2b145b55540e9609d22" }
+        ],
+        "proof_cbor_hex": "a3687369626c696e677381a2646861736858206ecdad13ec133fa2d026b5ed88e2cab04054d3415226e2b145b55540e9609d226473696465646c6566746a6c6561665f636f756e74026a6c6561665f696e64657801",
+        "derivation": "counter=2 sits at sorted index 1 (odd) -> one Left sibling = leaf_hash(canonical_1) = the 1-leaf root."
+      },
+      {
+        "name": "inclusion-proof-three-leaf-counter2-v1",
+        "leaf_count": 3,
+        "leaf_index": 1,
+        "proven_counter": 2,
+        "proven_member_id_hex": "0000000000000002000000000000000000000000000000000000000000000000",
+        "proven_canonical_hex": "a565726f6c657381666d656d6265726673746174757366616374697665696772616e745f73657103696d656d6265725f6964582000000000000000020000000000000000000000000000000000000000000000006e6163746976655f6465766963657380",
+        "root_hex": "4f86836e0bdf54299eff4037da8f80f71d2abf2fdcd4227045e11d14b5a40da9",
+        "siblings": [
+          { "side": "left", "hash_hex": "6ecdad13ec133fa2d026b5ed88e2cab04054d3415226e2b145b55540e9609d22" },
+          { "side": "right", "hash_hex": "6e6605f02a41c087b8a1ee549b788bf63fae1094687ba68bf1ae080cef23af82" }
+        ],
+        "proof_cbor_hex": "a3687369626c696e677382a2646861736858206ecdad13ec133fa2d026b5ed88e2cab04054d3415226e2b145b55540e9609d226473696465646c656674a2646861736858206e6605f02a41c087b8a1ee549b788bf63fae1094687ba68bf1ae080cef23af8264736964656572696768746a6c6561665f636f756e74036a6c6561665f696e64657801",
+        "derivation": "counter=2 at sorted index 1 (odd): level-0 Left sibling = leaf_hash(1); parent = node(leaf1,leaf2) moves to level-1 index 0 (even, has right neighbor) -> Right sibling = leaf_hash(3), promoted unchanged. Exercises both sides plus odd-node promotion."
+      },
+      {
+        "name": "inclusion-proof-three-leaf-counter3-v1",
+        "leaf_count": 3,
+        "leaf_index": 2,
+        "proven_counter": 3,
+        "proven_member_id_hex": "0000000000000003000000000000000000000000000000000000000000000000",
+        "proven_canonical_hex": "a565726f6c657381666d656d6265726673746174757366616374697669696772616e745f73657104696d656d6265725f6964582000000000000000030000000000000000000000000000000000000000000000006e6163746976655f6465766963657380",
+        "root_hex": "4f86836e0bdf54299eff4037da8f80f71d2abf2fdcd4227045e11d14b5a40da9",
+        "siblings": [
+          { "side": "left", "hash_hex": "72be3ac1b430ccfe99a237fa470d202017c5a46a335463038ba2252611bfbbf5" }
+        ],
+        "proof_cbor_hex": "a3687369626c696e677381a26468617368582072be3ac1b430ccfe99a237fa470d202017c5a46a335463038ba2252611bfbbf56473696465646c6566746a6c6561665f636f756e74036a6c6561665f696e64657802",
+        "derivation": "counter=3 at sorted index 2 (even, no right neighbor): trailing leaf promoted UNCHANGED to level 1 with no sibling step; at level 1 index 1 (odd) -> one Left sibling = node(leaf1,leaf2) = the 2-leaf root. Exercises a node-hash sibling produced by odd-node promotion."
+      }
+    ]
+  },
   "change_log": [
     {
       "version": "v1",
       "issue": "#151",
       "note": "Initial freeze of the #151 sorted member Merkle tree: canonical §8.1 record schema, deterministic-CBOR empty-bstr byte 0x40, sorted-by-raw-identity-key leaf order, exact odd-node 'promote unchanged' rule, and compact inclusion proofs. The legacy sparse 256-level map remains isolated for the #153 signed-record golden vectors and is not interoperable with these roots."
+    },
+    {
+      "version": "v2",
+      "issue": "#153",
+      "note": "Added the frozen inclusion-proof fixture set (inclusion_proofs) closing the #153 / spec §4 D7 / §8 Step 12 'pin inclusion proof in vectors' requirement: three hand-derived, independently-reproducible canonical-CBOR inclusion proofs over the already-frozen 2- and 3-leaf trees (a leaf sibling on each side; a two-step path exercising both sides + odd-node promotion; and a node-hash sibling produced by trailing-leaf promotion). No frozen root or leaf hash changes — v2 only adds proof fixtures composed of already-frozen hashes. Exclusion remains expressed as absence-of-proof + rebound-proof rejection (no separate byte fixture)."
     }
   ]
 }

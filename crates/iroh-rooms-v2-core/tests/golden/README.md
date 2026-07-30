@@ -11,9 +11,9 @@ There are three fixture sets, all frozen under the same change discipline:
   negative vector (issue #146, spec `v2-identifiers-domain-separation.md`, refs
   #134 §6.2 / §6.3 / §6.4). Driven by `../identifiers.rs`.
 - `v2-member-merkle.json` — the #151 §8.1/§8.2 member-record and sorted-tree
-  vectors for 0, 1, 2, 3, and 10,000 leaves. Driven by
-  `../member_sorted_merkle.rs`; release timing uses
-  `cargo bench -p iroh-rooms-v2-core --bench member_merkle`.
+  vectors for 0, 1, 2, 3, and 10,000 leaves, plus the #153 frozen
+  inclusion-proof fixtures. Driven by `../member_sorted_merkle.rs`; release
+  timing uses `cargo bench -p iroh-rooms-v2-core --bench member_merkle`.
 
 ## These vectors are FROZEN
 
@@ -35,6 +35,20 @@ changing the frozen byte/hash expectations.
 
 ### Change log
 
+- **v6** — `#153` closed the last frozen-vector gap for the member Merkle map:
+  byte-exact **inclusion-proof fixtures** were missing (spec §4 D7 / §8 Step 12
+  require "pin ... inclusion proof ... in vectors"; proofs were exercised only
+  behaviourally before). Added three hand-derived, independently-reproducible
+  canonical-CBOR inclusion proofs to `v2-member-merkle.json` (a leaf sibling on
+  each side; a two-step path exercising both sides + odd-node promotion; and a
+  node-hash sibling produced by trailing-leaf promotion), driven by the new
+  `frozen_inclusion_proofs_match_independently_derived_structure` test in
+  `member_sorted_merkle.rs`. Sibling hashes are `member_leaf_hash` of the
+  already-frozen canonical records (cross-checked: `leaf_hash(1)` == the 1-leaf
+  root; `node(leaf1,leaf2)` == the 2-leaf root). **No frozen root or leaf hash
+  changes** — v6 only adds proof fixtures composed of already-frozen hashes.
+  Exclusion remains expressed as absence-of-proof + rebound-proof rejection (no
+  separate byte fixture).
 - **v5** — `#152` landed the normative #134 §9.2 `ContentEventBody`
   (`content::body`) and the concrete exact-byte content-event envelope
   (`content::event`: `ContentEvent` / `VerifiedContentEvent` /
