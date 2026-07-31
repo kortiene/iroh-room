@@ -437,17 +437,12 @@ impl Shared {
             if let iroh_rooms_core::sync::SyncMessage::Events { room_id, .. } = &out.msg {
                 if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
                     mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
-                    // R2 EXPERIMENT (hub-overload isolation): gossip-ONLY
-                    // Events fan-out when a mesh is installed — the spec's
-                    // open-question-4 alternative to dual-path. Dual-path
-                    // makes every leaf re-fan each gossip-received event into
-                    // its seed hubs over the per-peer queues, multiplying hub
-                    // inbound volume by ~N-K; suspected as what fills the
-                    // event-plane budgets whose saturation closes hub links.
-                    // If no mesh is installed the queue path below still
-                    // carries Events alone (pre-overlay behavior).
-                    return;
                 }
+                // Fall through to the per-peer queue path: dual-path delivery.
+                // If no mesh is installed (loopback / early startup), the
+                // queue path carries Events alone — exactly the pre-overlay
+                // behavior, so existing tests pass under both feature
+                // configurations.
             }
         }
 
