@@ -90,9 +90,12 @@ pub struct PeerManager {
     /// Operator-supplied addressing hints (`--peer`), by device id. Immutable for a
     /// session (spec D4).
     addr_hints: HashMap<EndpointId, EndpointAddr>,
-    /// Full admitted-member set. Warm dials use only `desired_seeds`, while
-    /// this set authorizes lazy point-to-point pulls to non-seeds.
-    #[cfg(feature = "gossip_overlay")]
+    /// Full admitted-member set from the last reconcile. Warm dials use only
+    /// `desired_seeds`, while this set authorizes lazy point-to-point pulls to
+    /// non-seeds (gossip overlay) and drives the revoked-peer teardown for
+    /// links the manager never dialed (every build): an inbound-only removed
+    /// device owns a `Shared` queue/connection that must enter the same
+    /// terminal receipt lifecycle as a dialed one.
     active_links: Mutex<BTreeSet<EndpointId>>,
     /// Lazily-created, quiescence-bounded `EVENT_ALPN` links for pull/query
     /// variants targeting active members outside the warm seed set.
@@ -117,7 +120,6 @@ impl PeerManager {
             self_device,
             dials: Mutex::new(HashMap::new()),
             addr_hints,
-            #[cfg(feature = "gossip_overlay")]
             active_links: Mutex::new(BTreeSet::new()),
             #[cfg(feature = "gossip_overlay")]
             on_demand: Mutex::new(HashMap::new()),
@@ -276,26 +278,24 @@ impl PeerManager {
         #[cfg(not(feature = "gossip_overlay"))]
         let desired = admitted_links.clone();
 
+        // Track every device admitted at the previous reconcile so a revoked
+        // peer is torn down even when this manager never dialed it. An
+        // inbound-only removed device (e.g. an inbound provisional invitee)
+        // owns a `Shared` queue/connection exactly like a dialed one and must
+        // enter the same terminal receipt lifecycle — in the default build
+        // too, not only under the gossip overlay.
+        let revoked: BTreeSet<EndpointId> = {
+            let mut active = self
+                .active_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = active.clone();
+            active.clone_from(&admitted_links);
+            previous.difference(&admitted_links).copied().collect()
+        };
+
         #[cfg(feature = "gossip_overlay")]
         let overlay_to_stop = {
-            let previous_active = {
-                let mut active = self
-                    .active_links
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let previous = active.clone();
-                active.clone_from(&admitted_links);
-                previous
-            };
-            // Include every newly-revoked overlay peer, not only locally-owned
-            // warm/on-demand dials. A non-seed may have an inbound EVENT link;
-            // it still owns a Shared queue/connection that must enter the same
-            // terminal receipt lifecycle.
-            let mut to_stop: BTreeSet<_> = previous_active
-                .difference(&admitted_links)
-                .copied()
-                .collect();
-
             // A removed/fail-closed peer must lose any transient link too.
             let mut on_demand = self
                 .on_demand
@@ -311,8 +311,7 @@ impl PeerManager {
                     entry.handle.abort();
                 }
             }
-            to_stop.extend(stale);
-            to_stop
+            stale.into_iter().collect::<BTreeSet<_>>()
         };
 
         let mut dials = self
@@ -320,18 +319,17 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Stop: running loops whose device left the desired set.
-        let to_stop: BTreeSet<EndpointId> = dials
+        // Stop: running loops whose device left the desired set, plus every
+        // newly-revoked previously-admitted device (inbound-only links
+        // included).
+        let mut to_stop: BTreeSet<EndpointId> = dials
             .keys()
             .filter(|d| !desired.contains(*d))
             .copied()
             .collect();
+        to_stop.extend(revoked);
         #[cfg(feature = "gossip_overlay")]
-        let to_stop = {
-            let mut combined = to_stop;
-            combined.extend(overlay_to_stop);
-            combined
-        };
+        to_stop.extend(overlay_to_stop);
         for device in to_stop {
             if let Some(entry) = dials.remove(&device) {
                 entry.handle.abort();
@@ -534,16 +532,11 @@ mod tests {
     };
     use iroh_rooms_core::event::wire::WireEvent;
     use iroh_rooms_core::membership::RoomMembership;
-    #[cfg(feature = "gossip_overlay")]
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
-    #[cfg(feature = "gossip_overlay")]
     use std::sync::Arc;
 
-    #[cfg(feature = "gossip_overlay")]
     use crate::admission::{Admission, AllowlistAdmission};
-    #[cfg(feature = "gossip_overlay")]
     use crate::audit::TracingAudit;
-    #[cfg(feature = "gossip_overlay")]
     use crate::transport::{NetConfig, NetTransport};
 
     // Deterministic fixtures shared across the tests below.
@@ -1194,5 +1187,143 @@ mod tests {
         manager.shutdown();
         source.shutdown().await.expect("source shutdown");
         target.shutdown().await.expect("target shutdown");
+    }
+
+    /// Default-feature (no `gossip_overlay`) regression for the #194-review
+    /// inbound-only gap: a device admitted at one reconcile and removed at the
+    /// next — that this manager **never dialed** (an inbound-only link, the
+    /// #121 provisional-invitee path) — must still flow through
+    /// `teardown_reconciled_link`: its `Shared` outbound queue is revoked and,
+    /// with a pending terminal receipt installed (as `route_terminal_removal`
+    /// does), `begin_terminal_teardown` reaps that pending after the grace.
+    /// Before the hoist of `previous_active.difference(&admitted_links)` out
+    /// of `#[cfg(feature = "gossip_overlay")]`, the default build derived
+    /// `to_stop` only from the `dials` map, so this device was never stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_only_removed_device_is_torn_down_in_default_build() {
+        let admin = Actor::new(0x31);
+        let member = Actor::new(0x32);
+        let (room_id, genesis) = mk_genesis(&admin);
+        let gid = genesis.event_id;
+        let invite = mk_invite(&admin, room_id, &[gid], member.identity(), 1, T0 + 1);
+        let iid = invite.event_id;
+        let join = mk_join(&member, room_id, &[iid], 1, T0 + 2);
+        let jid = join.event_id;
+        let admitted_snapshot =
+            RoomMembership::from_events(room_id, [genesis.clone(), invite.clone(), join.clone()])
+                .snapshot();
+        let remove = mk_remove(&admin, room_id, &[jid], member.identity(), T0 + 3);
+        let removed_snapshot =
+            RoomMembership::from_events(room_id, [genesis, invite, join, remove]).snapshot();
+
+        // Admission keeps both devices admittable across both reconciles so
+        // `admitted_links` isolates the membership fold as the only change.
+        let member_identity = member.identity();
+        let gate: Arc<dyn Admission> = Arc::new(
+            AllowlistAdmission::new()
+                .bind_device(member.endpoint_id(), member_identity)
+                .set_active(member_identity),
+        );
+        let transport = NetTransport::bind(
+            SecretKey::from_bytes(&admin.dev_sk.to_seed()),
+            gate,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind transport");
+        let shared = transport.shared();
+        let manager =
+            PeerManager::new(shared.clone(), transport.endpoint(), transport.id(), vec![]);
+
+        let device = member.endpoint_id();
+        // First reconcile: member is admitted → recorded in `active_links`.
+        // No addr hints, so the warm dial loop never reaches the device: the
+        // only live link is the **inbound** one dialed below — the #121 path.
+        manager.reconcile(&admitted_snapshot);
+        // Abort the warm dial loop so the device stays inbound-only: the only
+        // live link is the inbound one dialed below, never a manager dial.
+        manager.shutdown();
+
+        // Build the inbound-only link: the removed device dials in, its bidi
+        // stream registers a `Shared` queue/connection + generation that this
+        // manager never dialed.
+        let member_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&member.dev_sk.to_seed()))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("member endpoint bind");
+        let admin_addr = transport.endpoint_addr().expect("admin loopback address");
+        let conn = member_ep
+            .connect(admin_addr, crate::alpn::EVENT_ALPN)
+            .await
+            .expect("member dial");
+        let (mut send, _recv) = conn.open_bi().await.expect("open bidi");
+        send.write_all(b"x").await.expect("nudge stream");
+        // Wait for the accept task to register the device's link.
+        let mut registered = false;
+        for _ in 0..100_000 {
+            tokio::task::yield_now().await;
+            if shared
+                .outbound_queue_depths()
+                .iter()
+                .any(|(d, _)| *d == device)
+            {
+                registered = true;
+                break;
+            }
+        }
+        assert!(
+            registered,
+            "the inbound link must register a `Shared` queue"
+        );
+
+        // Install the pending terminal receipt exactly as `route_terminal_removal`
+        // does when the removal fans out to the removed device.
+        shared.route_terminal_removal(
+            &Outgoing {
+                fanout: false,
+                peer: PeerId::from_bytes(*device.as_bytes()),
+                msg: SyncMessage::Events {
+                    room_id,
+                    frames: vec![],
+                },
+            },
+            EventId::from_bytes([0xAB; 32]),
+        );
+        assert!(
+            shared.has_any_terminal_confirmation(device),
+            "route_terminal_removal must install the pending receipt on the live link"
+        );
+
+        // Second reconcile: member removed (the production `reconcile_admitted`
+        // path, which flags `membership_removed`). The default build must stop
+        // the inbound-only device too — revoking its outbound queue (routing)
+        // and reaping the pending receipt after the confirmation grace.
+        manager.reconcile_admitted(&removed_snapshot);
+        assert!(
+            shared
+                .outbound_queue_depths()
+                .iter()
+                .all(|(d, _)| *d != device),
+            "the inbound-only removed device's outbound routing must be revoked in the default build"
+        );
+
+        // The pending receipt is reaped once the terminal grace expires.
+        tokio::time::sleep(
+            crate::transport::TERMINAL_CONFIRM_TIMEOUT + std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            !shared.has_any_terminal_confirmation(device),
+            "the pending terminal receipt must be reaped after the grace"
+        );
+
+        member_ep.close().await;
+        manager.shutdown();
+        transport.shutdown().await.expect("transport shutdown");
     }
 }
