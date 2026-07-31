@@ -413,7 +413,10 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         cluster.room_id,
         &cluster.admin.identity_secret(),
         &cluster.admin.device_secret(),
-        cluster.genesis_id,
+        // Final membership head, never genesis: a genesis-parented admin
+        // chain collides with invite #1 at admin_seq = 1 (see
+        // HarnessCluster::final_head_id).
+        cluster.final_head_id,
         baseline_count,
         base_created_at(seed_base),
         "n40 baseline",
@@ -431,6 +434,7 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
     let target_seeds = node_seeds(n, seed_base)[target_index].clone();
     let room_id = cluster.room_id;
     let genesis_id = cluster.genesis_id;
+    let final_head_id = cluster.final_head_id;
     let admin_identity = cluster.admin.identity;
     let admin_identity_seed = cluster.admin.identity_seed;
     let admin_device_seed = cluster.admin.device_seed;
@@ -459,7 +463,11 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         room_id,
         &admin_identity_secret,
         &admin_device_secret,
-        genesis_id,
+        // Chain the missed events causally after the baseline (never
+        // genesis — the admin_seq collision, and a realistic gap shape).
+        *baseline_ids
+            .last()
+            .context("baseline workload is non-empty by construction")?,
         missed_events,
         base_created_at(seed_base) + 1000 * (baseline_count as u64 + 1),
         "n40 missed",
@@ -479,6 +487,7 @@ pub async fn rebind_scenario(n: usize, missed_events: usize, rate: f64) -> Resul
         connect_mode: ConnectMode::FullMesh,
         room_id,
         genesis_id,
+        final_head_id,
         admin: AdminPrincipal {
             identity: admin_identity,
             identity_seed: admin_identity_seed,
@@ -612,7 +621,11 @@ pub async fn run_one_scenario(
             cluster.room_id,
             &cluster.admin.identity_secret(),
             &cluster.admin.device_secret(),
-            cluster.genesis_id,
+            // Parent on the final membership head, NEVER genesis: a
+            // genesis-parented admin chat event collides with invite #1 at
+            // admin_seq = 1 and manufactures an AdminForkDetected fail-close
+            // (see the field doc on HarnessCluster::final_head_id).
+            cluster.final_head_id,
             planned_event_count(r, measure_secs),
             base_created_at(seed_base),
             "n40 load",
@@ -967,7 +980,7 @@ fn render_run_document(results: &[ScenarioResult]) -> serde_json::Value {
         "relay": "disabled",
         "caveats": [
             "connect_mode records whether links were formed by full-mesh connect_to or managed gossip seeds",
-            "per-node RSS is derived from process RSS / N (D3)",
+            "per-node RSS is estimated as (process RSS - pre-spawn baseline RSS) / N (D3)",
             "writer/reader task counts are estimated from connected peer entries (risk 3)",
         ],
         "results": results,

@@ -18,8 +18,16 @@ use iroh_rooms_core::event::signed::{self, event_id_from_bytes, SignedEvent};
 use iroh_rooms_core::event::wire::WireEvent;
 
 /// A deterministic admin-authored `message.text` chain: `wires[0]` parents on
-/// `genesis_id`; `wires[k]` parents on `wires[k-1]`'s id. Byte-identical on
-/// every `Workload::build(...)` call with the same inputs.
+/// `initial_parent_id`; `wires[k]` parents on `wires[k-1]`'s id. Byte-identical
+/// on every `Workload::build(...)` call with the same inputs.
+///
+/// The initial parent may be ANY event id every node already holds — but for
+/// an admin-authored chain it must NEVER be the genesis: a genesis-parented
+/// admin event derives `admin_seq = 1` (the store keys the admin chain on
+/// *sender == admin* regardless of event type) and collides with the
+/// membership fixture's invite #1, manufacturing an `AdminForkDetected`
+/// fail-close. Parent on the fixture's final membership head
+/// (`HarnessCluster::final_head_id`) or a later already-converged event.
 ///
 /// Note: the admin signing keys are **not** held on the struct (the
 /// `iroh_rooms_core::event::keys::SigningKey` is not `Clone`, and the wires
@@ -30,21 +38,23 @@ pub struct Workload {
     pub room_id: RoomId,
     /// The admin author's identity key (`sender_id`).
     pub admin_identity: IdentityKey,
-    /// The genesis id this chain parents on.
-    pub genesis_id: EventId,
+    /// The initial parent `wires[0]` was built on (see the struct doc for
+    /// why this must not be the genesis for admin-authored chains).
+    pub initial_parent_id: EventId,
     /// The ordered signed event wires, each a `message.text`.
     pub wires: Vec<WireEvent>,
 }
 
 impl Workload {
     /// Build an admin-authored `message_count`-event chain parented on
-    /// `genesis_id`, scoped to `room_id`, signed by the admin node 0.
+    /// `initial_parent_id`, scoped to `room_id`, signed by the admin node 0.
     ///
     /// # Arguments
     /// * `room_id` - The room the events belong to.
     /// * `admin_identity_secret` - The admin's identity key seed source.
     /// * `admin_device_secret` - The admin's device signing key.
-    /// * `genesis_id` - The genesis event id (the chain root).
+    /// * `initial_parent_id` - The already-held event the chain roots on.
+    ///   NEVER the genesis for admin-authored chains (see the struct doc).
     /// * `message_count` - How many `message.text` events to build.
     /// * `base_created_at` - The deterministic `created_at` for event 0; each
     ///   subsequent event advances by 1000 ms.
@@ -55,13 +65,13 @@ impl Workload {
         room_id: RoomId,
         admin_identity_secret: &SigningKey,
         admin_device_secret: &SigningKey,
-        genesis_id: EventId,
+        initial_parent_id: EventId,
         message_count: usize,
         base_created_at: u64,
         body_prefix: &str,
     ) -> Self {
         let admin_identity = admin_identity_secret.identity_key();
-        let mut prev = vec![genesis_id];
+        let mut prev = vec![initial_parent_id];
         let mut wires = Vec::with_capacity(message_count);
         for k in 0..message_count {
             let created_at = base_created_at + 1000 * (k as u64 + 1);
@@ -84,7 +94,7 @@ impl Workload {
         Self {
             room_id,
             admin_identity,
-            genesis_id,
+            initial_parent_id,
             wires,
         }
     }

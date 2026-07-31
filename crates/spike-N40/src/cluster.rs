@@ -133,8 +133,20 @@ pub struct HarnessCluster {
     /// The room every node is admitted to (transport scope; not a product
     /// supported active-member room — see D1 caveat).
     pub room_id: RoomId,
-    /// The genesis event id (the chain root the workload parents on).
+    /// The genesis event id. NOT the workload parent — see `final_head_id`.
     pub genesis_id: iroh_rooms_core::event::EventId,
+    /// The fixture's final membership head (last member's `member.joined`) —
+    /// the event the load workload MUST parent on. Parenting the admin-authored
+    /// load chain on genesis instead derives `admin_seq = 1` for its first
+    /// event (the store keys the admin chain on *sender == admin* regardless of
+    /// event type), colliding with the fixture's invite #1 — a manufactured
+    /// `AdminForkDetected` that fail-closes every non-admin member and tears
+    /// the whole cluster down at first publish. That artifact produced the
+    /// superseded 2026-07-30 all-load-legs-collapse matrix. Real clients parent
+    /// on current heads, which is what this head reproduces (member-authored,
+    /// so its `admin_seq` is NULL and the load chain stays off the admin
+    /// chain). See `results/results-gossip.md` for the full diagnosis.
+    pub final_head_id: iroh_rooms_core::event::EventId,
     /// The admin (node 0) principal — every load event is authored here.
     pub admin: AdminPrincipal,
     /// Per-node live handles, index-aligned.
@@ -265,6 +277,7 @@ pub fn full_mesh_admission(seeds: &[NodeSeeds]) -> AllowlistAdmission {
 struct MembershipFixture {
     room_id: RoomId,
     genesis_id: iroh_rooms_core::event::EventId,
+    final_head_id: iroh_rooms_core::event::EventId,
     admin: AdminPrincipal,
     wires: Vec<Vec<u8>>,
     view: AdmissionView,
@@ -366,6 +379,7 @@ impl MembershipFixture {
         Ok(Self {
             room_id,
             genesis_id,
+            final_head_id: prev,
             admin,
             wires,
             view,
@@ -495,6 +509,7 @@ impl HarnessCluster {
             connect_mode,
             room_id: fixture.room_id,
             genesis_id: fixture.genesis_id,
+            final_head_id: fixture.final_head_id,
             admin: fixture.admin,
             nodes,
             audit,

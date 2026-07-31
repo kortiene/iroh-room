@@ -76,12 +76,14 @@ async fn n5_cluster_reaches_full_mesh_readiness() {
 async fn n5_admin_publish_fans_out_to_every_node() {
     let cluster = spawn().await.expect("spawn N=5 cluster");
 
-    // Author a short admin-authored burst parented on the genesis.
+    // Author a short admin-authored burst parented on the final membership
+    // head (never genesis: that collides with invite #1 at admin_seq = 1 —
+    // see HarnessCluster::final_head_id).
     let workload = Workload::build(
         cluster.room_id,
         &cluster.admin.identity_secret(),
         &cluster.admin.device_secret(),
-        cluster.genesis_id,
+        cluster.final_head_id,
         5,
         1_771_000_555_000,
         "n40 self-check",
@@ -115,7 +117,7 @@ async fn n5_counters_show_frames_sent_and_accepted() {
         cluster.room_id,
         &cluster.admin.identity_secret(),
         &cluster.admin.device_secret(),
-        cluster.genesis_id,
+        cluster.final_head_id,
         3,
         1_771_000_666_000,
         "n40 self-check",
@@ -194,6 +196,7 @@ async fn n5_mini_rebound_node_catches_missed_events() {
     let target_seeds = spike_n40::cluster::node_seeds(N, SEED_BASE)[target_index].clone();
     let room_id = cluster.room_id;
     let genesis_id = cluster.genesis_id;
+    let final_head_id = cluster.final_head_id;
     let admin_identity = cluster.admin.identity;
     let admin_identity_seed = cluster.admin.identity_seed;
     let admin_device_seed = cluster.admin.device_seed;
@@ -224,7 +227,8 @@ async fn n5_mini_rebound_node_catches_missed_events() {
         room_id,
         &admin_identity_secret,
         &admin_device_secret,
-        genesis_id,
+        // Final membership head, never genesis (admin_seq collision).
+        final_head_id,
         1,
         1_771_000_777_000,
         "n40 missed",
@@ -241,6 +245,7 @@ async fn n5_mini_rebound_node_catches_missed_events() {
         connect_mode: ConnectMode::FullMesh,
         room_id,
         genesis_id,
+        final_head_id,
         admin: spike_n40::cluster::AdminPrincipal {
             identity: admin_identity,
             identity_seed: admin_identity_seed,
@@ -448,7 +453,7 @@ async fn n5_disconnect_peer_drops_then_redials_and_delivery_recovers() {
         cluster.room_id,
         &cluster.admin.identity_secret(),
         &cluster.admin.device_secret(),
-        cluster.genesis_id,
+        cluster.final_head_id,
         1,
         1_771_000_888_000,
         "n40 after reconnect",

@@ -613,29 +613,42 @@ Run the existing test suites unchanged and green:
    rows, with the same cascade/connectedness/delivery rubric.
 4. The AC passes iff: no cascade at 1 event/s, connectedness >95%, delivery >95% at every N.
 
-> **Status 2026-07-30: the AC FAILS.** The matrix was run through the committed
-> harness for the first time (`crates/spike-N40/results/results-gossip.md`).
-> N=40 idle forms its bounded topology, but every load leg — 1 and 5 events/s,
-> at N=5 as well as N=40 — cascades on `connectedness_below_95pct_for_10s` +
-> `delivery_below_95pct_for_2_windows`, logging `gossip.mesh.spawn_failed`
-> ("timed out waiting to join the room events gossip topic") against the 5 s
-> `GOSSIP_JOIN_TIMEOUT`. A full-mesh control at N=5 / 1 event/s on the same
-> binary delivers 60/60 with no cascade, so the collapse is specific to the
-> gossip path. The figures that originally accompanied the Phase C cap raise
-> came from an uncommitted seed-only override and do not reproduce; N=10 and
-> N=20 were never run at all.
+> **Status 2026-07-31 (supersedes 2026-07-30): the 2026-07-30 failure was a
+> harness artifact; the measured legs (N=5, N=40) now meet the AC thresholds
+> at 1 event/s on loopback — the AC itself remains PENDING because its
+> N=10/20 legs have never been run — and a new, genuine hub-overload limit
+> was found above the AC's rate.** The 2026-07-30
+> all-load-legs collapse was diagnosed (three-reader + decisive-experiment +
+> adversarial-verification workflow) as the spike workload parenting its
+> admin-authored load chain on genesis, deriving `admin_seq = 1` for its first
+> event and colliding with the fixture's invite #1 — a manufactured
+> `AdminForkDetected` whose shipped fail-closed response tore down every leg at
+> first publish. With the workload parented on the fixture's final membership
+> head (what real clients do), the corrected matrix
+> (`crates/spike-N40/results/2026-07-31-gossip-matrix.json`) shows:
 >
-> Consequence: Phase C is **held back** in v0.1.0-rc.4 — the shipped CLI and
-> SDK no longer enable `gossip_overlay`, so binaries keep the full-mesh
-> topology and `MAX_ACTIVE_MEMBERS = 5`. Two things must be settled before it
-> returns: (a) whether the collapse is harness fidelity — loopback lacks the
-> address-discovery service the gossip dialer needs, which D1 already cites as
-> the reason Events delivery is dual-path — or a real defect in the overlay;
-> and (b) a Phase B re-run covering N=10/20/40 that actually passes the AC
-> above. Two harness defects block a literal re-run and must be fixed first:
-> the documented single-invocation matrix aborts after row 1 because
-> consecutive rows overlap ports, and the fixed ports sit inside the kernel
-> ephemeral range.
+> - **1 event/s: clean at N=5 and N=40** (delivery 60/60 on every node, no
+>   cascade, zero spawn failures) — the AC's thresholds hold at both measured
+>   sizes; N=10 and N=20 remain unmeasured, so the AC stays unchecked.
+> - **5 events/s: clean at N=5; N=40 cascades** with a real hub-overload
+>   signature — 28,087 queue saturations, reconnect churn peaking 1,769/s, the
+>   three highest-degree hub nodes stalling at ~100/300 while 37/40 leaves
+>   receive everything. Suspected mechanism (code-read, not yet isolated):
+>   gossip-delivered frames charge the same per-peer inbound byte budgets as
+>   the event plane, and saturation closes the connection
+>   (`crates/iroh-rooms-net/src/peer.rs:113-116`) — mesh shred around hubs.
+>
+> Consequence: Phase C stays **held** (shipped binaries keep full-mesh and
+> `MAX_ACTIVE_MEMBERS = 5`). Before it returns: (a) fix or product-bound the
+> N=40 hub overload at ≥5 events/s (decouple gossip delivery from event-plane
+> per-peer budgets, or document a sustained-rate ceiling) and re-run this
+> matrix clean; (b) resolve the real-defect kernel the diagnosis exposed —
+> admin-authored non-membership events join the admin_seq chain, so ONE
+> same-seq collision permanently fail-closes a room with no recovery path
+> (reachable via admin stale-head publish races, independent of gossip);
+> (c) N=10/20 legs and real-network overlay evidence remain owed. The two
+> harness port defects noted on 2026-07-30 still block the one-shot matrix
+> invocation (per-cell processes work).
 
 ### Step 8 — Phase C: cap raise (only after Step 7 passes)
 
