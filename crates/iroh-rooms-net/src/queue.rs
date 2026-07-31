@@ -183,9 +183,8 @@ pub(crate) struct QueuedFrame {
     pub bytes: usize,
     pub family: QueueFamily,
     /// Whether this frame was charged against the gossip ledger (a parallel
-    /// per-peer budget map) instead of the event-plane ledger. Gossip fan-in
-    /// must not consume the budgets whose saturation makes the event-plane
-    /// reader close the connection (hub-overload isolation experiment).
+    /// per-peer budget map) instead of the event-plane ledger, so the pop
+    /// refund lands on the ledger that was charged. See `gossip_budgets`.
     pub gossip: bool,
 }
 
@@ -202,9 +201,15 @@ struct QueueState {
     peer_cap: usize,
     stream_cap: usize,
     budgets: HashMap<PeerId, PeerBudget>,
-    /// Separate ledger for gossip-delivered frames, same caps: gossip fan-in
-    /// saturating its own ledger drops gossip frames (audit-only) without
-    /// ever consuming the event-plane budget that closes connections.
+    /// Separate ledger for gossip-delivered frames, same caps as the
+    /// event-plane ledger. With fan-out riding the gossip broadcast, a
+    /// high-degree node's gossip fan-in is real steady-state volume; charging
+    /// it against the event-plane per-peer budgets would let gossip load
+    /// saturate them, and the event-plane reader closes the connection on
+    /// saturation (`peer.rs`) — converting gossip volume into link churn.
+    /// On this ledger, gossip saturation drops the gossip frame (audit-only,
+    /// `transport.queue.saturated` queue=`gossip`): the engine's anti-entropy
+    /// re-pulls cover the gap, and the link stays up.
     gossip_budgets: HashMap<PeerId, PeerBudget>,
     /// One deque per priority ordinal; index by `QueuePriority::ordinal`.
     by_priority: [VecDeque<QueuedFrame>; 4],

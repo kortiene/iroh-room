@@ -1417,3 +1417,141 @@ fn batch_preserves_fanout_and_feed_order() {
         .collect();
     assert_eq!(fed, expected_ids, "feed emits in input order");
 }
+
+// ---------------------------------------------------------------------------
+// Bounded tick-pull fan-out + the accept-path `fanout` marker (N=40
+// hub-overload isolation: an unbounded pull fan-out lets a high-degree node
+// summon up to N-1 overlapping serve batches per tick, saturating its inbound
+// budgets; see `SyncConfig::pull_fanout_peers`).
+// ---------------------------------------------------------------------------
+
+fn peer(seed: u8) -> PeerId {
+    PeerId::from_bytes([seed; 32])
+}
+
+/// With more peers than `pull_fanout_peers`, one tick pulls from exactly the
+/// configured window while the (cheap, load-bearing) admin tip still reaches
+/// every peer — and successive ticks rotate the window across the whole set.
+#[test]
+fn tick_pulls_are_bounded_to_a_rotating_window_and_sweep_all_peers() {
+    let cfg = SyncConfig::default();
+    let bound = cfg.pull_fanout_peers;
+    let (mut engine, _room, _genesis) = seeded_engine(cfg);
+    let peers: Vec<PeerId> = (0..6).map(|i| peer(0xC0 + i)).collect();
+    for p in &peers {
+        let _ = engine.on_connect(*p);
+    }
+
+    let mut pulled_union: std::collections::BTreeSet<PeerId> = std::collections::BTreeSet::new();
+    for round in 0..peers.len() as u64 {
+        // `on_connect` re-arms the pull flag without adding sync work, so every
+        // tick in this loop emits pulls (a converged engine would otherwise
+        // quiesce — that suppression is separate, older behavior).
+        let _ = engine.on_connect(peers[0]);
+        let out = engine.on_tick(T0 + round);
+
+        let tips: std::collections::BTreeSet<PeerId> = out
+            .iter()
+            .filter(|o| matches!(o.msg, SyncMessage::AdminTip { .. }))
+            .map(|o| o.peer)
+            .collect();
+        assert_eq!(
+            tips.len(),
+            peers.len(),
+            "the admin tip must still reach every peer every tick"
+        );
+
+        let pulled: std::collections::BTreeSet<PeerId> = out
+            .iter()
+            .filter(|o| matches!(o.msg, SyncMessage::WantRecentChat { .. }))
+            .map(|o| o.peer)
+            .collect();
+        assert_eq!(
+            pulled.len(),
+            bound,
+            "each tick must pull from exactly `pull_fanout_peers` peers"
+        );
+        // Membership and chat pulls target the same window.
+        let membership_pulled: std::collections::BTreeSet<PeerId> = out
+            .iter()
+            .filter(|o| matches!(o.msg, SyncMessage::WantMembership { .. }))
+            .map(|o| o.peer)
+            .collect();
+        assert_eq!(
+            membership_pulled, pulled,
+            "membership and chat pulls must share the tick's window"
+        );
+        // No pull Outgoing is ever marked as fan-out.
+        assert!(
+            out.iter().all(|o| !o.fanout),
+            "tick emissions are targeted, never fan-out"
+        );
+        pulled_union.extend(pulled);
+    }
+    assert_eq!(
+        pulled_union,
+        peers.iter().copied().collect(),
+        "rotation must sweep every peer within one full cycle of ticks"
+    );
+}
+
+/// Rooms with at most `pull_fanout_peers` peers keep the original behavior:
+/// every peer is pulled from on every pull-emitting tick.
+#[test]
+fn tick_pulls_reach_all_peers_at_or_under_the_bound() {
+    let cfg = SyncConfig::default();
+    let bound = cfg.pull_fanout_peers;
+    let (mut engine, _room, _genesis) = seeded_engine(cfg);
+    let peers: Vec<PeerId> = (0..bound as u8).map(|i| peer(0xD0 + i)).collect();
+    for p in &peers {
+        let _ = engine.on_connect(*p);
+    }
+    let _ = engine.on_connect(peers[0]);
+    let out = engine.on_tick(T0);
+    let pulled: std::collections::BTreeSet<PeerId> = out
+        .iter()
+        .filter(|o| matches!(o.msg, SyncMessage::WantRecentChat { .. }))
+        .map(|o| o.peer)
+        .collect();
+    assert_eq!(
+        pulled,
+        peers.iter().copied().collect(),
+        "at or under the bound, every peer is pulled from (pre-bound behavior)"
+    );
+}
+
+/// The accept-path fan-out is the one emission marked `fanout: true`; a
+/// transport with a broadcast plane rides it, and targeted serves must never
+/// carry the marker. Pinned at the publish path, which shares the fan-out
+/// site with inbound accepts.
+#[test]
+fn publish_fanout_is_marked_and_targeted_pulls_are_not() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let _ = engine.on_connect(NODE_A);
+    let _ = engine.on_connect(NODE_B);
+
+    let (admin_id, admin_dev) = (sk(1), sk(2));
+    let msg = make_message(&admin_id, &admin_dev, room, &[genesis_id], "fanout-marker", T0 + 1);
+    let out = engine.publish(&msg).expect("publish");
+
+    let events: Vec<&Outgoing> = out
+        .iter()
+        .filter(|o| matches!(o.msg, SyncMessage::Events { .. }))
+        .collect();
+    assert_eq!(events.len(), 2, "publish fans the event to both peers");
+    assert!(
+        events.iter().all(|o| o.fanout),
+        "accept-path fan-out must be marked fanout: true"
+    );
+}
+
+/// `pull_fanout_peers == 0` must be rejected at config validation: a zero
+/// window would silence anti-entropy entirely.
+#[test]
+fn zero_pull_fanout_is_rejected() {
+    let cfg = SyncConfig {
+        pull_fanout_peers: 0,
+        ..SyncConfig::default()
+    };
+    assert_eq!(cfg.validate(), Err("pull_fanout_zero"));
+}

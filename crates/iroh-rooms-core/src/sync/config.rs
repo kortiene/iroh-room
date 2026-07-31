@@ -33,6 +33,18 @@ pub struct SyncConfig {
     /// Max ids in a single `WantEvents`; larger needs are chunked
     /// (`MAX_BACKFILL_FANOUT_IDS`).
     pub max_backfill_fanout_ids: usize,
+    /// Max peers the periodic tick's anti-entropy pulls (`WantMembership` +
+    /// `WantRecentChat`) are sent to per tick, on a deterministic rotating
+    /// window over the peer set. Rooms with at most this many peers pull from
+    /// everyone. **Why bounded:** a high-degree node (a gossip seed hub holds
+    /// ~N-1 links) that falls slightly behind would otherwise pull from every
+    /// peer every tick and receive up to N-1 overlapping serve batches at
+    /// once — measured at N=40 x 5 events/s as the inbound budget saturation
+    /// that closes hub links (#141's fail-closed recovery) and ignites a
+    /// reconnect-churn cascade. The rotation still sweeps the whole peer set
+    /// across consecutive ticks, so convergence is delayed by at most
+    /// ceil(peers / this) ticks, never lost.
+    pub pull_fanout_peers: usize,
     /// Token-bucket capacity for backfill requests, keyed by the requesting
     /// (parked-frame) author (`BACKFILL_TOKENS_PER_AUTHOR`).
     pub backfill_tokens_per_author: u32,
@@ -131,6 +143,7 @@ impl Default for SyncConfig {
             max_parked_per_author: 1024,
             max_parked_total: 1024,
             max_backfill_fanout_ids: 256,
+            pull_fanout_peers: 3,
             backfill_tokens_per_author: 32,
             backfill_refill_per_tick: 8,
             // Chase depth must exceed a realistic returning-member gap so the by-id
@@ -184,6 +197,9 @@ impl SyncConfig {
         }
         if self.max_backfill_fanout_ids == 0 || self.response_max_frames == 0 {
             return Err("fanout_cap_zero");
+        }
+        if self.pull_fanout_peers == 0 {
+            return Err("pull_fanout_zero");
         }
         if self.chat_window_max == 0 || self.chat_window_default == 0 {
             return Err("chat_window_zero");

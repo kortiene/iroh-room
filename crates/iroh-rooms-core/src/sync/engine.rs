@@ -793,14 +793,10 @@ impl SyncEngine {
     /// are empty and the mesh quiesces. `now_ms` is advisory (token refill is
     /// per-call, not clock-driven, to stay deterministic — spec R4).
     ///
-    /// Pulls are bounded to `PULL_FANOUT_PEERS` peers per tick on a
-    /// deterministic rotating window (R6 hub-overload isolation) — see the
-    /// inline rationale at the window computation.
+    /// Pulls are bounded to [`SyncConfig::pull_fanout_peers`] peers per tick
+    /// on a deterministic rotating window — see the field doc for why an
+    /// unbounded pull fan-out melts high-degree nodes.
     pub fn on_tick(&mut self, _now_ms: u64) -> Vec<Outgoing> {
-        /// Max peers pulled from per tick. Rooms at or under this size pull
-        /// from everyone (identical to the pre-R6 behavior); larger rooms
-        /// sweep their peer set across consecutive ticks.
-        const PULL_FANOUT_PEERS: usize = 3;
         let mut out = Vec::new();
         // Advance the claim's rotating window (issue #113) — per tick, not per
         // peer, so every peer sees the same claim this round (determinism, R4).
@@ -818,25 +814,24 @@ impl SyncEngine {
         self.force_next_tick_pull = false;
         let membership_have = emit_pulls.then(|| self.membership_have());
         let chat_have = emit_pulls.then(|| self.chat_have());
-        // R6 EXPERIMENT (hub-overload isolation): bound the per-tick pull
-        // fan-out to a rotating window of K peers instead of ALL peers. A
-        // high-degree node (a gossip seed hub, ~N-1 peers) that fell slightly
-        // behind previously pulled from every peer every tick and received up
-        // to N-1 overlapping serve batches at once — measured as the inbound
-        // budget saturation that closes hub links and ignites the churn
-        // cascade at N=40 x 5 events/s. The rotation reuses `claim_rotation`
-        // (already advanced once per tick, deterministically), so successive
-        // ticks sweep the whole peer set; the tiny `admin_tip_msg` still goes
-        // to every peer (fork-detection latency is load-bearing).
+        // Bound the pull fan-out to a rotating window of
+        // `pull_fanout_peers` peers instead of ALL peers (see the config
+        // field doc for the hub-overload rationale). The rotation reuses
+        // `claim_rotation` — already advanced exactly once per tick, so the
+        // window is deterministic (R4) and successive ticks sweep the whole
+        // peer set. The tiny `admin_tip_msg` still goes to every peer:
+        // fork-detection latency is load-bearing and the frame is a fixed
+        // few bytes, not a serve trigger.
+        let pull_fanout = self.config.pull_fanout_peers;
         let all_peers: Vec<_> = self.peers.iter().copied().collect();
-        let pull_set: std::collections::BTreeSet<_> = if all_peers.len() <= PULL_FANOUT_PEERS {
+        let pull_set: std::collections::BTreeSet<_> = if all_peers.len() <= pull_fanout {
             all_peers.iter().copied().collect()
         } else {
             // Truncating u64 -> usize is fine: it feeds a modulus, where a
             // wrapped rotation index only changes which window this tick gets.
             #[allow(clippy::cast_possible_truncation)]
             let start = (self.claim_rotation as usize) % all_peers.len();
-            (0..PULL_FANOUT_PEERS)
+            (0..pull_fanout)
                 .map(|i| all_peers[(start + i) % all_peers.len()])
                 .collect()
         };

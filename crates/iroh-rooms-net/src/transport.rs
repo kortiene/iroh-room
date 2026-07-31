@@ -435,16 +435,18 @@ impl Shared {
         #[cfg(feature = "gossip_overlay")]
         {
             if let iroh_rooms_core::sync::SyncMessage::Events { room_id, .. } = &out.msg {
-                // R5 EXPERIMENT (hub-overload isolation): split Events by
-                // intent. Accept-path FAN-OUT (out.fanout) rides the gossip
-                // broadcast alone when a mesh is installed — the per-peer
-                // queue copy is what multiplied every event into the seed
-                // hubs by ~N-K and drowned them (R4). TARGETED serves (pull
-                // responses, backfill, bootstrap closures) never broadcast —
-                // broadcasting them spammed the whole mesh with per-requester
-                // batches (R3's duplicate blizzard) — and stay point-to-point
-                // on the queue path below. With no mesh installed, fan-out
-                // falls through to the queue path: pre-overlay behavior.
+                // Split Events by intent (spec §4 D1, revised by the N=40
+                // hub-overload isolation): accept-path FAN-OUT (out.fanout)
+                // rides the gossip broadcast alone when a mesh is installed —
+                // a dual-path per-peer queue copy multiplies every event into
+                // the seed hubs by ~N-K and drowns them. TARGETED serves
+                // (pull responses, backfill, bootstrap closures) never
+                // broadcast — broadcasting per-requester batches spams the
+                // whole mesh with duplicates — and stay point-to-point on the
+                // queue path below, keeping per-link FIFO. With no mesh
+                // installed, fan-out falls through to the queue path: exactly
+                // the pre-overlay behavior, so no-gossip builds and
+                // early-startup windows are unchanged.
                 if out.fanout {
                     if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
                         mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
@@ -516,9 +518,11 @@ impl Shared {
 
     /// [`try_enqueue_inbound`](Self::try_enqueue_inbound) for gossip-delivered
     /// frames: same sink and priorities, charged against the separate gossip
-    /// ledger so hub-scale gossip fan-in cannot exhaust the event-plane
-    /// budget whose saturation closes the peer's connection
-    /// (hub-overload isolation experiment).
+    /// ledger. With fan-out riding the gossip broadcast, hub-scale gossip
+    /// fan-in is real steady-state volume — it must not be able to exhaust
+    /// the event-plane budget whose saturation makes the event-plane reader
+    /// close the peer's connection (`peer.rs`), or gossip load converts into
+    /// link churn.
     pub(crate) fn try_enqueue_inbound_gossip(
         &self,
         peer: PeerId,
