@@ -260,6 +260,53 @@ fn events_frames(out: &[Outgoing]) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn terminal_events_confirms_only_ids_stored_in_the_room() {
+    let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
+    let terminal_frame = make_message(
+        &sk(1),
+        &sk(2),
+        room,
+        genesis_id,
+        "terminal delivery",
+        T0 + 1,
+    );
+    let terminal_id = frame_id(&terminal_frame, room);
+    let missing_id = EventId::from_bytes([0xfe; 32]);
+    let nonce = [0x6d; 16];
+    assert!(!engine
+        .store_mut()
+        .contains_in_room(&room, &terminal_id)
+        .expect("query terminal event before delivery"));
+
+    let out = engine.on_message(
+        NODE_A,
+        SyncMessage::TerminalEvents {
+            room_id: room,
+            frames: vec![terminal_frame],
+            ids: vec![missing_id, terminal_id],
+            nonce,
+        },
+    );
+
+    assert!(engine
+        .store_mut()
+        .contains_in_room(&room, &terminal_id)
+        .expect("query terminal event after delivery"));
+    assert_eq!(
+        out,
+        vec![Outgoing {
+            peer: NODE_A,
+            fanout: false,
+            msg: SyncMessage::EventsConfirmed {
+                room_id: room,
+                ids: vec![terminal_id],
+                nonce,
+            },
+        }]
+    );
+}
+
+#[test]
 fn content_message_publish_does_not_refresh_membership_projection() {
     let (mut engine, room, genesis_id) = seeded_engine(SyncConfig::default());
     let before = engine.counters().membership_projection_recomputes;

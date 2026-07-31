@@ -29,7 +29,9 @@ use crate::frame::{read_frame, write_frame};
 use crate::handler::REJECT_CODE;
 use crate::queue::PushError;
 use crate::state::{OfflineReason, PeerConnState};
-use crate::transport::{LinkTeardown, OutboundQueue, OutboundReceiver, Shared};
+use crate::transport::{
+    LinkActivation, LinkRegistration, LinkTeardown, OutboundQueue, OutboundReceiver, Shared,
+};
 
 /// Bridge an iroh [`EndpointId`] (device key) to the engine's [`PeerId`] — both
 /// are the same raw 32 `device_id` bytes (Membership §1).
@@ -44,7 +46,8 @@ pub(crate) fn peer_id(device: EndpointId) -> PeerId {
 /// Called by both the accept handler (inbound) and [`dial_loop`] (outbound).
 /// The outbound queue is registered **before** the caller flips the peer to
 /// `Connected`, so the engine's `on_connect` handshake always finds a writer.
-/// Returns this link's generation, which the caller passes to
+/// Returns the final admission decision and, when registered, this link's
+/// generation, which the caller passes to
 /// [`teardown_if_current`](Shared::teardown_if_current) on close so a
 /// superseded link never clobbers its successor (issue #126).
 #[must_use]
@@ -55,7 +58,7 @@ pub(crate) fn register_connection(
     send: SendStream,
     recv: RecvStream,
     provisional: bool,
-) -> u64 {
+) -> LinkRegistration {
     // Issue #141: the per-peer outbound queue is byte-bounded (default 8 MiB
     // peer / 2 MiB stream) and priority-aware, replacing the prior
     // frame-count `mpsc::channel(capacity)`.
@@ -63,12 +66,12 @@ pub(crate) fn register_connection(
         shared.outbound_peer_queue_bytes(),
         shared.stream_queue_bytes(),
     );
-    let generation = shared.register_link(device, queue, provisional);
-    shared.register_connection(device, conn);
-
-    tokio::spawn(writer_task(send, rx));
-    tokio::spawn(reader_task(shared, device, recv));
-    generation
+    let registration = shared.register_established_link(device, queue, conn, provisional);
+    if !matches!(&registration, LinkRegistration::Rejected { .. }) {
+        tokio::spawn(writer_task(send, rx));
+        tokio::spawn(reader_task(shared, device, recv));
+    }
+    registration
 }
 
 /// Drain the per-peer outbound byte-priority queue, writing each body as a
@@ -226,6 +229,15 @@ pub(crate) async fn dial_loop(shared: Arc<Shared>, endpoint: Endpoint, addr: End
                                 shared.table.set(remote, PeerConnState::Unauthorized, None);
                                 return;
                             }
+                            Established::Stale => {
+                                // A crossed, newer admitted link may have won the
+                                // generation race. Keep this warm-dial owner alive:
+                                // if that link later drops, it must still redial.
+                                // A roster removal terminates on the admission
+                                // check at the top of the next attempt (and the
+                                // manager normally aborts us before then).
+                                tracing::debug!(peer = %remote, "dial: registration became stale; retrying");
+                            }
                             Established::Failed => {
                                 // Connected at QUIC but the stream open/handshake failed —
                                 // reachable, but the transport could not carry events.
@@ -345,6 +357,7 @@ pub(crate) async fn on_demand_dial(
                 shared.table.set(remote, PeerConnState::Unauthorized, None);
                 return;
             }
+            Established::Stale => return,
             Established::Failed => {
                 attempt = attempt.saturating_add(1);
                 continue;
@@ -408,6 +421,8 @@ enum Established {
     Up(u64),
     /// The remote's accept-gate refused us (stable REJECT close): stop dialing.
     RemoteRejected,
+    /// The local roster/generation changed during final registration.
+    Stale,
     /// A transient failure (stream open error, not a reject): redial.
     Failed,
 }
@@ -424,12 +439,30 @@ async fn establish_outbound(
             shared.audit.accepted(remote, &identity);
             // A dialed link is never provisional: the dialer only establishes to a
             // fully-admitted member (a provisional verdict backs off, above).
-            let generation =
-                register_connection(shared.clone(), remote, conn.clone(), send, recv, false);
-            shared
-                .table
-                .set(remote, PeerConnState::Connected, Some(identity));
-            shared.audit.connected(remote);
+            let generation = match register_connection(
+                shared.clone(),
+                remote,
+                conn.clone(),
+                send,
+                recv,
+                false,
+            ) {
+                LinkRegistration::Admitted { generation } => generation,
+                LinkRegistration::Provisional { .. } | LinkRegistration::Rejected { .. } => {
+                    conn.close(REJECT_CODE, b"admission-changed");
+                    return Established::Stale;
+                }
+            };
+            if shared.activate_link_if_current(remote, generation, false)
+                != LinkActivation::Admitted
+            {
+                if !shared.has_terminal_confirmation(remote, generation) {
+                    conn.close(REJECT_CODE, b"activation-stale");
+                    let _ =
+                        shared.teardown_if_current(remote, generation, LinkTeardown::Unauthorized);
+                }
+                return Established::Stale;
+            }
             Established::Up(generation)
         }
         Err(err) => {

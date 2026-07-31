@@ -2159,6 +2159,7 @@ dependencies = [
  "bao-tree",
  "blake3",
  "bytes",
+ "getrandom 0.4.3",
  "hex",
  "iroh",
  "iroh-blobs",

@@ -748,6 +748,7 @@ impl SyncEngine {
     /// Handle one inbound control/data message (§6.4 responder + the detector).
     pub fn on_message(&mut self, from: PeerId, msg: SyncMessage) -> Vec<Outgoing> {
         let mut out = Vec::new();
+        let mut terminal_confirmation = None;
         self.force_next_tick_pull = true;
         if msg.room_id() != &self.room_id {
             self.log("dropped frame for foreign room");
@@ -772,20 +773,41 @@ impl SyncEngine {
                     self.deliver_bytes(Some(from), &frame, &mut out);
                 }
             }
+            SyncMessage::TerminalEvents {
+                frames, ids, nonce, ..
+            } => {
+                for frame in frames {
+                    self.deliver_bytes(Some(from), &frame, &mut out);
+                }
+                terminal_confirmation = Some((ids, nonce));
+            }
+            SyncMessage::EventsConfirmed { .. } | SyncMessage::ProveCapability { .. } => {}
             SyncMessage::NotFound { ids, .. } => {
                 self.log(&format!("peer lacks {} requested ids", ids.len()));
             }
-            // A join-bootstrap capability proof (issue #112) is a transport-layer
-            // concern: the network adapter verifies it (via `capability_proof_matches`)
-            // and gates the provisional membership-closure serve on it, before this
-            // point. The deterministic engine treats it as a no-op so a forwarded or
-            // replayed proof never affects the validated set or convergence.
-            SyncMessage::ProveCapability { .. } => {}
         }
         // Issue #143: flush the batched accepted events and run parked-frame
         // promotion before returning, so post-commit side effects land in
         // order and the transport adapter observes a consistent store state.
         self.finalize_delivery(&mut out);
+        if let Some((ids, nonce)) = terminal_confirmation {
+            let mut confirmed = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.store.contains_in_room(&self.room_id, &id) {
+                    Ok(true) => confirmed.push(id),
+                    Ok(false) => {}
+                    Err(e) => self.log(&format!("store contains failed: {e}")),
+                }
+            }
+            out.push(to(
+                from,
+                SyncMessage::EventsConfirmed {
+                    room_id: self.room_id,
+                    ids: confirmed,
+                    nonce,
+                },
+            ));
+        }
         out
     }
 
