@@ -23,8 +23,8 @@ use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
 use iroh_rooms_net::pipe::is_loopback_target;
 use iroh_rooms_net::{
-    NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome, DEFAULT_TICK,
-    PIPE_MAX_CONCURRENT_FORWARDS,
+    AdmissionView, NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome,
+    SnapshotAdmission, DEFAULT_TICK, PIPE_MAX_CONCURRENT_FORWARDS,
 };
 use serde_json::json;
 
@@ -134,7 +134,18 @@ pub async fn expose(
 
     // ---- Bring up the node, expose, and serve until Ctrl-C. ----
     let self_device = endpoint_id_of(secret.device.device_key())?;
-    let admission = build_admission(&snapshot);
+    // The accept gate reads a LIVE admission cell the pump refreshes on every fold
+    // change, so a member removed mid-serve stops being admitted (and a re-invited
+    // one is re-admitted) even though `pipe expose` runs an unmanaged session. Seed
+    // the cell from the opening snapshot; the engine's `fail_closed_subjects()` is
+    // not available until the engine exists (the snapshot folds before then), so we
+    // pass an empty fail-closed list here — the pump re-seeds the cell from the live
+    // engine on the first fold, populating the fail-closed set then.
+    let admission_cell = std::sync::Arc::new(std::sync::Mutex::new(AdmissionView::from_snapshot(
+        &snapshot,
+        &[],
+    )));
+    let admission = SnapshotAdmission::new(admission_cell.clone());
     let dial_set = build_dial_set(&snapshot, self_device, &peer_addrs);
 
     let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
@@ -148,14 +159,19 @@ pub async fn expose(
     // are locally logged both on stderr and in audit.ndjson (AC3 / §4.3); the CLI
     // has no `tracing` subscriber, so the default sink would be silent.
     let persistent_audit = audit::PersistentAudit::open(home)?;
-    let node = Node::spawn_with_pipe_audit(
+    let node = Node::spawn_unmanaged_live_admission(
         secret_key,
         std::sync::Arc::new(admission),
         audit::sink_with(persistent_audit.clone()),
         engine,
         cfg,
         DEFAULT_TICK,
-        std::sync::Arc::new(LocalPipeAudit::new(verbose, persistent_audit)),
+        Some(std::sync::Arc::new(LocalPipeAudit::new(
+            verbose,
+            persistent_audit,
+        ))),
+        None,
+        admission_cell,
     )
     .await
     .context("could not bring up the network node")?;
@@ -222,6 +238,7 @@ pub async fn expose(
 /// # Errors
 /// A non-member caller, an unsynced/unknown pipe, no reachable owner address, or a
 /// node/listener failure.
+#[allow(clippy::too_many_lines)] // one linear validate-then-connect-then-serve flow; splitting hurts readability
 pub async fn connect(
     home: &Path,
     room_id: &RoomId,
@@ -248,7 +265,16 @@ pub async fn connect(
     }
 
     let self_device = endpoint_id_of(secret.device.device_key())?;
-    let admission = build_admission(&snapshot);
+    // The accept gate reads a LIVE admission cell the pump refreshes on every fold
+    // change (this listener stays up serving until Ctrl-C). The seed view passes an
+    // empty fail-closed list: `fail_closed_subjects()` needs the engine, which does
+    // not exist yet (the snapshot folds before then) — the pump re-seeds the cell
+    // from the live engine on the first fold, populating the fail-closed set then.
+    let admission_cell = std::sync::Arc::new(std::sync::Mutex::new(AdmissionView::from_snapshot(
+        &snapshot,
+        &[],
+    )));
+    let admission = SnapshotAdmission::new(admission_cell.clone());
     let dial_set = build_dial_set(&snapshot, self_device, &peer_addrs);
 
     let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
@@ -259,13 +285,16 @@ pub async fn connect(
         ..NetConfig::default()
     };
     let audit_sink = audit::sink(home)?;
-    let node = Node::spawn(
+    let node = Node::spawn_unmanaged_live_admission(
         secret_key,
         std::sync::Arc::new(admission),
         audit_sink,
         engine,
         cfg,
         DEFAULT_TICK,
+        None,
+        None,
+        admission_cell,
     )
     .await
     .context("could not bring up the network node")?;

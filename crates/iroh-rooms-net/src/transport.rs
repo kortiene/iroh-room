@@ -49,7 +49,7 @@ const LOCAL_CLOSE_CODE: VarInt = VarInt::from_u32(0);
 /// the sender waits for an application-level receipt for its terminal removal
 /// event. Admission and outbound routing are revoked before this grace starts;
 /// the timeout is only a bounded delivery opportunity, never continued access.
-const TERMINAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TERMINAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many bidirectional QUIC streams a remote endpoint may have open toward us on
 /// one connection, set **explicitly** on the endpoint's `QuicTransportConfig` instead
@@ -259,6 +259,14 @@ struct TerminalConfirmation {
     generation: u64,
     confirmed: AtomicBool,
     changed: Notify,
+    /// Install instant, used by the `register_established_link` gate to bound
+    /// how long an unconfirmed entry blocks re-registration. A pending entry is
+    /// enforced for at most [`TERMINAL_CONFIRM_TIMEOUT`] on **every** session
+    /// type — including unmanaged pumps with no `PeerManager` to run the
+    /// teardown timer — so a removed device can never be locked out of
+    /// `EVENT_ALPN` for the process lifetime. `tokio::time::Instant` so paused
+    /// test runtimes can advance the TTL deterministically.
+    installed_at: tokio::time::Instant,
 }
 
 impl TerminalConfirmation {
@@ -270,6 +278,7 @@ impl TerminalConfirmation {
             generation,
             confirmed: AtomicBool::new(false),
             changed: Notify::new(),
+            installed_at: tokio::time::Instant::now(),
         }
     }
 
@@ -326,6 +335,11 @@ pub struct Shared {
     /// Exact application receipts pending for peers that are about to become
     /// logically deauthorized. Entries are installed only for a routed
     /// `member.removed` event and are cleared on confirmation or bounded timeout.
+    /// An unconfirmed entry blocks re-registration for at most
+    /// [`TERMINAL_CONFIRM_TIMEOUT`] on every session type and feature
+    /// combination — the `register_established_link` gate enforces the TTL
+    /// lazily from the entry's `installed_at`, so even a `PeerManager`-less
+    /// (unmanaged) pump can never lock a device out for the process lifetime.
     terminal_confirmations: Mutex<HashMap<EndpointId, Arc<TerminalConfirmation>>>,
     /// Devices admitted **provisionally** for the join bootstrap (IR-0104,
     /// Approach A): a not-yet-Active invitee allowed to pull the membership sub-DAG
@@ -602,6 +616,11 @@ impl Shared {
             return false;
         }
         pending.confirm();
+        // A confirmed device is immediately re-registrable: it must not stay
+        // blocked from `EVENT_ALPN` until the TTL/teardown reaps the entry.
+        // `begin_terminal_teardown` still observes the confirmed flag on its
+        // own `Arc` to skip the grace close, so removing here loses nothing.
+        self.remove_terminal_confirmation(device, nonce);
         true
     }
 
@@ -611,6 +630,17 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&device)
             .is_some_and(|pending| pending.generation == generation)
+    }
+
+    /// Whether any terminal-confirmation entry (of any generation) is pending
+    /// for `device`. Used by manager tests asserting the pending receipt is
+    /// reaped after the grace.
+    #[cfg(test)]
+    pub(crate) fn has_any_terminal_confirmation(&self, device: EndpointId) -> bool {
+        self.terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&device)
     }
 
     /// Revoke routing immediately, then keep the exact physical connection alive
@@ -823,14 +853,26 @@ impl Shared {
             .generations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self
-            .terminal_confirmations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&device)
         {
-            queue.close();
-            return LinkRegistration::Rejected { cause: None };
+            let mut terminal = self
+                .terminal_confirmations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = terminal.get(&device) {
+                // A pending entry blocks re-registration for at most
+                // `TERMINAL_CONFIRM_TIMEOUT`, independent of any `PeerManager`
+                // teardown timer (unmanaged pumps have none). A confirmed or
+                // stale entry no longer blocks: remove it inline and fall
+                // through to normal admission so a re-invited device is
+                // re-admitted.
+                let blocking = !pending.confirmed.load(Ordering::Acquire)
+                    && pending.installed_at.elapsed() < TERMINAL_CONFIRM_TIMEOUT;
+                if blocking {
+                    queue.close();
+                    return LinkRegistration::Rejected { cause: None };
+                }
+                terminal.remove(&device);
+            }
         }
         let decision = self.admission.authorize(device);
         let (identity, provisional) = match decision {
@@ -1530,8 +1572,9 @@ fn loopback_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InboundReceiver, LinkTeardown, NetConfig, NetMode, OutboundQueue, OutboundReceiver, Shared,
-        TerminalConfirmation, RELAY_ONLY_TEST_BUILD, TERMINAL_CONFIRM_TIMEOUT,
+        loopback_addr, InboundReceiver, LinkRegistration, LinkTeardown, NetConfig, NetMode,
+        OutboundQueue, OutboundReceiver, Shared, TerminalConfirmation, RELAY_ONLY_TEST_BUILD,
+        TERMINAL_CONFIRM_TIMEOUT,
     };
     use crate::admission::AllowlistAdmission;
     use crate::audit::TracingAudit;
@@ -1539,7 +1582,10 @@ mod tests {
         BytePriorityQueue, PushError, DEFAULT_PER_PEER_QUEUE_BYTES, DEFAULT_PER_STREAM_QUEUE_BYTES,
     };
     use crate::state::{OfflineReason, PeerConnState, PeerTable};
-    use iroh::{EndpointId, SecretKey};
+    use crate::{EventProtocolHandler, EVENT_ALPN};
+    use iroh::endpoint::presets;
+    use iroh::protocol::Router;
+    use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
     use iroh_rooms_core::event::ids::{EventId, RoomId};
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
     use std::collections::{HashMap, HashSet};
@@ -1578,6 +1624,29 @@ mod tests {
             peer_manager: Mutex::new(None),
         });
         (shared, InboundReceiver { rx: inbound_rx })
+    }
+
+    /// An admission gate that admits every device provisionally (never fully,
+    /// never rejects) — stands in for a re-invited device that has not yet
+    /// been folded to Active. The provisional accept path registers its link,
+    /// which is what the terminal-gate tests assert on.
+    struct ProvisionalAll;
+
+    impl crate::admission::Admission for ProvisionalAll {
+        fn authorize(&self, _device: EndpointId) -> crate::admission::AdmissionDecision {
+            crate::admission::AdmissionDecision::AdmitProvisional
+        }
+    }
+
+    /// `make_shared` with a caller-supplied admission gate.
+    fn make_shared_with_admission(
+        admission: Arc<dyn crate::admission::Admission>,
+    ) -> (Arc<Shared>, InboundReceiver) {
+        let (mut shared, rx) = make_shared();
+        Arc::get_mut(&mut shared)
+            .expect("fresh shared is uniquely owned")
+            .admission = admission;
+        (shared, rx)
     }
 
     #[tokio::test]
@@ -1619,6 +1688,149 @@ mod tests {
             .await
             .expect("exact confirmation wakes terminal waiter")
             .expect("waiter task completes");
+    }
+
+    /// Drive one loopback dial from `dialer` into the real accept path over
+    /// `shared`, returning the gate's registration decision. The accept path
+    /// registers only after the dialer opens a bidi stream, so the helper
+    /// opens one. This exercises `register_established_link` end-to-end — the
+    /// exact gate an unmanaged session's removed device hits on re-dial.
+    /// Bind the endpoints **before** pausing time: a frozen clock stalls the
+    /// QUIC handshake.
+    async fn accept_path_registration(
+        shared: &Arc<Shared>,
+        dialer: &Endpoint,
+        server: &Endpoint,
+    ) -> LinkRegistration {
+        let _router = Router::builder(server.clone())
+            .accept(EVENT_ALPN, EventProtocolHandler::new(shared.clone()))
+            .spawn();
+        let conn = dialer
+            .connect(
+                loopback_addr(server).expect("server loopback address"),
+                EVENT_ALPN,
+            )
+            .await
+            .expect("loopback connect");
+        let (mut send, _recv) = conn.open_bi().await.expect("open bidi stream");
+        // The server's `accept_bi` only yields the stream once the dialer's
+        // open has propagated; a small payload + flush forces that promptly.
+        send.write_all(b"x").await.expect("nudge stream");
+        // Wait until the accept task has stored the connection handle (it
+        // registers before it parks in `closed().await`) or the gate has
+        // closed the link. Bare `yield_now` — registration needs no timer, so
+        // a generous yield budget schedules the accept task to completion.
+        let device = dialer.id();
+        for _ in 0..100_000 {
+            tokio::task::yield_now().await;
+            if shared
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&device)
+            {
+                return LinkRegistration::Admitted { generation: 0 };
+            }
+            if conn.close_reason().is_some() {
+                return LinkRegistration::Rejected { cause: None };
+            }
+        }
+        LinkRegistration::Rejected { cause: None }
+    }
+
+    async fn minimal_endpoint(seed: u8) -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[seed; 32]))
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("endpoint bind")
+    }
+
+    /// The terminal-confirmation entry must bound its own lockout even when no
+    /// `PeerManager` exists to run the teardown timer (unmanaged sessions:
+    /// `Node::spawn` / `spawn_join_bootstrap` / `pipe expose` / `file`). The
+    /// `register_established_link` gate enforces a pending entry for at most
+    /// `TERMINAL_CONFIRM_TIMEOUT`; after that the device falls through to
+    /// normal admission instead of being locked out for the process lifetime.
+    /// The fixture installs the entry exactly like `route_terminal_removal`
+    /// does on an unmanaged pump (the pending marker with no manager to run
+    /// the teardown timer), then drives the device's re-dial through the real
+    /// accept path. The `ProvisionalAll` gate admits the device provisionally
+    /// (`AdmitProvisional` + the accept path's `allow_provisional = true`), so
+    /// a registered link means the gate let it through to normal admission.
+    /// Real-time test: the gate's TTL check is a lazy clock read that never
+    /// spawns a timer, so the only wait is the explicit `sleep` past the TTL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_confirmation_lockout_expires_without_peer_manager() {
+        let (shared, _inbound) = make_shared_with_admission(Arc::new(ProvisionalAll));
+        let server = minimal_endpoint(0x01).await;
+        let dialer = minimal_endpoint(0x71).await;
+        let peer = dialer.id();
+        let room_id = RoomId::from_bytes([0x72; 32]);
+        let event_id = EventId::from_bytes([0x73; 32]);
+        let nonce = [0x74; 16];
+        shared
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                peer,
+                Arc::new(TerminalConfirmation::new(room_id, vec![event_id], nonce, 1)),
+            );
+
+        // While pending and younger than the TTL, registration is rejected.
+        assert!(matches!(
+            accept_path_registration(&shared, &dialer, &server).await,
+            LinkRegistration::Rejected { cause: None }
+        ));
+
+        // After the TTL — with no PeerManager and no teardown — the stale
+        // entry no longer blocks: the device is subject to normal admission
+        // (`ProvisionalAll` → the provisional accept path registers the link).
+        tokio::time::sleep(TERMINAL_CONFIRM_TIMEOUT).await;
+        assert!(matches!(
+            accept_path_registration(&shared, &dialer, &server).await,
+            LinkRegistration::Admitted { .. }
+        ));
+        assert!(
+            !shared.has_terminal_confirmation(peer, 1),
+            "the gate must reap the stale entry it observed"
+        );
+    }
+
+    /// A confirmed terminal entry unblocks re-registration immediately — the
+    /// device must not wait out the full timeout once its receipt arrived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_confirmation_confirm_unblocks_registration_immediately() {
+        let (shared, _inbound) = make_shared_with_admission(Arc::new(ProvisionalAll));
+        let server = minimal_endpoint(0x01).await;
+        let dialer = minimal_endpoint(0x75).await;
+        let peer = dialer.id();
+        let room_id = RoomId::from_bytes([0x76; 32]);
+        let event_id = EventId::from_bytes([0x77; 32]);
+        let nonce = [0x78; 16];
+        shared
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                peer,
+                Arc::new(TerminalConfirmation::new(room_id, vec![event_id], nonce, 3)),
+            );
+
+        assert!(shared.confirm_terminal_events(peer, &room_id, &[event_id], &nonce));
+        assert!(
+            !shared.has_terminal_confirmation(peer, 3),
+            "confirmation must clear the entry, not leave it until the timeout"
+        );
+
+        // No time has advanced: registration must already proceed to normal
+        // admission (`ProvisionalAll` → the provisional accept path registers).
+        assert!(matches!(
+            accept_path_registration(&shared, &dialer, &server).await,
+            LinkRegistration::Admitted { .. }
+        ));
     }
 
     #[tokio::test(start_paused = true)]

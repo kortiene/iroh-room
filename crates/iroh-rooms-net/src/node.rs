@@ -110,6 +110,41 @@ struct RoomConfig {
     blob: Option<BlobServeConfig>,
 }
 
+/// The admission-only core of a reconcile: refresh the live admission cell from
+/// the current fold so a device the room has since removed stops being admitted
+/// (and a re-invited device is re-admitted). Shared by the managed
+/// [`RoomReconciler`] (which also reconciles the dial set) and by unmanaged
+/// sessions, which have no [`PeerManager`] but must still track removal on their
+/// accept gate (PR #195 review: a fixed startup allowlist would otherwise
+/// re-admit a removed device after its terminal-confirmation TTL/confirmation).
+struct AdmissionRefresher {
+    cell: Arc<Mutex<AdmissionView>>,
+    /// The last view swapped in — the cheap fold-change detector.
+    last: Option<AdmissionView>,
+}
+
+impl AdmissionRefresher {
+    fn new(cell: Arc<Mutex<AdmissionView>>) -> Self {
+        Self { cell, last: None }
+    }
+
+    /// Swap a fresh [`AdmissionView`] into the cell iff the fold changed since
+    /// the last refresh. Returns the current snapshot for any caller that also
+    /// reconciles a dial set against it.
+    fn refresh(&mut self, engine: &SyncEngine) -> MembershipSnapshot {
+        let snapshot = engine.snapshot();
+        let view = AdmissionView::from_snapshot(&snapshot, &engine.fail_closed_subjects());
+        if self.last.as_ref() != Some(&view) {
+            *self
+                .cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = view.clone();
+            self.last = Some(view);
+        }
+        snapshot
+    }
+}
+
 /// The pump-owned reconciler that keeps the dial set and the admission cell in step
 /// with the live membership fold (spec §4.3 — snapshot-diff on the existing tick).
 struct RoomReconciler {
@@ -406,7 +441,7 @@ impl Node {
         tick: Duration,
     ) -> Result<Self> {
         Self::spawn_inner(
-            secret, admission, audit, engine, cfg, tick, None, None, None,
+            secret, admission, audit, engine, cfg, tick, None, None, None, None,
         )
         .await
     }
@@ -440,6 +475,7 @@ impl Node {
             None,
             None,
             Some(proof),
+            None,
         )
         .await
     }
@@ -474,6 +510,49 @@ impl Node {
             None,
             Some(pipe_audit),
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Node::spawn_with_pipe_audit`] but the accept gate reads a **live**
+    /// admission cell the pump refreshes on every fold change, so a device the room
+    /// removes mid-session stops being admitted (and a re-invited device is
+    /// re-admitted) even though this session has no [`PeerManager`].
+    ///
+    /// Build the gate as `SnapshotAdmission::new(admission_cell.clone())` (optionally
+    /// wrapped by [`JoinBootstrapAdmission`]) and pass the same `admission_cell`
+    /// here; the pump owns refreshing it from the fold. This is the long-running
+    /// unmanaged-session counterpart to [`Node::spawn_room`]'s managed admission —
+    /// `pipe expose` is the canonical caller (PR #195 review: a fixed startup
+    /// allowlist would otherwise re-admit a removed device once its
+    /// terminal-confirmation TTL/confirmation clears the re-registration block).
+    ///
+    /// # Errors
+    /// Returns an error if the endpoint fails to bind.
+    #[allow(clippy::too_many_arguments)] // one wiring seam; each arg is a distinct input
+    pub async fn spawn_unmanaged_live_admission(
+        secret: SecretKey,
+        admission: Arc<dyn Admission>,
+        audit: Arc<dyn AuditSink>,
+        engine: SyncEngine,
+        cfg: NetConfig,
+        tick: Duration,
+        pipe_audit: Option<Arc<dyn PipeAuditSink>>,
+        bootstrap_proof: Option<BootstrapProof>,
+        admission_cell: Arc<Mutex<AdmissionView>>,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            secret,
+            admission,
+            audit,
+            engine,
+            cfg,
+            tick,
+            None,
+            pipe_audit,
+            bootstrap_proof,
+            Some(admission_cell),
         )
         .await
     }
@@ -528,6 +607,7 @@ impl Node {
             }),
             None,
             None,
+            None,
         )
         .await
     }
@@ -543,6 +623,7 @@ impl Node {
         room: Option<RoomConfig>,
         pipe_audit: Option<Arc<dyn PipeAuditSink>>,
         bootstrap_proof: Option<BootstrapProof>,
+        unmanaged_admission_cell: Option<Arc<Mutex<AdmissionView>>>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         // A dedicated, **bounded** channel for the Pipe plane's reads against
@@ -677,6 +758,18 @@ impl Node {
             None => (None, None),
         };
 
+        // Unmanaged sessions have no `PeerManager`, but their accept gate must
+        // still track a removal the fold learns: when the caller supplied a live
+        // admission cell (a `SnapshotAdmission` gate), the pump refreshes it on
+        // every fold change so a removed device stops being admitted and a
+        // re-invited device is re-admitted (PR #195 review). `None` keeps a
+        // caller's fixed gate byte-for-byte (test fixtures).
+        let admission_refresh = if room_reconciler.is_none() {
+            unmanaged_admission_cell.map(AdmissionRefresher::new)
+        } else {
+            None
+        };
+
         let pump = tokio::spawn(pump(
             engine,
             inbound_rx,
@@ -688,6 +781,7 @@ impl Node {
             room_reconciler,
             room_event_tx.clone(),
             bootstrap_proof,
+            admission_refresh,
         ));
 
         // The teardown-on-learn watcher (spec §4.5/D5): re-evaluates every live pipe
@@ -1359,6 +1453,7 @@ async fn pump(
     mut room: Option<RoomReconciler>,
     room_event_tx: broadcast::Sender<StoredEvent>,
     bootstrap_proof: Option<BootstrapProof>,
+    mut admission_refresh: Option<AdmissionRefresher>,
 ) {
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1374,16 +1469,27 @@ async fn pump(
 
     // Establish the initial dial set + admission view from the opening snapshot so a
     // managed session starts dialing its active members immediately (not after the
-    // first fold change).
+    // first fold change). An unmanaged session's live admission cell is seeded the
+    // same way so its gate reflects the opening roster before the first fold.
     if let Some(room) = room.as_mut() {
         room.maybe_reconcile(&engine);
+    }
+    if let Some(cell) = admission_refresh.as_mut() {
+        cell.refresh(&engine);
     }
 
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
-                if handle_cmd(&mut engine, &shared, &mut room, cmd, &room_event_tx) {
+                if handle_cmd(
+                    &mut engine,
+                    &shared,
+                    &mut room,
+                    cmd,
+                    &room_event_tx,
+                    &mut admission_refresh,
+                ) {
                     break;
                 }
             }
@@ -1542,6 +1648,9 @@ async fn pump(
                             if let Some(room) = room.as_mut() {
                                 room.maybe_reconcile(&engine);
                             }
+                            if let Some(cell) = admission_refresh.as_mut() {
+                                cell.refresh(&engine);
+                            }
                         }
                     }
                     Err(err) => {
@@ -1577,6 +1686,9 @@ async fn pump(
                 if let Some(room) = room.as_mut() {
                     room.maybe_reconcile(&engine);
                 }
+                if let Some(cell) = admission_refresh.as_mut() {
+                    cell.refresh(&engine);
+                }
             }
         }
     }
@@ -1589,6 +1701,7 @@ fn handle_cmd(
     room: &mut Option<RoomReconciler>,
     cmd: Cmd,
     room_event_tx: &broadcast::Sender<StoredEvent>,
+    admission_refresh: &mut Option<AdmissionRefresher>,
 ) -> bool {
     match cmd {
         Cmd::Publish(bytes, reply) => {
@@ -1606,6 +1719,9 @@ fn handle_cmd(
             // reconcile the dial set + admission against the new snapshot.
             if let Some(room) = room.as_mut() {
                 room.maybe_reconcile(engine);
+            }
+            if let Some(cell) = admission_refresh.as_mut() {
+                cell.refresh(engine);
             }
             let _ = reply.send(result);
             false
@@ -2024,5 +2140,187 @@ mod room_events_pump_tests {
                 "{label} must receive its own copy of all three events"
             );
         }
+    }
+}
+
+/// Tests for the unmanaged-session [`AdmissionRefresher`] (PR #195 review): an
+/// unmanaged pump has no `PeerManager`, so its accept gate must still track a
+/// removal the fold learns — otherwise a fixed startup allowlist would re-admit
+/// a removed device once its terminal-confirmation TTL/confirmation clears the
+/// re-registration block. Exercises the refresher directly over a real engine.
+#[cfg(test)]
+mod admission_refresher_tests {
+    use std::sync::{Arc, Mutex};
+
+    use iroh::{EndpointId, SecretKey};
+    use iroh_rooms_core::event::binding::DeviceBinding;
+    use iroh_rooms_core::event::content::{
+        capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved,
+        RoomCreated,
+    };
+    use iroh_rooms_core::event::ids::EventId;
+    use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+    use iroh_rooms_core::event::signed::{self, SignedEvent};
+    use iroh_rooms_core::event::wire::WireEvent;
+    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms_core::sync::SyncConfig;
+
+    use super::{AdmissionRefresher, SyncEngine};
+    use crate::admission::{
+        Admission, AdmissionDecision, AdmissionView, RejectCause, SnapshotAdmission,
+    };
+
+    const NONCE: [u8; 16] = [0xcd; 16];
+    const T0: u64 = 1_760_000_000_000;
+
+    /// A test actor: one identity key + one device key (endpoint id == device id).
+    struct Actor {
+        id: SigningKey,
+        dev: SigningKey,
+    }
+
+    impl Actor {
+        fn new(seed: u8) -> Self {
+            Self {
+                id: SigningKey::from_seed(&[seed; 32]),
+                dev: SigningKey::from_seed(&[seed.wrapping_add(0x80); 32]),
+            }
+        }
+        fn identity(&self) -> IdentityKey {
+            self.id.identity_key()
+        }
+        fn endpoint_id(&self) -> EndpointId {
+            SecretKey::from_bytes(&self.dev.to_seed()).public()
+        }
+    }
+
+    fn wire(ev: &SignedEvent, dev: &SigningKey) -> Vec<u8> {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        WireEvent::seal(csb, sig).to_bytes()
+    }
+
+    fn genesis(host: &Actor) -> (iroh_rooms_core::event::ids::RoomId, EventId, Vec<u8>) {
+        let room = signed::derive_room_id(&host.identity(), &NONCE, T0);
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: host.identity(),
+            device_id: host.dev.device_key(),
+            event_type: EventType::RoomCreated,
+            created_at: T0,
+            prev_events: vec![],
+            content: Content::RoomCreated(RoomCreated {
+                room_name: "refresh-test".to_owned(),
+                room_nonce: NONCE,
+                admins: vec![host.identity()],
+                device_binding: DeviceBinding::create(&room, &host.id, host.dev.device_key()),
+            }),
+        };
+        let id = ev.event_id();
+        (room, id, wire(&ev, &host.dev))
+    }
+
+    #[test]
+    fn refresher_revokes_removed_device_and_readmits_reinvited() {
+        let host = Actor::new(0x01);
+        let member = Actor::new(0x02);
+        let (room, genesis_id, genesis_wire) = genesis(&host);
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        engine.publish(&genesis_wire).expect("publish genesis");
+
+        let cell = Arc::new(Mutex::new(AdmissionView::empty()));
+        let gate = SnapshotAdmission::new(cell.clone());
+        let mut refresher = AdmissionRefresher::new(cell);
+        let member_dev = member.endpoint_id();
+
+        // Seed from genesis: only the host is a member; the member device is
+        // unknown to the fold and must be rejected.
+        refresher.refresh(&engine);
+        assert!(matches!(
+            gate.authorize(member_dev),
+            AdmissionDecision::Reject(RejectCause::UnknownDevice)
+        ));
+
+        // Invite + join: the member becomes Active and is admitted.
+        let invite_id = [0x11; 16];
+        let secret = [0x22; 16];
+        let cap_hash = capability_hash(&room, &invite_id, &secret);
+        let invite = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: host.identity(),
+            device_id: host.dev.device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: T0 + 1,
+            prev_events: vec![genesis_id],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: cap_hash,
+                role: "member".to_owned(),
+                invitee_key: member.identity(),
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        let invite_ev_id = invite.event_id();
+        engine
+            .publish(&wire(&invite, &host.dev))
+            .expect("publish invite");
+        let join = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: member.identity(),
+            device_id: member.dev.device_key(),
+            event_type: EventType::MemberJoined,
+            created_at: T0 + 2,
+            prev_events: vec![invite_ev_id],
+            content: Content::MemberJoined(MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: secret,
+                role: "member".to_owned(),
+                device_binding: DeviceBinding::create(&room, &member.id, member.dev.device_key()),
+                display_name: None,
+            }),
+        };
+        let join_id = join.event_id();
+        engine
+            .publish(&wire(&join, &member.dev))
+            .expect("publish join");
+        refresher.refresh(&engine);
+        assert!(
+            matches!(gate.authorize(member_dev), AdmissionDecision::Admit { .. }),
+            "an Active member must be admitted after the join fold"
+        );
+
+        // Removal: the fold learns it and the gate must now reject the device
+        // as NotActive — even though nothing else (no PeerManager) revoked it.
+        let remove = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: host.identity(),
+            device_id: host.dev.device_key(),
+            event_type: EventType::MemberRemoved,
+            created_at: T0 + 3,
+            prev_events: vec![join_id],
+            content: Content::MemberRemoved(MemberRemoved {
+                member_id: member.identity(),
+                removed_by: host.identity(),
+                reason: None,
+                device_binding: None,
+            }),
+        };
+        engine
+            .publish(&wire(&remove, &host.dev))
+            .expect("publish removal");
+        refresher.refresh(&engine);
+        assert!(
+            matches!(
+                gate.authorize(member_dev),
+                AdmissionDecision::Reject(RejectCause::NotActive)
+            ),
+            "a removed device must be rejected as NotActive after the removal fold"
+        );
     }
 }
