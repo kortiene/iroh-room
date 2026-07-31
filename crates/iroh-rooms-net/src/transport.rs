@@ -435,14 +435,30 @@ impl Shared {
         #[cfg(feature = "gossip_overlay")]
         {
             if let iroh_rooms_core::sync::SyncMessage::Events { room_id, .. } = &out.msg {
-                if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
-                    mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
+                // Split Events by intent (spec §4 D1, revised by the N=40
+                // hub-overload isolation): accept-path FAN-OUT (out.fanout)
+                // rides the gossip broadcast alone when a mesh is installed —
+                // a dual-path per-peer queue copy multiplies every event into
+                // the seed hubs by ~N-K and drowns them. TARGETED serves
+                // (pull responses, backfill, bootstrap closures) never
+                // broadcast — broadcasting per-requester batches spams the
+                // whole mesh with duplicates — and stay point-to-point on the
+                // queue path below, keeping per-link FIFO. With no mesh
+                // installed, fan-out falls through to the queue path: exactly
+                // the pre-overlay behavior, so no-gossip builds and
+                // early-startup windows are unchanged.
+                if out.fanout {
+                    if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
+                        // Gossip-only ONLY when the mesh accepts the body: a
+                        // declined broadcast (zero live neighbors, oversized)
+                        // falls through to the per-peer queue so a
+                        // dysfunctional mesh degrades to the pre-overlay
+                        // topology instead of silently dropping live fan-out.
+                        if mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode()) {
+                            return;
+                        }
+                    }
                 }
-                // Fall through to the per-peer queue path: dual-path delivery.
-                // If no mesh is installed (loopback / early startup), the
-                // queue path carries Events alone — exactly the pre-overlay
-                // behavior, so existing tests pass under both feature
-                // configurations.
             }
         }
 
@@ -504,6 +520,22 @@ impl Shared {
     ) -> Result<(), PushError> {
         let family = classify_inbound_bytes(&bytes);
         self.inbound.try_push(peer, bytes, family)
+    }
+
+    /// [`try_enqueue_inbound`](Self::try_enqueue_inbound) for gossip-delivered
+    /// frames: same sink and priorities, charged against the separate gossip
+    /// ledger. With fan-out riding the gossip broadcast, hub-scale gossip
+    /// fan-in is real steady-state volume — it must not be able to exhaust
+    /// the event-plane budget whose saturation makes the event-plane reader
+    /// close the peer's connection (`peer.rs`), or gossip load converts into
+    /// link churn.
+    pub(crate) fn try_enqueue_inbound_gossip(
+        &self,
+        peer: PeerId,
+        bytes: Vec<u8>,
+    ) -> Result<(), PushError> {
+        let family = classify_inbound_bytes(&bytes);
+        self.inbound.try_push_gossip(peer, bytes, family)
     }
 
     /// Close the inbound sink (transport shutdown): reader tasks observe
@@ -1182,6 +1214,7 @@ mod tests {
 
     fn dummy_outgoing(peer: EndpointId) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::NotFound {
                 room_id: RoomId::from_bytes([0xAA; 32]),
@@ -1192,6 +1225,7 @@ mod tests {
 
     fn admin_tip_outgoing(peer: EndpointId) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::AdminTip {
                 room_id: RoomId::from_bytes([0xAB; 32]),
@@ -1202,6 +1236,7 @@ mod tests {
 
     fn want_membership_outgoing(peer: EndpointId) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::WantMembership {
                 room_id: RoomId::from_bytes([0xAC; 32]),
@@ -1220,6 +1255,7 @@ mod tests {
     fn want_recent_chat_outgoing(peer: EndpointId) -> Outgoing {
         use iroh_rooms_core::sync::Window;
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::WantRecentChat {
                 room_id: RoomId::from_bytes([0xAE; 32]),
@@ -1234,6 +1270,7 @@ mod tests {
 
     fn events_outgoing(peer: EndpointId, payload_len: usize) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::Events {
                 room_id: RoomId::from_bytes([0xAD; 32]),
@@ -2576,6 +2613,9 @@ mod tests {
             // encoded body on the room's gossip topic. `broadcast_events` is
             // fire-and-forget (spawns a task), so delivery is awaited below.
             let out = Outgoing {
+                // This test simulates the engine's accept-path fan-out (the one
+                // emission that broadcasts under the R5 split): mark it so.
+                fanout: true,
                 peer: PeerId::from_bytes(*b_id.as_bytes()),
                 msg: SyncMessage::Events {
                     room_id: room,
@@ -2708,6 +2748,97 @@ mod tests {
         /// a recording audit: iroh-gossip dedups identical content at
         /// *delivery*, so counting received copies would not surface the bug —
         /// only the sender-side audit (one outcome per broadcast task that ran)
+        /// A mesh with ZERO live gossip neighbors must DECLINE the broadcast
+        /// so `route` falls back to the per-peer queue path — a first-member
+        /// mesh (or one whose neighbors all dropped, the #192 health-check
+        /// gap) must degrade to the pre-overlay topology, not silently eat
+        /// live fan-out. Once a neighbor joins, the same route call is
+        /// accepted for broadcast.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn zero_neighbor_mesh_declines_broadcast_until_a_neighbor_joins() {
+            let room = RoomId::from_bytes([0xAF; 32]);
+            let a_seed: u8 = 0x81;
+            let b_seed: u8 = 0x82;
+
+            let spy = Arc::new(BroadcastSpy::default());
+            let (a_shared, _a_rx, a_ep, _a_router) = spawn_overlay_node_with_audit(
+                a_seed,
+                &[a_seed, b_seed],
+                vec![],
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            )
+            .await;
+            let a_addr = loopback_addr(&a_ep);
+            let a_id = a_ep.id();
+
+            // First member: mesh installs with empty bootstrap => 0 neighbors.
+            let a_actor = a_shared
+                .gossip_state
+                .actor()
+                .expect("A has a live gossip actor")
+                .clone();
+            let a_mesh = GossipMesh::spawn(a_shared.clone(), a_actor, room, vec![])
+                .await
+                .expect("A subscribes the room gossip topic");
+            a_shared.gossip_state.install_mesh(room, a_mesh);
+            assert_eq!(
+                a_shared.gossip_state.neighbor_count(),
+                0,
+                "a first-member mesh starts with zero neighbors"
+            );
+
+            // Fan-out routed into a neighborless mesh: declined, no broadcast
+            // task spawned, queue-path fallback taken (silently dropped here —
+            // no registered writer — exactly the pre-overlay contract).
+            let declined = Outgoing {
+                fanout: true,
+                peer: PeerId::from_bytes([b_seed; 32]),
+                msg: SyncMessage::Events {
+                    room_id: room,
+                    frames: vec![vec![0xE1; 64]],
+                },
+            };
+            a_shared.route(&declined);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                spy.outcomes(),
+                0,
+                "a zero-neighbor mesh must not accept a broadcast"
+            );
+
+            // B joins the topic; A gains a neighbor; the SAME body may now be
+            // broadcast (a decline records nothing in the dedup window).
+            let (b_shared, _b_rx, b_ep, _b_router) =
+                spawn_overlay_node(b_seed, &[a_seed, b_seed], vec![a_addr]).await;
+            let _ = b_ep.id();
+            let b_actor = b_shared
+                .gossip_state
+                .actor()
+                .expect("B has a live gossip actor")
+                .clone();
+            let b_mesh = GossipMesh::spawn(b_shared.clone(), b_actor, room, vec![a_id])
+                .await
+                .expect("B subscribes + joins the room gossip topic");
+            b_shared.gossip_state.install_mesh(room, b_mesh);
+            assert!(
+                wait_for_neighbors(&a_shared, 1, WAIT).await,
+                "A must gain a gossip neighbor after B joins"
+            );
+
+            a_shared.route(&declined);
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                if spy.outcomes() >= 1 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "with a live neighbor the broadcast must be accepted"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
         /// does. Routing the same body to several distinct peers must collapse
         /// to exactly one outcome.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2775,6 +2906,9 @@ mod tests {
             for n in 0..FANOUT_PEERS {
                 let peer = PeerId::from_bytes([0xC0 + n; 32]);
                 let out = Outgoing {
+                    // This test simulates the engine's accept-path fan-out (the one
+                    // emission that broadcasts under the R5 split): mark it so.
+                    fanout: true,
                     peer,
                     msg: SyncMessage::Events {
                         room_id: room,

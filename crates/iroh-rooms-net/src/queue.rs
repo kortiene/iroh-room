@@ -182,6 +182,10 @@ pub(crate) struct QueuedFrame {
     pub body: Vec<u8>,
     pub bytes: usize,
     pub family: QueueFamily,
+    /// Whether this frame was charged against the gossip ledger (a parallel
+    /// per-peer budget map) instead of the event-plane ledger, so the pop
+    /// refund lands on the ledger that was charged. See `gossip_budgets`.
+    pub gossip: bool,
 }
 
 /// Per-peer accounting: total queued body bytes plus the bytes charging the
@@ -197,6 +201,16 @@ struct QueueState {
     peer_cap: usize,
     stream_cap: usize,
     budgets: HashMap<PeerId, PeerBudget>,
+    /// Separate ledger for gossip-delivered frames, same caps as the
+    /// event-plane ledger. With fan-out riding the gossip broadcast, a
+    /// high-degree node's gossip fan-in is real steady-state volume; charging
+    /// it against the event-plane per-peer budgets would let gossip load
+    /// saturate them, and the event-plane reader closes the connection on
+    /// saturation (`peer.rs`) — converting gossip volume into link churn.
+    /// On this ledger, gossip saturation drops the gossip frame (audit-only,
+    /// `transport.queue.saturated` queue=`gossip`): the engine's anti-entropy
+    /// re-pulls cover the gap, and the link stays up.
+    gossip_budgets: HashMap<PeerId, PeerBudget>,
     /// One deque per priority ordinal; index by `QueuePriority::ordinal`.
     by_priority: [VecDeque<QueuedFrame>; 4],
 }
@@ -208,6 +222,7 @@ impl QueueState {
             peer_cap,
             stream_cap,
             budgets: HashMap::new(),
+            gossip_budgets: HashMap::new(),
             // `[T; N]::default()` is implemented for N ≤ 32 via std; this yields
             // four independent empty deques (Default does not require Copy).
             by_priority: Default::default(),
@@ -215,19 +230,25 @@ impl QueueState {
     }
 
     fn total_depth(&self) -> usize {
-        self.budgets.values().map(|b| b.total).sum()
+        self.budgets.values().map(|b| b.total).sum::<usize>()
+            + self.gossip_budgets.values().map(|b| b.total).sum::<usize>()
     }
 
     fn pop_highest(&mut self) -> Option<QueuedFrame> {
         for priority in QueuePriority::DRAIN_ORDER {
             if let Some(frame) = self.by_priority[priority.ordinal()].pop_front() {
-                if let Some(budget) = self.budgets.get_mut(&frame.peer) {
+                let ledger = if frame.gossip {
+                    &mut self.gossip_budgets
+                } else {
+                    &mut self.budgets
+                };
+                if let Some(budget) = ledger.get_mut(&frame.peer) {
                     budget.total = budget.total.saturating_sub(frame.bytes);
                     if frame.family.charges_stream_budget() {
                         budget.stream = budget.stream.saturating_sub(frame.bytes);
                     }
                     if budget.total == 0 {
-                        self.budgets.remove(&frame.peer);
+                        ledger.remove(&frame.peer);
                     }
                 }
                 return Some(frame);
@@ -278,6 +299,28 @@ impl BytePriorityQueue {
         body: Vec<u8>,
         family: QueueFamily,
     ) -> Result<(), PushError> {
+        self.try_push_ledger(peer, body, family, false)
+    }
+
+    /// [`try_push`](Self::try_push), but charged against the separate gossip
+    /// ledger: same caps, independent budget, so gossip fan-in can never
+    /// consume the event-plane budget whose saturation closes connections.
+    pub(crate) fn try_push_gossip(
+        &self,
+        peer: PeerId,
+        body: Vec<u8>,
+        family: QueueFamily,
+    ) -> Result<(), PushError> {
+        self.try_push_ledger(peer, body, family, true)
+    }
+
+    fn try_push_ledger(
+        &self,
+        peer: PeerId,
+        body: Vec<u8>,
+        family: QueueFamily,
+        gossip: bool,
+    ) -> Result<(), PushError> {
         if body.is_empty() {
             return Err(PushError::Empty);
         }
@@ -294,7 +337,11 @@ impl BytePriorityQueue {
         let peer_cap = state.peer_cap;
         let stream_cap = state.stream_cap;
         let charges_stream = family.charges_stream_budget();
-        let budget = state.budgets.entry(peer).or_default();
+        let budget = if gossip {
+            state.gossip_budgets.entry(peer).or_default()
+        } else {
+            state.budgets.entry(peer).or_default()
+        };
         let new_total = budget.total.saturating_add(bytes);
         if new_total > peer_cap {
             return Err(PushError::Saturated);
@@ -313,6 +360,7 @@ impl BytePriorityQueue {
             body,
             bytes,
             family,
+            gossip,
         });
         drop(state);
         // New frame available: wake one waiting consumer (or none if no one is

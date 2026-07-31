@@ -510,6 +510,11 @@ pub struct SyncEngine {
     /// Whether the next tick should emit full anti-entropy pulls even if no local
     /// sync activity has happened since the previous tick.
     force_next_tick_pull: bool,
+    /// Pull-emitting ticks still owed from the last forced pull, so a single
+    /// nudge sweeps the FULL rotating window cycle (every peer) even when
+    /// `has_pending_sync_work()` is false — a forced pull that visited only
+    /// one window could permanently miss the peer holding a dropped frame.
+    pull_sweep_remaining: usize,
 
     /// Bounded early event-id dedup cache (issue #143): checked before signature
     /// verification and any store work, so a replay inside the cache window is a
@@ -613,6 +618,7 @@ impl SyncEngine {
             covered_cache: BTreeMap::new(),
             claim_rotation: 0,
             force_next_tick_pull: true,
+            pull_sweep_remaining: 0,
             dedup_cache,
             pending_batch: PendingStoreBatch::new(),
         };
@@ -792,6 +798,10 @@ impl SyncEngine {
     /// recovers it. The pulls carry `have` lists, so a converged peer's responses
     /// are empty and the mesh quiesces. `now_ms` is advisory (token refill is
     /// per-call, not clock-driven, to stay deterministic — spec R4).
+    ///
+    /// Pulls are bounded to [`SyncConfig::pull_fanout_peers`] peers per tick
+    /// on a deterministic rotating window — see the field doc for why an
+    /// unbounded pull fan-out melts high-degree nodes.
     pub fn on_tick(&mut self, _now_ms: u64) -> Vec<Outgoing> {
         let mut out = Vec::new();
         // Advance the claim's rotating window (issue #113) — per tick, not per
@@ -806,12 +816,50 @@ impl SyncEngine {
         // A restart may have left parked frames owed their one-shot by-id backfill;
         // the first tick after `open` re-issues it if no `on_connect` did (spec §6.3).
         self.retry_restored_park(&mut out);
-        let emit_pulls = self.force_next_tick_pull || self.has_pending_sync_work();
-        self.force_next_tick_pull = false;
+        // A forced pull arms a full sweep: enough consecutive pull-emitting
+        // ticks that the rotating window covers every peer once, so the nudge
+        // reaches the peer that actually holds the missing data even in a
+        // room much larger than the per-tick window.
+        if self.force_next_tick_pull {
+            self.force_next_tick_pull = false;
+            let window = self.config.pull_fanout_peers.max(1);
+            self.pull_sweep_remaining = self
+                .pull_sweep_remaining
+                .max(self.peers.len().div_ceil(window).max(1));
+        }
+        let emit_pulls = self.pull_sweep_remaining > 0 || self.has_pending_sync_work();
+        self.pull_sweep_remaining = self.pull_sweep_remaining.saturating_sub(1);
         let membership_have = emit_pulls.then(|| self.membership_have());
         let chat_have = emit_pulls.then(|| self.chat_have());
-        for peer in self.peers.iter().copied().collect::<Vec<_>>() {
+        // Bound the pull fan-out to a rotating window of
+        // `pull_fanout_peers` peers instead of ALL peers (see the config
+        // field doc for the hub-overload rationale). The rotation reuses
+        // `claim_rotation` — already advanced exactly once per tick, so the
+        // window is deterministic (R4) and successive ticks sweep the whole
+        // peer set. The tiny `admin_tip_msg` still goes to every peer:
+        // fork-detection latency is load-bearing and the frame is a fixed
+        // few bytes, not a serve trigger.
+        let pull_fanout = self.config.pull_fanout_peers;
+        let all_peers: Vec<_> = self.peers.iter().copied().collect();
+        let pull_set: std::collections::BTreeSet<_> = if all_peers.len() <= pull_fanout {
+            all_peers.iter().copied().collect()
+        } else {
+            // Truncating u64 -> usize is fine: it feeds a modulus, where a
+            // wrapped rotation index only changes which window this tick gets.
+            // Stride by the window width so consecutive pull-emitting ticks
+            // cover the NEXT block of peers: full coverage in
+            // ceil(peers / window) ticks, not peers - window + 1.
+            #[allow(clippy::cast_possible_truncation)]
+            let start = (self.claim_rotation as usize).wrapping_mul(pull_fanout) % all_peers.len();
+            (0..pull_fanout)
+                .map(|i| all_peers[(start + i) % all_peers.len()])
+                .collect()
+        };
+        for peer in all_peers {
             out.push(to(peer, self.admin_tip_msg()));
+            if emit_pulls && !pull_set.contains(&peer) {
+                continue;
+            }
             if let Some(have) = &membership_have {
                 out.push(to(
                     peer,
@@ -1378,6 +1426,7 @@ impl SyncEngine {
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     if Some(peer) != from {
                         out.push(Outgoing {
+                            fanout: true,
                             peer,
                             msg: SyncMessage::Events {
                                 room_id: self.room_id,
@@ -1605,6 +1654,7 @@ impl SyncEngine {
         for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
             for &peer in &targets {
                 out.push(Outgoing {
+                    fanout: false,
                     peer,
                     msg: SyncMessage::WantEvents {
                         room_id: self.room_id,
@@ -1779,6 +1829,7 @@ impl SyncEngine {
             for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     out.push(Outgoing {
+                        fanout: false,
                         peer,
                         msg: SyncMessage::WantEvents {
                             room_id: self.room_id,
@@ -2147,6 +2198,7 @@ impl SyncEngine {
                 let have = self.membership_have();
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     out.push(Outgoing {
+                        fanout: false,
                         peer,
                         msg: SyncMessage::WantMembership {
                             room_id: self.room_id,
@@ -2463,6 +2515,7 @@ impl SyncEngine {
             for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     out.push(Outgoing {
+                        fanout: false,
                         peer,
                         msg: SyncMessage::WantEvents {
                             room_id: self.room_id,
@@ -2695,7 +2748,11 @@ impl SyncEngine {
 
 /// Build an [`Outgoing`] addressed to `peer`.
 fn to(peer: PeerId, msg: SyncMessage) -> Outgoing {
-    Outgoing { peer, msg }
+    Outgoing {
+        peer,
+        msg,
+        fanout: false,
+    }
 }
 
 /// Cheap pre-validation parse for the early event-id dedup path (issue #143 /

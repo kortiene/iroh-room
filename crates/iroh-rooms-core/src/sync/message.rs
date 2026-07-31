@@ -197,6 +197,14 @@ pub struct Outgoing {
     pub peer: PeerId,
     /// The message to deliver.
     pub msg: SyncMessage,
+    /// `true` only for the accept-path fan-out of a newly accepted event to
+    /// every connected peer — the one emission that is a *broadcast* by
+    /// nature. Targeted emissions (pull responses, backfill serves, bootstrap
+    /// closures) stay `false`, so a transport with a broadcast plane (the
+    /// gossip overlay) can ride it for fan-out without turning targeted
+    /// serves into mesh-wide duplicate spam. Transports without a broadcast
+    /// plane ignore the flag (every Outgoing rides the per-peer queue).
+    pub fanout: bool,
 }
 
 /// A `SyncMessage` failed to decode from peer-supplied bytes.

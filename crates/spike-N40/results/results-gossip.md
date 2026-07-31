@@ -4,7 +4,38 @@ Rendered from `n40-probe matrix --connect-mode gossip` (loopback
 `NetMode::Loopback`, no relay/discovery). Regenerate with the command
 documented in [`README.md`](README.md).
 
-> **Status: measured 2026-07-31** on `dgx-spark` (Ubuntu 24.04.4 LTS, aarch64,
+> **Status: FIXED — measured 2026-07-31 (fix branch)** on `dgx-spark`
+> (Ubuntu 24.04.4 LTS, aarch64, 20 cores, 121 GiB RAM), release profile,
+> single-process loopback — no relay, no real NAT. With the three hub-overload
+> fixes in place (gossip `max_message_size` raised to the wire cap; fan-out
+> riding the gossip broadcast while targeted serves stay point-to-point via
+> `Outgoing::fanout`; tick pulls bounded to `SyncConfig::pull_fanout_peers`),
+> **every load cell of the full Step 7 matrix passes** — N=5/10/20/40 at 1 and
+> 5 events/s, one process per cell, committed as
+> [`2026-07-31-gossip-matrix-fixed.json`](2026-07-31-gossip-matrix-fixed.json):
+>
+> | N | rate | accepted min/max | connected | saturations | reconnects/s | cascade |
+> |---:|---:|---|---:|---:|---:|---|
+> | 5 | 1 | 60/60 | 18/15 | 0 | 0.00 | no |
+> | 5 | 5 | 300/300 | 18/15 | 0 | 0.00 | no |
+> | 10 | 1 | 60/60 | 60/30 | 0 | 0.00 | no |
+> | 10 | 5 | 300/300 | 60/30 | 0 | 0.00 | no |
+> | 20 | 1 | 60/60 | 140/60 | 0 | 0.00 | no |
+> | 20 | 5 | 300/300 | 140/60 | 0 | 0.00 | no |
+> | 40 | 1 | 60/60 | 300/120 | 0 | 0.00 | no |
+> | 40 | 5 | 300/300 | 300/120 | 0 | 0.00 | no |
+>
+> `accepted min/max` equal means **every node received every event**. The
+> N=10/20 legs are the first ever run (the Step 7 AC always required them).
+> The spec's Step 7 acceptance criterion — no cascade at 1 event/s,
+> connectedness >95%, delivery >95% at every N — is met at every required N
+> **on loopback**. Real-network overlay evidence remains owed before Phase C.
+>
+> Everything below this box documents the defective pre-fix behavior and the
+> diagnosis that led to the fixes; it is kept as the record of WHY the fixes
+> exist.
+
+> **Superseded status (pre-fix): measured 2026-07-31** on `dgx-spark` (Ubuntu 24.04.4 LTS, aarch64,
 > 20 cores, 121 GiB RAM), **release profile**, single-process loopback — no
 > relay, no real NAT — with the corrected workload parent (see below). The
 > structured run document for the four load legs is committed as
@@ -123,9 +154,10 @@ the harness manufacturing an admin fork. The corrected matrix meets the
 Step 7 thresholds at every **measured** N (the AC's N=10/20 legs remain
 unrun, so the AC stays pending) — but a
 40-member room at 5 events/s collapses its hub nodes, and 5 events/s is a
-realistic busy-room rate. `MAX_ACTIVE_MEMBERS = 40` should stay held until the
-hub overload is either fixed (e.g. decoupling gossip delivery from the
-event-plane per-peer budgets, or spreading hub degree) or explicitly bounded
-in the product (a documented sustained-rate ceiling for large rooms), and this
-matrix is re-run clean at 5 events/s. Loopback-only still applies: no relay,
-no real NAT, no internet-path evidence for the overlay at any size.
+realistic busy-room rate. The hub overload is now **fixed** — see the
+FIXED status box at the top: with the message-size cap, the fan-out/serve
+routing split, and bounded tick pulls, the full N=5/10/20/40 × {1, 5}
+events/s matrix passes clean. `MAX_ACTIVE_MEMBERS = 40` remains held on the
+two non-loopback gates: real-network overlay evidence (no relay, no NAT, no
+internet-path measurement exists at any size) and the admin fail-closed
+recovery story (issue #191).

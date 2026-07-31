@@ -1135,6 +1135,7 @@ mod tests {
         manager.reconcile(&snapshot);
 
         let out = Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*omitted.as_bytes()),
             msg: SyncMessage::WantMembership {
                 room_id,

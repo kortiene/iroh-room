@@ -138,6 +138,21 @@ impl RecordingAudit {
         lock(&self.inner).saturated.values().sum()
     }
 
+    /// Per-queue-kind totals of `transport.queue.saturated` events (e.g.
+    /// `inbound` vs `outbound` vs `gossip`), sorted by kind. The sink already
+    /// keys by `(device, kind)`; this aggregates over devices so a matrix run
+    /// can attribute WHICH plane saturated (hub-overload isolation).
+    #[must_use]
+    pub fn queue_saturations_by_kind(&self) -> Vec<(&'static str, u64)> {
+        let g = lock(&self.inner);
+        let mut by_kind: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        for ((_, kind), n) in &g.saturated {
+            *by_kind.entry(kind).or_insert(0) += n;
+        }
+        by_kind.into_iter().collect()
+    }
+
     /// Count of `connected` transitions recorded since `baseline`.
     #[must_use]
     pub fn connected_since(&self, baseline: &AuditSnapshot) -> u64 {

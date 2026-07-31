@@ -108,6 +108,24 @@ that fails admission at the connection level never reaches the gossip layer.
 
 ### D1 — Surgical seam: `Shared::route` branches on `SyncMessage::Events`
 
+> **Revised 2026-07-31 (hub-overload isolation, answers open question 4):**
+> the Phase A landing chose dual-path (broadcast + per-peer queue copy) for
+> minimum regression risk; the N=40 measurement ladder showed BOTH uniform
+> choices fail at scale. Dual-path multiplies every event into the seed hubs
+> by ~N-K over the queue path and drowns them; gossip-only turns targeted
+> serves (pull responses, backfill batches) into mesh-wide duplicate spam.
+> The landed answer splits by intent, carried on a new `Outgoing::fanout`
+> flag set only by the engine's accept-path fan-out: **fan-out rides the
+> gossip broadcast alone when a mesh is installed; targeted serves never
+> broadcast and keep the queue path's per-link FIFO; with no mesh installed
+> fan-out falls through to the queue path** (pre-overlay behavior, so
+> no-gossip builds are unchanged). Two companions landed with it: the gossip
+> actor's `max_message_size` is raised to the 1 MiB wire cap (the 4 KiB
+> default was a whole-connection kill-switch for any over-cap broadcast),
+> and gossip-delivered frames charge a separate inbound ledger so hub-scale
+> gossip fan-in cannot exhaust the event-plane budgets whose saturation
+> closes connections.
+
 The single load-bearing change in the routing layer. Today `Shared::route`
 (`transport.rs:382-410`) classifies the variant for priority, encodes the body, looks up the
 destination peer's `BytePriorityQueue`, and pushes (dropping silently if no live writer).
@@ -613,6 +631,21 @@ Run the existing test suites unchanged and green:
    rows, with the same cascade/connectedness/delivery rubric.
 4. The AC passes iff: no cascade at 1 event/s, connectedness >95%, delivery >95% at every N.
 
+> **Status update, later 2026-07-31: the hub overload is root-caused and
+> fixed, and the AC now passes at every required N on loopback.** Three
+> stacked mechanisms (gossip 4 KiB message-size kill-switch; unbounded
+> per-tick pull fan-out concentrating up to N-1 serve batches on high-degree
+> hubs; dual-path fan-out duplication) were isolated by a single-variable
+> experiment ladder and fixed (`max_message_size` = wire cap;
+> `Outgoing::fanout` routing split per the D1 revision note; bounded rotating
+> pulls via `SyncConfig::pull_fanout_peers`). The full matrix — N=5/10/20/40
+> × {1, 5} events/s, including the first-ever N=10/20 runs — passes with full
+> delivery, zero saturations, and zero reconnect churn
+> (`crates/spike-N40/results/2026-07-31-gossip-matrix-fixed.json`). Step 7's
+> AC is met **on loopback**; Phase C remains gated on real-network overlay
+> evidence and the admin fail-closed recovery story (issue #191); see also
+> issue #192 for the remaining mesh-lifecycle observability work.
+>
 > **Status 2026-07-31 (supersedes 2026-07-30): the 2026-07-30 failure was a
 > harness artifact; the measured legs (N=5, N=40) now meet the AC thresholds
 > at 1 event/s on loopback — the AC itself remains PENDING because its
@@ -709,11 +742,11 @@ Copied verbatim from issue #171, with the spec section that satisfies each:
 3. **Bootstrap peer selection (D3 answers: K=3 lowest-bytewise Active devices + admin,
    reused `resolve_addr + admission gate`).** Confirm K=3 is the right constant for the target
    N; revisit if connectedness <95% at N=20 in Phase B.
-4. **Should `Events` fan-out be dual-path (mesh + gossip) at N≤5, or gossip-only?** The spec
-   is neutral: the engine's `event_id` dedup makes both correct. Recommend gossip-only when
-   the overlay is on (simpler; matches the #154 decision's intent), with the mesh path
-   retained behind the `gossip_overlay` feature flag for fallback. Confirm before Phase A
-   landing.
+4. **Should `Events` fan-out be dual-path (mesh + gossip) at N≤5, or gossip-only?**
+   **ANSWERED 2026-07-31: neither uniformly — split by intent** (see the D1 revision note):
+   accept-path fan-out is gossip-only when a mesh is installed; targeted serves are always
+   point-to-point. Both uniform choices were measured failing at N=40 x 5 events/s
+   (dual-path: hub inbound overload; gossip-only: serve-broadcast duplicate storm).
 5. **`SyncTransport::peers` semantics under D3.** Should it return gossip neighbors that are
    not warm seeds? The spec says yes (so engine fan-out targets reach them), but this widens
    the engine's view of "connected peers." Confirm the engine's `on_disconnect` behavior is
