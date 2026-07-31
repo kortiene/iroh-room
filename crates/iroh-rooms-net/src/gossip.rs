@@ -456,7 +456,7 @@ async fn receiver_task(
                 // The same inbound sink the mesh reader task uses. The engine
                 // pump re-decodes, runs `provisional_allows`, re-validates
                 // every `WireEvent`, and dedups by `event_id` (D8).
-                match shared.try_enqueue_inbound(from, msg.content.to_vec()) {
+                match shared.try_enqueue_inbound_gossip(from, msg.content.to_vec()) {
                     Ok(())
                     | Err(crate::queue::PushError::Closed | crate::queue::PushError::Empty) => {}
                     Err(crate::queue::PushError::Saturated) => {

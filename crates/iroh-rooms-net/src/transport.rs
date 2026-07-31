@@ -506,6 +506,20 @@ impl Shared {
         self.inbound.try_push(peer, bytes, family)
     }
 
+    /// [`try_enqueue_inbound`](Self::try_enqueue_inbound) for gossip-delivered
+    /// frames: same sink and priorities, charged against the separate gossip
+    /// ledger so hub-scale gossip fan-in cannot exhaust the event-plane
+    /// budget whose saturation closes the peer's connection
+    /// (hub-overload isolation experiment).
+    pub(crate) fn try_enqueue_inbound_gossip(
+        &self,
+        peer: PeerId,
+        bytes: Vec<u8>,
+    ) -> Result<(), PushError> {
+        let family = classify_inbound_bytes(&bytes);
+        self.inbound.try_push_gossip(peer, bytes, family)
+    }
+
     /// Close the inbound sink (transport shutdown): reader tasks observe
     /// `PushError::Closed` on the next push and exit; the pump drains and then
     /// observes `None` from [`InboundReceiver::recv`].
