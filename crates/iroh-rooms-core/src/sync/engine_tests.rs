@@ -1502,6 +1502,7 @@ fn tick_pulls_reach_all_peers_at_or_under_the_bound() {
     let cfg = SyncConfig::default();
     let bound = cfg.pull_fanout_peers;
     let (mut engine, _room, _genesis) = seeded_engine(cfg);
+    #[allow(clippy::cast_possible_truncation)] // bound is 3 in the default config
     let peers: Vec<PeerId> = (0..bound as u8).map(|i| peer(0xD0 + i)).collect();
     for p in &peers {
         let _ = engine.on_connect(*p);
@@ -1531,7 +1532,14 @@ fn publish_fanout_is_marked_and_targeted_pulls_are_not() {
     let _ = engine.on_connect(NODE_B);
 
     let (admin_id, admin_dev) = (sk(1), sk(2));
-    let msg = make_message(&admin_id, &admin_dev, room, &[genesis_id], "fanout-marker", T0 + 1);
+    let msg = make_message(
+        &admin_id,
+        &admin_dev,
+        room,
+        genesis_id,
+        "fanout-marker",
+        T0 + 1,
+    );
     let out = engine.publish(&msg).expect("publish");
 
     let events: Vec<&Outgoing> = out

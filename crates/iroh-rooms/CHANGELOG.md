@@ -7,6 +7,67 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Fixed the three stacked defects behind the N=40 gossip-overlay load collapse
+  (the reason rc.4 held #171/#173 out of shipped binaries), isolated by a
+  seven-step single-variable experiment ladder on the corrected spike-N40
+  harness (`crates/spike-N40/results/results-gossip.md`):
+  - **iroh-gossip message-size kill-switch** (`iroh-rooms-net`):
+    `spawn_gossip_actor` now sets `max_message_size` to the 1 MiB wire frame
+    cap. The 4096-byte default was a whole-connection kill-switch — one
+    broadcast of an `Events` frame over 4 KiB (our frames are byte-budgeted
+    against the wire cap, not 4 KiB) errored the send loop and killed the
+    gossip link to **every** neighbor at once, measured as cluster-wide
+    gossip death at ~event 10 under a 5 events/s load. Only compiled under
+    `gossip_overlay`, which shipped binaries do not enable.
+  - **Fan-out/serve routing split** (`iroh-rooms-core` / `iroh-rooms-net`):
+    `Outgoing` gains a `fanout` flag, set only by the engine's accept-path
+    fan-out — the one emission that is a broadcast by nature. With a mesh
+    installed, fan-out `Events` ride the gossip broadcast alone (a dual-path
+    per-peer copy multiplied every event into the seed hubs by ~N-K and
+    drowned them), while targeted serves (pull responses, backfill,
+    bootstrap closures) never broadcast (per-requester batches would spam
+    the mesh with duplicates) and keep the queue path's per-link FIFO.
+    Transports without a mesh ignore the flag — no-gossip builds are
+    byte-identical in behavior. **Experimental-tier API note:** consumers
+    constructing `Outgoing` literals must now populate `fanout` (`false` for
+    anything except an accept-path fan-out).
+  - **Bounded anti-entropy pull fan-out** (`iroh-rooms-core`): `on_tick` now
+    sends its `WantMembership` + `WantRecentChat` pulls to a deterministic
+    rotating window of `SyncConfig::pull_fanout_peers` peers (default 3,
+    validated non-zero) instead of every connected peer. A high-degree node
+    that fell slightly behind previously summoned up to N-1 overlapping
+    serve batches every tick — measured at N=40 x 5 events/s as the inbound
+    budget saturation that closed hub links (#141's fail-closed recovery)
+    and ignited a reconnect-churn cascade; the serve storm, not gossip and
+    not fan-out duplication, was the invariant initiator across the
+    experiment ladder. The rotation reuses the per-tick claim rotation, so
+    consecutive ticks sweep the whole peer set: convergence is delayed by at
+    most ceil(peers / bound) ticks, never lost. The tiny admin-tip
+    advertisement still reaches every peer every tick (fork-detection
+    latency is load-bearing). **This change is active in shipped binaries**
+    (it does not depend on `gossip_overlay`): rooms at the shipped 5-member
+    cap have at most 4 peers, so a behind node sweeps them in 2 ticks
+    (~300 ms) instead of 1. **Mixed-version note (docs/compatibility.md):**
+    pulls are ordinary requests and responders are unchanged, so mixed
+    rc.4/next rooms interoperate with no coordinated upgrade; the only
+    observable difference is that a many-peer node paces its pulls.
+  - **Per-plane inbound accounting** (`iroh-rooms-net`): gossip-delivered
+    frames now charge a separate ledger in the byte-bounded inbound sink,
+    same caps as the event-plane ledger. With fan-out riding the broadcast,
+    hub-scale gossip fan-in is real steady-state volume; on the shared
+    ledger it could saturate the event-plane budget whose exhaustion makes
+    the event-plane reader close the connection — converting gossip volume
+    into link churn. Gossip-ledger saturation drops the gossip frame
+    (audited, queue=`gossip`) and the link stays up; anti-entropy re-pulls
+    cover the gap. Only compiled under `gossip_overlay`.
+
+  With all four in place the corrected loopback matrix is clean at every
+  measured cell — N=40 x 5 events/s: 300/300 delivery on every node, zero
+  queue saturations, zero reconnect churn (previously 100/300, 28k
+  saturations, 775 reconnects/s). The overlay and the 40-member cap remain
+  **disabled in shipped binaries**: re-enablement still gates on real-network
+  overlay evidence and the admin fail-closed recovery story.
+
 ## 0.1.0-rc.4 - 2026-07-30
 
 - Landed a **bounded gossip overlay for `Events` fan-out** and a feature-gated
