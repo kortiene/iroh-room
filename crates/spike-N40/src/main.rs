@@ -643,6 +643,12 @@ pub async fn run_one_scenario(
         (Some(idle.metrics), None, 0, idle.cascade)
     };
 
+    // Hub-overload isolation observability: attribute saturations to the
+    // plane that hit its budget before the audit handle goes away.
+    for (kind, count) in cluster.audit.queue_saturations_by_kind() {
+        eprintln!("[sat] N={n} rate={rate:?} kind={kind} count={count}");
+    }
+
     cluster.shutdown().await?;
 
     Ok(ScenarioResult {
