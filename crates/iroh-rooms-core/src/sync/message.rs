@@ -159,6 +159,31 @@ pub enum SyncMessage {
         /// Verbatim `WireEvent` byte frames.
         frames: Vec<WireBytes>,
     },
+    /// A terminal event batch whose receipt must be confirmed before the sender
+    /// physically closes a removed peer's link. On the wire this keeps the
+    /// `events` tag and adds `ids`/`nonce`: older peers therefore still deliver
+    /// the events (and merely omit the receipt), while newer transports can
+    /// recognize and reserve bounded lifecycle capacity for the envelope.
+    TerminalEvents {
+        /// Room scope.
+        room_id: RoomId,
+        /// Verbatim event frames, ending with the target's removal event.
+        frames: Vec<WireBytes>,
+        /// Event ids whose durable presence must be confirmed.
+        ids: Vec<EventId>,
+        /// Request correlation nonce.
+        nonce: [u8; SHORT_ID_LEN],
+    },
+    /// The subset of a [`TerminalEvents`](Self::TerminalEvents) request that is
+    /// actually present in the responder's room-scoped durable store.
+    EventsConfirmed {
+        /// Room scope.
+        room_id: RoomId,
+        /// Requested event ids that are durably stored in this room.
+        ids: Vec<EventId>,
+        /// Correlation nonce copied verbatim from the request.
+        nonce: [u8; SHORT_ID_LEN],
+    },
     /// The responder does not hold these requested ids.
     NotFound {
         /// Room scope.
@@ -242,6 +267,8 @@ impl SyncMessage {
             | Self::WantMembership { room_id, .. }
             | Self::WantRecentChat { room_id, .. }
             | Self::Events { room_id, .. }
+            | Self::TerminalEvents { room_id, .. }
+            | Self::EventsConfirmed { room_id, .. }
             | Self::NotFound { room_id, .. }
             | Self::ProveCapability { room_id, .. } => room_id,
         }
@@ -294,6 +321,35 @@ impl SyncMessage {
                     "frames".to_owned(),
                     CborValue::Array(frames.iter().map(|f| CborValue::Bytes(f.clone())).collect()),
                 ),
+            ],
+            Self::TerminalEvents {
+                room_id,
+                frames,
+                ids,
+                nonce,
+            } => vec![
+                // Keep the established tag for rolling-upgrade delivery. The
+                // legacy decoder ignores unknown map keys and treats this as a
+                // normal Events message; the current decoder recognizes the
+                // paired receipt fields below.
+                tag("events"),
+                room_field(room_id),
+                (
+                    "frames".to_owned(),
+                    CborValue::Array(frames.iter().map(|f| CborValue::Bytes(f.clone())).collect()),
+                ),
+                ("ids".to_owned(), id_array(ids)),
+                ("nonce".to_owned(), CborValue::Bytes(nonce.to_vec())),
+            ],
+            Self::EventsConfirmed {
+                room_id,
+                ids,
+                nonce,
+            } => vec![
+                tag("events_confirmed"),
+                room_field(room_id),
+                ("ids".to_owned(), id_array(ids)),
+                ("nonce".to_owned(), CborValue::Bytes(nonce.to_vec())),
             ],
             Self::NotFound { room_id, ids } => vec![
                 tag("not_found"),
@@ -359,9 +415,25 @@ impl SyncMessage {
                 },
                 have: read_id_array(field(entries, "have"))?,
             },
-            "events" => Self::Events {
+            "events" => {
+                let frames = read_bytes_array(field(entries, "frames"))?;
+                match (field(entries, "ids"), field(entries, "nonce")) {
+                    (None, None) => Self::Events { room_id, frames },
+                    (Some(ids), Some(nonce)) => Self::TerminalEvents {
+                        room_id,
+                        frames,
+                        ids: read_id_array(Some(ids))?,
+                        nonce: read_short_id(Some(nonce))?,
+                    },
+                    // A partially-specified receipt request is malformed, not
+                    // an ordinary Events frame with ignorable metadata.
+                    _ => return Err(MessageError::BadShape),
+                }
+            }
+            "events_confirmed" => Self::EventsConfirmed {
                 room_id,
-                frames: read_bytes_array(field(entries, "frames"))?,
+                ids: read_id_array(field(entries, "ids"))?,
+                nonce: read_short_id(field(entries, "nonce"))?,
             },
             "not_found" => Self::NotFound {
                 room_id,
@@ -564,6 +636,17 @@ mod tests {
             room_id: room(),
             frames: vec![vec![0xde, 0xad], vec![0xbe, 0xef]],
         });
+        round_trip(&SyncMessage::TerminalEvents {
+            room_id: room(),
+            frames: vec![vec![0xca, 0xfe]],
+            ids: vec![id(7), id(8)],
+            nonce: [0x6d; SHORT_ID_LEN],
+        });
+        round_trip(&SyncMessage::EventsConfirmed {
+            room_id: room(),
+            ids: vec![id(7)],
+            nonce: [0x6d; SHORT_ID_LEN],
+        });
         round_trip(&SyncMessage::NotFound {
             room_id: room(),
             ids: vec![id(9)],
@@ -592,9 +675,10 @@ mod tests {
         // Events encoding cannot silently under-budget and produce frames the
         // net writer drops.
         for (count, frame_len) in [(1usize, 0usize), (1, 1_048_000), (23, 100), (512, 2040)] {
+            let frames = vec![vec![0xEE; frame_len]; count];
             let msg = SyncMessage::Events {
                 room_id: room(),
-                frames: vec![vec![0xEE; frame_len]; count],
+                frames: frames.clone(),
             };
             let payload: usize = count * frame_len;
             let budgeted = payload + count * EVENTS_PER_FRAME_OVERHEAD + EVENTS_ENVELOPE_ALLOWANCE;
@@ -603,7 +687,83 @@ mod tests {
                 encoded <= budgeted,
                 "{count} frames of {frame_len} B encode to {encoded} > budget {budgeted}"
             );
+            let terminal_encoded = SyncMessage::TerminalEvents {
+                room_id: room(),
+                frames,
+                ids: vec![id(1)],
+                nonce: [0x6d; SHORT_ID_LEN],
+            }
+            .encode()
+            .len();
+            assert!(
+                terminal_encoded <= budgeted,
+                "terminal batch of {count} frames / {frame_len} B encodes to \
+                 {terminal_encoded} > budget {budgeted}"
+            );
         }
+    }
+
+    #[test]
+    fn terminal_events_keep_the_legacy_events_projection() {
+        let expected_frames = vec![vec![0xca, 0xfe]];
+        let bytes = SyncMessage::TerminalEvents {
+            room_id: room(),
+            frames: expected_frames.clone(),
+            ids: vec![id(7)],
+            nonce: [0x6d; SHORT_ID_LEN],
+        }
+        .encode();
+        let value = cbor::decode_canonical(&bytes).expect("canonical terminal envelope");
+        let entries = value.as_map().expect("terminal envelope map");
+
+        // This is the projection performed by the rc.4 decoder: it recognizes
+        // the established tag and ignores additive map keys. Pinning it here
+        // prevents a future wire-tag edit from silently breaking rolling
+        // removal delivery.
+        assert_eq!(
+            field(entries, "type").and_then(CborValue::as_text),
+            Some("events")
+        );
+        let legacy_projection = SyncMessage::Events {
+            room_id: field(entries, "room")
+                .and_then(read_room)
+                .expect("legacy room"),
+            frames: read_bytes_array(field(entries, "frames")).expect("legacy frames"),
+        };
+        assert_eq!(
+            legacy_projection,
+            SyncMessage::Events {
+                room_id: room(),
+                frames: expected_frames,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_events_reject_partial_receipt_metadata() {
+        let base = vec![
+            tag("events"),
+            room_field(&room()),
+            (
+                "frames".to_owned(),
+                CborValue::Array(vec![CborValue::Bytes(vec![0xca, 0xfe])]),
+            ),
+        ];
+        let mut ids_only = base.clone();
+        ids_only.push(("ids".to_owned(), id_array(&[id(7)])));
+        assert_eq!(
+            SyncMessage::decode(&cbor::encode(&CborValue::Map(ids_only))),
+            Err(MessageError::BadShape)
+        );
+        let mut nonce_only = base;
+        nonce_only.push((
+            "nonce".to_owned(),
+            CborValue::Bytes(vec![0x6d; SHORT_ID_LEN]),
+        ));
+        assert_eq!(
+            SyncMessage::decode(&cbor::encode(&CborValue::Map(nonce_only))),
+            Err(MessageError::BadShape)
+        );
     }
 
     #[test]

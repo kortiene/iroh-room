@@ -33,7 +33,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use iroh_rooms_core::sync::{PeerId, SyncMessage};
+use iroh_rooms_core::sync::{PeerId, SyncMessage, MAX_FRAME_BYTES};
 use tokio::sync::Notify;
 
 /// Default per-peer queued-byte cap for both inbound and outbound event-plane
@@ -44,6 +44,16 @@ pub(crate) const DEFAULT_PER_PEER_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// subscribed stream per peer). For v1 each peer has exactly one logical event
 /// ALPN stream, so this is the per-peer content/stream bucket (spec D4).
 pub(crate) const DEFAULT_PER_STREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Fixed envelope margin above the shared one-frame maximum. A terminal
+/// envelope wraps exactly one already-bounded event frame with a receipt nonce
+/// and id, so this covers its canonical-CBOR metadata without making the
+/// ordinary peer budget unbounded.
+const TERMINAL_ENVELOPE_MARGIN_BYTES: usize = 512;
+const TERMINAL_DELIVERY_RESERVE_BYTES: usize = MAX_FRAME_BYTES + TERMINAL_ENVELOPE_MARGIN_BYTES;
+/// One small receipt must be able to leave and enter an otherwise-full peer
+/// queue, or the terminal envelope's reserved delivery cannot complete.
+const TERMINAL_RECEIPT_RESERVE_BYTES: usize = 512;
 
 /// The four scheduler priorities (spec D3). `Ord` and the `as u8` discriminant
 /// both put `Governance` highest; the consumer drains larger ordinals first.
@@ -86,6 +96,12 @@ pub(crate) enum QueueFamily {
     Governance,
     Subscription,
     Publication,
+    /// The exact terminal removal envelope. Its wire tag remains `events` for
+    /// rolling-upgrade delivery, while the receipt fields let current decoders
+    /// recognize it and reserve one bounded frame on both queue directions.
+    TerminalPublication,
+    /// Nonce-bound durable-store receipt for a terminal publication.
+    DeliveryConfirmation,
     Reconciliation,
     Checkpoint,
     BlobHints,
@@ -99,8 +115,12 @@ impl QueueFamily {
             Self::Governance => QueuePriority::Governance,
             // `ProveCapability` is session control and must not be starved
             // behind content during join bootstrap (spec D3 rationale).
-            Self::Checkpoint | Self::Session => QueuePriority::Checkpoint,
-            Self::Publication | Self::Subscription => QueuePriority::Content,
+            Self::Checkpoint | Self::Session | Self::DeliveryConfirmation => {
+                QueuePriority::Checkpoint
+            }
+            Self::Publication | Self::Subscription | Self::TerminalPublication => {
+                QueuePriority::Content
+            }
             Self::Reconciliation | Self::BlobHints => QueuePriority::BlobHints,
         }
     }
@@ -134,7 +154,9 @@ pub(crate) fn classify_sync_message(msg: &SyncMessage) -> QueueFamily {
         }
         SyncMessage::Heads { .. } => QueueFamily::Checkpoint,
         SyncMessage::ProveCapability { .. } => QueueFamily::Session,
+        SyncMessage::EventsConfirmed { .. } => QueueFamily::DeliveryConfirmation,
         SyncMessage::Events { .. } => QueueFamily::Publication,
+        SyncMessage::TerminalEvents { .. } => QueueFamily::TerminalPublication,
         SyncMessage::WantRecentChat { .. } => QueueFamily::Subscription,
         SyncMessage::WantEvents { .. } | SyncMessage::NotFound { .. } => {
             QueueFamily::Reconciliation
@@ -292,7 +314,10 @@ impl BytePriorityQueue {
 
     /// Try to enqueue `body` from `peer` with classification `family`.
     /// Non-blocking. Charges `body.len()` against the peer cap, and against
-    /// the stream cap when [`QueueFamily::charges_stream_budget`].
+    /// the stream cap when [`QueueFamily::charges_stream_budget`]. A terminal
+    /// removal may use one fixed frame reserve, and its receipt a separate
+    /// 512-byte reserve, above the ordinary peer cap; the queue remains hard
+    /// byte-bounded.
     pub(crate) fn try_push(
         &self,
         peer: PeerId,
@@ -343,7 +368,16 @@ impl BytePriorityQueue {
             state.budgets.entry(peer).or_default()
         };
         let new_total = budget.total.saturating_add(bytes);
-        if new_total > peer_cap {
+        let peer_limit = match family {
+            QueueFamily::TerminalPublication => {
+                peer_cap.saturating_add(TERMINAL_DELIVERY_RESERVE_BYTES)
+            }
+            QueueFamily::DeliveryConfirmation => {
+                peer_cap.saturating_add(TERMINAL_RECEIPT_RESERVE_BYTES)
+            }
+            _ => peer_cap,
+        };
+        if new_total > peer_limit {
             return Err(PushError::Saturated);
         }
         if charges_stream {
@@ -891,5 +925,88 @@ mod tests {
             QueuePriority::BlobHints
         );
         assert!(QueueFamily::Reconciliation.charges_stream_budget());
+    }
+
+    #[test]
+    fn terminal_envelope_has_bounded_reserve_and_preserves_content_fifo() {
+        let room_id = RoomId::from_bytes([0x11; 32]);
+        let ids = vec![EventId::from_bytes([0xaa; 32])];
+        let nonce = [0x6b; 16];
+        let terminal = SyncMessage::TerminalEvents {
+            room_id,
+            frames: vec![vec![0xee; 64]],
+            ids: ids.clone(),
+            nonce,
+        };
+        assert_eq!(
+            classify_sync_message(&terminal),
+            QueueFamily::TerminalPublication
+        );
+        assert_eq!(
+            QueueFamily::TerminalPublication.priority(),
+            QueuePriority::Content
+        );
+        assert!(!QueueFamily::TerminalPublication.charges_stream_budget());
+        assert_eq!(
+            classify_inbound_bytes(&terminal.encode()),
+            QueueFamily::TerminalPublication
+        );
+        let receipt = SyncMessage::EventsConfirmed {
+            room_id,
+            ids,
+            nonce,
+        };
+        assert_eq!(
+            classify_sync_message(&receipt),
+            QueueFamily::DeliveryConfirmation
+        );
+        assert_eq!(
+            classify_inbound_bytes(&receipt.encode()),
+            QueueFamily::DeliveryConfirmation
+        );
+        assert_eq!(
+            QueueFamily::DeliveryConfirmation.priority(),
+            QueuePriority::Checkpoint
+        );
+        assert!(!QueueFamily::DeliveryConfirmation.charges_stream_budget());
+
+        // Fill both ordinary caps before the removal arrives. The bounded
+        // terminal reserve must still admit the exact envelope, and equal
+        // Content priority must drain it after content already queued.
+        let terminal_body = terminal.encode();
+        let ordinary_len = terminal_body.len();
+        let (queue, mut receiver) = BytePriorityQueue::channel(ordinary_len, ordinary_len);
+        let peer = peer(0x44);
+        queue
+            .try_push(peer, vec![0x99; ordinary_len], QueueFamily::Publication)
+            .expect("ordinary content fills both caps");
+        queue
+            .try_push(peer, terminal_body, QueueFamily::TerminalPublication)
+            .expect("terminal envelope uses its one-frame reserve");
+        assert_eq!(
+            receiver.try_recv().expect("ordinary content first").body,
+            vec![0x99; ordinary_len]
+        );
+        assert!(matches!(
+            SyncMessage::decode(&receiver.try_recv().expect("terminal second").body),
+            Ok(SyncMessage::TerminalEvents { .. })
+        ));
+
+        // The receipt has its own small reserve on a separately saturated
+        // directional queue (the receiver's outbound / sender's inbound side).
+        let receipt_body = receipt.encode();
+        assert!(receipt_body.len() <= TERMINAL_RECEIPT_RESERVE_BYTES);
+        let (receipt_queue, mut receipt_rx) =
+            BytePriorityQueue::channel(ordinary_len, ordinary_len);
+        receipt_queue
+            .try_push(peer, vec![0x77; ordinary_len], QueueFamily::Publication)
+            .expect("ordinary content fills receipt queue");
+        receipt_queue
+            .try_push(peer, receipt_body, QueueFamily::DeliveryConfirmation)
+            .expect("receipt uses fixed control reserve");
+        assert!(matches!(
+            SyncMessage::decode(&receipt_rx.try_recv().expect("receipt first").body),
+            Ok(SyncMessage::EventsConfirmed { .. })
+        ));
     }
 }

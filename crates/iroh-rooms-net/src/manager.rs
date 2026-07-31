@@ -246,7 +246,8 @@ impl PeerManager {
         let membership_links = Self::desired_devices(snapshot, self.self_device);
         let admitted_links: BTreeSet<EndpointId> = if enforce_admission {
             membership_links
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|device| {
                     matches!(
                         self.shared.admission.authorize(*device),
@@ -255,7 +256,7 @@ impl PeerManager {
                 })
                 .collect()
         } else {
-            membership_links
+            membership_links.clone()
         };
 
         // The desired warm dial set: every active member (full mesh) when the
@@ -276,11 +277,24 @@ impl PeerManager {
         let desired = admitted_links.clone();
 
         #[cfg(feature = "gossip_overlay")]
-        {
-            self.active_links
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone_from(&admitted_links);
+        let overlay_to_stop = {
+            let previous_active = {
+                let mut active = self
+                    .active_links
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let previous = active.clone();
+                active.clone_from(&admitted_links);
+                previous
+            };
+            // Include every newly-revoked overlay peer, not only locally-owned
+            // warm/on-demand dials. A non-seed may have an inbound EVENT link;
+            // it still owns a Shared queue/connection that must enter the same
+            // terminal receipt lifecycle.
+            let mut to_stop: BTreeSet<_> = previous_active
+                .difference(&admitted_links)
+                .copied()
+                .collect();
 
             // A removed/fail-closed peer must lose any transient link too.
             let mut on_demand = self
@@ -292,13 +306,14 @@ impl PeerManager {
                 .filter(|device| !admitted_links.contains(*device))
                 .copied()
                 .collect();
-            for device in stale {
-                if let Some(entry) = on_demand.remove(&device) {
+            for device in &stale {
+                if let Some(entry) = on_demand.remove(device) {
                     entry.handle.abort();
                 }
-                self.shared.close_connection(device);
             }
-        }
+            to_stop.extend(stale);
+            to_stop
+        };
 
         let mut dials = self
             .dials
@@ -306,37 +321,26 @@ impl PeerManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Stop: running loops whose device left the desired set.
-        let to_stop: Vec<EndpointId> = dials
+        let to_stop: BTreeSet<EndpointId> = dials
             .keys()
             .filter(|d| !desired.contains(*d))
             .copied()
             .collect();
+        #[cfg(feature = "gossip_overlay")]
+        let to_stop = {
+            let mut combined = to_stop;
+            combined.extend(overlay_to_stop);
+            combined
+        };
         for device in to_stop {
             if let Some(entry) = dials.remove(&device) {
                 entry.handle.abort();
-                // Tear down any in-flight link so we stop serving a now-removed peer,
-                // then mark the entry terminal so the CLI can show "stopped dialing".
-                // Invalidate the connection generation *before* closing the link
-                // (issue #126 follow-up): an inbound accept task, woken by the close,
-                // would otherwise run its own `teardown_if_current` and overwrite this
-                // terminal `Deauthorized` with a generic `LinkDropped`. Bumping the
-                // generation first makes that late teardown a no-op, so our forced
-                // teardown below is the one that sticks.
-                self.shared.invalidate_link(device);
-                self.shared.close_connection(device);
-                self.shared.unregister(device);
-                if admitted_links.contains(&device) {
-                    // Still Active but no longer selected as a warm seed.
-                    self.shared
-                        .table
-                        .set_offline(device, OfflineReason::LinkDropped, None);
-                } else {
-                    self.shared
-                        .table
-                        .set_offline(device, OfflineReason::Deauthorized, None);
-                    self.shared.audit.deauthorized(device);
-                }
             }
+            self.teardown_reconciled_link(
+                device,
+                admitted_links.contains(&device),
+                enforce_admission && !membership_links.contains(&device),
+            );
         }
 
         // Start: newly-desired devices with no running loop.
@@ -356,6 +360,41 @@ impl PeerManager {
                 addr.clone(),
             ));
             dials.insert(*device, DialEntry { handle, addr });
+        }
+    }
+
+    fn teardown_reconciled_link(
+        &self,
+        device: EndpointId,
+        still_admitted: bool,
+        membership_removed: bool,
+    ) {
+        // Invalidate before close so a woken accept task cannot overwrite this
+        // manager-owned terminal state with a generic LinkDropped transition.
+        self.shared.invalidate_link(device);
+        if still_admitted {
+            // Still Active but no longer selected as a warm overlay seed.
+            self.shared.close_connection(device);
+            self.shared.unregister(device);
+            self.shared
+                .table
+                .set_offline(device, OfflineReason::LinkDropped, None);
+        } else if membership_removed {
+            // The receipt-bearing removal was queued before reconcile.
+            // Routing/admission are revoked now; only physical close gets grace.
+            self.shared.begin_terminal_teardown(device);
+            self.shared
+                .table
+                .set_offline(device, OfflineReason::Deauthorized, None);
+            self.shared.audit.deauthorized(device);
+        } else {
+            // Fail-closed Active subjects must not receive content-delivery grace.
+            self.shared.close_connection(device);
+            self.shared.unregister(device);
+            self.shared
+                .table
+                .set_offline(device, OfflineReason::Deauthorized, None);
+            self.shared.audit.deauthorized(device);
         }
     }
 

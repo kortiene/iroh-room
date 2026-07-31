@@ -578,7 +578,7 @@ async fn managed_room_unknown_inbound_rejected_by_snapshot_admission() {
 /// * Admin node — `spawn_room`; fold seeded with genesis + invite + join;
 ///   member's `EndpointAddr` supplied as an `addr_hint`. The `PeerManager`
 ///   auto-dials member on the initial reconcile.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn managed_room_removal_stops_loop_and_marks_deauthorized() {
     let admin = Actor::new(35);
     let member = Actor::new(36);
@@ -588,20 +588,21 @@ async fn managed_room_removal_stops_loop_and_marks_deauthorized() {
         mk_invite(&admin, room_id, &[genesis_id], member.identity(), 1, T0 + 1);
     let (join_id, join_bytes) = mk_join(&member, room_id, &[invite_id], 1, T0 + 2);
 
+    let events = [
+        genesis_bytes.clone(),
+        invite_bytes.clone(),
+        join_bytes.clone(),
+    ];
+
     // Member: static admission admitting admin (accepts the inbound dial loop).
-    let member_node = spawn_static_node(&member, make_engine(room_id, &[]), &[&admin]).await;
+    // Seed the complete pre-removal fold so the terminal event is immediately
+    // ingestible; this test isolates transport delivery from backfill timing.
+    let member_node = spawn_static_node(&member, make_engine(room_id, &events), &[&admin]).await;
     let member_addr = member_node.endpoint_addr().expect("member addr");
 
     // Admin: spawn_room with full fold seeded and member addr hint.
     // PeerManager derives desired = {member} and starts the dial loop.
-    let admin_engine = make_engine(
-        room_id,
-        &[
-            genesis_bytes.clone(),
-            invite_bytes.clone(),
-            join_bytes.clone(),
-        ],
-    );
+    let admin_engine = make_engine(room_id, &events);
     let admin_node = spawn_room_node(&admin, admin_engine, vec![member_addr.clone()]).await;
 
     // Wait for the managed dial to succeed — proves the loop ran before we mutate.
@@ -613,17 +614,39 @@ async fn managed_room_removal_stops_loop_and_marks_deauthorized() {
         .wait_for_state(admin.endpoint_id(), PeerConnState::Connected, WAIT)
         .await
         .expect("member sees admin as Connected (inbound, pre-removal)");
+    let mut terminal_events = member_node.room_events();
 
     // Build and publish member.removed. After publish() returns, the pump has
     // already called maybe_reconcile (it runs synchronously before sending the
     // reply), so the manager has stopped member's loop and set the Deauthorized
     // reason before we reach the assert.
-    let (_remove_id, remove_bytes) =
+    let (remove_id, remove_bytes) =
         mk_remove(&admin, room_id, &[join_id], member.identity(), T0 + 3);
     admin_node
         .publish(remove_bytes)
         .await
         .expect("admin publishes member.removed");
+
+    // The removal is the target's terminal room fact. The admin must let its
+    // writer drain that exact event before deauthorization closes the link;
+    // otherwise the target cannot learn why access ended and cannot converge.
+    member_node
+        .wait_until_contains(remove_id, WAIT)
+        .await
+        .expect("removed member receives terminal member.removed before teardown");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match terminal_events.recv().await {
+                Ok(event) if event.event_id == remove_id => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("removed member's room-event stream closed before terminal removal")
+                }
+            }
+        }
+    })
+    .await
+    .expect("removed member surfaces terminal member.removed to subscribers");
 
     // AC3 part 1: PeerTable shows Offline(Deauthorized) for the removed member.
     let removed_entry = admin_node

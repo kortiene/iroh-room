@@ -68,6 +68,9 @@ iroh-blobs = "=0.103.0"
 # hash (spike NOTES.md §4 belt-and-suspenders — an internal-bug guard). Same 1.x
 # line `iroh-rooms-core` already resolves.
 blake3 = "1"
+# Unpredictable nonces bind a removed peer's terminal-event confirmation to the
+# exact pending teardown. Already present in the workspace lock via core/CLI.
+getrandom = "0.4"
 # The verified-fetch client's return type (`iroh_blobs::get`'s buffered getter
 # yields `bytes::Bytes`, spike NOTES.md §4). Already resolved transitively via
 # `iroh-blobs`; named explicitly since `net::blob::fetch` is a public boundary.

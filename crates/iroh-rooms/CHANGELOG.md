@@ -67,6 +67,25 @@ where feasible); the **experimental** tier may change on any release.
   saturations, 775 reconnects/s). The overlay and the 40-member cap remain
   **disabled in shipped binaries**: re-enablement still gates on real-network
   overlay evidence and the admin fail-closed recovery story.
+- Made `member.removed` the removed device's receipt-gated final room fact.
+  The sender now deauthorizes and detaches routing immediately, but keeps
+  that exact connection generation alive for at most five seconds while a
+  bounded terminal `events` envelope drains; a current peer acknowledges only
+  after the removal is present in its room-scoped durable store, then physical
+  teardown completes. Both envelope and receipt have fixed queue reserves, so
+  saturated ordinary content cannot prevent current peers from enqueueing the
+  lifecycle exchange. The
+  receipt is device/room/event-id/nonce/generation bound, and no other frame
+  from the revoked peer passes the post-removal admission gate. **Mixed-version
+  behavior:** terminal envelopes retain the existing `type = "events"` wire tag
+  and add fields that rc.4 decoders ignore, so a valid envelope remains
+  wire-decodable as ordinary events and normally folds, but an rc.4 peer sends
+  no receipt and has no terminal inbound-queue reserve. The upgraded sender
+  therefore uses the five-second grace before closing; a saturated or stalled
+  legacy recipient remains best-effort. No coordinated upgrade is required.
+  Upgrade admins/senders first to remove the old immediate-close race; a room
+  whose admin is still rc.4 retains the previous behavior until that admin
+  upgrades.
 
 ## 0.1.0-rc.4 - 2026-07-30
 

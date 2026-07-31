@@ -33,8 +33,8 @@ use iroh_rooms_core::event::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
 use iroh_rooms_core::event::content::{Content, PipeOpened};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::event::{build_pipe_closed, build_pipe_opened};
+use iroh_rooms_core::event::signed::{event_id_from_bytes, SignedEvent};
+use iroh_rooms_core::event::{build_pipe_closed, build_pipe_opened, WireEvent};
 use iroh_rooms_core::membership::{
     active_member_warning_crossed, MembershipSnapshot, MAX_ACTIVE_MEMBERS,
 };
@@ -46,9 +46,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-#[cfg(feature = "gossip_overlay")]
-use crate::admission::AdmissionDecision;
-use crate::admission::{Admission, AdmissionView};
+use crate::admission::{Admission, AdmissionDecision, AdmissionView};
 use crate::audit::AuditSink;
 use crate::blob::{self, BlobAclView, BlobError, BlobImport, BlobStore, FetchOutcome};
 use crate::manager::PeerManager;
@@ -1405,11 +1403,47 @@ async fn pump(
                 // drop, never a crash (spec §4.3 defense-in-depth).
                 match SyncMessage::decode(&inbound.bytes) {
                     Ok(msg) => {
+                        let device = endpoint_of(inbound.peer);
+                        // A removed peer may send exactly one adapter-owned frame
+                        // during its physical-close grace: the nonce-bound receipt
+                        // proving its terminal removal reached the room store. It is
+                        // consumed here before the live admission recheck and never
+                        // reaches the deterministic engine.
+                        if let SyncMessage::EventsConfirmed {
+                            room_id,
+                            ids,
+                            nonce,
+                        } = &msg
+                        {
+                            if room_id == engine.room_id() {
+                                if let Some(device) = device {
+                                    let _ = shared.confirm_terminal_events(
+                                        device, room_id, ids, nonce,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Admission is re-evaluated at dequeue time, not only when
+                        // the QUIC stream was accepted. Frames already queued when a
+                        // removal lands therefore cannot exploit the bounded physical
+                        // grace; only the matching receipt above is exempt.
+                        let admitted = device.is_some_and(|device| {
+                            !matches!(
+                                shared.admission.authorize(device),
+                                AdmissionDecision::Reject(_)
+                            )
+                        });
+                        if !admitted {
+                            tracing::debug!(peer = %inbound.peer, "pump: dropping frame from no-longer-admitted peer");
+                            continue;
+                        }
+
                         // Join-bootstrap restriction (IR-0104, Approach A): a
                         // *provisional* peer is served the membership sub-DAG only,
                         // and — since #111 lets that closure carry chat ancestry —
                         // only once it has proven invite possession (issue #112).
-                        let device = endpoint_of(inbound.peer);
                         let provisional = device.is_some_and(|d| shared.is_provisional(d));
                         let serve = if provisional {
                             match &msg {
@@ -1437,7 +1471,7 @@ async fn pump(
                                             // fan-out and advertisements.
                                             if deferred_handshakes.remove(&inbound.peer) {
                                                 let outs = engine.on_connect(inbound.peer);
-                                                route_all(&shared, outs);
+                                                route_all(&engine, &shared, outs);
                                             }
                                         } else {
                                             shared.audit.bootstrap_capability_rejected(d);
@@ -1470,7 +1504,7 @@ async fn pump(
                             // per-frame `reject.<code>` detail is in engine.logs().
                             let rejected_before = engine.counters().rejected;
                             let outs = engine.on_message(inbound.peer, msg);
-                            route_all(&shared, outs);
+                            route_all(&engine, &shared, outs);
                             let rejected = engine
                                 .counters()
                                 .rejected
@@ -1534,7 +1568,7 @@ async fn pump(
             }
             _ = ticker.tick() => {
                 let outs = engine.on_tick(now_ms());
-                route_all(&shared, outs);
+                route_all(&engine, &shared, outs);
                 // Push-subscription feed (issue #83): `on_tick` also drives
                 // `wake_park`, so park-promotions surface here.
                 drain_room_events(&mut engine, &room_event_tx);
@@ -1560,7 +1594,7 @@ fn handle_cmd(
         Cmd::Publish(bytes, reply) => {
             let result = match engine.publish(&bytes) {
                 Ok(outs) => {
-                    route_all(shared, outs);
+                    route_all(engine, shared, outs);
                     Ok(())
                 }
                 Err(err) => Err(err.to_string()),
@@ -1679,7 +1713,7 @@ fn handle_conn_event(
                 deferred.insert(peer);
             } else {
                 let outs = engine.on_connect(peer);
-                route_all(shared, outs);
+                route_all(engine, shared, outs);
             }
         }
         PeerConnState::Offline | PeerConnState::Unauthorized => {
@@ -1698,10 +1732,50 @@ fn handle_conn_event(
 }
 
 /// Route every engine output to its peer's writer queue (best-effort).
-fn route_all(shared: &Arc<Shared>, outs: Vec<Outgoing>) {
-    for out in outs {
-        shared.route(&out);
+///
+/// A `member.removed` push addressed to the removed device is terminal: trim
+/// its existing causal batch immediately after the removal, send that prefix in
+/// one receipt-bearing terminal envelope, and suppress later output to that
+/// peer. Keeping the prefix and removal in one queue entry prevents a crossed
+/// connection replacement from splitting their delivery. The room
+/// reconciler then revokes routing and admission before waiting on the receipt.
+fn route_all(engine: &SyncEngine, shared: &Arc<Shared>, outs: Vec<Outgoing>) {
+    let snapshot = engine.snapshot();
+    let mut sealed = BTreeSet::new();
+    for mut out in outs {
+        if sealed.contains(&out.peer) {
+            continue;
+        }
+        if let Some((terminal_index, event_id)) = terminal_removal(&snapshot, &out) {
+            if let SyncMessage::Events { frames, .. } = &mut out.msg {
+                frames.truncate(terminal_index + 1);
+            }
+            let peer = out.peer;
+            shared.route_terminal_removal(&out, event_id);
+            sealed.insert(peer);
+        } else {
+            shared.route(&out);
+        }
     }
+}
+
+/// Locate an exact removal of `out.peer` in a trusted engine-produced Events
+/// batch. The post-fold snapshot retains inactive members' device bindings, so
+/// the target comparison remains available after the removal was applied.
+fn terminal_removal(snapshot: &MembershipSnapshot, out: &Outgoing) -> Option<(usize, EventId)> {
+    let SyncMessage::Events { frames, .. } = &out.msg else {
+        return None;
+    };
+    let device = DeviceKey::from_bytes(*out.peer.as_bytes());
+    let removed_identity = snapshot.identity_of_device(&device)?;
+    frames.iter().enumerate().find_map(|(index, frame)| {
+        let wire = WireEvent::decode(frame).ok()?;
+        let event = SignedEvent::decode(&wire.signed).ok()?;
+        let Content::MemberRemoved(removed) = event.content else {
+            return None;
+        };
+        (removed.member_id == *removed_identity).then(|| (index, event_id_from_bytes(&wire.signed)))
+    })
 }
 
 /// Map an engine [`PeerId`] back to its transport [`EndpointId`] (same 32
@@ -1792,7 +1866,7 @@ fn maybe_upgrade_provisional(
     // new member enters the fan-out set.
     if deferred.remove(&peer) {
         let outs = engine.on_connect(peer);
-        route_all(shared, outs);
+        route_all(engine, shared, outs);
     }
 }
 

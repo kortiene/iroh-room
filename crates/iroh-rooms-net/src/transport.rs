@@ -10,21 +10,25 @@
 //! the peer is offline — the engine re-pulls on reconnect), and
 //! [`peers`](SyncTransport::peers) is the set of `Connected` authenticated devices.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "gossip_overlay")]
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, VarInt};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
-use iroh_rooms_core::sync::{Outgoing, PeerId, SyncTransport};
-use tokio::sync::broadcast;
+use iroh_rooms_core::event::constants::SHORT_ID_LEN;
+use iroh_rooms_core::event::ids::{EventId, RoomId};
+use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage, SyncTransport};
+use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 
-use crate::admission::Admission;
+use crate::admission::{Admission, AdmissionDecision, RejectCause};
 use crate::alpn::EVENT_ALPN;
 use crate::audit::AuditSink;
 use crate::handler::EventProtocolHandler;
@@ -40,6 +44,12 @@ use crate::state::{ConnEvent, OfflineReason, PeerConnState, PeerEntry, PeerTable
 /// Normal application close code for a locally-initiated disconnect (distinct from
 /// [`crate::handler::REJECT_CODE`], which means "unauthorized").
 const LOCAL_CLOSE_CODE: VarInt = VarInt::from_u32(0);
+
+/// Maximum time a logically-removed peer's physical link may remain open while
+/// the sender waits for an application-level receipt for its terminal removal
+/// event. Admission and outbound routing are revoked before this grace starts;
+/// the timeout is only a bounded delivery opportunity, never continued access.
+const TERMINAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many bidirectional QUIC streams a remote endpoint may have open toward us on
 /// one connection, set **explicitly** on the endpoint's `QuicTransportConfig` instead
@@ -238,6 +248,59 @@ impl OutboundQueue {
     }
 }
 
+/// One exact, removal-only application receipt awaited during terminal link
+/// teardown. The removal's causal prefix and receipt request travel in one
+/// terminal `events` envelope; the remote confirms only ids already present in
+/// its room store. A random nonce binds the response to this link transition.
+struct TerminalConfirmation {
+    room_id: RoomId,
+    ids: BTreeSet<EventId>,
+    nonce: [u8; SHORT_ID_LEN],
+    generation: u64,
+    confirmed: AtomicBool,
+    changed: Notify,
+}
+
+impl TerminalConfirmation {
+    fn new(room_id: RoomId, ids: Vec<EventId>, nonce: [u8; SHORT_ID_LEN], generation: u64) -> Self {
+        Self {
+            room_id,
+            ids: ids.into_iter().collect(),
+            nonce,
+            generation,
+            confirmed: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    fn matches(&self, room_id: &RoomId, nonce: &[u8; SHORT_ID_LEN], ids: &[EventId]) -> bool {
+        self.room_id == *room_id
+            && self.nonce == *nonce
+            && self.ids.len() == ids.len()
+            && self.ids.iter().all(|expected| ids.contains(expected))
+    }
+
+    fn confirm(&self) {
+        self.confirmed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.confirmed.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.confirmed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Shared transport state: the identity/authorizer/audit + the per-peer routing
 /// tables + the byte-bounded inbound sink. Cloned (as `Arc<Shared>`) into the
 /// accept handler and every connection task so they observe one consistent view
@@ -260,6 +323,10 @@ pub struct Shared {
     stream_queue_bytes: usize,
     /// Live connection handles (so a local disconnect can close a specific link).
     connections: Mutex<HashMap<EndpointId, Connection>>,
+    /// Exact application receipts pending for peers that are about to become
+    /// logically deauthorized. Entries are installed only for a routed
+    /// `member.removed` event and are cleared on confirmation or bounded timeout.
+    terminal_confirmations: Mutex<HashMap<EndpointId, Arc<TerminalConfirmation>>>,
     /// Devices admitted **provisionally** for the join bootstrap (IR-0104,
     /// Approach A): a not-yet-Active invitee allowed to pull the membership sub-DAG
     /// and push its `member.joined`, but served nothing else. The engine driver
@@ -330,6 +397,23 @@ pub(crate) enum LinkTeardown {
     Offline(OfflineReason),
     /// The remote refused us mid-stream (stable reject close): mark `Unauthorized`.
     Unauthorized,
+}
+
+/// Result of the final, generation-serialized admission check performed when a
+/// QUIC stream is ready to register. Rechecking here closes the accept/reconcile
+/// TOCTOU: a stream authorized under the old roster cannot register after the
+/// admission cell has learned a removal.
+pub(crate) enum LinkRegistration {
+    Admitted { generation: u64 },
+    Provisional { generation: u64 },
+    Rejected { cause: Option<RejectCause> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkActivation {
+    Admitted,
+    Provisional,
+    Stale,
 }
 
 impl Shared {
@@ -409,29 +493,202 @@ impl Shared {
     /// §7). A closed queue (peer torn down) is a silent drop, matching the
     /// prior `mpsc::Sender::Closed` path (issue #141).
     pub(crate) fn route(&self, out: &Outgoing) {
-        // Gossip overlay fan-out (issue #171 / spec §4 D1 + open question 4):
-        // when the feature is on AND the message is `SyncMessage::Events` AND a
-        // gossip mesh is installed for the room, broadcast the encoded body on
-        // the room's gossip topic. This is **additive** with the per-peer
-        // queue path below — Events is also delivered to the destination
-        // peer's queue when a live writer exists. The engine's `event_id`
-        // G-set dedup makes a frame delivered by both paths idempotent, so
-        // dual-path is correct (spec open question 4 explicitly leaves the
-        // gossip-only vs dual-path choice to Phase A; dual-path is chosen here
-        // for minimum regression risk: the loopback endpoint lacks the
-        // address-discovery service `iroh-gossip`'s dialer needs, so a
-        // gossip-only path would silently drop Events in loopback tests).
-        //
-        // At production scale (N>5, real-network mode with DNS discovery) the
-        // gossip path dominates Events delivery; the per-peer queue path is
-        // the fallback / coexisting channel. The K-bounded seed selector
-        // (PeerManager::desired_seeds) bounds the warm-link count regardless.
-        // A future Phase B revisit can switch to gossip-only once the
-        // loopback discovery gap is closed.
-        //
-        // Pull/query variants stay on the queue path only — they rely on
-        // per-link FIFO that gossip's epidemic delivery does not provide
-        // (spec §4 D1 consequence).
+        if self.route_gossip_events(out) {
+            return;
+        }
+        self.route_direct(out);
+    }
+
+    /// Route a `member.removed` push in the terminal wire envelope that requests
+    /// an application-level store receipt. Its distinct queue family reserves one
+    /// bounded frame on both outbound and inbound paths. The peer manager later
+    /// detaches this exact generation and waits before physically closing it.
+    pub(crate) fn route_terminal_removal(&self, out: &Outgoing, id: EventId) {
+        let SyncMessage::Events { room_id, frames } = &out.msg else {
+            return;
+        };
+        let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
+            tracing::warn!("route: terminal outgoing peer id is invalid; dropping");
+            return;
+        };
+        let mut nonce = [0_u8; SHORT_ID_LEN];
+        if let Err(err) = getrandom::fill(&mut nonce) {
+            // Entropy failure must not fall back to the old route-then-close
+            // race. The event id is unique to this removal; its prefix keeps
+            // correlation deterministic and replay-safe together with the
+            // exact room/id/device/generation checks.
+            tracing::warn!(%err, "using event-derived terminal-delivery nonce");
+            nonce.copy_from_slice(&id.as_bytes()[..SHORT_ID_LEN]);
+        }
+
+        // Terminal delivery deliberately retains a direct receipt-bearing copy
+        // even when the ordinary fan-out copy was accepted by gossip.
+        let _ = self.route_gossip_events(out);
+        // Serialize the terminal push and pending-receipt install against
+        // link replacement. A registration that started first completes and we
+        // use its queue; a later registration sees the pending terminal marker
+        // and is rejected by `register_established_link`.
+        let generation_guard = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(generation) = generation_guard.get(&device).copied() else {
+            return;
+        };
+        let outbound = self
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(queue) = outbound.get(&device).cloned() else {
+            return;
+        };
+
+        let pending = Arc::new(TerminalConfirmation::new(
+            *room_id,
+            vec![id],
+            nonce,
+            generation,
+        ));
+        self.terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(device, pending);
+
+        let terminal = SyncMessage::TerminalEvents {
+            room_id: *room_id,
+            frames: frames.clone(),
+            ids: vec![id],
+            nonce,
+        };
+        match queue.try_push(
+            out.peer,
+            terminal.encode(),
+            queue::QueueFamily::TerminalPublication,
+        ) {
+            Ok(()) => {}
+            Err(PushError::Saturated) => {
+                self.remove_terminal_confirmation(device, &nonce);
+                drop(outbound);
+                drop(generation_guard);
+                self.audit.transport_queue_saturated(device, "outbound");
+                self.close_connection(device);
+            }
+            Err(PushError::Closed | PushError::Empty) => {
+                self.remove_terminal_confirmation(device, &nonce);
+            }
+        }
+    }
+
+    /// Accept only the exact confirmation currently armed for `device`.
+    /// Returns `true` when the frame matched (and should be consumed by the net
+    /// adapter even though the peer is now logically deauthorized).
+    pub(crate) fn confirm_terminal_events(
+        &self,
+        device: EndpointId,
+        room_id: &RoomId,
+        ids: &[EventId],
+        nonce: &[u8; SHORT_ID_LEN],
+    ) -> bool {
+        let pending = self
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device)
+            .cloned();
+        let Some(pending) = pending else {
+            return false;
+        };
+        if !pending.matches(room_id, nonce, ids) {
+            return false;
+        }
+        pending.confirm();
+        true
+    }
+
+    pub(crate) fn has_terminal_confirmation(&self, device: EndpointId, generation: u64) -> bool {
+        self.terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device)
+            .is_some_and(|pending| pending.generation == generation)
+    }
+
+    /// Revoke routing immediately, then keep the exact physical connection alive
+    /// only until its application confirmation arrives or the fixed grace expires.
+    /// No mutex guard crosses the spawned task's await.
+    pub(crate) fn begin_terminal_teardown(self: &Arc<Self>, device: EndpointId) {
+        let queue = self
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
+        if let Some(queue) = queue {
+            queue.close();
+        }
+        let connection = self
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
+        let pending = self
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device)
+            .cloned();
+
+        let Some(pending) = pending else {
+            if let Some(connection) = connection {
+                connection.close(LOCAL_CLOSE_CODE, b"terminal-unconfirmed");
+            }
+            return;
+        };
+        let nonce = pending.nonce;
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let confirmed = tokio::time::timeout(TERMINAL_CONFIRM_TIMEOUT, pending.wait())
+                .await
+                .is_ok();
+            if !confirmed {
+                tracing::warn!(peer = %device, "terminal event confirmation timed out");
+            }
+            if let Some(connection) = connection {
+                let reason: &[u8] = if confirmed {
+                    b"terminal-delivered"
+                } else {
+                    b"terminal-timeout"
+                };
+                connection.close(LOCAL_CLOSE_CODE, reason);
+            }
+            if let Some(shared) = weak.upgrade() {
+                shared.remove_terminal_confirmation(device, &nonce);
+            }
+        });
+    }
+
+    fn remove_terminal_confirmation(&self, device: EndpointId, nonce: &[u8; SHORT_ID_LEN]) {
+        let mut pending = self
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .get(&device)
+            .is_some_and(|current| current.nonce == *nonce)
+        {
+            pending.remove(&device);
+        }
+    }
+
+    /// Return whether a fan-out `Events` body was accepted by the gossip mesh
+    /// and therefore must not also use the ordinary direct path.
+    fn route_gossip_events(&self, out: &Outgoing) -> bool {
+        // Keep the no-overlay build's method shape identical without a lint-only
+        // attribute; the overlay build uses the full shared state below.
+        let _ = (&self.me, &out.msg);
+        // Gossip overlay fan-out (issue #171 / spec §4 D1): an accept-path
+        // fan-out Events body uses gossip alone when a live mesh accepts it.
+        // Targeted serves and a declined/unavailable mesh fall through to the
+        // direct queue, preserving per-link FIFO and the no-overlay behavior.
         #[cfg(feature = "gossip_overlay")]
         {
             if let iroh_rooms_core::sync::SyncMessage::Events { room_id, .. } = &out.msg {
@@ -455,13 +712,17 @@ impl Shared {
                         // dysfunctional mesh degrades to the pre-overlay
                         // topology instead of silently dropping live fan-out.
                         if mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode()) {
-                            return;
+                            return true;
                         }
                     }
                 }
             }
         }
+        false
+    }
 
+    /// Route one frame on the direct per-peer queue.
+    fn route_direct(&self, out: &Outgoing) {
         let Ok(device) = EndpointId::from_bytes(out.peer.as_bytes()) else {
             tracing::warn!("route: outgoing peer id is not a valid endpoint id; dropping");
             return;
@@ -545,6 +806,124 @@ impl Shared {
         self.inbound.close();
     }
 
+    /// Atomically perform the final admission check and install both halves of
+    /// an established link. Holding the generation lock across the check,
+    /// outbound-queue install, and connection-handle install serializes this
+    /// against roster-driven invalidation: registration either lands before the
+    /// manager's teardown (and is detached by it) or observes the new admission
+    /// view and is rejected.
+    pub(crate) fn register_established_link(
+        &self,
+        device: EndpointId,
+        queue: OutboundQueue,
+        connection: Connection,
+        allow_provisional: bool,
+    ) -> LinkRegistration {
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&device)
+        {
+            queue.close();
+            return LinkRegistration::Rejected { cause: None };
+        }
+        let decision = self.admission.authorize(device);
+        let (identity, provisional) = match decision {
+            AdmissionDecision::Admit { identity } => (Some(identity), false),
+            AdmissionDecision::AdmitProvisional if allow_provisional => (None, true),
+            AdmissionDecision::AdmitProvisional => {
+                queue.close();
+                return LinkRegistration::Rejected { cause: None };
+            }
+            AdmissionDecision::Reject(cause) => {
+                queue.close();
+                return LinkRegistration::Rejected { cause: Some(cause) };
+            }
+        };
+
+        let generation = generations
+            .get(&device)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        generations.insert(device, generation);
+        if provisional {
+            self.provisional
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(device);
+        } else {
+            self.provisional
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&device);
+        }
+        self.register_outbound(device, queue);
+        self.register_connection(device, connection);
+
+        if identity.is_some() {
+            LinkRegistration::Admitted { generation }
+        } else {
+            LinkRegistration::Provisional { generation }
+        }
+    }
+
+    /// Publish `Connected` only if this registration is still current and the
+    /// live admission view still permits it. The check and table transition run
+    /// under the generation lock, so roster teardown either happens afterward
+    /// and overwrites this state, or wins first and makes this a no-op.
+    pub(crate) fn activate_link_if_current(
+        &self,
+        device: EndpointId,
+        generation: u64,
+        allow_provisional: bool,
+    ) -> LinkActivation {
+        let generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generations.get(&device).copied() != Some(generation) {
+            return LinkActivation::Stale;
+        }
+        let identity = match self.admission.authorize(device) {
+            AdmissionDecision::Admit { identity } => Some(identity),
+            AdmissionDecision::AdmitProvisional if allow_provisional => None,
+            AdmissionDecision::AdmitProvisional | AdmissionDecision::Reject(_) => {
+                return LinkActivation::Stale;
+            }
+        };
+        if identity.is_some() {
+            self.provisional
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&device);
+            self.capability_proven
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&device);
+        } else {
+            self.provisional
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(device);
+        }
+        self.table.set(device, PeerConnState::Connected, identity);
+        // Keep the observable audit sequence inside the same lifecycle
+        // critical section: teardown cannot publish Deauthorized and then be
+        // followed by a stale Connected audit from this generation.
+        self.audit.connected(device);
+        if identity.is_some() {
+            LinkActivation::Admitted
+        } else {
+            LinkActivation::Provisional
+        }
+    }
+
     /// Register a new live link for `device` and return its connection generation
     /// (issue #126). Atomically, under the generations lock: assign the next
     /// generation, set the provisional mark when `provisional` (IR-0104, Approach A
@@ -557,6 +936,7 @@ impl Shared {
     /// generation bump and wrongly clear that mark. The connection handle is
     /// registered separately by the caller — it feeds only `close_connection`, not
     /// the gate decision, and its guarded removal on teardown keeps it consistent.
+    #[cfg(test)]
     pub(crate) fn register_link(
         &self,
         device: EndpointId,
@@ -895,6 +1275,7 @@ impl NetTransport {
             outbound_peer_queue_bytes: cfg.outbound_peer_queue_bytes.max(1),
             stream_queue_bytes: cfg.stream_queue_bytes.max(1),
             connections: Mutex::new(HashMap::new()),
+            terminal_confirmations: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
@@ -1150,7 +1531,7 @@ fn loopback_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
 mod tests {
     use super::{
         InboundReceiver, LinkTeardown, NetConfig, NetMode, OutboundQueue, OutboundReceiver, Shared,
-        RELAY_ONLY_TEST_BUILD,
+        TerminalConfirmation, RELAY_ONLY_TEST_BUILD, TERMINAL_CONFIRM_TIMEOUT,
     };
     use crate::admission::AllowlistAdmission;
     use crate::audit::TracingAudit;
@@ -1159,10 +1540,11 @@ mod tests {
     };
     use crate::state::{OfflineReason, PeerConnState, PeerTable};
     use iroh::{EndpointId, SecretKey};
-    use iroh_rooms_core::event::ids::RoomId;
+    use iroh_rooms_core::event::ids::{EventId, RoomId};
     use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn device(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()
@@ -1185,6 +1567,7 @@ mod tests {
             outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
             stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
             connections: Mutex::new(HashMap::new()),
+            terminal_confirmations: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
@@ -1195,6 +1578,100 @@ mod tests {
             peer_manager: Mutex::new(None),
         });
         (shared, InboundReceiver { rx: inbound_rx })
+    }
+
+    #[tokio::test]
+    async fn terminal_confirmation_requires_exact_peer_room_nonce_and_ids() {
+        let (shared, _inbound) = make_shared();
+        let peer = device(0x22);
+        let room_id = RoomId::from_bytes([0x33; 32]);
+        let event_id = EventId::from_bytes([0x44; 32]);
+        let nonce = [0x55; 16];
+        let pending = Arc::new(TerminalConfirmation::new(room_id, vec![event_id], nonce, 7));
+        shared
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer, pending.clone());
+
+        assert!(!shared.confirm_terminal_events(device(0x23), &room_id, &[event_id], &nonce));
+        assert!(!shared.confirm_terminal_events(
+            peer,
+            &RoomId::from_bytes([0x34; 32]),
+            &[event_id],
+            &nonce
+        ));
+        assert!(shared.has_terminal_confirmation(peer, 7));
+        assert!(!shared.has_terminal_confirmation(peer, 6));
+        assert!(!shared.confirm_terminal_events(peer, &room_id, &[event_id], &[0x56; 16]));
+        assert!(!shared.confirm_terminal_events(peer, &room_id, &[], &nonce));
+        assert!(!shared.confirm_terminal_events(
+            peer,
+            &room_id,
+            &[event_id, EventId::from_bytes([0x45; 32])],
+            &nonce
+        ));
+
+        let waiter = tokio::spawn(async move { pending.wait().await });
+        tokio::task::yield_now().await;
+        assert!(shared.confirm_terminal_events(peer, &room_id, &[event_id], &nonce));
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("exact confirmation wakes terminal waiter")
+            .expect("waiter task completes");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_teardown_cleans_pending_confirmation_on_receipt_or_timeout() {
+        let (shared, _inbound) = make_shared();
+        let room_id = RoomId::from_bytes([0x61; 32]);
+        let event_id = EventId::from_bytes([0x62; 32]);
+
+        let confirmed_peer = device(0x63);
+        let confirmed_nonce = [0x64; 16];
+        shared
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                confirmed_peer,
+                Arc::new(TerminalConfirmation::new(
+                    room_id,
+                    vec![event_id],
+                    confirmed_nonce,
+                    1,
+                )),
+            );
+        shared.begin_terminal_teardown(confirmed_peer);
+        assert!(shared.confirm_terminal_events(
+            confirmed_peer,
+            &room_id,
+            &[event_id],
+            &confirmed_nonce
+        ));
+        tokio::task::yield_now().await;
+        assert!(!shared.has_terminal_confirmation(confirmed_peer, 1));
+
+        let timed_out_peer = device(0x65);
+        let timed_out_nonce = [0x66; 16];
+        shared
+            .terminal_confirmations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                timed_out_peer,
+                Arc::new(TerminalConfirmation::new(
+                    room_id,
+                    vec![event_id],
+                    timed_out_nonce,
+                    2,
+                )),
+            );
+        shared.begin_terminal_teardown(timed_out_peer);
+        tokio::task::yield_now().await;
+        tokio::time::advance(TERMINAL_CONFIRM_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(!shared.has_terminal_confirmation(timed_out_peer, 2));
     }
 
     /// Build a per-peer outbound queue and its receiver with the default 8 MiB
@@ -1438,6 +1915,7 @@ mod tests {
             outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
             stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
             connections: Mutex::new(HashMap::new()),
+            terminal_confirmations: Mutex::new(HashMap::new()),
             provisional: Mutex::new(HashSet::new()),
             capability_proven: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
@@ -2097,6 +2575,7 @@ mod tests {
                 outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
                 stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
                 connections: Mutex::new(HashMap::new()),
+                terminal_confirmations: Mutex::new(HashMap::new()),
                 provisional: Mutex::new(HashSet::new()),
                 capability_proven: Mutex::new(HashSet::new()),
                 generations: Mutex::new(HashMap::new()),
@@ -2496,6 +2975,7 @@ mod tests {
                 outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
                 stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
                 connections: Mutex::new(HashMap::new()),
+                terminal_confirmations: Mutex::new(HashMap::new()),
                 provisional: Mutex::new(HashSet::new()),
                 capability_proven: Mutex::new(HashSet::new()),
                 generations: Mutex::new(HashMap::new()),
