@@ -191,7 +191,19 @@ impl ProtocolHandler for GossipProtocolHandler {
 /// already bound — one `Endpoint`, many planes (ADR-1).
 #[must_use]
 pub fn spawn_gossip_actor(endpoint: iroh::Endpoint) -> Gossip {
-    Gossip::builder().alpn(GOSSIP_ALPN).spawn(endpoint)
+    // R3 EXPERIMENT (hub-overload isolation): raise iroh-gossip's max message
+    // size from its 4096-byte default to the wire frame cap. The default is a
+    // whole-connection kill-switch: `SendLoop::write_message` errors on any
+    // frame over the cap and `connection_loop` exits, so ONE broadcast of an
+    // `Events` re-serve batch larger than 4 KiB (byte-budgeted against the
+    // 1 MiB wire cap, not 4 KiB) kills the gossip link to EVERY neighbor at
+    // once — measured as cluster-wide gossip death at ~event 10 under load.
+    // `broadcast_events` already guards at MAX_FRAME_BYTES; this makes the
+    // actor accept what the guard admits.
+    Gossip::builder()
+        .alpn(GOSSIP_ALPN)
+        .max_message_size(MAX_FRAME_BYTES as usize)
+        .spawn(endpoint)
 }
 
 /// Per-room gossip broadcast state held on [`Shared`] (spec §4 D8 / Step 2).
