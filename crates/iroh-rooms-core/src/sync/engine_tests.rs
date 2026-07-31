@@ -1563,3 +1563,51 @@ fn zero_pull_fanout_is_rejected() {
     };
     assert_eq!(cfg.validate(), Err("pull_fanout_zero"));
 }
+
+/// A SINGLE forced pull must sweep the full rotating cycle on its own: one
+/// nudge arms `ceil(peers / window)` consecutive pull-emitting ticks, so the
+/// peer holding a dropped frame is reached even when `has_pending_sync_work`
+/// is false throughout. (The rotation test above re-arms every round, which
+/// would mask a sweep that dies after one window.)
+#[test]
+fn single_forced_pull_sweeps_every_peer_then_quiesces() {
+    let cfg = SyncConfig::default();
+    let bound = cfg.pull_fanout_peers;
+    let (mut engine, _room, _genesis) = seeded_engine(cfg);
+    let peers: Vec<PeerId> = (0..7).map(|i| peer(0xE0 + i)).collect();
+    for p in &peers {
+        let _ = engine.on_connect(*p); // each arms the forced-pull flag
+    }
+    let sweep_ticks = peers.len().div_ceil(bound);
+
+    let mut pulled_union: std::collections::BTreeSet<PeerId> = std::collections::BTreeSet::new();
+    for round in 0..sweep_ticks as u64 {
+        // No re-arming inside the loop: the single arm from `on_connect` must
+        // carry the whole sweep.
+        let out = engine.on_tick(T0 + round);
+        let pulled: Vec<PeerId> = out
+            .iter()
+            .filter(|o| matches!(o.msg, SyncMessage::WantRecentChat { .. }))
+            .map(|o| o.peer)
+            .collect();
+        assert!(
+            !pulled.is_empty(),
+            "tick {round} of the armed sweep must emit pulls"
+        );
+        pulled_union.extend(pulled);
+    }
+    assert_eq!(
+        pulled_union,
+        peers.iter().copied().collect(),
+        "one forced sweep must reach every peer"
+    );
+
+    // Sweep exhausted, no pending sync work: the mesh quiesces.
+    let after = engine.on_tick(T0 + 100);
+    assert!(
+        !after
+            .iter()
+            .any(|o| matches!(o.msg, SyncMessage::WantRecentChat { .. })),
+        "after the sweep completes, ticks emit no pulls until re-armed"
+    );
+}

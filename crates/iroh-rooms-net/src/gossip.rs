@@ -310,6 +310,18 @@ impl GossipMesh {
     /// (spec §5.3). The engine re-pulls on the next `on_connect` /
     /// `Lagged`-triggered anti-entropy.
     ///
+    /// Returns whether the body was **accepted for broadcast** (or already
+    /// accepted by an earlier call in the same fan-out batch — the dedup
+    /// window). `false` means this mesh cannot usefully carry it right now —
+    /// no live gossip neighbor, or the body exceeds the wire cap — and the
+    /// caller must fall back to the per-peer queue path so a dysfunctional
+    /// mesh degrades to the pre-overlay topology instead of silently losing
+    /// live fan-out. A `false` records nothing in the dedup window, so a
+    /// sibling fan-out call can still broadcast if the mesh recovers
+    /// mid-batch. Asynchronous failure after acceptance is still possible
+    /// (fire-and-forget); that residue is covered by the anti-entropy pull
+    /// sweep, which is why the sweep must visit every peer.
+    ///
     /// `body` is the *same* canonical CBOR the per-peer queue path would have
     /// sent, so a peer cannot tell (and does not need to tell) which path
     /// delivered it (D1 consequence).
@@ -318,14 +330,21 @@ impl GossipMesh {
         audit: Arc<dyn crate::audit::AuditSink>,
         me: EndpointId,
         body: Vec<u8>,
-    ) {
+    ) -> bool {
         if body.len() > MAX_FRAME_BYTES as usize {
             tracing::warn!(
                 declared = body.len(),
                 max = MAX_FRAME_BYTES,
                 "gossip: dropped oversized outbound frame"
             );
-            return;
+            return false;
+        }
+        // Availability gate: a mesh with zero live neighbors broadcasts into
+        // the void (a first-member mesh before anyone joins, or a mesh whose
+        // neighbors all dropped — the no-health-check gap tracked in #192).
+        // Decline so the caller keeps the queue path.
+        if self.neighbor_count() == 0 {
+            return false;
         }
 
         // Dedup (issue #171): the engine fans an accepted `Events` frame out to
@@ -345,7 +364,9 @@ impl GossipMesh {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if recent.contains(hash.as_bytes()) {
-                return;
+                // An earlier call in this fan-out batch already accepted the
+                // identical body for broadcast.
+                return true;
             }
             if recent.len() >= RECENT_BROADCAST_CAPACITY {
                 recent.pop_front();
@@ -366,6 +387,7 @@ impl GossipMesh {
                 Err(_) => audit.transport_queue_saturated(me, "gossip_out"),
             }
         });
+        true
     }
 
     /// The room this mesh carries Events for.

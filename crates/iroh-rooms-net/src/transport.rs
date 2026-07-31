@@ -449,8 +449,14 @@ impl Shared {
                 // early-startup windows are unchanged.
                 if out.fanout {
                     if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
-                        mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
-                        return;
+                        // Gossip-only ONLY when the mesh accepts the body: a
+                        // declined broadcast (zero live neighbors, oversized)
+                        // falls through to the per-peer queue so a
+                        // dysfunctional mesh degrades to the pre-overlay
+                        // topology instead of silently dropping live fan-out.
+                        if mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode()) {
+                            return;
+                        }
                     }
                 }
             }
@@ -2742,6 +2748,97 @@ mod tests {
         /// a recording audit: iroh-gossip dedups identical content at
         /// *delivery*, so counting received copies would not surface the bug —
         /// only the sender-side audit (one outcome per broadcast task that ran)
+        /// A mesh with ZERO live gossip neighbors must DECLINE the broadcast
+        /// so `route` falls back to the per-peer queue path — a first-member
+        /// mesh (or one whose neighbors all dropped, the #192 health-check
+        /// gap) must degrade to the pre-overlay topology, not silently eat
+        /// live fan-out. Once a neighbor joins, the same route call is
+        /// accepted for broadcast.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn zero_neighbor_mesh_declines_broadcast_until_a_neighbor_joins() {
+            let room = RoomId::from_bytes([0xAF; 32]);
+            let a_seed: u8 = 0x81;
+            let b_seed: u8 = 0x82;
+
+            let spy = Arc::new(BroadcastSpy::default());
+            let (a_shared, _a_rx, a_ep, _a_router) = spawn_overlay_node_with_audit(
+                a_seed,
+                &[a_seed, b_seed],
+                vec![],
+                Arc::clone(&spy) as Arc<dyn AuditSink>,
+            )
+            .await;
+            let a_addr = loopback_addr(&a_ep);
+            let a_id = a_ep.id();
+
+            // First member: mesh installs with empty bootstrap => 0 neighbors.
+            let a_actor = a_shared
+                .gossip_state
+                .actor()
+                .expect("A has a live gossip actor")
+                .clone();
+            let a_mesh = GossipMesh::spawn(a_shared.clone(), a_actor, room, vec![])
+                .await
+                .expect("A subscribes the room gossip topic");
+            a_shared.gossip_state.install_mesh(room, a_mesh);
+            assert_eq!(
+                a_shared.gossip_state.neighbor_count(),
+                0,
+                "a first-member mesh starts with zero neighbors"
+            );
+
+            // Fan-out routed into a neighborless mesh: declined, no broadcast
+            // task spawned, queue-path fallback taken (silently dropped here —
+            // no registered writer — exactly the pre-overlay contract).
+            let declined = Outgoing {
+                fanout: true,
+                peer: PeerId::from_bytes([b_seed; 32]),
+                msg: SyncMessage::Events {
+                    room_id: room,
+                    frames: vec![vec![0xE1; 64]],
+                },
+            };
+            a_shared.route(&declined);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                spy.outcomes(),
+                0,
+                "a zero-neighbor mesh must not accept a broadcast"
+            );
+
+            // B joins the topic; A gains a neighbor; the SAME body may now be
+            // broadcast (a decline records nothing in the dedup window).
+            let (b_shared, _b_rx, b_ep, _b_router) =
+                spawn_overlay_node(b_seed, &[a_seed, b_seed], vec![a_addr]).await;
+            let _ = b_ep.id();
+            let b_actor = b_shared
+                .gossip_state
+                .actor()
+                .expect("B has a live gossip actor")
+                .clone();
+            let b_mesh = GossipMesh::spawn(b_shared.clone(), b_actor, room, vec![a_id])
+                .await
+                .expect("B subscribes + joins the room gossip topic");
+            b_shared.gossip_state.install_mesh(room, b_mesh);
+            assert!(
+                wait_for_neighbors(&a_shared, 1, WAIT).await,
+                "A must gain a gossip neighbor after B joins"
+            );
+
+            a_shared.route(&declined);
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                if spy.outcomes() >= 1 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "with a live neighbor the broadcast must be accepted"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
         /// does. Routing the same body to several distinct peers must collapse
         /// to exactly one outcome.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

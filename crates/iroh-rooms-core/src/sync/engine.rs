@@ -510,6 +510,11 @@ pub struct SyncEngine {
     /// Whether the next tick should emit full anti-entropy pulls even if no local
     /// sync activity has happened since the previous tick.
     force_next_tick_pull: bool,
+    /// Pull-emitting ticks still owed from the last forced pull, so a single
+    /// nudge sweeps the FULL rotating window cycle (every peer) even when
+    /// `has_pending_sync_work()` is false — a forced pull that visited only
+    /// one window could permanently miss the peer holding a dropped frame.
+    pull_sweep_remaining: usize,
 
     /// Bounded early event-id dedup cache (issue #143): checked before signature
     /// verification and any store work, so a replay inside the cache window is a
@@ -613,6 +618,7 @@ impl SyncEngine {
             covered_cache: BTreeMap::new(),
             claim_rotation: 0,
             force_next_tick_pull: true,
+            pull_sweep_remaining: 0,
             dedup_cache,
             pending_batch: PendingStoreBatch::new(),
         };
@@ -810,8 +816,19 @@ impl SyncEngine {
         // A restart may have left parked frames owed their one-shot by-id backfill;
         // the first tick after `open` re-issues it if no `on_connect` did (spec §6.3).
         self.retry_restored_park(&mut out);
-        let emit_pulls = self.force_next_tick_pull || self.has_pending_sync_work();
-        self.force_next_tick_pull = false;
+        // A forced pull arms a full sweep: enough consecutive pull-emitting
+        // ticks that the rotating window covers every peer once, so the nudge
+        // reaches the peer that actually holds the missing data even in a
+        // room much larger than the per-tick window.
+        if self.force_next_tick_pull {
+            self.force_next_tick_pull = false;
+            let window = self.config.pull_fanout_peers.max(1);
+            self.pull_sweep_remaining = self
+                .pull_sweep_remaining
+                .max(self.peers.len().div_ceil(window).max(1));
+        }
+        let emit_pulls = self.pull_sweep_remaining > 0 || self.has_pending_sync_work();
+        self.pull_sweep_remaining = self.pull_sweep_remaining.saturating_sub(1);
         let membership_have = emit_pulls.then(|| self.membership_have());
         let chat_have = emit_pulls.then(|| self.chat_have());
         // Bound the pull fan-out to a rotating window of
@@ -829,8 +846,11 @@ impl SyncEngine {
         } else {
             // Truncating u64 -> usize is fine: it feeds a modulus, where a
             // wrapped rotation index only changes which window this tick gets.
+            // Stride by the window width so consecutive pull-emitting ticks
+            // cover the NEXT block of peers: full coverage in
+            // ceil(peers / window) ticks, not peers - window + 1.
             #[allow(clippy::cast_possible_truncation)]
-            let start = (self.claim_rotation as usize) % all_peers.len();
+            let start = (self.claim_rotation as usize).wrapping_mul(pull_fanout) % all_peers.len();
             (0..pull_fanout)
                 .map(|i| all_peers[(start + i) % all_peers.len()])
                 .collect()
