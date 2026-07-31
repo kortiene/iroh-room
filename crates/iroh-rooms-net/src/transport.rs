@@ -435,14 +435,22 @@ impl Shared {
         #[cfg(feature = "gossip_overlay")]
         {
             if let iroh_rooms_core::sync::SyncMessage::Events { room_id, .. } = &out.msg {
-                if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
-                    mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
+                // R5 EXPERIMENT (hub-overload isolation): split Events by
+                // intent. Accept-path FAN-OUT (out.fanout) rides the gossip
+                // broadcast alone when a mesh is installed — the per-peer
+                // queue copy is what multiplied every event into the seed
+                // hubs by ~N-K and drowned them (R4). TARGETED serves (pull
+                // responses, backfill, bootstrap closures) never broadcast —
+                // broadcasting them spammed the whole mesh with per-requester
+                // batches (R3's duplicate blizzard) — and stay point-to-point
+                // on the queue path below. With no mesh installed, fan-out
+                // falls through to the queue path: pre-overlay behavior.
+                if out.fanout {
+                    if let Some(mesh) = self.gossip_state.mesh_for(room_id) {
+                        mesh.broadcast_events(self.audit.clone(), self.me, out.msg.encode());
+                        return;
+                    }
                 }
-                // Fall through to the per-peer queue path: dual-path delivery.
-                // If no mesh is installed (loopback / early startup), the
-                // queue path carries Events alone — exactly the pre-overlay
-                // behavior, so existing tests pass under both feature
-                // configurations.
             }
         }
 
@@ -1196,6 +1204,7 @@ mod tests {
 
     fn dummy_outgoing(peer: EndpointId) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::NotFound {
                 room_id: RoomId::from_bytes([0xAA; 32]),
@@ -1206,6 +1215,7 @@ mod tests {
 
     fn admin_tip_outgoing(peer: EndpointId) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::AdminTip {
                 room_id: RoomId::from_bytes([0xAB; 32]),
@@ -1216,6 +1226,7 @@ mod tests {
 
     fn want_membership_outgoing(peer: EndpointId) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::WantMembership {
                 room_id: RoomId::from_bytes([0xAC; 32]),
@@ -1234,6 +1245,7 @@ mod tests {
     fn want_recent_chat_outgoing(peer: EndpointId) -> Outgoing {
         use iroh_rooms_core::sync::Window;
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::WantRecentChat {
                 room_id: RoomId::from_bytes([0xAE; 32]),
@@ -1248,6 +1260,7 @@ mod tests {
 
     fn events_outgoing(peer: EndpointId, payload_len: usize) -> Outgoing {
         Outgoing {
+            fanout: false,
             peer: PeerId::from_bytes(*peer.as_bytes()),
             msg: SyncMessage::Events {
                 room_id: RoomId::from_bytes([0xAD; 32]),
@@ -2590,6 +2603,7 @@ mod tests {
             // encoded body on the room's gossip topic. `broadcast_events` is
             // fire-and-forget (spawns a task), so delivery is awaited below.
             let out = Outgoing {
+                fanout: false,
                 peer: PeerId::from_bytes(*b_id.as_bytes()),
                 msg: SyncMessage::Events {
                     room_id: room,
@@ -2789,6 +2803,7 @@ mod tests {
             for n in 0..FANOUT_PEERS {
                 let peer = PeerId::from_bytes([0xC0 + n; 32]);
                 let out = Outgoing {
+                    fanout: false,
                     peer,
                     msg: SyncMessage::Events {
                         room_id: room,

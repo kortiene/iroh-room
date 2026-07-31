@@ -1666,6 +1666,7 @@ fn handle_conn_event(
             // link, so the closure serve is never blocked for a genuine joiner.
             if let Some(proof) = bootstrap_proof {
                 shared.route(&Outgoing {
+                    fanout: false,
                     peer,
                     msg: SyncMessage::ProveCapability {
                         room_id: proof.room_id,

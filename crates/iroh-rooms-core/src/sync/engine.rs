@@ -810,8 +810,31 @@ impl SyncEngine {
         self.force_next_tick_pull = false;
         let membership_have = emit_pulls.then(|| self.membership_have());
         let chat_have = emit_pulls.then(|| self.chat_have());
-        for peer in self.peers.iter().copied().collect::<Vec<_>>() {
+        // R6 EXPERIMENT (hub-overload isolation): bound the per-tick pull
+        // fan-out to a rotating window of K peers instead of ALL peers. A
+        // high-degree node (a gossip seed hub, ~N-1 peers) that fell slightly
+        // behind previously pulled from every peer every tick and received up
+        // to N-1 overlapping serve batches at once — measured as the inbound
+        // budget saturation that closes hub links and ignites the churn
+        // cascade at N=40 x 5 events/s. The rotation reuses `claim_rotation`
+        // (already advanced once per tick, deterministically), so successive
+        // ticks sweep the whole peer set; the tiny `admin_tip_msg` still goes
+        // to every peer (fork-detection latency is load-bearing).
+        const PULL_FANOUT_PEERS: usize = 3;
+        let all_peers: Vec<_> = self.peers.iter().copied().collect();
+        let pull_set: std::collections::BTreeSet<_> = if all_peers.len() <= PULL_FANOUT_PEERS {
+            all_peers.iter().copied().collect()
+        } else {
+            let start = (self.claim_rotation as usize) % all_peers.len();
+            (0..PULL_FANOUT_PEERS)
+                .map(|i| all_peers[(start + i) % all_peers.len()])
+                .collect()
+        };
+        for peer in all_peers {
             out.push(to(peer, self.admin_tip_msg()));
+            if emit_pulls && !pull_set.contains(&peer) {
+                continue;
+            }
             if let Some(have) = &membership_have {
                 out.push(to(
                     peer,
@@ -1378,6 +1401,7 @@ impl SyncEngine {
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     if Some(peer) != from {
                         out.push(Outgoing {
+                            fanout: true,
                             peer,
                             msg: SyncMessage::Events {
                                 room_id: self.room_id,
@@ -1605,6 +1629,7 @@ impl SyncEngine {
         for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
             for &peer in &targets {
                 out.push(Outgoing {
+                    fanout: false,
                     peer,
                     msg: SyncMessage::WantEvents {
                         room_id: self.room_id,
@@ -1779,6 +1804,7 @@ impl SyncEngine {
             for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     out.push(Outgoing {
+                        fanout: false,
                         peer,
                         msg: SyncMessage::WantEvents {
                             room_id: self.room_id,
@@ -2147,6 +2173,7 @@ impl SyncEngine {
                 let have = self.membership_have();
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     out.push(Outgoing {
+                        fanout: false,
                         peer,
                         msg: SyncMessage::WantMembership {
                             room_id: self.room_id,
@@ -2463,6 +2490,7 @@ impl SyncEngine {
             for chunk in to_fetch.chunks(self.config.max_backfill_fanout_ids) {
                 for peer in self.peers.iter().copied().collect::<Vec<_>>() {
                     out.push(Outgoing {
+                        fanout: false,
                         peer,
                         msg: SyncMessage::WantEvents {
                             room_id: self.room_id,
@@ -2695,7 +2723,7 @@ impl SyncEngine {
 
 /// Build an [`Outgoing`] addressed to `peer`.
 fn to(peer: PeerId, msg: SyncMessage) -> Outgoing {
-    Outgoing { peer, msg }
+    Outgoing { peer, msg, fanout: false }
 }
 
 /// Cheap pre-validation parse for the early event-id dedup path (issue #143 /
