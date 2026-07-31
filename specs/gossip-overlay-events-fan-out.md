@@ -614,8 +614,10 @@ Run the existing test suites unchanged and green:
 4. The AC passes iff: no cascade at 1 event/s, connectedness >95%, delivery >95% at every N.
 
 > **Status 2026-07-31 (supersedes 2026-07-30): the 2026-07-30 failure was a
-> harness artifact; the AC as written now PASSES on loopback, but a new,
-> genuine hub-overload limit was found above the AC's rate.** The 2026-07-30
+> harness artifact; the measured legs (N=5, N=40) now meet the AC thresholds
+> at 1 event/s on loopback — the AC itself remains PENDING because its
+> N=10/20 legs have never been run — and a new, genuine hub-overload limit
+> was found above the AC's rate.** The 2026-07-30
 > all-load-legs collapse was diagnosed (three-reader + decisive-experiment +
 > adversarial-verification workflow) as the spike workload parenting its
 > admin-authored load chain on genesis, deriving `admin_seq = 1` for its first
@@ -626,7 +628,8 @@ Run the existing test suites unchanged and green:
 > (`crates/spike-N40/results/2026-07-31-gossip-matrix.json`) shows:
 >
 > - **1 event/s: clean at N=5 and N=40** (delivery 60/60 on every node, no
->   cascade, zero spawn failures) — the AC above passes on loopback.
+>   cascade, zero spawn failures) — the AC's thresholds hold at both measured
+>   sizes; N=10 and N=20 remain unmeasured, so the AC stays unchecked.
 > - **5 events/s: clean at N=5; N=40 cascades** with a real hub-overload
 >   signature — 28,087 queue saturations, reconnect churn peaking 1,769/s, the
 >   three highest-degree hub nodes stalling at ~100/300 while 37/40 leaves

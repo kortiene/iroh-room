@@ -45,8 +45,10 @@ Caveats that apply to every row (spec §4 D1 / D3 / §6.6 / §13 risk 3,5,6):
   `iroh-gossip` form the bounded seed topology, rather than dialing every
   ordered pair. `connected entries` are therefore `connected / (N × K)` warm
   seed links, not `N × (N - 1)` full-mesh entries.
-- `rss_per_node_est` is derived from process RSS / N, not a true per-process
-  measurement.
+- `rss_per_node_est` is `(process RSS − pre-spawn baseline RSS) / N`
+  (`metrics.rs::cluster_metrics`), not a true per-process measurement — it is
+  the cluster's *incremental* RSS spread over N, so it understates what a
+  standalone node would report.
 - `dial loops/node` is the live warm dial count (bounded by the seed selector),
   read from `Node::dial_count()`.
 - **The documented one-shot matrix invocation aborts after its first row.**
@@ -90,9 +92,11 @@ Caveats that apply to every row (spec §4 D1 / D3 / §6.6 / §13 risk 3,5,6):
   parent, every node accepts every published event (60/60) at N=5 and N=40,
   connected entries hold at their idle values (18/15 and 300/120), dial loops
   stay at 3, and no cascade trigger fires. `gossip.mesh.spawn_failed`, join
-  timeouts, and equivocations are all **zero**. This is the spec's Step 7
-  acceptance criterion ("no cascade at 1 event/s, connectedness >95%, delivery
-  >95% at every N") passing on loopback.
+  timeouts, and equivocations are all **zero**. This meets the Step 7
+  acceptance thresholds ("no cascade at 1 event/s, connectedness >95%, delivery
+  >95%") at both measured sizes — but the AC quantifies over N=10/20/40, and
+  N=10/20 have never been run, so Step 7 itself remains **pending**, not
+  passed.
 - **5 events/s passes at N=5 and fails at N=40 with a hub-overload cascade.**
   The N=40 leg reaches full idle topology, then all four cascade triggers fire
   under load: 28,087 queue saturations, reconnect churn averaging 775.72/s
@@ -115,8 +119,9 @@ Caveats that apply to every row (spec §4 D1 / D3 / §6.6 / §13 risk 3,5,6):
 
 **Consequence for the 40-member cap.** The superseded 2026-07-30 conclusion
 ("the overlay loses topic membership under any load") is withdrawn: that was
-the harness manufacturing an admin fork. The corrected matrix supports the
-Step 7 AC as written — 1 event/s is clean at every measured N — but a
+the harness manufacturing an admin fork. The corrected matrix meets the
+Step 7 thresholds at every **measured** N (the AC's N=10/20 legs remain
+unrun, so the AC stays pending) — but a
 40-member room at 5 events/s collapses its hub nodes, and 5 events/s is a
 realistic busy-room rate. `MAX_ACTIVE_MEMBERS = 40` should stay held until the
 hub overload is either fixed (e.g. decoupling gossip delivery from the

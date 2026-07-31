@@ -980,7 +980,7 @@ fn render_run_document(results: &[ScenarioResult]) -> serde_json::Value {
         "relay": "disabled",
         "caveats": [
             "connect_mode records whether links were formed by full-mesh connect_to or managed gossip seeds",
-            "per-node RSS is derived from process RSS / N (D3)",
+            "per-node RSS is estimated as (process RSS - pre-spawn baseline RSS) / N (D3)",
             "writer/reader task counts are estimated from connected peer entries (risk 3)",
         ],
         "results": results,
