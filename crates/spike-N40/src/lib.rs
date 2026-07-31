@@ -145,7 +145,8 @@ impl RecordingAudit {
     #[must_use]
     pub fn queue_saturations_by_kind(&self) -> Vec<(&'static str, u64)> {
         let g = lock(&self.inner);
-        let mut by_kind: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+        let mut by_kind: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
         for ((_, kind), n) in &g.saturated {
             *by_kind.entry(kind).or_insert(0) += n;
         }

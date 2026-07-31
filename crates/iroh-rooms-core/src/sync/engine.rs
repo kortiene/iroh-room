@@ -792,7 +792,15 @@ impl SyncEngine {
     /// recovers it. The pulls carry `have` lists, so a converged peer's responses
     /// are empty and the mesh quiesces. `now_ms` is advisory (token refill is
     /// per-call, not clock-driven, to stay deterministic — spec R4).
+    ///
+    /// Pulls are bounded to `PULL_FANOUT_PEERS` peers per tick on a
+    /// deterministic rotating window (R6 hub-overload isolation) — see the
+    /// inline rationale at the window computation.
     pub fn on_tick(&mut self, _now_ms: u64) -> Vec<Outgoing> {
+        /// Max peers pulled from per tick. Rooms at or under this size pull
+        /// from everyone (identical to the pre-R6 behavior); larger rooms
+        /// sweep their peer set across consecutive ticks.
+        const PULL_FANOUT_PEERS: usize = 3;
         let mut out = Vec::new();
         // Advance the claim's rotating window (issue #113) — per tick, not per
         // peer, so every peer sees the same claim this round (determinism, R4).
@@ -820,11 +828,13 @@ impl SyncEngine {
         // (already advanced once per tick, deterministically), so successive
         // ticks sweep the whole peer set; the tiny `admin_tip_msg` still goes
         // to every peer (fork-detection latency is load-bearing).
-        const PULL_FANOUT_PEERS: usize = 3;
         let all_peers: Vec<_> = self.peers.iter().copied().collect();
         let pull_set: std::collections::BTreeSet<_> = if all_peers.len() <= PULL_FANOUT_PEERS {
             all_peers.iter().copied().collect()
         } else {
+            // Truncating u64 -> usize is fine: it feeds a modulus, where a
+            // wrapped rotation index only changes which window this tick gets.
+            #[allow(clippy::cast_possible_truncation)]
             let start = (self.claim_rotation as usize) % all_peers.len();
             (0..PULL_FANOUT_PEERS)
                 .map(|i| all_peers[(start + i) % all_peers.len()])
@@ -2723,7 +2733,11 @@ impl SyncEngine {
 
 /// Build an [`Outgoing`] addressed to `peer`.
 fn to(peer: PeerId, msg: SyncMessage) -> Outgoing {
-    Outgoing { peer, msg, fanout: false }
+    Outgoing {
+        peer,
+        msg,
+        fanout: false,
+    }
 }
 
 /// Cheap pre-validation parse for the early event-id dedup path (issue #143 /

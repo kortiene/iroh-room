@@ -2603,7 +2603,9 @@ mod tests {
             // encoded body on the room's gossip topic. `broadcast_events` is
             // fire-and-forget (spawns a task), so delivery is awaited below.
             let out = Outgoing {
-                fanout: false,
+                // This test simulates the engine's accept-path fan-out (the one
+                // emission that broadcasts under the R5 split): mark it so.
+                fanout: true,
                 peer: PeerId::from_bytes(*b_id.as_bytes()),
                 msg: SyncMessage::Events {
                     room_id: room,
@@ -2803,7 +2805,9 @@ mod tests {
             for n in 0..FANOUT_PEERS {
                 let peer = PeerId::from_bytes([0xC0 + n; 32]);
                 let out = Outgoing {
-                    fanout: false,
+                    // This test simulates the engine's accept-path fan-out (the one
+                    // emission that broadcasts under the R5 split): mark it so.
+                    fanout: true,
                     peer,
                     msg: SyncMessage::Events {
                         room_id: room,
