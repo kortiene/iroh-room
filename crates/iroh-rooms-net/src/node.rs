@@ -1539,7 +1539,13 @@ async fn pump(
                         // during its physical-close grace: the nonce-bound receipt
                         // proving its terminal removal reached the room store. It is
                         // consumed here before the live admission recheck and never
-                        // reaches the deterministic engine.
+                        // reaches the deterministic engine — but ONLY when it
+                        // actually matches a pending terminal confirmation (exact
+                        // device + room + ids + nonce). A non-matching
+                        // `EventsConfirmed` is not exempt: it falls through to the
+                        // admission recheck below like any other frame, so a
+                        // no-longer-admitted peer cannot inject receipts that are
+                        // silently swallowed past the gate (wire-tag-trust budget).
                         if let SyncMessage::EventsConfirmed {
                             room_id,
                             ids,
@@ -1548,12 +1554,13 @@ async fn pump(
                         {
                             if room_id == engine.room_id() {
                                 if let Some(device) = device {
-                                    let _ = shared.confirm_terminal_events(
+                                    if shared.confirm_terminal_events(
                                         device, room_id, ids, nonce,
-                                    );
+                                    ) {
+                                        continue;
+                                    }
                                 }
                             }
-                            continue;
                         }
 
                         // Admission is re-evaluated at dequeue time, not only when
@@ -1903,7 +1910,20 @@ fn route_all(engine: &SyncEngine, shared: &Arc<Shared>, outs: Vec<Outgoing>) {
 /// Locate an exact removal of `out.peer` in a trusted engine-produced Events
 /// batch. The post-fold snapshot retains inactive members' device bindings, so
 /// the target comparison remains available after the removal was applied.
+///
+/// Only a **live fan-out** (`out.fanout`, the accept-path push of a freshly
+/// accepted event) can be a terminal removal: it is the one emission carrying a
+/// *new* removal to the device being removed. A targeted serve or backfill
+/// (`fanout == false`) may legitimately carry a **historical** `member.removed`
+/// naming the recipient (e.g. a re-invited device pulling the membership closure
+/// that contains its own past removal); treating that as terminal would wrongly
+/// truncate the serve, install a spurious receipt-pending entry, and seal the
+/// peer's output. Gating on `fanout` keeps the receipt lifecycle scoped to the
+/// fresh-removal push it exists for.
 fn terminal_removal(snapshot: &MembershipSnapshot, out: &Outgoing) -> Option<(usize, EventId)> {
+    if !out.fanout {
+        return None;
+    }
     let SyncMessage::Events { frames, .. } = &out.msg else {
         return None;
     };
@@ -2346,6 +2366,203 @@ mod admission_refresher_tests {
                 AdmissionDecision::Reject(RejectCause::NotActive)
             ),
             "a removed device must be rejected as NotActive after the removal fold"
+        );
+    }
+}
+
+/// Tests for the `terminal_removal` classifier (PR #194 review follow-up): the
+/// receipt-bearing terminal envelope is scoped to a **fresh** removal being
+/// pushed live (`fanout == true`). A targeted serve/backfill (`fanout == false`)
+/// may carry a historical `member.removed` naming the recipient and must NOT be
+/// misclassified as terminal.
+#[cfg(test)]
+mod terminal_removal_tests {
+    use iroh::{EndpointId, SecretKey};
+    use iroh_rooms_core::event::binding::DeviceBinding;
+    use iroh_rooms_core::event::content::{
+        capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved,
+        RoomCreated,
+    };
+    use iroh_rooms_core::event::ids::{EventId, RoomId};
+    use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+    use iroh_rooms_core::event::signed::{self, SignedEvent};
+    use iroh_rooms_core::event::validate::{
+        validate_wire_bytes, ValidatedEvent, ValidationContext,
+    };
+    use iroh_rooms_core::event::wire::WireEvent;
+    use iroh_rooms_core::membership::{MembershipSnapshot, RoomMembership};
+    use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
+
+    use super::terminal_removal;
+
+    const NONCE: [u8; 16] = [0xbd; 16];
+    const T0: u64 = 1_780_000_000_000;
+
+    struct Actor {
+        id: SigningKey,
+        dev: SigningKey,
+    }
+
+    impl Actor {
+        fn new(seed: u8) -> Self {
+            Self {
+                id: SigningKey::from_seed(&[seed; 32]),
+                dev: SigningKey::from_seed(&[seed.wrapping_add(0x80); 32]),
+            }
+        }
+        fn identity(&self) -> IdentityKey {
+            self.id.identity_key()
+        }
+        fn endpoint_id(&self) -> EndpointId {
+            SecretKey::from_bytes(&self.dev.to_seed()).public()
+        }
+    }
+
+    fn validate(ev: &SignedEvent, dev: &SigningKey, room_id: RoomId) -> ValidatedEvent {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        let bytes = WireEvent::seal(csb, sig).to_bytes();
+        validate_wire_bytes(&bytes, &ValidationContext::for_room(room_id))
+            .expect("test event must be stateless-valid")
+    }
+
+    fn seal(ev: &SignedEvent, dev: &SigningKey) -> Vec<u8> {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        WireEvent::seal(csb, sig).to_bytes()
+    }
+
+    /// Build the two-member snapshot (admin + member Active), and the verbatim
+    /// wire bytes of a `member.removed` for `member` parented on the join.
+    /// Returns (post-removal snapshot, removal frame bytes, removal `EventId`,
+    /// member endpoint id).
+    fn removal_fixture() -> (MembershipSnapshot, Vec<u8>, EventId, EndpointId) {
+        let admin = Actor::new(0x61);
+        let member = Actor::new(0x62);
+        let room = signed::derive_room_id(&admin.identity(), &NONCE, T0);
+        let genesis = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::RoomCreated,
+            created_at: T0,
+            prev_events: vec![],
+            content: Content::RoomCreated(RoomCreated {
+                room_name: "terminal-removal".to_owned(),
+                room_nonce: NONCE,
+                admins: vec![admin.identity()],
+                device_binding: DeviceBinding::create(&room, &admin.id, admin.dev.device_key()),
+            }),
+        };
+        let gid = genesis.event_id();
+        let invite_id = [0x41; 16];
+        let secret = [0x51; 16];
+        let invite = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: T0 + 1,
+            prev_events: vec![gid],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: capability_hash(&room, &invite_id, &secret),
+                role: "member".to_owned(),
+                invitee_key: member.identity(),
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        let iid = invite.event_id();
+        let join = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: member.identity(),
+            device_id: member.dev.device_key(),
+            event_type: EventType::MemberJoined,
+            created_at: T0 + 2,
+            prev_events: vec![iid],
+            content: Content::MemberJoined(MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: secret,
+                role: "member".to_owned(),
+                device_binding: DeviceBinding::create(&room, &member.id, member.dev.device_key()),
+                display_name: None,
+            }),
+        };
+        let jid = join.event_id();
+        let remove = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::MemberRemoved,
+            created_at: T0 + 3,
+            prev_events: vec![jid],
+            content: Content::MemberRemoved(MemberRemoved {
+                member_id: member.identity(),
+                removed_by: admin.identity(),
+                reason: None,
+                device_binding: None,
+            }),
+        };
+        let remove_id = remove.event_id();
+        let remove_bytes = seal(&remove, &admin.dev);
+        let snapshot = RoomMembership::from_events(
+            room,
+            [
+                validate(&genesis, &admin.dev, room),
+                validate(&invite, &admin.dev, room),
+                validate(&join, &member.dev, room),
+                validate(&remove, &admin.dev, room),
+            ],
+        )
+        .snapshot();
+        (snapshot, remove_bytes, remove_id, member.endpoint_id())
+    }
+
+    /// A live fan-out push (`fanout == true`) of a fresh removal to the removed
+    /// device IS terminal: the receipt lifecycle applies.
+    #[test]
+    fn live_fanout_removal_is_terminal() {
+        let (snapshot, remove_bytes, remove_id, member_dev) = removal_fixture();
+        let out = Outgoing {
+            fanout: true,
+            peer: PeerId::from_bytes(*member_dev.as_bytes()),
+            msg: SyncMessage::Events {
+                room_id: RoomId::from_bytes([0x00; 32]),
+                frames: vec![remove_bytes],
+            },
+        };
+        let found = terminal_removal(&snapshot, &out);
+        assert_eq!(
+            found,
+            Some((0, remove_id)),
+            "a fresh removal pushed live to the removed device must be classified terminal"
+        );
+    }
+
+    /// A targeted serve/backfill (`fanout == false`) that carries a historical
+    /// removal naming the recipient is NOT terminal: the recipient may be a
+    /// re-invited device pulling the membership closure that contains its own
+    /// past removal. Misclassifying it would truncate the serve and seal output.
+    #[test]
+    fn backfill_carrying_historical_removal_is_not_terminal() {
+        let (snapshot, remove_bytes, _remove_id, member_dev) = removal_fixture();
+        let out = Outgoing {
+            fanout: false,
+            peer: PeerId::from_bytes(*member_dev.as_bytes()),
+            msg: SyncMessage::Events {
+                room_id: RoomId::from_bytes([0x00; 32]),
+                frames: vec![remove_bytes],
+            },
+        };
+        assert_eq!(
+            terminal_removal(&snapshot, &out),
+            None,
+            "a backfill serve carrying a historical removal must not be classified terminal"
         );
     }
 }
