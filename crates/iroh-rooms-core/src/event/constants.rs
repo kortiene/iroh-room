@@ -79,9 +79,17 @@ pub const ENCRYPTED_NONCE_LEN: usize = 12;
 pub const ENCRYPTED_TAG_LEN: usize = 16;
 
 /// Maximum canonical-CBOR plaintext bytes for an encrypted `message.text`
-/// body (spec D2a): the §7 body cap plus headroom for `format`,
-/// `in_reply_to`, `mentions` at the v1 room ceiling (N≤40 → ~1.4 KiB), and
-/// map overhead.
+/// body (spec D2a): the §7 body cap plus 4 KiB headroom for `format`,
+/// `in_reply_to`, `mentions`, and map overhead.
+///
+/// Like [`MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT`], this is a deliberate **new,
+/// tighter authoring bound**, not a restatement of plaintext validity:
+/// plaintext `message.text` places no count cap on `mentions`, so a
+/// max-length body with more than ~120 mentions is strictly valid in
+/// plaintext yet cannot be sealed within this bound (the headroom covers
+/// ~120 mentions; the v1 room ceiling is N≤40). The R2 writer must keep the
+/// plaintext CBOR under this cap before sealing — the bound is fail-closed
+/// only and never widens what a reader accepts.
 pub const MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT: usize = MAX_MESSAGE_BODY_BYTES + 4096;
 
 /// Maximum canonical-CBOR plaintext bytes for an encrypted `file.shared` body

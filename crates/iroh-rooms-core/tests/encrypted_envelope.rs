@@ -26,7 +26,7 @@
 use iroh_rooms_core::event::cbor::{self, CborValue};
 use iroh_rooms_core::event::constants::{
     ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN,
-    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT,
+    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
 };
 use iroh_rooms_core::event::content::{Content, EncryptedContent, EventType, MessageText};
 use iroh_rooms_core::event::ids::EventId;
@@ -235,11 +235,19 @@ fn base_entries() -> Vec<(&'static str, CborValue)> {
     ]
 }
 
-fn with_entry(key: &'static str, value: &CborValue) -> Vec<(&'static str, CborValue)> {
-    base_entries()
+fn replace_entry(
+    entries: Vec<(&'static str, CborValue)>,
+    key: &'static str,
+    value: &CborValue,
+) -> Vec<(&'static str, CborValue)> {
+    entries
         .into_iter()
         .map(|(k, v)| if k == key { (k, value.clone()) } else { (k, v) })
         .collect()
+}
+
+fn with_entry(key: &'static str, value: &CborValue) -> Vec<(&'static str, CborValue)> {
+    replace_entry(base_entries(), key, value)
 }
 
 fn expect_invalid(entries: Vec<(&'static str, CborValue)>, what: &str) {
@@ -319,6 +327,41 @@ fn ciphertext_bounds_are_exact() {
             "an out-of-bounds ciphertext",
         );
     }
+}
+
+/// The D2a cap dispatches **per inner type**: the same ciphertext length is
+/// out-of-bounds for `pipe.closed` (cap 1,024) yet in-bounds for
+/// `message.text` (cap 20,480). A regression collapsing
+/// `EventType::max_encrypted_plaintext_bytes` to one constant fails here.
+#[test]
+fn ciphertext_cap_dispatches_per_inner_type() {
+    let pipe_closed_cap = MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT + ENCRYPTED_TAG_LEN;
+    let as_pipe_closed = |len: usize| {
+        replace_entry(
+            with_entry("inner_type", &CborValue::Text("pipe.closed".to_owned())),
+            "ciphertext",
+            &CborValue::Bytes(vec![0x5a; len]),
+        )
+    };
+
+    // Exactly at the pipe.closed cap: accepted.
+    let bytes = envelope_bytes_with(as_pipe_closed(pipe_closed_cap));
+    validate_wire_bytes(&bytes, &ValidationContext::for_room(room_a()))
+        .expect("pipe.closed ciphertext at its own cap must validate");
+
+    // One byte over the pipe.closed cap: rejected for pipe.closed...
+    expect_invalid(
+        as_pipe_closed(pipe_closed_cap + 1),
+        "a ciphertext over the pipe.closed cap",
+    );
+
+    // ...while the identical length is fine under message.text's larger cap.
+    let bytes = envelope_bytes_with(with_entry(
+        "ciphertext",
+        &CborValue::Bytes(vec![0x5a; pipe_closed_cap + 1]),
+    ));
+    validate_wire_bytes(&bytes, &ValidationContext::for_room(room_a()))
+        .expect("the same length must be in-bounds for message.text");
 }
 
 /// The strict key set: a missing required key and an unknown extra key are
@@ -424,22 +467,36 @@ mod engine {
     }
 
     /// D8 phase R1: `publish` refuses a locally-authored envelope with the
-    /// typed writers-disabled error — before any persist or fan-out.
+    /// typed writers-disabled error — **before** any persist or fan-out: the
+    /// refused event must not enter the validated set.
     #[test]
     fn publish_rejects_locally_authored_envelope() {
         let mut engine = fresh_engine();
         engine
             .publish(&seal(&genesis_event()))
             .expect("genesis publishes");
+
+        let refused =
+            live_encrypted_event(EventType::MessageText, vec![0x5a; ENCRYPTED_TAG_LEN + 32]);
+        let refused_id = refused.event_id();
         let err = engine
-            .publish(&seal(&live_encrypted_event(
-                EventType::MessageText,
-                vec![0x5a; ENCRYPTED_TAG_LEN + 32],
-            )))
+            .publish(&seal(&refused))
             .expect_err("R1 must refuse a locally-authored content.encrypted");
         assert!(
             matches!(err, SyncError::EncryptedWritesDisabled),
             "expected the writers-disabled error, got: {err}"
+        );
+
+        // The gate must run before deliver(): nothing persisted, no fan-out.
+        let digest = engine.digest().expect("digest");
+        assert!(
+            !digest.event_ids.contains(&refused_id),
+            "a refused envelope must not be persisted"
+        );
+        assert_eq!(
+            digest.event_ids.len(),
+            1,
+            "only the genesis may be in the validated set"
         );
     }
 
@@ -472,6 +529,173 @@ mod engine {
             assert!(
                 digest.event_ids.contains(&encrypted_id),
                 "the encrypted event must be in {node:?}'s validated set"
+            );
+        }
+    }
+
+    /// The envelope is **chat-class** (`is_chat_class`): it must travel the
+    /// bounded recent-chat window like the bodies it wraps — otherwise R2
+    /// writers' events would be invisible to R1 readers' window pulls,
+    /// defeating reader-first. With a 1-event window and three chat siblings,
+    /// the window serves only its canonical-order tail: the encrypted event
+    /// must fill the slot and the plaintext siblings must NOT arrive by any
+    /// other path. (Verified discriminating: dropping `ContentEncrypted` from
+    /// `is_chat_class` fails this test, while the plain convergence test
+    /// above still passes under that mutation.)
+    #[test]
+    #[allow(clippy::too_many_lines)] // fully-specified invite/join/chat cast inline for clarity
+    fn envelope_travels_the_bounded_chat_window() {
+        // Chat-class means non-admin-authored: alice (the admin) would stamp
+        // admin_seq on her events and sync them via the never-windowed admin
+        // chain. Bob, a plain member, authors the chat here.
+        let bob_identity_secret = SigningKey::from_seed(&[0x10; 32]);
+        let bob_device_secret = SigningKey::from_seed(&[0x90; 32]);
+        let bob = bob_identity_secret.identity_key();
+
+        let genesis = genesis_event();
+        let invite_id = [0x01; 16];
+        let invite_secret = [0x41; 16];
+        let invite = SignedEvent {
+            schema_version: 1,
+            room_id: room_a(),
+            sender_id: alice_identity(),
+            device_id: alice_device_secret().device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: ROOM_CREATED_AT + 1,
+            prev_events: vec![genesis.event_id()],
+            content: Content::MemberInvited(iroh_rooms_core::event::content::MemberInvited {
+                invite_id,
+                capability_hash: iroh_rooms_core::event::capability_hash(
+                    &room_a(),
+                    &invite_id,
+                    &invite_secret,
+                ),
+                role: "member".to_owned(),
+                invitee_key: bob,
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        let join = SignedEvent {
+            schema_version: 1,
+            room_id: room_a(),
+            sender_id: bob,
+            device_id: bob_device_secret.device_key(),
+            event_type: EventType::MemberJoined,
+            created_at: ROOM_CREATED_AT + 2,
+            prev_events: vec![invite.event_id()],
+            content: Content::MemberJoined(iroh_rooms_core::event::content::MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: invite_secret,
+                role: "member".to_owned(),
+                device_binding: DeviceBinding::create(
+                    &room_a(),
+                    &bob_identity_secret,
+                    bob_device_secret.device_key(),
+                ),
+                display_name: None,
+            }),
+        };
+
+        let bob_message = |body: &str, created_at: u64| SignedEvent {
+            schema_version: 1,
+            room_id: room_a(),
+            sender_id: bob,
+            device_id: bob_device_secret.device_key(),
+            event_type: EventType::MessageText,
+            created_at,
+            prev_events: vec![join.event_id()],
+            content: Content::MessageText(MessageText {
+                body: body.to_owned(),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        let msg1 = bob_message("first plaintext", ENCRYPTED_CREATED_AT - 2);
+        let msg2 = bob_message("second plaintext", ENCRYPTED_CREATED_AT - 1);
+
+        let bob_encrypted = |fill: u8| SignedEvent {
+            schema_version: 1,
+            room_id: room_a(),
+            sender_id: bob,
+            device_id: bob_device_secret.device_key(),
+            event_type: EventType::ContentEncrypted,
+            created_at: ENCRYPTED_CREATED_AT,
+            prev_events: vec![join.event_id()],
+            content: Content::Encrypted(EncryptedContent {
+                inner_type: EventType::MessageText,
+                key_epoch: 1,
+                suite: ENCRYPTED_SUITE_V1,
+                nonce: GOLDEN_NONCE,
+                ciphertext: vec![fill; 64],
+            }),
+        };
+        // All three chat events are equal-lamport siblings of bob's join, so
+        // the 1-event window serves the max **event id** among them. Event ids
+        // are hashes, so pick the first ciphertext fill byte that makes the
+        // envelope sort last — deterministic for fixed fixtures, and
+        // self-adjusting if an encoding change ever reshuffles the ids.
+        let encrypted = (0u8..=255)
+            .map(bob_encrypted)
+            .find(|ev| ev.event_id() > msg1.event_id() && ev.event_id() > msg2.event_id())
+            .expect("some fill byte makes the envelope sort last among the siblings");
+
+        let bob_seal = |ev: &SignedEvent| {
+            let csb = ev.to_csb();
+            let sig = signed::sign_csb(&csb, &bob_device_secret);
+            WireEvent::seal(csb, sig).to_bytes()
+        };
+
+        let mut net = SimNet::new(room_a());
+        net.add_peer(NODE_A, fresh_engine());
+        let tight = iroh_rooms_core::sync::SyncConfig {
+            chat_window_default: 1,
+            ..iroh_rooms_core::sync::SyncConfig::default()
+        };
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        net.add_peer(
+            NODE_B,
+            SyncEngine::open(store, room_a(), tight).expect("open engine"),
+        );
+
+        net.engine_mut(NODE_A)
+            .publish(&seal(&genesis))
+            .expect("genesis publishes");
+        net.engine_mut(NODE_A)
+            .publish(&seal(&invite))
+            .expect("invite publishes");
+        for frame in [bob_seal(&join), bob_seal(&msg1), bob_seal(&msg2)] {
+            net.engine_mut(NODE_A)
+                .ingest_frame(PeerId::from_bytes([0xC3; 32]), &frame);
+        }
+        // The envelope enters via ingest too (the R1 gate blocks local publish).
+        net.engine_mut(NODE_A)
+            .ingest_frame(PeerId::from_bytes([0xC3; 32]), &bob_seal(&encrypted));
+
+        // Sanity: node A accepted all of bob's events.
+        let a = net.engine(NODE_A).digest().expect("digest");
+        for (name, id) in [
+            ("join", join.event_id()),
+            ("msg1", msg1.event_id()),
+            ("msg2", msg2.event_id()),
+            ("encrypted", encrypted.event_id()),
+        ] {
+            assert!(a.event_ids.contains(&id), "node A must hold {name}");
+        }
+
+        net.connect(NODE_A, NODE_B);
+        net.run_to_quiescence();
+
+        let b = net.engine(NODE_B).digest().expect("digest");
+        assert!(
+            b.event_ids.contains(&encrypted.event_id()),
+            "the encrypted event must arrive via the bounded chat window"
+        );
+        for (name, ev) in [("msg1", &msg1), ("msg2", &msg2)] {
+            assert!(
+                !b.event_ids.contains(&ev.event_id()),
+                "{name} is outside the 1-event window and must not arrive"
             );
         }
     }
