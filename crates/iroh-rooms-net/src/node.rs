@@ -1539,7 +1539,13 @@ async fn pump(
                         // during its physical-close grace: the nonce-bound receipt
                         // proving its terminal removal reached the room store. It is
                         // consumed here before the live admission recheck and never
-                        // reaches the deterministic engine.
+                        // reaches the deterministic engine — but ONLY when it
+                        // actually matches a pending terminal confirmation (exact
+                        // device + room + ids + nonce). A non-matching
+                        // `EventsConfirmed` is not exempt: it falls through to the
+                        // admission recheck below like any other frame, so a
+                        // no-longer-admitted peer cannot inject receipts that are
+                        // silently swallowed past the gate (wire-tag-trust budget).
                         if let SyncMessage::EventsConfirmed {
                             room_id,
                             ids,
@@ -1548,12 +1554,13 @@ async fn pump(
                         {
                             if room_id == engine.room_id() {
                                 if let Some(device) = device {
-                                    let _ = shared.confirm_terminal_events(
+                                    if shared.confirm_terminal_events(
                                         device, room_id, ids, nonce,
-                                    );
+                                    ) {
+                                        continue;
+                                    }
                                 }
                             }
-                            continue;
                         }
 
                         // Admission is re-evaluated at dequeue time, not only when
@@ -1568,6 +1575,29 @@ async fn pump(
                         });
                         if !admitted {
                             tracing::debug!(peer = %inbound.peer, "pump: dropping frame from no-longer-admitted peer");
+                            continue;
+                        }
+
+                        // Self-standing recheck for gossip-origin frames (the
+                        // gossip-plane leak, PR #197 review). The gossip receiver
+                        // task authorizes `shared.me` *before* enqueueing, but it
+                        // runs concurrently with this pump: if the pump folds a
+                        // self-removal between that authorize and this dequeue, the
+                        // queued frame would still be ingested while the local
+                        // device is already removed. Re-checking here — on the
+                        // single pump task, where fold mutation and ingestion are
+                        // serialized — closes that in-flight race. Direct-link
+                        // frames are unaffected: their accept gate already rejects
+                        // a removed peer's connection.
+                        if inbound.via_gossip
+                            && matches!(
+                                shared.admission.authorize(shared.me),
+                                AdmissionDecision::Reject(_)
+                            )
+                        {
+                            tracing::debug!(
+                                "pump: dropping gossip frame; local device is no longer admitted"
+                            );
                             continue;
                         }
 
@@ -1903,7 +1933,20 @@ fn route_all(engine: &SyncEngine, shared: &Arc<Shared>, outs: Vec<Outgoing>) {
 /// Locate an exact removal of `out.peer` in a trusted engine-produced Events
 /// batch. The post-fold snapshot retains inactive members' device bindings, so
 /// the target comparison remains available after the removal was applied.
+///
+/// Only a **live fan-out** (`out.fanout`, the accept-path push of a freshly
+/// accepted event) can be a terminal removal: it is the one emission carrying a
+/// *new* removal to the device being removed. A targeted serve or backfill
+/// (`fanout == false`) may legitimately carry a **historical** `member.removed`
+/// naming the recipient (e.g. a re-invited device pulling the membership closure
+/// that contains its own past removal); treating that as terminal would wrongly
+/// truncate the serve, install a spurious receipt-pending entry, and seal the
+/// peer's output. Gating on `fanout` keeps the receipt lifecycle scoped to the
+/// fresh-removal push it exists for.
 fn terminal_removal(snapshot: &MembershipSnapshot, out: &Outgoing) -> Option<(usize, EventId)> {
+    if !out.fanout {
+        return None;
+    }
     let SyncMessage::Events { frames, .. } = &out.msg else {
         return None;
     };
@@ -2350,6 +2393,203 @@ mod admission_refresher_tests {
     }
 }
 
+/// Tests for the `terminal_removal` classifier (PR #194 review follow-up): the
+/// receipt-bearing terminal envelope is scoped to a **fresh** removal being
+/// pushed live (`fanout == true`). A targeted serve/backfill (`fanout == false`)
+/// may carry a historical `member.removed` naming the recipient and must NOT be
+/// misclassified as terminal.
+#[cfg(test)]
+mod terminal_removal_tests {
+    use iroh::{EndpointId, SecretKey};
+    use iroh_rooms_core::event::binding::DeviceBinding;
+    use iroh_rooms_core::event::content::{
+        capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved,
+        RoomCreated,
+    };
+    use iroh_rooms_core::event::ids::{EventId, RoomId};
+    use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+    use iroh_rooms_core::event::signed::{self, SignedEvent};
+    use iroh_rooms_core::event::validate::{
+        validate_wire_bytes, ValidatedEvent, ValidationContext,
+    };
+    use iroh_rooms_core::event::wire::WireEvent;
+    use iroh_rooms_core::membership::{MembershipSnapshot, RoomMembership};
+    use iroh_rooms_core::sync::{Outgoing, PeerId, SyncMessage};
+
+    use super::terminal_removal;
+
+    const NONCE: [u8; 16] = [0xbd; 16];
+    const T0: u64 = 1_780_000_000_000;
+
+    struct Actor {
+        id: SigningKey,
+        dev: SigningKey,
+    }
+
+    impl Actor {
+        fn new(seed: u8) -> Self {
+            Self {
+                id: SigningKey::from_seed(&[seed; 32]),
+                dev: SigningKey::from_seed(&[seed.wrapping_add(0x80); 32]),
+            }
+        }
+        fn identity(&self) -> IdentityKey {
+            self.id.identity_key()
+        }
+        fn endpoint_id(&self) -> EndpointId {
+            SecretKey::from_bytes(&self.dev.to_seed()).public()
+        }
+    }
+
+    fn validate(ev: &SignedEvent, dev: &SigningKey, room_id: RoomId) -> ValidatedEvent {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        let bytes = WireEvent::seal(csb, sig).to_bytes();
+        validate_wire_bytes(&bytes, &ValidationContext::for_room(room_id))
+            .expect("test event must be stateless-valid")
+    }
+
+    fn seal(ev: &SignedEvent, dev: &SigningKey) -> Vec<u8> {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        WireEvent::seal(csb, sig).to_bytes()
+    }
+
+    /// Build the two-member snapshot (admin + member Active), and the verbatim
+    /// wire bytes of a `member.removed` for `member` parented on the join.
+    /// Returns (post-removal snapshot, removal frame bytes, removal `EventId`,
+    /// member endpoint id).
+    fn removal_fixture() -> (MembershipSnapshot, Vec<u8>, EventId, EndpointId) {
+        let admin = Actor::new(0x61);
+        let member = Actor::new(0x62);
+        let room = signed::derive_room_id(&admin.identity(), &NONCE, T0);
+        let genesis = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::RoomCreated,
+            created_at: T0,
+            prev_events: vec![],
+            content: Content::RoomCreated(RoomCreated {
+                room_name: "terminal-removal".to_owned(),
+                room_nonce: NONCE,
+                admins: vec![admin.identity()],
+                device_binding: DeviceBinding::create(&room, &admin.id, admin.dev.device_key()),
+            }),
+        };
+        let gid = genesis.event_id();
+        let invite_id = [0x41; 16];
+        let secret = [0x51; 16];
+        let invite = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: T0 + 1,
+            prev_events: vec![gid],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: capability_hash(&room, &invite_id, &secret),
+                role: "member".to_owned(),
+                invitee_key: member.identity(),
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        let iid = invite.event_id();
+        let join = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: member.identity(),
+            device_id: member.dev.device_key(),
+            event_type: EventType::MemberJoined,
+            created_at: T0 + 2,
+            prev_events: vec![iid],
+            content: Content::MemberJoined(MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: secret,
+                role: "member".to_owned(),
+                device_binding: DeviceBinding::create(&room, &member.id, member.dev.device_key()),
+                display_name: None,
+            }),
+        };
+        let jid = join.event_id();
+        let remove = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::MemberRemoved,
+            created_at: T0 + 3,
+            prev_events: vec![jid],
+            content: Content::MemberRemoved(MemberRemoved {
+                member_id: member.identity(),
+                removed_by: admin.identity(),
+                reason: None,
+                device_binding: None,
+            }),
+        };
+        let remove_id = remove.event_id();
+        let remove_bytes = seal(&remove, &admin.dev);
+        let snapshot = RoomMembership::from_events(
+            room,
+            [
+                validate(&genesis, &admin.dev, room),
+                validate(&invite, &admin.dev, room),
+                validate(&join, &member.dev, room),
+                validate(&remove, &admin.dev, room),
+            ],
+        )
+        .snapshot();
+        (snapshot, remove_bytes, remove_id, member.endpoint_id())
+    }
+
+    /// A live fan-out push (`fanout == true`) of a fresh removal to the removed
+    /// device IS terminal: the receipt lifecycle applies.
+    #[test]
+    fn live_fanout_removal_is_terminal() {
+        let (snapshot, remove_bytes, remove_id, member_dev) = removal_fixture();
+        let out = Outgoing {
+            fanout: true,
+            peer: PeerId::from_bytes(*member_dev.as_bytes()),
+            msg: SyncMessage::Events {
+                room_id: RoomId::from_bytes([0x00; 32]),
+                frames: vec![remove_bytes],
+            },
+        };
+        let found = terminal_removal(&snapshot, &out);
+        assert_eq!(
+            found,
+            Some((0, remove_id)),
+            "a fresh removal pushed live to the removed device must be classified terminal"
+        );
+    }
+
+    /// A targeted serve/backfill (`fanout == false`) that carries a historical
+    /// removal naming the recipient is NOT terminal: the recipient may be a
+    /// re-invited device pulling the membership closure that contains its own
+    /// past removal. Misclassifying it would truncate the serve and seal output.
+    #[test]
+    fn backfill_carrying_historical_removal_is_not_terminal() {
+        let (snapshot, remove_bytes, _remove_id, member_dev) = removal_fixture();
+        let out = Outgoing {
+            fanout: false,
+            peer: PeerId::from_bytes(*member_dev.as_bytes()),
+            msg: SyncMessage::Events {
+                room_id: RoomId::from_bytes([0x00; 32]),
+                frames: vec![remove_bytes],
+            },
+        };
+        assert_eq!(
+            terminal_removal(&snapshot, &out),
+            None,
+            "a backfill serve carrying a historical removal must not be classified terminal"
+        );
+    }
+}
+
 /// Test for the gossip-plane self-removal revocation (PR #195 follow-up, the
 /// "removed device keeps receiving" leak). `GossipReconciler::admitted_devices`
 /// builds its set from `desired_devices`, which excludes `self_device` — so
@@ -2616,5 +2856,143 @@ mod gossip_self_removal_tests {
         );
 
         endpoint.close().await;
+    }
+}
+
+/// Test for the pump-boundary self-standing recheck on gossip-origin frames
+/// (PR #197 review). The gossip receiver task authorizes `shared.me` *before*
+/// enqueueing, but it runs concurrently with the pump: a self-removal folded
+/// between that authorize and the pump's dequeue would otherwise let a queued
+/// gossip frame be ingested while the local device is already removed. The
+/// pump's dequeue gate re-checks `shared.me` for gossip-origin frames, closing
+/// the in-flight race. This drives `pump` directly with a gossip-ledger frame
+/// while the local device is NOT admitted, asserting the engine never ingests.
+#[cfg(all(test, feature = "gossip_overlay"))]
+mod pump_gossip_self_check_tests {
+    use std::sync::Arc;
+
+    use iroh_rooms_core::event::ids::RoomId;
+    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms_core::sync::{PeerId, SyncConfig, SyncEngine, SyncMessage};
+    use tokio::sync::{broadcast, mpsc};
+
+    use super::pump;
+    use crate::admission::{Admission, AdmissionDecision, AllowlistAdmission};
+    use crate::audit::TracingAudit;
+    use crate::demo;
+    use crate::transport::{NetConfig, NetTransport};
+
+    /// An admission gate that admits everyone EXCEPT the local device `me` —
+    /// standing in for the post-self-removal view: the neighbor is admitted,
+    /// the local device is not.
+    struct NotSelf {
+        me: iroh::EndpointId,
+        inner: AllowlistAdmission,
+    }
+
+    impl Admission for NotSelf {
+        fn authorize(&self, device: iroh::EndpointId) -> AdmissionDecision {
+            if device == self.me {
+                return AdmissionDecision::Reject(crate::admission::RejectCause::NotActive);
+            }
+            self.inner.authorize(device)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_drops_gossip_frame_when_self_not_admitted() {
+        let host = demo::Participant::new(0x21);
+        let neighbor = demo::Participant::new(0x22);
+        let (room, genesis_id, genesis_wire) = demo::genesis(&host);
+
+        // Bind a transport whose admission rejects the local device (self) but
+        // admits the neighbor. `me` is derived from the host's device secret.
+        let host_secret = host.iroh_secret();
+        let me = host_secret.public();
+        // Admit the neighbor in the inner gate so the frame passes the
+        // neighbor-admission check; ONLY the self-standing gate can drop it.
+        let neighbor_gate = AllowlistAdmission::new()
+            .bind_device(neighbor.endpoint_id(), neighbor.identity())
+            .set_active(neighbor.identity());
+        let admission: Arc<dyn Admission> = Arc::new(NotSelf {
+            me,
+            inner: neighbor_gate,
+        });
+        let mut transport = NetTransport::bind(
+            host_secret,
+            admission,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind transport");
+        let inbound_rx = transport.take_inbound().expect("take inbound");
+        let conn_rx = transport.conn_events();
+        let shared = transport.shared();
+
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let engine_room: RoomId = room;
+        let engine =
+            SyncEngine::open(store, engine_room, SyncConfig::default()).expect("open engine");
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_pipe_query_tx, pipe_query_rx) = mpsc::channel(8);
+        let (room_event_tx, mut room_event_rx) = broadcast::channel(16);
+
+        // Drive the real pump (unmanaged: no room reconciler, no live cell).
+        let pump_handle = tokio::spawn(pump(
+            engine,
+            inbound_rx,
+            conn_rx,
+            shared.clone(),
+            cmd_rx,
+            pipe_query_rx,
+            std::time::Duration::from_millis(50),
+            None,
+            room_event_tx,
+            None,
+            None,
+        ));
+
+        // Enqueue a gossip-origin Events frame carrying the (valid) genesis,
+        // delivered by the admitted neighbor. The neighbor passes the
+        // neighbor-admission gate; only the self-standing gate can drop it.
+        let frame = SyncMessage::Events {
+            room_id: room,
+            frames: vec![genesis_wire.clone()],
+        }
+        .encode();
+        shared
+            .try_enqueue_inbound_gossip(
+                PeerId::from_bytes(*neighbor.endpoint_id().as_bytes()),
+                frame,
+            )
+            .expect("enqueue gossip frame");
+
+        // Give the pump a few ticks to drain the inbound queue. If the frame
+        // were ingested, the genesis would be drained onto the room-events
+        // broadcast; it must NOT appear because the self-standing gate drops it.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut ingested = false;
+        while let Ok(ev) = room_event_rx.try_recv() {
+            if ev.event_id == genesis_id {
+                ingested = true;
+            }
+        }
+        assert!(
+            !ingested,
+            "a gossip frame must not be ingested while the local device is not admitted"
+        );
+
+        // Shut the pump down via its command channel (the only exit path).
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(super::Cmd::Shutdown(shutdown_tx))
+            .expect("send shutdown");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_rx).await;
+        pump_handle.await.expect("pump task joins");
+        transport.shutdown().await.expect("transport shutdown");
     }
 }
