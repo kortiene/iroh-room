@@ -24,8 +24,12 @@ where feasible); the **experimental** tier may change on any release.
   key store, rotation latency, and metadata-length residuals.
   **Wire-format note:** `member.removed` gains an optional `rotation` field
   and the new `member.key_distribution` event type joins the closed content
-  registry; both are backward-compatible additions — rc.4 peers parse and
-  persist them as ordinary events but do not adopt keys.
+  registry. These are **strict wire additions**: a pre-step-6 peer rejects
+  both the new event type and the new `rotation` field as unknown content
+  keys, so a room must upgrade every member past the step-6 compatibility
+  floor before enabling rotation (reader-first rollout, spec D8). The
+  reader-first `Content::Encrypted` envelope (step 3) is the prior floor;
+  this change adds the rotation events on top of it.
 - Fixed the three stacked defects behind the N=40 gossip-overlay load collapse
   (the reason rc.4 held #171/#173 out of shipped binaries), isolated by a
   seven-step single-variable experiment ladder on the corrected spike-N40

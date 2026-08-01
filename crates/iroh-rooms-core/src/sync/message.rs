@@ -46,6 +46,11 @@ pub(crate) const EVENTS_PER_FRAME_OVERHEAD: usize = 5;
 /// `"room"` / `"chunks"` array head. Measured under 40 bytes; 128 leaves margin.
 pub(crate) const KEY_HISTORY_ENVELOPE_ALLOWANCE: usize = 128;
 
+/// The maximum number of key-history chunks served in a single `KeyHistory`
+/// response (spec D6 rate bound). A requester with more missing epochs sends
+/// another `WantKeyHistory` with an updated `have_epochs` set.
+pub(crate) const MAX_KEY_HISTORY_CHUNKS_PER_RESPONSE: usize = 32;
+
 /// A transport peer address: the remote device id (`device_id` == iroh
 /// `EndpointId`). The engine fans out and directs pulls by this opaque id; it is
 /// independent of the membership identity the device is bound to.

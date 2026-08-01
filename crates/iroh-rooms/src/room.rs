@@ -41,7 +41,7 @@ pub use iroh_rooms_core::event::ids::RoomId; // also surfaced here for discovera
 pub use iroh_rooms_core::event::signed::derive_room_id;
 pub use iroh_rooms_core::event::{
     build_member_invited, build_member_joined, build_member_left, build_member_removed,
-    build_room_created,
+    build_member_removed_with_rotation, build_room_created,
 };
 pub use iroh_rooms_core::membership::{
     blob_serve_allowed, pipe_connect_allowed, AncestorView, BlobDecision, DenyReason, Ingest,

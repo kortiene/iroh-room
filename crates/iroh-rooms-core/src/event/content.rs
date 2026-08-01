@@ -873,12 +873,15 @@ fn parse_member_key_distribution(
 /// Parse a `MemberKeyDistribution` from a canonical CBOR map value.
 ///
 /// Exposed crate-internally so the sync layer can decode key-history chunks
-/// with the exact same wire shape (spec D6).
+/// with the exact same wire shape (spec D6). Unknown keys are rejected
+/// (strict closed schema, spec D2b).
 pub(crate) fn parse_member_key_distribution_value(
     value: &CborValue,
 ) -> Result<MemberKeyDistribution, RejectReason> {
     let mut f = Fields::new(value)?;
-    parse_member_key_distribution(&mut f)
+    let out = parse_member_key_distribution(&mut f)?;
+    f.finish()?;
+    Ok(out)
 }
 
 fn parse_wrapped_keys(

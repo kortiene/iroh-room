@@ -2554,6 +2554,7 @@ fn removal_with_rotation_converges_and_removed_device_reads_ciphertext_only() {
         &alice.dev,
         &room,
         &bob.identity(),
+        Some(bob.device()),
         None,
         None,
         Some(2),
@@ -2865,9 +2866,12 @@ fn key_history_transfer_unlocks_backlog_for_new_member() {
     );
 
     // Carol sends WantKeyHistory to alice; alice serves KeyHistory chunks; the
-    // response is delivered back to carol, who adopts the keys.
+    // response is delivered back to carol, who adopts the keys. The requester
+    // is identified by her device key (in the real transport, PeerId ==
+    // DeviceKey).
+    let carol_peer = PeerId::from_bytes(*carol.device().as_bytes());
     let out = net.engine_mut(NODE_A).on_message(
-        NODE_C,
+        carol_peer,
         SyncMessage::WantKeyHistory {
             room_id: room,
             have_epochs: std::collections::BTreeSet::new(),
@@ -2878,7 +2882,7 @@ fn key_history_transfer_unlocks_backlog_for_new_member() {
         "alice must serve at least one KeyHistory message"
     );
     for outgoing in out {
-        assert_eq!(outgoing.peer, NODE_C);
+        assert_eq!(outgoing.peer, carol_peer);
         let msg = outgoing.msg;
         let responses = net.engine_mut(NODE_C).on_message(NODE_A, msg);
         // Carol's adoption produces no outgoing messages; the fold/key store

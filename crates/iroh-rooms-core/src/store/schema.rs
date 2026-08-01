@@ -156,9 +156,10 @@ CREATE TABLE IF NOT EXISTS trust_decisions (
 -- ======================================================================
 
 CREATE TABLE IF NOT EXISTS room_keys (
-    room_id     BLOB    NOT NULL,                          -- 32 bytes
-    epoch       INTEGER NOT NULL,                          -- key_epoch
-    key         BLOB    NOT NULL,                          -- 32-byte room_key
+    room_id         BLOB    NOT NULL,                      -- 32 bytes
+    epoch           INTEGER NOT NULL,                      -- key_epoch
+    key             BLOB    NOT NULL,                      -- 32-byte room_key
+    source_event_id BLOB    NOT NULL,                      -- 32-byte adopting event_id
     PRIMARY KEY (room_id, epoch)
 ) STRICT;
 ";

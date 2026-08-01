@@ -253,10 +253,10 @@ fn encrypted_file_share_serves_hash_only_where_the_key_is_held() {
     net.add_peer(READER_WITH_KEY, engine_with(SyncConfig::default()));
     net.add_peer(READER_NO_KEY, engine_with(SyncConfig::default()));
     net.engine_mut(WRITER)
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("writer key");
     net.engine_mut(READER_WITH_KEY)
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("reader key");
 
     net.engine_mut(WRITER)
@@ -299,10 +299,10 @@ fn encrypted_pipe_lifecycle_feeds_the_gate_key_aware() {
     net.add_peer(READER_WITH_KEY, engine_with(SyncConfig::default()));
     net.add_peer(READER_NO_KEY, engine_with(SyncConfig::default()));
     net.engine_mut(WRITER)
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("writer key");
     net.engine_mut(READER_WITH_KEY)
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("reader key");
 
     net.engine_mut(WRITER)
@@ -417,7 +417,7 @@ fn unreadable_close_conservatively_closes_every_pipe() {
 fn unreadable_close_never_reopens_a_closed_pipe() {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("key held");
     engine
         .publish(&seal(&genesis_event()))
@@ -456,7 +456,7 @@ fn unreadable_close_never_reopens_a_closed_pipe() {
 fn sealed_but_invalid_bodies_feed_no_projection_even_with_the_key() {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("key held");
     engine
         .publish(&seal(&genesis_event()))
@@ -507,7 +507,7 @@ fn sealed_but_invalid_bodies_feed_no_projection_even_with_the_key() {
 fn assert_governing_open_for_ordering(encrypted_wins: bool) {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("key held");
     engine
         .publish(&seal(&genesis_event()))
@@ -579,7 +579,7 @@ fn governing_pipe_open_is_deterministic_when_encrypted_wins() {
 fn governing_pick_prefers_lower_lamport_over_lower_event_id() {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("key held");
     engine
         .publish(&seal(&genesis_event()))
@@ -636,7 +636,7 @@ fn governing_pick_prefers_lower_lamport_over_lower_event_id() {
 fn readable_encrypted_pipe_events_discriminate_on_pipe_id() {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("key held");
     engine
         .publish(&seal(&genesis_event()))
@@ -683,7 +683,7 @@ fn readable_encrypted_pipe_events_discriminate_on_pipe_id() {
 fn encrypted_file_shares_accumulate_with_plaintext() {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("key held");
     engine
         .publish(&seal(&genesis_event()))
@@ -729,7 +729,7 @@ fn encrypted_file_shares_accumulate_with_plaintext() {
 fn poisoned_epoch_fails_closed_through_all_three_reads() {
     let mut engine = engine_with(SyncConfig::default());
     engine
-        .insert_room_key(KEY_EPOCH, room_key())
+        .insert_room_key(KEY_EPOCH, &room_key())
         .expect("fresh key");
     engine
         .publish(&seal(&genesis_event()))
@@ -749,7 +749,7 @@ fn poisoned_epoch_fails_closed_through_all_three_reads() {
     assert!(engine.pipe_opened(&PIPE_ID).expect("lookup").is_some());
 
     engine
-        .insert_room_key(KEY_EPOCH, RoomKey::from_bytes([0xBB; 32]))
+        .insert_room_key(KEY_EPOCH, &RoomKey::from_bytes([0xBB; 32]))
         .expect_err("the conflicting offer poisons the epoch (D5a)");
 
     assert!(

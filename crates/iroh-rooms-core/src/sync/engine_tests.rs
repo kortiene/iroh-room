@@ -1746,6 +1746,7 @@ fn removal_with_rotation_adopts_epoch_key_for_remaining_member() {
         &admin_dev,
         &room,
         &member_id.identity_key(),
+        Some(member_dev.device_key()),
         None,
         None,
         Some(2),

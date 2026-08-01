@@ -34,8 +34,10 @@ enum EpochKeyState {
 pub(crate) struct ConflictCandidate {
     /// The distribution event that offered this key.
     pub event_id: EventId,
-    /// The offered key.
-    pub key: RoomKey,
+    /// The offered key, if this device was able to unwrap it. `None` when the
+    /// candidate is retained for commitment-only conflict detection (the local
+    /// device is not in the wrapped set).
+    pub key: Option<RoomKey>,
 }
 
 /// A same-epoch key conflict (spec D5a): the epoch is now poisoned.
@@ -79,7 +81,7 @@ impl EpochKeyStore {
                 // candidate, then poison the epoch.
                 let held_candidate = ConflictCandidate {
                     event_id: *held_id,
-                    key: held.clone(),
+                    key: Some(held.clone()),
                 };
                 self.epochs.insert(epoch, EpochKeyState::Poisoned);
                 self.candidates
@@ -101,6 +103,13 @@ impl EpochKeyStore {
         }
     }
 
+    /// Poison `epoch` directly (spec D5a), used when a fold-visible commitment
+    /// conflict is detected independently of unwrap ability. The held key, if
+    /// any, is dropped and the epoch fails closed until deterministic resolution.
+    pub fn poison(&mut self, epoch: u64) {
+        self.epochs.insert(epoch, EpochKeyState::Poisoned);
+    }
+
     /// Deterministically resolve a poisoned epoch (spec D5a step-6 rule). Among
     /// all retained candidates, the candidate whose `event_id` is
     /// lexicographically smallest wins and its key becomes the held key. If no
@@ -117,12 +126,16 @@ impl EpochKeyStore {
         let Some(list) = self.candidates.remove(&epoch) else {
             return false;
         };
+        // Only candidates whose key this device could unwrap are eligible to
+        // win; commitment-only candidates cannot become the held key.
         let winner = list
             .into_iter()
+            .filter(|c| c.key.is_some())
             .min_by(|a, b| a.event_id.as_bytes().cmp(b.event_id.as_bytes()));
         if let Some(winner) = winner {
+            let key = winner.key.expect("filtered to Some");
             self.epochs
-                .insert(epoch, EpochKeyState::Key(winner.key, winner.event_id));
+                .insert(epoch, EpochKeyState::Key(key, winner.event_id));
             true
         } else {
             false
@@ -256,7 +269,7 @@ mod tests {
             3,
             ConflictCandidate {
                 event_id: EventId::from_bytes([0x00; 32]),
-                key: key(0xCC),
+                key: Some(key(0xCC)),
             },
         );
         assert!(store.resolve(3));

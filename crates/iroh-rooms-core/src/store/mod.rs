@@ -1041,26 +1041,41 @@ impl EventStore {
     /// # Errors
     /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] on a
     /// malformed row.
-    pub fn load_room_keys(&self, room: &RoomId) -> Result<BTreeMap<u64, RoomKey>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT epoch, key FROM room_keys WHERE room_id = ?1 ORDER BY epoch")?;
+    pub fn load_room_keys(
+        &self,
+        room: &RoomId,
+    ) -> Result<BTreeMap<u64, (RoomKey, EventId)>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT epoch, key, source_event_id FROM room_keys WHERE room_id = ?1 ORDER BY epoch",
+        )?;
         let rows = stmt.query_map(params![&room.as_bytes()[..]], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
         })?;
         let mut out = BTreeMap::new();
         for r in rows {
-            let (epoch, key) = r?;
+            let (epoch, key, source_event_id) = r?;
             let epoch = sql_to_u64(epoch)?;
             let key = <[u8; 32]>::try_from(key.as_slice())
                 .map_err(|_| StoreError::integrity("room_keys.key is not 32 bytes"))?;
-            out.insert(epoch, RoomKey::from_bytes(key));
+            let source_event_id = <[u8; 32]>::try_from(source_event_id.as_slice())
+                .map_err(|_| StoreError::integrity("room_keys.source_event_id is not 32 bytes"))?;
+            out.insert(
+                epoch,
+                (
+                    RoomKey::from_bytes(key),
+                    EventId::from_bytes(source_event_id),
+                ),
+            );
         }
         Ok(out)
     }
 
-    /// Persist one adopted epoch key. Idempotent: upserts the row so
-    /// re-announcing the same epoch is harmless.
+    /// Persist one adopted epoch key, attributed to the event that adopted it.
+    /// Idempotent: upserts the row so re-announcing the same epoch is harmless.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] on a DB error.
@@ -1069,12 +1084,21 @@ impl EventStore {
         room: &RoomId,
         epoch: u64,
         key: &RoomKey,
+        source_event_id: &EventId,
     ) -> Result<(), StoreError> {
         let epoch = u64_to_sql(epoch)?;
         self.conn.execute(
-            "INSERT INTO room_keys (room_id, epoch, key) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(room_id, epoch) DO UPDATE SET key = excluded.key",
-            params![&room.as_bytes()[..], epoch, &key.as_bytes()[..]],
+            "INSERT INTO room_keys (room_id, epoch, key, source_event_id) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(room_id, epoch) DO UPDATE SET \
+                 key = excluded.key, \
+                 source_event_id = excluded.source_event_id",
+            params![
+                &room.as_bytes()[..],
+                epoch,
+                &key.as_bytes()[..],
+                &source_event_id.as_bytes()[..]
+            ],
         )?;
         Ok(())
     }

@@ -148,6 +148,7 @@ pub fn build_member_removed_with_rotation(
     admin_device_secret: &SigningKey,
     room_id: &RoomId,
     subject: &IdentityKey,
+    subject_device: Option<DeviceKey>,
     reason: Option<&str>,
     device_binding: Option<DeviceBinding>,
     new_epoch: Option<u64>,
@@ -156,9 +157,20 @@ pub fn build_member_removed_with_rotation(
     prev_events: &[EventId],
     created_at: u64,
 ) -> Result<WireEvent, DistributionError> {
+    // The removed subject must never receive the new epoch key (G1). Filter
+    // its device from the caller-provided recipient list; if the list is
+    // empty after filtering and a rotation was requested, fail closed.
+    let recipients: Vec<DeviceKey> = recipients
+        .iter()
+        .copied()
+        .filter(|d| Some(*d) != subject_device)
+        .collect();
     let rotation = match (new_epoch, room_key) {
         (Some(epoch), Some(key)) => Some(build_key_distribution_content(
-            room_id, epoch, key, recipients,
+            room_id,
+            epoch,
+            key,
+            &recipients,
         )?),
         _ => None,
     };
@@ -291,6 +303,7 @@ mod tests {
             &dev,
             &room_id,
             &subject,
+            None,
             Some("policy violation"),
             None,
             Some(3),
@@ -326,6 +339,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &fixture_heads(),
             CREATED_AT,
@@ -350,6 +364,7 @@ mod tests {
                 &dev,
                 &room_id,
                 &subject,
+                None,
                 None,
                 None,
                 Some(1),
