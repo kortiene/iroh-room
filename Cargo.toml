@@ -8,6 +8,14 @@ members = [
   # dependencies; `publish = false` and unused pure infrastructure in this phase
   # (spec §12), so it stays compatible with the P-26/D-9 schema-evolution gate.
   "crates/iroh-rooms-v2-core",
+  # Pure SUITE_V1 content-key primitives for #191 (spec
+  # `content-key-rotation.md` D3/D3a, §7 step 2): Ed25519→X25519 conversion,
+  # HKDF-SHA-256 wrap KDF, AES-256-GCM key wrap + content AEAD. A NEW sibling
+  # pure crate (OQ-1 resolved: sibling, not a relaxation of
+  # `iroh-rooms-v2-core`'s no-payload-encryption invariant, so that crate's
+  # purity tripwire stays intact). Same purity discipline: no network, no
+  # store, no async; machine-checked by its own `banned_dependencies` test.
+  "crates/iroh-rooms-crypto",
   "crates/iroh-rooms-cli",
   # The real full-mesh iroh QUIC event-transport adapter (IR-0005). A shipping
   # crate (the CLI will depend on it), unlike the throwaway spike below.

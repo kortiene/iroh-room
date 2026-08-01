@@ -1,0 +1,62 @@
+[package]
+name = "iroh-rooms-crypto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Pure SUITE_V1 content-key primitives (issue #191, spec
+# `content-key-rotation.md` D3/D3a, §7 step 2). Lands as unused, isolated
+# infrastructure like `iroh-rooms-v2-core` did: never published, no consumer
+# wiring in this phase. The rotation lifecycle / wire schema / net / CLI wire
+# to it through separate, later issues (§7 steps 3–6).
+publish = false
+description = "Pure SUITE_V1 content-key crypto for #191: Ed25519→X25519 conversion, HKDF-SHA-256 wrap KDF, AES-256-GCM key wrap and content AEAD. No network, no store, no async."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# SUITE_V1 is pinned (spec D3): X25519 wrap agreement, HKDF-SHA-256 wrap KDF,
+# AES-256-GCM for both the key wrap and the content AEAD, `getrandom` CSPRNG
+# for room keys and ephemeral secrets. This crate must not pull in `iroh`,
+# `iroh-blobs`, `iroh-gossip`, `tokio`, or `rusqlite`; the
+# `banned_dependencies` test machine-checks this via `cargo tree`, mirroring
+# `iroh-rooms-v2-core`.
+#
+# Device identities are Ed25519; converted to X25519 via
+# `SigningKey::to_scalar_bytes` / `VerifyingKey::to_montgomery`. Pinned to the
+# same line as the rest of the workspace so key bytes stay reproducible.
+ed25519-dalek = "=3.0.0-rc.0"
+# X25519 itself (RFC 7748) is `MontgomeryPoint::mul_clamped` /
+# `mul_base_clamped` on the curve crate the dalek pin above already brings in —
+# using it directly avoids a second, differently-versioned X25519 dependency
+# (`x25519-dalek` would drag its own curve25519 line into the tree).
+curve25519-dalek = "=5.0.0-rc.0"
+# HKDF-SHA-256 wrap KDF (spec D3: salt = room_id, no salt-less shortcut).
+# 0.13 is the digest-0.11 line matching the in-tree `sha2 0.11`.
+hkdf = "0.13"
+sha2 = "0.11"
+# AES-256-GCM (key 32 B, nonce 12 B, tag 16 B) for wrap + content AEAD.
+# Default features minus `getrandom`: that feature would drag aead's legacy
+# rand_core 0.6 / getrandom 0.2 stack into the lock for RNG APIs this crate
+# never uses (it calls `getrandom` 0.4 directly, below). `zeroize` wipes the
+# cipher's derived GHASH subkey on drop.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# aes-gcm's `zeroize` feature does NOT forward to the block cipher, and an
+# `Aes256Gcm` holds the full expanded round-key schedule (whose first words
+# are the raw key). A direct dependency turns on the wipe-on-drop there too,
+# so dropped cipher objects don't outlive the crate's Zeroizing discipline.
+aes = { version = "0.8", features = ["zeroize"] }
+# OS CSPRNG for room keys, ephemeral wrap secrets, and nonces (spec D3).
+getrandom = "0.4"
+# Zeroize room keys, ephemeral secrets, and derived wrap keys on drop.
+zeroize = "1"
+
+[dev-dependencies]
+# Golden-vector constants are pinned as hex strings (derived independently by
+# `tests/golden/suite_v1_reference.py`).
+hex = "0.4"
