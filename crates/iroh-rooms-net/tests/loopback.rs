@@ -1,3 +1,5 @@
+#![allow(clippy::large_futures)] // SyncEngine grew with the epoch-key store (step 6)
+
 //! Loopback integration tests — the AC oracle for the full-mesh QUIC event
 //! transport (spec §7.2). Two (or three) in-process [`Node`]s on
 //! `RelayMode::Disabled` over `127.0.0.1`, each driving a real `SyncEngine`. Every
@@ -33,6 +35,7 @@ const WAIT: Duration = Duration::from_secs(10);
 
 /// Spawn a loopback [`Node`] for `secret` driving a fresh in-memory engine on
 /// `room`. A short tick keeps anti-entropy / reconnect catch-up brisk.
+#[allow(clippy::large_futures)] // SyncEngine grew with the epoch-key store (step 6)
 async fn spawn_node(secret: iroh::SecretKey, admission: AllowlistAdmission, room: RoomId) -> Node {
     let store = EventStore::open_in_memory().expect("in-memory store");
     let engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");

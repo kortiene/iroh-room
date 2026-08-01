@@ -12,7 +12,12 @@ use std::collections::BTreeSet;
 
 use crate::event::cbor::{self, CborValue};
 use crate::event::constants::{DIGEST_LEN, SHORT_ID_LEN};
+use crate::event::content::{
+    member_key_distribution_to_cbor, parse_member_key_distribution_value, MemberKeyDistribution,
+    WrappedKeyEntry,
+};
 use crate::event::ids::{EventId, RoomId};
+use crate::event::keys::DeviceKey;
 
 /// Maximum encoded size of one sync-message body (1 MiB) — the **shared wire
 /// contract** with the transport's per-frame cap
@@ -35,6 +40,16 @@ pub(crate) const EVENTS_ENVELOPE_ALLOWANCE: usize = 128;
 /// Conservative per-frame overhead inside an `Events` batch: the frame's CBOR
 /// byte-string head (at most 5 bytes for any frame under 4 GiB).
 pub(crate) const EVENTS_PER_FRAME_OVERHEAD: usize = 5;
+
+/// Conservative fixed allowance for the CBOR envelope of one
+/// [`KeyHistory`](SyncMessage::KeyHistory) message — map head + `"type"` /
+/// `"room"` / `"chunks"` array head. Measured under 40 bytes; 128 leaves margin.
+pub(crate) const KEY_HISTORY_ENVELOPE_ALLOWANCE: usize = 128;
+
+/// The maximum number of key-history chunks served in a single `KeyHistory`
+/// response (spec D6 rate bound). A requester with more missing epochs sends
+/// another `WantKeyHistory` with an updated `have_epochs` set.
+pub(crate) const MAX_KEY_HISTORY_CHUNKS_PER_RESPONSE: usize = 32;
 
 /// A transport peer address: the remote device id (`device_id` == iroh
 /// `EndpointId`). The engine fans out and directs pulls by this opaque id; it is
@@ -88,6 +103,84 @@ pub struct Window {
 /// Verbatim `WireEvent` bytes (`== WireEvent::to_bytes()`) carried in an
 /// [`SyncMessage::Events`] response. Re-validated by the requester on receipt.
 pub type WireBytes = Vec<u8>;
+
+/// One chunk of a chunked key-history transfer (spec D6). Mirrors the
+/// `member.key_distribution` payload shape so a single chunk can be
+/// authenticated and adopted by the same key-adoption path as a DAG event.
+///
+/// The chunk carries the original distribution event's `event_id` so the same
+/// deterministic conflict-resolution rule (smallest event id wins) applies
+/// whether the payload arrives over the DAG or over the key-history channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyHistoryChunk {
+    /// The original `member.key_distribution` event id that produced this chunk.
+    pub distribution_event_id: EventId,
+    /// The epoch this chunk distributes.
+    pub epoch: u64,
+    /// `BLAKE3(epoch_be8 || room_id || room_key)` — verified at adoption.
+    pub key_commitment: [u8; DIGEST_LEN],
+    /// Per-recipient wrapped keys, sorted by device id in canonical CBOR.
+    pub wrapped_keys: Vec<(DeviceKey, WrappedKeyEntry)>,
+}
+
+impl KeyHistoryChunk {
+    /// Convert to the equivalent `MemberKeyDistribution` content payload.
+    #[must_use]
+    fn to_distribution(&self) -> MemberKeyDistribution {
+        MemberKeyDistribution {
+            new_epoch: self.epoch,
+            key_commitment: self.key_commitment,
+            wrapped_keys: self.wrapped_keys.clone(),
+        }
+    }
+
+    /// Build a chunk from a `MemberKeyDistribution` payload.
+    #[must_use]
+    fn from_distribution(event_id: EventId, d: MemberKeyDistribution) -> Self {
+        Self {
+            distribution_event_id: event_id,
+            epoch: d.new_epoch,
+            key_commitment: d.key_commitment,
+            wrapped_keys: d.wrapped_keys,
+        }
+    }
+
+    pub(crate) fn to_cbor(&self) -> CborValue {
+        // Encode as a two-key map: the distribution payload plus the event id
+        // that authenticates/conflict-resolves it. The encoder sorts canonically.
+        let mut entries = vec![
+            (
+                "distribution_event_id".to_owned(),
+                CborValue::Bytes(self.distribution_event_id.as_bytes().to_vec()),
+            ),
+            (
+                "distribution".to_owned(),
+                member_key_distribution_to_cbor(&self.to_distribution()),
+            ),
+        ];
+        entries.sort_by(|a, b| {
+            a.0.len()
+                .cmp(&b.0.len())
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
+        CborValue::Map(entries)
+    }
+
+    fn from_cbor(value: &CborValue) -> Result<Self, MessageError> {
+        let entries = value.as_map().ok_or(MessageError::BadShape)?;
+        let event_id = field(entries, "distribution_event_id")
+            .and_then(read_digest)
+            .map(EventId::from_bytes)
+            .ok_or(MessageError::BadShape)?;
+        let distribution = match field(entries, "distribution") {
+            Some(v) => {
+                parse_member_key_distribution_value(v).map_err(|_| MessageError::BadShape)?
+            }
+            None => return Err(MessageError::BadShape),
+        };
+        Ok(Self::from_distribution(event_id, distribution))
+    }
+}
 
 /// One frame of the bounded recent-sync protocol (spec §4.2).
 ///
@@ -212,6 +305,30 @@ pub enum SyncMessage {
         /// The capability secret proving possession of that invite.
         capability_secret: [u8; SHORT_ID_LEN],
     },
+    /// Pull the room's epoch key history that the requester lacks (spec D6).
+    ///
+    /// `have_epochs` is a trust input only in the sense that a requester cannot
+    /// forge a key it does not hold; the responder still sends only signed
+    /// `member.key_distribution` payload shapes, and the requester verifies the
+    /// D5 commitment + unwraps with its own device secret before adoption.
+    WantKeyHistory {
+        /// Room scope.
+        room_id: RoomId,
+        /// Epochs the requester already holds keys for.
+        have_epochs: BTreeSet<u64>,
+    },
+    /// A response carrying one or more bounded `KeyHistoryChunk`s (spec D6).
+    ///
+    /// Chunks are encoded with the same canonical shape as a
+    /// `member.key_distribution` payload so the receiver can feed each chunk
+    /// through the ordinary key-adoption path.
+    KeyHistory {
+        /// Room scope.
+        room_id: RoomId,
+        /// Bounded chunks. The encoder keeps the total message under
+        /// [`MAX_FRAME_BYTES`].
+        chunks: Vec<KeyHistoryChunk>,
+    },
 }
 
 /// A frame the engine wants sent to a peer. The engine performs no I/O; it
@@ -270,13 +387,16 @@ impl SyncMessage {
             | Self::TerminalEvents { room_id, .. }
             | Self::EventsConfirmed { room_id, .. }
             | Self::NotFound { room_id, .. }
-            | Self::ProveCapability { room_id, .. } => room_id,
+            | Self::ProveCapability { room_id, .. }
+            | Self::WantKeyHistory { room_id, .. }
+            | Self::KeyHistory { room_id, .. } => room_id,
         }
     }
 
     /// Encode to canonical deterministic CBOR (the on-wire body, before any
     /// length prefix). Deterministic: the same message always yields the same
     /// bytes (determinism guard, spec §8.4).
+    #[allow(clippy::too_many_lines)] // one arm per sync message variant; encoding is flat
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let entries = match self {
@@ -369,6 +489,22 @@ impl SyncMessage {
                     CborValue::Bytes(capability_secret.to_vec()),
                 ),
             ],
+            Self::WantKeyHistory {
+                room_id,
+                have_epochs,
+            } => vec![
+                tag("want_key_history"),
+                room_field(room_id),
+                ("have_epochs".to_owned(), uint_array(have_epochs)),
+            ],
+            Self::KeyHistory { room_id, chunks } => vec![
+                tag("key_history"),
+                room_field(room_id),
+                (
+                    "chunks".to_owned(),
+                    CborValue::Array(chunks.iter().map(KeyHistoryChunk::to_cbor).collect()),
+                ),
+            ],
         };
         cbor::encode(&CborValue::Map(entries))
     }
@@ -444,6 +580,14 @@ impl SyncMessage {
                 invite_id: read_short_id(field(entries, "invite_id"))?,
                 capability_secret: read_short_id(field(entries, "secret"))?,
             },
+            "want_key_history" => Self::WantKeyHistory {
+                room_id,
+                have_epochs: read_uint_array(field(entries, "have_epochs"))?,
+            },
+            "key_history" => Self::KeyHistory {
+                room_id,
+                chunks: read_chunk_array(field(entries, "chunks"))?,
+            },
             _ => return Err(MessageError::BadShape),
         };
         Ok(msg)
@@ -471,6 +615,10 @@ fn id_array(ids: &[EventId]) -> CborValue {
             .map(|id| CborValue::Bytes(id.as_bytes().to_vec()))
             .collect(),
     )
+}
+
+fn uint_array(values: &BTreeSet<u64>) -> CborValue {
+    CborValue::Array(values.iter().copied().map(CborValue::Uint).collect())
 }
 
 fn opt_tip(tip: Option<&(EventId, u64)>) -> CborValue {
@@ -543,6 +691,23 @@ fn read_bytes_array(value: Option<&CborValue>) -> Result<Vec<WireBytes>, Message
         .collect()
 }
 
+fn read_uint_array(value: Option<&CborValue>) -> Result<BTreeSet<u64>, MessageError> {
+    let items = value
+        .and_then(CborValue::as_array)
+        .ok_or(MessageError::BadShape)?;
+    items
+        .iter()
+        .map(|item| item.as_uint().ok_or(MessageError::BadShape))
+        .collect()
+}
+
+fn read_chunk_array(value: Option<&CborValue>) -> Result<Vec<KeyHistoryChunk>, MessageError> {
+    let items = value
+        .and_then(CborValue::as_array)
+        .ok_or(MessageError::BadShape)?;
+    items.iter().map(KeyHistoryChunk::from_cbor).collect()
+}
+
 fn read_opt_tip(value: &CborValue) -> Result<Option<(EventId, u64)>, MessageError> {
     let items = value.as_array().ok_or(MessageError::BadShape)?;
     match items {
@@ -584,6 +749,26 @@ mod tests {
 
     fn room() -> RoomId {
         RoomId::from_bytes([0x11; DIGEST_LEN])
+    }
+
+    fn device(b: u8) -> DeviceKey {
+        DeviceKey::from_bytes([b; DIGEST_LEN])
+    }
+
+    fn chunk(event_byte: u8, epoch: u64) -> KeyHistoryChunk {
+        KeyHistoryChunk {
+            distribution_event_id: id(event_byte),
+            epoch,
+            key_commitment: [0xcc; DIGEST_LEN],
+            wrapped_keys: vec![(
+                device(0x22),
+                WrappedKeyEntry {
+                    ephemeral_public: [0xee; DIGEST_LEN],
+                    nonce: [0x55; 12],
+                    ciphertext: [0x66; 48],
+                },
+            )],
+        }
     }
 
     fn round_trip(msg: &SyncMessage) {
@@ -656,6 +841,28 @@ mod tests {
             invite_id: [0x3c; SHORT_ID_LEN],
             capability_secret: [0x5e; SHORT_ID_LEN],
         });
+        round_trip(&SyncMessage::WantKeyHistory {
+            room_id: room(),
+            have_epochs: BTreeSet::from([1, 3, 5]),
+        });
+        round_trip(&SyncMessage::KeyHistory {
+            room_id: room(),
+            chunks: vec![chunk(0xaa, 2), chunk(0xbb, 4)],
+        });
+    }
+
+    #[test]
+    fn key_history_chunk_round_trips_distribution_shape() {
+        let original = chunk(0x12, 7);
+        let encoded = original.to_cbor();
+        let decoded = KeyHistoryChunk::from_cbor(&encoded).expect("decode");
+        assert_eq!(
+            decoded.distribution_event_id,
+            original.distribution_event_id
+        );
+        assert_eq!(decoded.epoch, original.epoch);
+        assert_eq!(decoded.key_commitment, original.key_commitment);
+        assert_eq!(decoded.wrapped_keys, original.wrapped_keys);
     }
 
     #[test]

@@ -194,7 +194,16 @@ pub async fn send(
         // `Box::pin` keeps `run_push`'s future off this caller's stack — issue
         // #141 grew `NetConfig` enough to trip clippy::large_futures here.
         let delivered = match Box::pin(run_push(
-            home, store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
+            home,
+            store,
+            room_id,
+            secret_key,
+            secret.device_seed(),
+            admission,
+            dial_set,
+            timeout,
+            mode,
+            wire_bytes,
         ))
         .await
         {
@@ -345,7 +354,16 @@ pub async fn send_agent_status(
         // `Box::pin` keeps `run_push`'s future off this caller's stack — issue
         // #141 grew `NetConfig` enough to trip clippy::large_futures here.
         let delivered = match Box::pin(run_push(
-            home, store, room_id, secret_key, admission, dial_set, timeout, mode, wire_bytes,
+            home,
+            store,
+            room_id,
+            secret_key,
+            secret.device_seed(),
+            admission,
+            dial_set,
+            timeout,
+            mode,
+            wire_bytes,
         ))
         .await
         {
@@ -473,8 +491,13 @@ pub async fn tail(
     // derives + maintains the dial set from the live snapshot (AC1); we pass the
     // `--peer` hints for deterministic loopback/LAN addressing and do **not** dial
     // explicitly — the manager owns dialing.
-    let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
-        .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(secret.device_seed()),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
     let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
     let cfg = NetConfig {
         mode: net_mode(loopback),
@@ -605,8 +628,13 @@ pub async fn members_status(
     // Live admission cell the pump refreshes; the manager derives the dial set.
     let admission_cell = Arc::new(Mutex::new(AdmissionView::from_snapshot(&snapshot, &[])));
     let admission: Arc<dyn Admission> = Arc::new(SnapshotAdmission::new(admission_cell.clone()));
-    let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
-        .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(secret.device_seed()),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
     let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
     let cfg = NetConfig {
         mode: net_mode(loopback),
@@ -823,14 +851,20 @@ async fn run_push(
     store: EventStore,
     room_id: &RoomId,
     secret_key: SecretKey,
+    device_seed: [u8; 32],
     admission: AllowlistAdmission,
     dial_set: Vec<EndpointAddr>,
     timeout: Duration,
     mode: NetMode,
     frame: Vec<u8>,
 ) -> Result<usize> {
-    let engine = SyncEngine::open(store, *room_id, SyncConfig::default())
-        .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(device_seed),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
     let cfg = NetConfig {
         mode,
         ..NetConfig::default()

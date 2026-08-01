@@ -63,6 +63,13 @@ impl Participant {
         SecretKey::from_bytes(&self.dev.to_seed())
     }
 
+    /// The 32-byte device signing-key seed. The engine needs this to unwrap epoch
+    /// keys from key-distribution payloads (issue #191 step 6).
+    #[must_use]
+    pub fn device_seed(&self) -> [u8; 32] {
+        *self.dev.to_seed()
+    }
+
     /// The participant's authenticated transport identity (`EndpointId`). Equal,
     /// byte-for-byte, to [`device`](Self::device) (spec A2).
     #[must_use]

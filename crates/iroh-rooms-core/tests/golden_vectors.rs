@@ -11,13 +11,16 @@
 
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::cbor::{self, CborValue};
-use iroh_rooms_core::event::content::{Content, EventType, MessageText, RoomCreated};
+use iroh_rooms_core::event::content::{
+    Content, EventType, MemberKeyDistribution, MessageText, RoomCreated, WrappedKeyEntry,
+};
 use iroh_rooms_core::event::ids::{EventId, HashParseError, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::reject::{Flag, RejectReason};
 use iroh_rooms_core::event::signed::{self, SignedEvent};
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
 use iroh_rooms_core::event::wire::WireEvent;
+use iroh_rooms_crypto::{room_key_commitment, wrap_room_key_with, EphemeralSecret, RoomKey};
 
 // --- Fixtures (PHASE-0-SPIKE.md Protocol Test Vectors, "Cast" / "Room"). ------
 
@@ -1151,4 +1154,93 @@ fn all_event_types_round_trip_registry_string() {
         );
     }
     assert_eq!(EventType::from_registry("room.bogus"), None);
+}
+
+// ---------------------------------------------------------------------------
+// member.key_distribution golden vector (issue #191 step 6, spec D4/D5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_member_key_distribution_vector() {
+    let room_id = RoomId::from_bytes(arr32(ROOM_ID_A_HEX));
+    let admin_id = alice_identity_secret();
+    let admin_dev = alice_device_secret();
+    let room_key = RoomKey::from_bytes([0x33; 32]);
+    let epoch = 2;
+    let ephemeral = EphemeralSecret::from_bytes([0x44; 32]);
+    let nonce = [0x55; 12];
+    let recipient = admin_dev.device_key();
+
+    let wrapped = wrap_room_key_with(
+        &room_key,
+        &ephemeral,
+        nonce,
+        recipient.as_bytes(),
+        room_id.as_bytes(),
+        epoch,
+    )
+    .expect("wrap");
+
+    assert_eq!(
+        hex::encode(wrapped.ephemeral_public),
+        "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b"
+    );
+    assert_eq!(hex::encode(wrapped.nonce), "555555555555555555555555");
+    assert_eq!(
+        hex::encode(wrapped.ciphertext),
+        "e74ce95ff88c636bc9f6b02d1807cd3e7e437ce5253954f34e2d15986a30c9a3004137f8e37d388479b7a7fed67062e6"
+    );
+
+    let distribution = MemberKeyDistribution {
+        new_epoch: epoch,
+        key_commitment: room_key_commitment(&room_key, room_id.as_bytes(), epoch),
+        wrapped_keys: vec![(
+            recipient,
+            WrappedKeyEntry {
+                ephemeral_public: wrapped.ephemeral_public,
+                nonce: wrapped.nonce,
+                ciphertext: wrapped.ciphertext,
+            },
+        )],
+    };
+
+    // The distribution references the room genesis so it passes the
+    // non-genesis `prev_events` rule.
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: admin_id.identity_key(),
+        device_id: admin_dev.device_key(),
+        event_type: EventType::RoomCreated,
+        created_at: ROOM_CREATED_AT,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Room".to_owned(),
+            room_nonce: arr16(ROOM_NONCE_HEX),
+            admins: vec![admin_id.identity_key()],
+            device_binding: DeviceBinding::create(&room_id, &admin_id, admin_dev.device_key()),
+        }),
+    };
+    let genesis_id = genesis.event_id();
+
+    let ev = SignedEvent {
+        schema_version: 1,
+        room_id,
+        sender_id: admin_id.identity_key(),
+        device_id: admin_dev.device_key(),
+        event_type: EventType::MemberKeyDistribution,
+        created_at: GOLDEN_CREATED_AT,
+        prev_events: vec![genesis_id],
+        content: Content::MemberKeyDistribution(distribution),
+    };
+    assert_eq!(
+        ev.event_id().to_string(),
+        "blake3:5939bd21040ecfcc9a108adfbabceacda6d53e22f99984bdde3182151d4f8076"
+    );
+
+    let wire = WireEvent::seal(ev.to_csb(), signed::sign_csb(&ev.to_csb(), &admin_dev));
+    let bytes = wire.to_bytes();
+    let parsed = validate_wire_bytes(&bytes, &ValidationContext::for_room(room_id))
+        .expect("golden wire must validate");
+    assert_eq!(parsed.event_id, ev.event_id());
 }

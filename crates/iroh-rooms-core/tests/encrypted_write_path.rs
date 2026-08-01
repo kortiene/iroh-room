@@ -502,7 +502,7 @@ mod engine {
     fn floor_on_gates_plaintext_and_admits_encrypted() {
         let mut engine = engine_with(floor_on());
         engine
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect("fresh key");
 
         // Membership publishes regardless of the floor: the genesis and an
@@ -610,12 +610,12 @@ mod engine {
     fn conflicting_epoch_key_poisons_the_epoch() {
         let mut engine = engine_with(SyncConfig::default());
         engine
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect("fresh key");
         assert!(engine.has_room_key(KEY_EPOCH));
 
         let err = engine
-            .insert_room_key(KEY_EPOCH, RoomKey::from_bytes([0xBB; 32]))
+            .insert_room_key(KEY_EPOCH, &RoomKey::from_bytes([0xBB; 32]))
             .expect_err("a conflicting key must be refused");
         assert!(
             matches!(err, SyncError::EpochKeyConflict { epoch } if epoch == KEY_EPOCH),
@@ -626,7 +626,7 @@ mod engine {
             "after a conflict the epoch must hold NEITHER key (D5a)"
         );
         engine
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect_err("a poisoned epoch refuses even the original key");
 
         assert_eq!(
@@ -648,10 +648,10 @@ mod engine {
         net.add_peer(READER_NO_KEY, engine_with(SyncConfig::default()));
 
         net.engine_mut(WRITER)
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect("writer key");
         net.engine_mut(READER_WITH_KEY)
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect("reader key");
 
         let encrypted = live_encrypted(&golden_inner(), ENCRYPTED_CREATED_AT);
@@ -768,10 +768,10 @@ mod engine {
         net.add_peer(READER_WITH_KEY, engine_with(SyncConfig::default()));
         net.add_peer(READER_NO_KEY, engine_with(SyncConfig::default()));
         net.engine_mut(WRITER)
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect("writer key");
         net.engine_mut(READER_WITH_KEY)
-            .insert_room_key(KEY_EPOCH, room_key())
+            .insert_room_key(KEY_EPOCH, &room_key())
             .expect("reader key");
 
         let malicious = live_encrypted(&oversized, ENCRYPTED_CREATED_AT + 1);

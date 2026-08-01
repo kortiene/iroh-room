@@ -23,11 +23,38 @@ use super::constants::{
     MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
     MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
     MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES,
-    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
+    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN, WRAPPED_KEY_CIPHERTEXT_LEN,
+    WRAPPED_KEY_NONCE_LEN,
 };
 use super::ids::{EventId, HashRef, RoomId};
 use super::keys::{DeviceKey, IdentityKey};
 use super::reject::RejectReason;
+
+/// One recipient's wrapped `room_key[epoch]` entry in a `member.key_distribution`
+/// payload (spec D5). Mirrors the crypto crate's `WrappedRoomKey` but is kept
+/// separately so the core wire type does not depend on crypto-crate internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedKeyEntry {
+    /// The admin's fresh ephemeral X25519 public key for this recipient (D3a).
+    pub ephemeral_public: [u8; PUBLIC_KEY_LEN],
+    /// The wrap AEAD nonce.
+    pub nonce: [u8; WRAPPED_KEY_NONCE_LEN],
+    /// `AES-256-GCM(wrap_key, nonce, room_key, aad)` — always
+    /// [`WRAPPED_KEY_CIPHERTEXT_LEN`] bytes (32-byte key + 16-byte tag).
+    pub ciphertext: [u8; WRAPPED_KEY_CIPHERTEXT_LEN],
+}
+
+/// `member.key_distribution` content — admin-authored distribution of a new
+/// epoch's room content key (spec `content-key-rotation.md` D4/D5/D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberKeyDistribution {
+    /// The new epoch being distributed.
+    pub new_epoch: u64,
+    /// `BLAKE3(new_epoch_be8 || room_id || room_key)` — verified at adoption.
+    pub key_commitment: [u8; DIGEST_LEN],
+    /// Per-recipient wrapped keys, sorted by device id in canonical CBOR.
+    pub wrapped_keys: Vec<(DeviceKey, WrappedKeyEntry)>,
+}
 
 /// Roles a participant may hold (Event Protocol §3.1/§7).
 const ROLES: &[&str] = &["member", "agent", "admin"];
@@ -68,6 +95,10 @@ pub enum EventType {
     /// opaque-but-valid; **writers are disabled** until the R2 compatibility
     /// floor.
     ContentEncrypted,
+    /// `member.key_distribution` — admin-authored distribution of a new epoch's
+    /// room content key (spec `content-key-rotation.md` D4/D5/D6). Not a
+    /// membership-affecting event; the fold ignores it.
+    MemberKeyDistribution,
 }
 
 impl EventType {
@@ -86,6 +117,7 @@ impl EventType {
             Self::PipeClosed => "pipe.closed",
             Self::AgentStatus => "agent.status",
             Self::ContentEncrypted => "content.encrypted",
+            Self::MemberKeyDistribution => "member.key_distribution",
         }
     }
 
@@ -112,6 +144,7 @@ impl EventType {
                 | Self::ContentEncrypted
                 | Self::MemberInvited
                 | Self::MemberLeft
+                | Self::MemberKeyDistribution
         )
     }
 
@@ -137,7 +170,8 @@ impl EventType {
             | Self::MemberJoined
             | Self::MemberLeft
             | Self::MemberRemoved
-            | Self::ContentEncrypted => None,
+            | Self::ContentEncrypted
+            | Self::MemberKeyDistribution => None,
         }
     }
 
@@ -156,6 +190,7 @@ impl EventType {
             "pipe.closed" => Self::PipeClosed,
             "agent.status" => Self::AgentStatus,
             "content.encrypted" => Self::ContentEncrypted,
+            "member.key_distribution" => Self::MemberKeyDistribution,
             _ => return None,
         };
         Some(ty)
@@ -233,6 +268,12 @@ pub struct MemberRemoved {
     /// (Event Protocol §7 member.removed schema lists no binding; §9 verifies
     /// "if present").
     pub device_binding: Option<DeviceBinding>,
+    /// Optional rotation payload: a new epoch key distributed to remaining
+    /// Active members, excluding the removed member (spec
+    /// `content-key-rotation.md` D4). Only emitted in rooms that have opted
+    /// into encrypted content; omitted entirely in plaintext rooms so old
+    /// parsers remain compatible.
+    pub rotation: Option<MemberKeyDistribution>,
 }
 
 /// `message.text` content.
@@ -363,6 +404,8 @@ pub enum Content {
     AgentStatus(AgentStatus),
     /// See [`EncryptedContent`].
     Encrypted(EncryptedContent),
+    /// See [`MemberKeyDistribution`].
+    MemberKeyDistribution(MemberKeyDistribution),
 }
 
 impl Content {
@@ -381,6 +424,7 @@ impl Content {
             Self::PipeClosed(_) => EventType::PipeClosed,
             Self::AgentStatus(_) => EventType::AgentStatus,
             Self::Encrypted(_) => EventType::ContentEncrypted,
+            Self::MemberKeyDistribution(_) => EventType::MemberKeyDistribution,
         }
     }
 
@@ -403,6 +447,9 @@ impl Content {
             EventType::PipeClosed => Self::PipeClosed(parse_pipe_closed(&mut f)?),
             EventType::AgentStatus => Self::AgentStatus(parse_agent_status(&mut f)?),
             EventType::ContentEncrypted => Self::Encrypted(parse_encrypted(&mut f)?),
+            EventType::MemberKeyDistribution => {
+                Self::MemberKeyDistribution(parse_member_key_distribution(&mut f)?)
+            }
         };
         // Reject any leftover (unknown) keys.
         f.finish()?;
@@ -459,6 +506,12 @@ impl Content {
                 push_opt_text(&mut m, "reason", c.reason.as_deref());
                 if let Some(binding) = &c.device_binding {
                     m.push(("device_binding".to_owned(), binding.to_cbor()));
+                }
+                if let Some(rotation) = &c.rotation {
+                    m.push((
+                        "rotation".to_owned(),
+                        member_key_distribution_to_cbor(rotation),
+                    ));
                 }
                 sort_into_map(&mut m)
             }
@@ -526,8 +579,53 @@ impl Content {
                 ];
                 sort_into_map(&mut m)
             }
+            Self::MemberKeyDistribution(c) => member_key_distribution_to_cbor(c),
         }
     }
+}
+
+/// Encode a `MemberKeyDistribution` to its canonical CBOR map value.
+///
+/// Exposed crate-internally so the sync layer can encode key-history chunks
+/// with the exact same wire shape (spec D6).
+pub(crate) fn member_key_distribution_to_cbor(d: &MemberKeyDistribution) -> CborValue {
+    let mut pairs: Vec<(DeviceKey, CborValue)> = d
+        .wrapped_keys
+        .iter()
+        .map(|(device, entry)| {
+            let record = CborValue::Map(vec![
+                (
+                    "ephemeral_public".to_owned(),
+                    CborValue::Bytes(entry.ephemeral_public.to_vec()),
+                ),
+                ("nonce".to_owned(), CborValue::Bytes(entry.nonce.to_vec())),
+                (
+                    "ciphertext".to_owned(),
+                    CborValue::Bytes(entry.ciphertext.to_vec()),
+                ),
+            ]);
+            (*device, record)
+        })
+        .collect();
+    // Deterministic order: by device id bytes.
+    pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let wrapped = CborValue::Array(
+        pairs
+            .into_iter()
+            .map(|(device, record)| {
+                CborValue::Array(vec![CborValue::Bytes(device.as_bytes().to_vec()), record])
+            })
+            .collect(),
+    );
+    let mut m = vec![
+        ("new_epoch".to_owned(), CborValue::Uint(d.new_epoch)),
+        (
+            "key_commitment".to_owned(),
+            CborValue::Bytes(d.key_commitment.to_vec()),
+        ),
+        ("wrapped_keys".to_owned(), wrapped),
+    ];
+    sort_into_map(&mut m)
 }
 
 fn sort_into_map(entries: &mut Vec<(String, CborValue)>) -> CborValue {
@@ -641,7 +739,8 @@ pub fn check_field_rules(content: &Content, sender_id: &IdentityKey) -> Result<(
         | Content::FileShared(_)
         | Content::PipeClosed(_)
         | Content::AgentStatus(_)
-        | Content::Encrypted(_) => {}
+        | Content::Encrypted(_)
+        | Content::MemberKeyDistribution(_) => {}
     }
     Ok(())
 }
@@ -745,12 +844,78 @@ fn parse_member_removed(f: &mut Fields<'_>) -> Result<MemberRemoved, RejectReaso
         Some(v) => Some(DeviceBinding::from_cbor(v)?),
         None => None,
     };
+    let rotation = match f.opt("rotation") {
+        Some(v) => Some(parse_member_key_distribution_value(v)?),
+        None => None,
+    };
     Ok(MemberRemoved {
         member_id,
         removed_by,
         reason,
         device_binding,
+        rotation,
     })
+}
+
+fn parse_member_key_distribution(
+    f: &mut Fields<'_>,
+) -> Result<MemberKeyDistribution, RejectReason> {
+    let new_epoch = f.require_uint("new_epoch")?;
+    let key_commitment = f.require_bytes::<DIGEST_LEN>("key_commitment")?;
+    let wrapped_keys = parse_wrapped_keys(f.require("wrapped_keys")?)?;
+    Ok(MemberKeyDistribution {
+        new_epoch,
+        key_commitment,
+        wrapped_keys,
+    })
+}
+
+/// Parse a `MemberKeyDistribution` from a canonical CBOR map value.
+///
+/// Exposed crate-internally so the sync layer can decode key-history chunks
+/// with the exact same wire shape (spec D6). Unknown keys are rejected
+/// (strict closed schema, spec D2b).
+pub(crate) fn parse_member_key_distribution_value(
+    value: &CborValue,
+) -> Result<MemberKeyDistribution, RejectReason> {
+    let mut f = Fields::new(value)?;
+    let out = parse_member_key_distribution(&mut f)?;
+    f.finish()?;
+    Ok(out)
+}
+
+fn parse_wrapped_keys(
+    value: &CborValue,
+) -> Result<Vec<(DeviceKey, WrappedKeyEntry)>, RejectReason> {
+    let items = value.as_array().ok_or(RejectReason::InvalidContent)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let pair = item.as_array().ok_or(RejectReason::InvalidContent)?;
+        if pair.len() != 2 {
+            return Err(RejectReason::InvalidContent);
+        }
+        let device = DeviceKey::from_bytes(fixed_bytes::<PUBLIC_KEY_LEN>(&pair[0])?);
+        let record = pair[1].as_map().ok_or(RejectReason::InvalidContent)?;
+        let get = |key: &str| {
+            record
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .ok_or(RejectReason::InvalidContent)
+        };
+        let ephemeral_public = fixed_bytes::<PUBLIC_KEY_LEN>(get("ephemeral_public")?)?;
+        let nonce = fixed_bytes::<WRAPPED_KEY_NONCE_LEN>(get("nonce")?)?;
+        let ciphertext = fixed_bytes::<WRAPPED_KEY_CIPHERTEXT_LEN>(get("ciphertext")?)?;
+        out.push((
+            device,
+            WrappedKeyEntry {
+                ephemeral_public,
+                nonce,
+                ciphertext,
+            },
+        ));
+    }
+    Ok(out)
 }
 
 fn parse_message_text(f: &mut Fields<'_>) -> Result<MessageText, RejectReason> {

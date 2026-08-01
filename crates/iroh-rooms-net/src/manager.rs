@@ -684,6 +684,7 @@ mod tests {
                 removed_by: admin.identity(),
                 reason: None,
                 device_binding: None,
+                rotation: None,
             }),
         };
         validate(&ev, &admin.dev_sk, room_id)

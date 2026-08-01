@@ -60,6 +60,8 @@ aes = { version = "0.8", features = ["zeroize"] }
 getrandom = "0.4"
 # Zeroize room keys, ephemeral secrets, and derived wrap keys on drop.
 zeroize = "1"
+# BLAKE3-256 for the D5 key commitment (binds epoch, room, and key).
+blake3 = "1"
 
 [dev-dependencies]
 # Golden-vector constants are pinned as hex strings (derived independently by

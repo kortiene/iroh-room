@@ -38,6 +38,8 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+use iroh_rooms_crypto::RoomKey;
+
 use crate::event::cbor::{self, CborValue};
 use crate::event::constants::DIGEST_LEN;
 use crate::event::content::EventType;
@@ -1028,6 +1030,90 @@ impl EventStore {
             });
         }
         Ok(out)
+    }
+
+    // -- room key persistence (#191 step 6) ----------------------------------
+
+    /// Load every adopted `(epoch, room_key)` for a room into a `BTreeMap`,
+    /// ascending by epoch. Missing or wrong-length rows are surfaced as
+    /// integrity errors.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error, or [`StoreError::Integrity`] on a
+    /// malformed row.
+    pub fn load_room_keys(
+        &self,
+        room: &RoomId,
+    ) -> Result<BTreeMap<u64, (RoomKey, EventId)>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT epoch, key, source_event_id FROM room_keys WHERE room_id = ?1 ORDER BY epoch",
+        )?;
+        let rows = stmt.query_map(params![&room.as_bytes()[..]], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for r in rows {
+            let (epoch, key, source_event_id) = r?;
+            let epoch = sql_to_u64(epoch)?;
+            let key = <[u8; 32]>::try_from(key.as_slice())
+                .map_err(|_| StoreError::integrity("room_keys.key is not 32 bytes"))?;
+            let source_event_id = <[u8; 32]>::try_from(source_event_id.as_slice())
+                .map_err(|_| StoreError::integrity("room_keys.source_event_id is not 32 bytes"))?;
+            out.insert(
+                epoch,
+                (
+                    RoomKey::from_bytes(key),
+                    EventId::from_bytes(source_event_id),
+                ),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Persist one adopted epoch key, attributed to the event that adopted it.
+    /// Idempotent: upserts the row so re-announcing the same epoch is harmless.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn save_room_key(
+        &mut self,
+        room: &RoomId,
+        epoch: u64,
+        key: &RoomKey,
+        source_event_id: &EventId,
+    ) -> Result<(), StoreError> {
+        let epoch = u64_to_sql(epoch)?;
+        self.conn.execute(
+            "INSERT INTO room_keys (room_id, epoch, key, source_event_id) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(room_id, epoch) DO UPDATE SET \
+                 key = excluded.key, \
+                 source_event_id = excluded.source_event_id",
+            params![
+                &room.as_bytes()[..],
+                epoch,
+                &key.as_bytes()[..],
+                &source_event_id.as_bytes()[..]
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every persisted room key for a room. Used when an epoch is
+    /// poisoned or when the derived cache is rebuilt from events.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn delete_room_keys(&mut self, room: &RoomId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM room_keys WHERE room_id = ?1",
+            params![&room.as_bytes()[..]],
+        )?;
+        Ok(())
     }
 
     /// Append one trust decision, assigning the next per-room monotone `seq`

@@ -11,8 +11,9 @@
   semantics, key store), `crates/iroh-rooms-v2-core` **or a sibling pure crate** (X25519 /
   HKDF / AEAD key-wrap primitives), `crates/iroh-rooms-net` (key-distribution fan-out,
   decrypt-on-read), `crates/iroh-rooms-cli` (join-time key wrap, backlog-read UX change).
-- **Status:** **Planning / spec only.** Do not implement from this document without a
-  follow-up build task and a security sign-off. This document changes no production code.
+- **Status:** **Step 6 (rotation lifecycle) implemented.** Steps 1–6 are landed; step 7
+  (broader test matrix) and step 8 (threat-model sign-off) are in progress. The distribution
+  payload layout is now fixed (OQ-2 resolved for step 6).
 
 ---
 
@@ -460,15 +461,18 @@ content becomes ciphertext for *new* events; existing plaintext history is uncha
    `pipe_opened`, `pipe_is_closed` to authenticated decryption with fail-closed semantics +
    their tests.
 6. **Rotation lifecycle (D4/D5/D6):** rotation payload embedded in `member.removed` /
-   `member.left` (single publish), key commitment + same-epoch conflict fail-closed (D5a),
-   per-epoch key store, chunked join-time key transfer (D6).
+    `member.left` (single publish), key commitment + same-epoch conflict fail-closed (D5a),
+    per-epoch key store, chunked join-time key transfer (D6). **(Landed: `member.removed`
+    rotation payload + standalone `member.key_distribution` event, D5a deterministic
+    resolution by smallest `event_id`, `room_keys` persistence table, `WantKeyHistory` /
+    `KeyHistory` sync messages, engine handlers for serving and adopting key history.)**
 7. **Tests:** golden vectors (SUITE_V1 wrap + encrypted event + distribution payload), rotation
-   convergence (two-node removal → post-removal content unreadable to the removed device),
-   D2b malicious-inner-body (valid DAG verdict, body unreadable), AEAD-failure no-panic,
-   same-epoch conflict fail-closed, backward-epoch rejection, join-time chunked transfer,
-   pipe/blob fail-closed reads.
+    convergence (two-node removal → post-removal content unreadable to the removed device),
+    D2b malicious-inner-body (valid DAG verdict, body unreadable), AEAD-failure no-panic,
+    same-epoch conflict fail-closed, backward-epoch rejection, join-time chunked transfer,
+    pipe/blob fail-closed reads.
 8. **Threat-model sign-off:** T27 → Controlled, add T28/T29/T30; update
-   `docs/security/threat-model.md` and the release-notes limitation list.
+    `docs/security/threat-model.md` and the release-notes limitation list.
 
 Each step is independently reviewable; do not start step 2 before step 1 sign-off.
 
@@ -535,8 +539,10 @@ The crypto suite (SUITE_V1, D3) is **pinned**, not open. These remain for build 
   (field names/order, `inner_type` encoding). The *structure* is decided (single
   `Content::Encrypted` variant; rotation in an admin-authored event); only the concrete field
   layout remains. *Resolved for the envelope + AAD:* the envelope field layout was frozen by
-  the §7 step 3 golden vectors, and the normative AAD encoding by step 4 (see D2). The
-  distribution payload's layout remains open for step 6.
+  the §7 step 3 golden vectors, and the normative AAD encoding by step 4 (see D2). *Resolved
+  for the distribution payload:* the `MemberKeyDistribution` payload layout was frozen by the
+  step 6 golden vectors (`new_epoch`, `key_commitment`, canonically-sorted `wrapped_keys`
+  array of `[device_id, {ephemeral_public, nonce, ciphertext}]` pairs).
 - **OQ-2b.** Where the post-`member.left` rotation lives: a dedicated admin rotation event vs.
   piggybacked on the admin's next ordinary event. (Default: a dedicated rotation event for
   clarity; piggybacking is the optimization.)

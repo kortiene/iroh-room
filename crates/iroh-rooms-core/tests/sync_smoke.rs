@@ -255,6 +255,7 @@ fn build_log(n_chat: u32, with_removal: bool) -> Built {
                 removed_by: alice.identity(),
                 reason: None,
                 device_binding: None,
+                rotation: None,
             }),
         };
         events.push(wire(&remove, &alice.dev));
@@ -618,6 +619,7 @@ fn admin_fork_raises_critical_equivocation() {
                 removed_by: built.alice.identity(),
                 reason: Some(reason.to_owned()),
                 device_binding: None,
+                rotation: None,
             }),
         };
         wire(&ev, &built.alice.dev)

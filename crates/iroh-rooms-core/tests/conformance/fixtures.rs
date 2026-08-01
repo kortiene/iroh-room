@@ -366,6 +366,7 @@ pub fn member_removed(
             removed_by: admin_id.identity_key(),
             reason: None,
             device_binding: None,
+            rotation: None,
         }),
     };
     seal_validate(&event, admin_dev)

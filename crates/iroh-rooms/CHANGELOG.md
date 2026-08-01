@@ -7,6 +7,29 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Landed the **content-key rotation lifecycle** (issue #191 step 6, spec
+  `content-key-rotation.md` D4/D5/D6), closing the malicious-reader forward
+  secrecy gap for removed devices. An admin-authored `member.removed` now
+  carries an optional inline rotation payload that wraps a new epoch key for
+  every remaining Active member; a dedicated `member.key_distribution` event
+  serves proactive rotations and post-`member.left` catch-up. The engine
+  adopts epoch keys fold-driven from the DAG, persists them to a new
+  `room_keys` table, and reloads them on restart. Same-epoch conflicting
+  commitments poison the epoch and resolve deterministically to the smallest
+  `event_id` (D5a), never arrival order. A newly-joined invitee requests
+  historical epoch keys via the new `WantKeyHistory` / `KeyHistory` sync
+  messages; the admin serves bounded chunks recomputed for the current Active
+  set. **Threat model:** T27 moves from "Partial — honest transport only" to
+  **Controlled** for the malicious-reader case; T28/T29/T30 record the epoch
+  key store, rotation latency, and metadata-length residuals.
+  **Wire-format note:** `member.removed` gains an optional `rotation` field
+  and the new `member.key_distribution` event type joins the closed content
+  registry. These are **strict wire additions**: a pre-step-6 peer rejects
+  both the new event type and the new `rotation` field as unknown content
+  keys, so a room must upgrade every member past the step-6 compatibility
+  floor before enabling rotation (reader-first rollout, spec D8). The
+  reader-first `Content::Encrypted` envelope (step 3) is the prior floor;
+  this change adds the rotation events on top of it.
 - Fixed the three stacked defects behind the N=40 gossip-overlay load collapse
   (the reason rc.4 held #171/#173 out of shipped binaries), isolated by a
   seven-step single-variable experiment ladder on the corrected spike-N40

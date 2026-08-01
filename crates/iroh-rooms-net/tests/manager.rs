@@ -173,6 +173,7 @@ fn mk_remove(
             removed_by: admin.identity(),
             reason: None,
             device_binding: None,
+            rotation: None,
         }),
     };
     seal_and_validate(&ev, &admin.dev_sk, room_id)
