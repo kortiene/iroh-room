@@ -222,7 +222,14 @@ impl GossipReconciler {
                 attempt.abort();
             }
             self.last_admitted.clear();
-            self.shared.gossip_state.remove_mesh(&self.room_id);
+            // Invalidate the mesh epoch, not just drop the mesh: an aborted join
+            // can still reach `install_mesh_if_current` after this removal, and a
+            // plain `remove_mesh` leaves its epoch current so the stale task would
+            // reinstall the removed device's subscription. `begin_mesh_attempt`
+            // advances the epoch under the same lock used by installation,
+            // serializing this removal against any in-flight join (the same path
+            // the peer-revocation branch below uses).
+            self.shared.gossip_state.begin_mesh_attempt(self.room_id);
             return;
         }
         let admitted = self.admitted_devices(snapshot);
@@ -2561,12 +2568,44 @@ mod gossip_self_removal_tests {
             "active member keeps its mesh"
         );
 
+        // Simulate an in-flight join that started before the removal: it captured
+        // this epoch at its `begin_mesh_attempt` and will validate against it at
+        // `install_mesh_if_current` time. (This also drops the mesh installed
+        // above, mirroring a real retry; the removal below must still hold.)
+        let stale_epoch = shared.gossip_state.begin_mesh_attempt(room);
+
         // Reconcile against the removal fold: the member is no longer Active, so
-        // its own mesh must be dropped and not re-subscribed.
+        // its own mesh must be dropped and not re-subscribed. The reconcile must
+        // also ADVANCE the epoch (not merely drop the mesh), so a stale in-flight
+        // join holding `stale_epoch` can no longer install.
         reconciler.reconcile(&removed_snapshot);
         assert!(
             !shared.gossip_state.has_mesh(&room),
             "a removed device's own reconcile must drop its mesh (the leak fix)"
+        );
+
+        // The epoch race (PR #196 review): a background join that started before
+        // the removal can reach `install_mesh_if_current` after
+        // `JoinHandle::abort()` returns (abort is not synchronous). With the epoch
+        // advanced by the removal, that stale install is rejected; with a plain
+        // `remove_mesh` it would reinstall the removed device's subscription.
+        let stale_mesh = GossipMesh::spawn(
+            shared.clone(),
+            shared.gossip_state.actor().cloned().expect("actor present"),
+            room,
+            vec![],
+        )
+        .await
+        .expect("spawn stale mesh");
+        assert!(
+            !shared
+                .gossip_state
+                .install_mesh_if_current(room, stale_epoch, stale_mesh),
+            "a stale pre-removal epoch must not install after the removal"
+        );
+        assert!(
+            !shared.gossip_state.has_mesh(&room),
+            "the stale join must not reinstall the removed device's mesh"
         );
 
         // A further reconcile must NOT re-subscribe while self is still removed.
