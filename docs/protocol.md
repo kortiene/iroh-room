@@ -322,6 +322,7 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 | `pipe.opened` | Any current member (`owner_id == sender_id`). | room heads |
 | `pipe.closed` | The pipe owner or the admin. | room heads |
 | `agent.status` | Any current member (typically `role == "agent"`). | room heads |
+| `content.encrypted` | Any current member. Encrypted-content envelope (spec `content-key-rotation.md` D2); rollout phase R1: readers parse it as opaque-but-valid, **writers are disabled**. | room heads |
 
 > **Removal is two distinct types**, not one type with a `reason` discriminator:
 > `member.left` (voluntary, signer == subject) and `member.removed` (admin kick, signer ==
@@ -401,6 +402,22 @@ device; verified when present, [§1](#1-identity--key-model)).
 `message: opt tstr` (≤ `MAX_STATUS_MESSAGE_BYTES` = 4,096) ·
 `related_artifact_ids: opt [bstr[16]]` (≤ `MAX_ARTIFACT_REFS` = 16) ·
 `progress_pct: opt uint` (0..=100, integer — no floats).
+
+**`content.encrypted`** *(spec `content-key-rotation.md` D2/D2a/D3; rollout D8 phase R1 — readers
+only, writers disabled until the R2 compatibility floor)*
+`inner_type: tstr` (the wrapped body's registry string — one of the five content types above;
+membership types and nested envelopes are rejected) · `key_epoch: uint` ·
+`suite: uint` (MUST be `ENCRYPTED_SUITE_V1` = 1; anything else fails closed) ·
+`nonce: bstr[12]` (`ENCRYPTED_NONCE_LEN`) ·
+`ciphertext: bstr` (AES-256-GCM over the inner body's canonical CBOR; length in
+`ENCRYPTED_TAG_LEN` = 16 ..= per-inner-type plaintext cap + tag: `message.text` ≤
+`MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT` = 20,480, `file.shared` ≤
+`MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT` = 4,096, `pipe.opened` ≤
+`MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT` = 8,192, `pipe.closed` ≤
+`MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT` = 1,024, `agent.status` ≤
+`MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT` = 8,192). The envelope's DAG verdict is computed from
+these cleartext fields only — never from the sealed body — so every node converges on the same
+verdict regardless of key possession.
 
 ### Structural sizes (from `event/constants.rs`)
 

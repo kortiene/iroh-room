@@ -469,6 +469,14 @@ fn content_summary(content: &Content) -> String {
                 .map_or_else(String::new, |a| format!(" artifacts={}", a.len()));
             format!("state={}{msg}{progress}{artifacts}", c.status)
         }
+        // Phase R1 (spec `content-key-rotation.md` D8): the body is sealed and
+        // no reader holds keys yet — surface only cleartext envelope facts,
+        // which an observer learns regardless (D2 metadata posture).
+        Content::Encrypted(c) => format!(
+            "inner={} epoch={} unreadable",
+            c.inner_type.as_str(),
+            c.key_epoch
+        ),
     }
 }
 
@@ -546,6 +554,13 @@ fn content_fields(content: &Content) -> Map<String, Value> {
                 }
             }
         }
+        // Phase R1 (spec `content-key-rotation.md` D8): cleartext envelope
+        // facts only; the sealed body is never surfaced.
+        Content::Encrypted(c) => {
+            m.insert("inner_type".into(), json!(c.inner_type.as_str()));
+            m.insert("key_epoch".into(), json!(c.key_epoch));
+            m.insert("unreadable".into(), json!(true));
+        }
     }
     m
 }
@@ -584,8 +599,8 @@ mod tests {
     use crate::identity;
     use iroh_rooms_core::event::binding::DeviceBinding;
     use iroh_rooms_core::event::content::{
-        AgentStatus, Content, FileShared, MemberInvited, MemberJoined, MemberLeft, MemberRemoved,
-        MessageText, PipeClosed, PipeOpened, RoomCreated,
+        AgentStatus, Content, EncryptedContent, EventType, FileShared, MemberInvited, MemberJoined,
+        MemberLeft, MemberRemoved, MessageText, PipeClosed, PipeOpened, RoomCreated,
     };
     use iroh_rooms_core::event::ids::{EventId, HashRef, RoomId};
     use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, Signature};
@@ -1048,6 +1063,49 @@ mod tests {
         assert!(
             summary.contains("format=markdown"),
             "summary with explicit format must contain format=<format>: {summary:?}"
+        );
+    }
+
+    /// A fixed envelope with distinctive ciphertext/nonce bytes whose hex
+    /// forms must never appear in any rendered output.
+    fn encrypted_content() -> Content {
+        Content::Encrypted(EncryptedContent {
+            inner_type: EventType::MessageText,
+            key_epoch: 7,
+            suite: 0x01,
+            nonce: [0xAB; 12],
+            ciphertext: vec![0xCD; 48],
+        })
+    }
+
+    #[test]
+    fn content_summary_encrypted_shows_envelope_facts_only() {
+        let summary = content_summary(&encrypted_content());
+        assert_eq!(
+            summary, "inner=message.text epoch=7 unreadable",
+            "the tail summary must show only cleartext envelope facts"
+        );
+        assert!(
+            !summary.to_lowercase().contains("abab") && !summary.to_lowercase().contains("cdcd"),
+            "no nonce/ciphertext bytes may leak into the summary: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn content_fields_encrypted_marks_unreadable_and_leaks_no_bytes() {
+        let fields = content_fields(&encrypted_content());
+        assert_eq!(fields["inner_type"].as_str(), Some("message.text"));
+        assert_eq!(fields["key_epoch"].as_u64(), Some(7));
+        assert_eq!(fields["unreadable"].as_bool(), Some(true));
+        assert_eq!(
+            fields.len(),
+            3,
+            "exactly the three cleartext envelope facts — nothing else: {fields:?}"
+        );
+        let rendered = serde_json::to_string(&fields).expect("serialize fields");
+        assert!(
+            !rendered.to_lowercase().contains("abab") && !rendered.to_lowercase().contains("cdcd"),
+            "no nonce/ciphertext bytes may leak into the JSON row: {rendered}"
         );
     }
 

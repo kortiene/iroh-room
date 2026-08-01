@@ -65,6 +65,13 @@ zeroize = "1"
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 
 [dev-dependencies]
+# The pure SUITE_V1 crypto crate (#191 step 2). Dev-only in phase R1: the
+# `content.encrypted` golden vector seals a real ciphertext with it, and a
+# cross-pin test asserts `ENCRYPTED_SUITE_V1`/`ENCRYPTED_NONCE_LEN`/
+# `ENCRYPTED_TAG_LEN` equal the crypto crate's canonical constants so the two
+# crates cannot drift. The production dependency edge lands with the R2 write
+# path (§7 step 4), not here.
+iroh-rooms-crypto = { path = "../iroh-rooms-crypto" }
 # Temporary directory / file creation for file-backed store e2e tests.
 tempfile = "3"
 # Property-based robustness/round-trip tests for the strict CBOR reader (risk
