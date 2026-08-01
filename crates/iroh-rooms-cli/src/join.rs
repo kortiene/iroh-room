@@ -157,8 +157,13 @@ pub async fn join(
     let db_path = home.join(DB_FILE);
     let store = EventStore::open(&db_path)
         .with_context(|| format!("could not open event store at {}", db_path.display()))?;
-    let engine = SyncEngine::open(store, room_id, SyncConfig::default())
-        .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        room_id,
+        SyncConfig::default(),
+        Some(secret.device_seed()),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
 
     let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
     let cfg = NetConfig {

@@ -1,3 +1,5 @@
+#![allow(clippy::large_futures)] // SyncEngine grew with the epoch-key store (step 6)
+
 //! `net-smoke` — a two-mode harness for the full-mesh QUIC event transport
 //! (spec §5 step 10 / G7). It drives one [`Node`] (a [`NetTransport`] + a real
 //! [`SyncEngine`]) and is used for both the local loopback demo and the Gate-A
@@ -86,7 +88,14 @@ async fn run_listen(mode: NetMode) -> Result<()> {
     // The host admits itself and the expected dialer (seed 2); a `--reject` dialer
     // (seed 99) is deliberately absent → the accept-gate refuses it.
     let admission = demo::allowlist(&[&host, &expected_dialer]);
-    let node = spawn_node(host.iroh_secret(), admission, room, mode).await?;
+    let node = spawn_node(
+        host.iroh_secret(),
+        host.device_seed(),
+        admission,
+        room,
+        mode,
+    )
+    .await?;
 
     node.publish(genesis_bytes)
         .await
@@ -138,7 +147,7 @@ async fn run_dial(
     };
     // The dialer admits the host (so its own accept side would work too).
     let admission = demo::allowlist(&[&me, &host]);
-    let node = spawn_node(me.iroh_secret(), admission, room, mode).await?;
+    let node = spawn_node(me.iroh_secret(), me.device_seed(), admission, room, mode).await?;
 
     let mut dial_addr = EndpointAddr::new(host_id);
     if let Some(socket) = addr {
@@ -188,15 +197,18 @@ async fn run_dial(
 }
 
 /// Build an in-memory engine for `room` and spawn a [`Node`] over it.
+#[allow(clippy::large_futures)] // SyncEngine grew with the epoch-key store (step 6)
 async fn spawn_node(
     secret: iroh::SecretKey,
+    device_seed: [u8; 32],
     admission: AllowlistAdmission,
     room: iroh_rooms_core::event::ids::RoomId,
     mode: NetMode,
 ) -> Result<Node> {
     let store = EventStore::open_in_memory().context("open in-memory event store")?;
     let engine =
-        SyncEngine::open(store, room, SyncConfig::default()).context("open sync engine")?;
+        SyncEngine::open_with_local_device(store, room, SyncConfig::default(), Some(device_seed))
+            .context("open sync engine")?;
     let cfg = NetConfig {
         mode,
         ..NetConfig::default()

@@ -2082,7 +2082,13 @@ mod room_events_pump_tests {
         let host = demo::Participant::new(0x01);
         let (room, genesis_id, genesis_wire) = demo::genesis(&host);
         let store = EventStore::open_in_memory().expect("in-memory store");
-        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        let mut engine = SyncEngine::open_with_local_device(
+            store,
+            room,
+            SyncConfig::default(),
+            Some(host.device_seed()),
+        )
+        .expect("open engine");
         engine.publish(&genesis_wire).expect("publish genesis");
         (engine, host, room, genesis_id)
     }
@@ -2260,6 +2266,9 @@ mod admission_refresher_tests {
         fn endpoint_id(&self) -> EndpointId {
             SecretKey::from_bytes(&self.dev.to_seed()).public()
         }
+        fn device_seed(&self) -> [u8; 32] {
+            *self.dev.to_seed()
+        }
     }
 
     fn wire(ev: &SignedEvent, dev: &SigningKey) -> Vec<u8> {
@@ -2295,7 +2304,13 @@ mod admission_refresher_tests {
         let member = Actor::new(0x02);
         let (room, genesis_id, genesis_wire) = genesis(&host);
         let store = EventStore::open_in_memory().expect("in-memory store");
-        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        let mut engine = SyncEngine::open_with_local_device(
+            store,
+            room,
+            SyncConfig::default(),
+            Some(host.device_seed()),
+        )
+        .expect("open engine");
         engine.publish(&genesis_wire).expect("publish genesis");
 
         let cell = Arc::new(Mutex::new(AdmissionView::empty()));
@@ -2377,6 +2392,7 @@ mod admission_refresher_tests {
                 removed_by: host.identity(),
                 reason: None,
                 device_binding: None,
+                rotation: None,
             }),
         };
         engine
@@ -2529,6 +2545,7 @@ mod terminal_removal_tests {
                 removed_by: admin.identity(),
                 reason: None,
                 device_binding: None,
+                rotation: None,
             }),
         };
         let remove_id = remove.event_id();
@@ -2759,6 +2776,7 @@ mod gossip_self_removal_tests {
                 removed_by: admin.identity(),
                 reason: None,
                 device_binding: None,
+                rotation: None,
             }),
         };
         let removed_snapshot = RoomMembership::from_events(
@@ -2934,8 +2952,13 @@ mod pump_gossip_self_check_tests {
 
         let store = EventStore::open_in_memory().expect("in-memory store");
         let engine_room: RoomId = room;
-        let engine =
-            SyncEngine::open(store, engine_room, SyncConfig::default()).expect("open engine");
+        let engine = SyncEngine::open_with_local_device(
+            store,
+            engine_room,
+            SyncConfig::default(),
+            Some(host.device_seed()),
+        )
+        .expect("open engine");
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (_pipe_query_tx, pipe_query_rx) = mpsc::channel(8);

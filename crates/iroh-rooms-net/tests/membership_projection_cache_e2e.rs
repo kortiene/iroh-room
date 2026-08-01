@@ -213,6 +213,7 @@ fn mk_remove(
             removed_by: admin.identity(),
             reason: None,
             device_binding: None,
+            rotation: None,
         }),
     };
     (ev.event_id(), wire_bytes(&ev, &admin.dev_sk))

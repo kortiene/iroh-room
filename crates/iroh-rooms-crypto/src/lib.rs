@@ -100,6 +100,20 @@ pub use error::CryptoError;
 pub use keys::{generate_nonce, EphemeralSecret, RoomKey};
 pub use wrap::{unwrap_room_key, wrap_room_key, wrap_room_key_with, WrappedRoomKey};
 
+/// The D5 key commitment: `BLAKE3(new_epoch_be8 || room_id || room_key)`.
+///
+/// Binding the epoch and room prevents a malicious admin from re-wrapping an
+/// old epoch key under a later epoch; the commitment is verified at key
+/// adoption (spec `content-key-rotation.md` D5/D5a).
+#[must_use]
+pub fn room_key_commitment(room_key: &RoomKey, room_id: &[u8; 32], epoch: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&epoch.to_be_bytes());
+    hasher.update(room_id);
+    hasher.update(room_key.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// The single pinned cryptographic suite (spec D3). Any other suite id is
 /// rejected fail-closed by [`ensure_suite`].
 pub const SUITE_V1: u8 = 0x01;

@@ -181,6 +181,16 @@ impl SecretKeys {
         Ok(keys)
     }
 
+    /// Return the 32-byte device secret seed.
+    ///
+    /// The engine needs this seed to unwrap epoch keys from key-distribution
+    /// payloads (issue #191 step 6). The returned array is a copy; the original
+    /// stays inside the [`SigningKey`] wrapper.
+    #[must_use]
+    pub fn device_seed(&self) -> [u8; 32] {
+        *self.device.to_seed()
+    }
+
     /// Decode both seeds into signing keys, validating the file version. Secret
     /// intermediates are held in `Zeroizing` and wiped on drop.
     fn from_secret_file(file: &SecretFile) -> Result<Self> {

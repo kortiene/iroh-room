@@ -145,6 +145,22 @@ CREATE TABLE IF NOT EXISTS trust_decisions (
     created_at  INTEGER NOT NULL,                          -- advisory/debug only
     PRIMARY KEY (room_id, seq)
 ) STRICT;
+
+-- ======================================================================
+-- Schema v2 extension (#191 step 6): persisted epoch key store.
+-- This is a DERIVED CACHE: the keys can be re-obtained by unwrapping the
+-- `member.key_distribution` / `member.removed.rotation` events stored in
+-- `events`, so the table is droppable and re-derivable. It persists only
+-- successfully adopted epoch keys (not conflict candidates), so a restart
+-- does not re-poison an epoch that was already resolved.
+-- ======================================================================
+
+CREATE TABLE IF NOT EXISTS room_keys (
+    room_id     BLOB    NOT NULL,                          -- 32 bytes
+    epoch       INTEGER NOT NULL,                          -- key_epoch
+    key         BLOB    NOT NULL,                          -- 32-byte room_key
+    PRIMARY KEY (room_id, epoch)
+) STRICT;
 ";
 
 /// Apply connection pragmas. `journal_mode = WAL` returns a row, so it is run via

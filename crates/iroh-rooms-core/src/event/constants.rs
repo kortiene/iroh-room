@@ -86,6 +86,14 @@ pub const ENCRYPTED_NONCE_LEN: usize = 12;
 /// `iroh_rooms_crypto::TAG_LEN`.
 pub const ENCRYPTED_TAG_LEN: usize = 16;
 
+/// Nonce length of a wrapped room key (AES-256-GCM, 96-bit — spec D3).
+/// Cross-pinned to `iroh_rooms_crypto::NONCE_LEN`.
+pub const WRAPPED_KEY_NONCE_LEN: usize = 12;
+
+/// Ciphertext length of a wrapped room key: 32-byte key + 16-byte tag
+/// (spec D3). Cross-pinned to `iroh_rooms_crypto::WRAPPED_ROOM_KEY_LEN`.
+pub const WRAPPED_KEY_CIPHERTEXT_LEN: usize = 48;
+
 /// Maximum canonical-CBOR plaintext bytes for an encrypted `message.text`
 /// body (spec D2a): the §7 body cap plus 4 KiB headroom for `format`,
 /// `in_reply_to`, `mentions`, and map overhead.

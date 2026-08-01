@@ -23,12 +23,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use iroh_rooms_crypto::RoomKey;
+use iroh_rooms_crypto::{room_key_commitment, unwrap_room_key, RoomKey, SUITE_V1};
 
-use crate::event::content::{Content, EventType};
+use crate::event::content::{Content, EventType, MemberKeyDistribution};
 use crate::event::encrypted::{open_encrypted_content, UnreadableReason};
 use crate::event::ids::{EventId, RoomId};
-use crate::event::keys::IdentityKey;
+use crate::event::keys::{DeviceKey, IdentityKey};
 use crate::event::reject::RejectReason;
 use crate::event::signed::{self, SignedEvent};
 use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
@@ -39,8 +39,10 @@ use crate::store::{
 };
 
 use super::config::SyncConfig;
-use super::keys::EpochKeyStore;
-use super::message::{id_set, Outgoing, PeerId, SyncMessage, Window};
+use super::keys::{ConflictCandidate, EpochKeyConflict, EpochKeyStore};
+use super::message::{
+    id_set, KeyHistoryChunk, Outgoing, PeerId, SyncMessage, Window, KEY_HISTORY_ENVELOPE_ALLOWANCE,
+};
 
 /// An engine-level fault (never a single invalid event — those are logged drops,
 /// spec §9). `Display` carries a stable lowercase code.
@@ -570,12 +572,18 @@ pub struct SyncEngine {
     pending_batch: PendingStoreBatch,
 
     /// In-memory `epoch → room_key` store for `content.encrypted` bodies
-    /// (#191 step 4, spec D5a/D7). Session-only on purpose: persistence and
-    /// fold-driven key adoption are the rotation lifecycle (§7 step 6); until
-    /// then keys arrive via [`insert_room_key`](Self::insert_room_key) only.
-    /// `RoomKey` zeroizes on drop, so an engine drop wipes the keys (the T28
-    /// at-rest posture is step-6 material).
+    /// (#191 step 4 + step 6, spec D5a/D7). Keys arrive via fold-driven
+    /// adoption from `member.key_distribution` / `member.removed.rotation`
+    /// payloads and via the local provisioning API
+    /// [`insert_room_key`](Self::insert_room_key). Adopted keys are persisted
+    /// to `room_keys` and reloaded on `open`. `RoomKey` zeroizes on drop, so an
+    /// engine drop wipes in-memory keys; the T28 at-rest posture is deferred.
     room_keys: EpochKeyStore,
+    /// The local device's Ed25519 secret seed, used to unwrap epoch keys from
+    /// distributions targeted at this device. `None` when the engine was opened
+    /// without a local device secret (e.g. read-only / audit nodes), in which
+    /// case distributions are accepted into the DAG but cannot be unwrapped.
+    local_device_seed: Option<[u8; 32]>,
 }
 
 /// How much of the responder's held set a `WantMembership` `have` ancestry
@@ -598,6 +606,24 @@ impl SyncEngine {
     /// [`SyncError::Config`] if `config` is invalid, or [`SyncError::Store`] on a
     /// store read failure.
     pub fn open(store: EventStore, room_id: RoomId, config: SyncConfig) -> Result<Self, SyncError> {
+        Self::open_with_local_device(store, room_id, config, None)
+    }
+
+    /// Open the engine with an optional local device secret seed. The seed is
+    /// required for this node to unwrap epoch keys from `member.key_distribution`
+    /// / `member.removed.rotation` payloads; read-only or audit nodes may pass
+    /// `None` and still validate/persist events, but encrypted content will be
+    /// unreadable.
+    ///
+    /// # Errors
+    /// [`SyncError::Config`] if `config` is invalid, or [`SyncError::Store`] on a
+    /// store read failure.
+    pub fn open_with_local_device(
+        store: EventStore,
+        room_id: RoomId,
+        config: SyncConfig,
+        local_device_seed: Option<[u8; 32]>,
+    ) -> Result<Self, SyncError> {
         config.validate().map_err(SyncError::Config)?;
 
         // Rebuild the fold from the authoritative table. Every stored event is
@@ -641,6 +667,25 @@ impl SyncEngine {
             dedup_cache.insert(id);
         }
 
+        // Load previously adopted epoch keys from the derived cache. A failure
+        // here is not fatal: the keys can be re-obtained from the distribution
+        // events in `events` via backfill/re-fold, so log and continue.
+        let mut room_keys = EpochKeyStore::default();
+        match store.load_room_keys(&room_id) {
+            Ok(keys) => {
+                for (epoch, key) in keys {
+                    // load_room_keys returns only successfully adopted keys, so
+                    // they cannot conflict; ignore the rare impossible conflict.
+                    // The original event id is not persisted; use a default.
+                    let _ = room_keys.insert(epoch, key, EventId::from_bytes([0u8; 32]));
+                }
+            }
+            Err(e) => {
+                // Log only; correctness does not depend on this derived cache.
+                eprintln!("iroh-rooms: failed to load room keys for {room_id}: {e}");
+            }
+        }
+
         let mut engine = Self {
             room_id,
             config,
@@ -671,14 +716,16 @@ impl SyncEngine {
             pull_sweep_remaining: 0,
             dedup_cache,
             pending_batch: PendingStoreBatch::new(),
-            room_keys: EpochKeyStore::default(),
+            room_keys,
+            local_device_seed,
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
-        // the unconfirmed admin-tip suspicion, the backfill token buckets, and the
-        // trust-decision audit) from the v2 sync-cache tables BEFORE recomputing
-        // completeness, so a persisted suspicion re-arms the fail-closed gate and a
-        // reboot cannot fail-open (spec §6.1 / D3).
+        // the unconfirmed admin-tip suspicion, the backfill token buckets, the
+        // trust-decision audit, and adopted room keys) from the v2 sync-cache
+        // tables BEFORE recomputing completeness, so a persisted suspicion
+        // re-arms the fail-closed gate and a reboot cannot fail-open
+        // (spec §6.1 / D3).
         engine.restore_persisted_state()?;
         engine.recompute_completeness()?;
         Ok(engine)
@@ -857,6 +904,14 @@ impl SyncEngine {
             SyncMessage::EventsConfirmed { .. } | SyncMessage::ProveCapability { .. } => {}
             SyncMessage::NotFound { ids, .. } => {
                 self.log(&format!("peer lacks {} requested ids", ids.len()));
+            }
+            SyncMessage::WantKeyHistory { have_epochs, .. } => {
+                self.serve_want_key_history(from, &have_epochs, &mut out);
+            }
+            SyncMessage::KeyHistory { chunks, .. } => {
+                for chunk in chunks {
+                    self.adopt_key_history_chunk(chunk);
+                }
             }
         }
         // Issue #143: flush the batched accepted events and run parked-frame
@@ -1071,8 +1126,9 @@ impl SyncEngine {
     /// # Errors
     /// [`SyncError::EpochKeyConflict`] on a conflicting offer.
     pub fn insert_room_key(&mut self, epoch: u64, key: RoomKey) -> Result<(), SyncError> {
+        // Local provisioning carries no attribution; a default event id is used.
         self.room_keys
-            .insert(epoch, key)
+            .insert(epoch, key, EventId::from_bytes([0u8; 32]))
             .map_err(|c| SyncError::EpochKeyConflict { epoch: c.epoch })
     }
 
@@ -1088,6 +1144,13 @@ impl SyncEngine {
     #[must_use]
     pub fn room_key(&self, epoch: u64) -> Option<&RoomKey> {
         self.room_keys.get(epoch)
+    }
+
+    /// Whether `epoch` has been poisoned by conflicting key offers (spec D5a).
+    /// A poisoned epoch has no usable key and refuses all future offers.
+    #[must_use]
+    pub fn is_room_key_poisoned(&self, epoch: u64) -> bool {
+        self.room_keys.is_poisoned(epoch)
     }
 
     /// The surfacing view of an event's content (spec D2b): a plaintext body
@@ -1682,6 +1745,9 @@ impl SyncEngine {
                 self.closure_cache = None;
                 self.covered_cache.clear();
                 self.note_admin_event(id);
+                // Fold-driven key adoption (#191 step 6): if this event carries a
+                // distribution payload, attempt to unwrap and adopt the epoch key.
+                self.adopt_key_from_event(id, &ev.event.content);
                 // Push-subscription feed (issue #83): emit exactly once, only on a real
                 // insert (the Duplicate arm never reaches here → exactly-once for free).
                 match self.store.get_in_room(&self.room_id, &id) {
@@ -2177,6 +2243,99 @@ impl SyncEngine {
                 },
             ));
         }
+    }
+
+    /// Serve a `WantKeyHistory` request (spec D6): return bounded chunks for
+    /// every epoch the requester lacks, drawn from the persisted `room_keys`
+    /// derived cache. Only successfully adopted keys are served; poisoned or
+    /// unresolved epochs are skipped. The response is chunked so the encoded
+    /// `KeyHistory` message stays under [`MAX_FRAME_BYTES`](super::message::MAX_FRAME_BYTES).
+    fn serve_want_key_history(
+        &mut self,
+        from: PeerId,
+        have_epochs: &BTreeSet<u64>,
+        out: &mut Vec<Outgoing>,
+    ) {
+        let mut chunks = Vec::new();
+        let mut budget = super::message::MAX_FRAME_BYTES - KEY_HISTORY_ENVELOPE_ALLOWANCE;
+        let held = self
+            .room_keys
+            .iter_held()
+            .map(|(epoch, key)| (epoch, key.clone()))
+            .collect::<Vec<_>>();
+        for (epoch, key) in held {
+            if have_epochs.contains(&epoch) {
+                continue;
+            }
+            // Build a chunk: the wrapped keys are recomputed for each recipient
+            // that is currently an Active member in this engine's view. If the
+            // local node has no device secret it cannot unwrap, so serving keys
+            // it only provisioned via `insert_room_key` is limited; this path is
+            // primarily for an admin that generated the keys to serve joiners.
+            let Some(chunk) = self.build_key_history_chunk(epoch, &key) else {
+                continue;
+            };
+            let chunk_cost =
+                KEY_HISTORY_ENVELOPE_ALLOWANCE + crate::event::cbor::encode(&chunk.to_cbor()).len();
+            if !chunks.is_empty() && chunk_cost > budget {
+                out.push(to(
+                    from,
+                    SyncMessage::KeyHistory {
+                        room_id: self.room_id,
+                        chunks: std::mem::take(&mut chunks),
+                    },
+                ));
+                budget = super::message::MAX_FRAME_BYTES - KEY_HISTORY_ENVELOPE_ALLOWANCE;
+            }
+            if chunk_cost > budget {
+                // A single chunk is too large for the wire cap; log and skip.
+                self.log(&format!("key_history chunk too large epoch={epoch}"));
+                continue;
+            }
+            budget -= chunk_cost;
+            chunks.push(chunk);
+        }
+        if !chunks.is_empty() {
+            out.push(to(
+                from,
+                SyncMessage::KeyHistory {
+                    room_id: self.room_id,
+                    chunks,
+                },
+            ));
+        }
+    }
+
+    /// Build one `KeyHistoryChunk` for `epoch`/`key`, wrapping it for every
+    /// currently-Active member (excluding removed/departed ones). Returns `None`
+    /// if the local node lacks a device secret to unwrap+re-wrap, or if there
+    /// are no recipients.
+    fn build_key_history_chunk(&self, epoch: u64, key: &RoomKey) -> Option<KeyHistoryChunk> {
+        let _seed = self.local_device_seed?;
+        let snapshot = self.membership_projection.snapshot.clone();
+        let admin = snapshot.admin()?;
+        let admin = *admin;
+        let recipients: Vec<DeviceKey> = snapshot
+            .members()
+            .filter(|m| m.identity != admin && m.status == Status::Active)
+            .filter_map(|m| m.device)
+            .collect();
+        if recipients.is_empty() {
+            return None;
+        }
+        let distribution = crate::event::distribution::build_key_distribution_content(
+            &self.room_id,
+            epoch,
+            key,
+            &recipients,
+        )
+        .ok()?;
+        Some(KeyHistoryChunk {
+            distribution_event_id: EventId::from_bytes([0u8; 32]),
+            epoch,
+            key_commitment: distribution.key_commitment,
+            wrapped_keys: distribution.wrapped_keys,
+        })
     }
 
     /// Serve the never-windowed authorization-class set **causally closed** —
@@ -2876,6 +3035,135 @@ impl SyncEngine {
 
     fn note_admin_id(&mut self, seq: u64, id: EventId) {
         self.admin_ids_by_seq.entry(seq).or_default().insert(id);
+    }
+
+    /// Fold-driven key adoption (#191 step 6). If `content` carries a
+    /// `MemberKeyDistribution` payload, try to unwrap the local device's key,
+    /// verify the D5 commitment, and adopt it. Same-epoch conflicts poison the
+    /// epoch and retain candidates for deterministic resolution.
+    fn adopt_key_from_event(&mut self, event_id: EventId, content: &Content) {
+        let distribution = match content {
+            Content::MemberKeyDistribution(d) => Some(d),
+            Content::MemberRemoved(c) => c.rotation.as_ref(),
+            _ => None,
+        };
+        if let Some(distribution) = distribution {
+            self.adopt_key_distribution(event_id, distribution);
+        }
+    }
+
+    /// Adopt a `MemberKeyDistribution` payload, whether it arrived in a DAG
+    /// event or in a key-history chunk. Verifies the D5 commitment, unwraps for
+    /// the local device, and handles same-epoch conflicts deterministically.
+    fn adopt_key_distribution(&mut self, event_id: EventId, distribution: &MemberKeyDistribution) {
+        let epoch = distribution.new_epoch;
+        let room_id = self.room_id;
+
+        // If the epoch is already poisoned we still want to record this
+        // candidate, so do not return early. If we already hold a key for this
+        // epoch, only skip when the D5 commitment matches (idempotent); a
+        // different key must flow through the conflict path below.
+        // If the epoch is already poisoned we still want to record this
+        // candidate, so do not return early. If we already hold a key for this
+        // epoch, only skip when the D5 commitment matches (idempotent); a
+        // different key must flow through the conflict path below.
+        if self.room_keys.has(epoch) {
+            if let Some(held) = self.room_keys.get(epoch) {
+                let held_commitment = room_key_commitment(held, room_id.as_bytes(), epoch);
+                if held_commitment == distribution.key_commitment {
+                    return;
+                }
+            }
+        }
+
+        let Some(seed) = self.local_device_seed else {
+            // Read-only node: cannot unwrap, so the epoch stays keyless for us.
+            return;
+        };
+
+        let local_device = DeviceKey::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let Some(entry) = distribution
+            .wrapped_keys
+            .iter()
+            .find(|(device, _)| *device == local_device)
+        else {
+            // This distribution does not target our device; nothing to adopt.
+            return;
+        };
+
+        let wrapped = iroh_rooms_crypto::WrappedRoomKey {
+            ephemeral_public: entry.1.ephemeral_public,
+            nonce: entry.1.nonce,
+            ciphertext: entry.1.ciphertext,
+        };
+        let Ok(key) = unwrap_room_key(SUITE_V1, &wrapped, &seed, room_id.as_bytes(), epoch) else {
+            self.log(&format!("key_unwrap_failed epoch={epoch} event={event_id}"));
+            return;
+        };
+
+        // Verify the D5 commitment binds epoch + room + key.
+        let expected = room_key_commitment(&key, room_id.as_bytes(), epoch);
+        if expected != distribution.key_commitment {
+            self.log(&format!(
+                "key_commitment_mismatch epoch={epoch} event={event_id}"
+            ));
+            return;
+        }
+
+        // Clone once before the consuming insert so the candidate path still has
+        // a copy if a conflict poisons the epoch.
+        let key_for_conflict = key.clone();
+        if let Err(EpochKeyConflict {
+            epoch: conflict_epoch,
+        }) = self.room_keys.insert(epoch, key, event_id)
+        {
+            // Conflict: retain this candidate and attempt deterministic resolution.
+            self.room_keys.add_conflict_candidate(
+                conflict_epoch,
+                ConflictCandidate {
+                    event_id,
+                    key: key_for_conflict.clone(),
+                },
+            );
+            let resolved = self.room_keys.resolve(conflict_epoch);
+            if resolved {
+                self.log(&format!("epoch_key_resolved epoch={conflict_epoch}"));
+            } else {
+                self.log(&format!(
+                    "epoch_key_conflict epoch={conflict_epoch} event={event_id}"
+                ));
+            }
+            return;
+        }
+
+        // Fresh adoption: persist the derived key.
+        self.persist_room_key(epoch, &key_for_conflict);
+        self.log(&format!("epoch_key_adopted epoch={epoch} event={event_id}"));
+    }
+
+    /// Adopt one key-history chunk received over the sync channel (spec D6).
+    /// The chunk carries a distribution payload plus the original event id for
+    /// deterministic conflict resolution.
+    fn adopt_key_history_chunk(&mut self, chunk: super::message::KeyHistoryChunk) {
+        let event_id = chunk.distribution_event_id;
+        let distribution = MemberKeyDistribution {
+            new_epoch: chunk.epoch,
+            key_commitment: chunk.key_commitment,
+            wrapped_keys: chunk.wrapped_keys,
+        };
+        self.adopt_key_distribution(event_id, &distribution);
+    }
+
+    /// Persist one adopted epoch key to the derived cache. Log and continue on
+    /// failure — correctness rests on the authoritative events table.
+    fn persist_room_key(&mut self, epoch: u64, key: &RoomKey) {
+        if let Err(e) = self.store.save_room_key(&self.room_id, epoch, key) {
+            self.log(&format!("checkpoint failed: room_key epoch={epoch}: {e}"));
+        }
     }
 
     /// On open, seed the per-seq fork-detection state from the persisted, validated

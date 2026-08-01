@@ -57,6 +57,7 @@ pub fn build_member_removed(
         removed_by: sender_id,
         reason: reason.map(ToOwned::to_owned),
         device_binding,
+        rotation: None,
     });
     let event = SignedEvent {
         schema_version: SCHEMA_VERSION,

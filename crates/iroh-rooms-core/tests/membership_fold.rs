@@ -195,6 +195,7 @@ fn remove(
             removed_by: signer.identity(),
             reason: None,
             device_binding: None,
+            rotation: None,
         }),
     };
     validate(&ev, &signer.dev, room_id)

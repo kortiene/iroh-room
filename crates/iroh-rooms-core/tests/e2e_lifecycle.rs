@@ -419,6 +419,7 @@ fn member_departure_lifecycle() {
             removed_by: alice_id.identity_key(),
             reason: Some("spam".to_owned()),
             device_binding: None,
+            rotation: None,
         }),
     };
     let v3 =
@@ -798,6 +799,7 @@ fn member_removed_with_optional_device_binding_accepted() {
             removed_by: alice_id.identity_key(),
             reason: Some("violation".to_owned()),
             device_binding: Some(alice_binding),
+            rotation: None,
         }),
     };
     let validated = validate_wire_bytes(&seal(&removed, &alice_dev), &ctx(room_id))

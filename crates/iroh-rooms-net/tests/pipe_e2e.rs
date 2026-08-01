@@ -193,6 +193,7 @@ fn build_member_removed(
             removed_by: admin.identity(),
             reason: Some("revoked".to_owned()),
             device_binding: None,
+            rotation: None,
         }),
     };
     wire_bytes(&ev, &admin.dev)

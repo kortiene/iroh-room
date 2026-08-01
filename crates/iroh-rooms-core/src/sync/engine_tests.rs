@@ -18,13 +18,15 @@ use crate::event::content::{
     capability_hash, Content, EventType, FileShared, MemberInvited, MemberJoined, MemberRemoved,
     MessageText, RoomCreated,
 };
+use crate::event::distribution::build_member_removed_with_rotation;
 use crate::event::ids::{EventId, HashRef, RoomId};
-use crate::event::keys::{IdentityKey, SigningKey};
+use crate::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use crate::event::signed::{self, SignedEvent};
 use crate::event::validate::{validate_wire_bytes, ValidationContext};
 use crate::event::wire::WireEvent;
 use crate::membership::{Role, Status};
 use crate::store::EventStore;
+use iroh_rooms_crypto::RoomKey;
 
 use super::engine::{Completeness, Severity, SyncEngine};
 use super::message::{Outgoing, PeerId, SyncMessage};
@@ -231,6 +233,7 @@ fn make_remove(
             removed_by: admin_id.identity_key(),
             reason: None,
             device_binding: None,
+            rotation: None,
         }),
     };
     seal(&ev, admin_dev)
@@ -1656,5 +1659,250 @@ fn single_forced_pull_sweeps_every_peer_then_quiesces() {
             .iter()
             .any(|o| matches!(o.msg, SyncMessage::WantRecentChat { .. })),
         "after the sweep completes, ticks emit no pulls until re-armed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Content-key rotation lifecycle (issue #191 step 6 / spec D4/D5/D6/D7)
+// ---------------------------------------------------------------------------
+
+/// The deterministic admin device seed used by `seeded_engine` (`sk(2)`).
+const ADMIN_DEV_SEED: [u8; 32] = [0x02; 32];
+
+/// Like [`seeded_engine`] but opens the engine with the admin's device seed so
+/// it can unwrap epoch keys from distribution payloads.
+fn seeded_engine_with_admin_seed(cfg: SyncConfig) -> (SyncEngine, RoomId, EventId) {
+    let (admin_id, admin_dev) = (sk(1), sk(2));
+    let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+    let store = EventStore::open_in_memory().expect("store");
+    let mut engine =
+        SyncEngine::open_with_local_device(store, room, cfg, Some(ADMIN_DEV_SEED)).expect("open");
+    engine.publish(&genesis).expect("publish genesis");
+    let genesis_id = frame_id(&genesis, room);
+    (engine, room, genesis_id)
+}
+
+/// Collect the device keys of every currently-Active member (the recipients for
+/// a key distribution).
+fn active_device_keys(engine: &SyncEngine) -> Vec<DeviceKey> {
+    engine
+        .snapshot()
+        .active_members()
+        .filter_map(|m| m.device)
+        .collect()
+}
+
+#[test]
+fn removal_with_rotation_adopts_epoch_key_for_remaining_member() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+    let member_id = sk(3);
+    let member_dev = sk(4);
+
+    // Invite and join a second member so the room has an Active non-admin.
+    let invite_id = [0x11; 16];
+    let secret = [0x22; 16];
+    let invite = make_invite(
+        &admin_id,
+        &admin_dev,
+        room,
+        genesis_id,
+        member_id.identity_key(),
+        invite_id,
+        secret,
+        "member",
+        T0 + 1,
+    );
+    let invite_id_ev = frame_id(&invite, room);
+    engine.publish(&invite).expect("publish invite");
+
+    let join = make_join(
+        &member_id,
+        &member_dev,
+        room,
+        invite_id_ev,
+        invite_id,
+        secret,
+        "member",
+        T0 + 2,
+    );
+    engine.publish(&join).expect("publish join");
+    assert_eq!(engine.snapshot().active_member_count(), 2);
+
+    // Admin removes the member and rotates to epoch 2. The removed member is
+    // excluded from recipients; only the admin's device remains.
+    let new_key = RoomKey::generate();
+    let recipients = active_device_keys(&engine);
+    assert_eq!(recipients.len(), 2);
+    let recipients: Vec<DeviceKey> = recipients
+        .into_iter()
+        .filter(|d| *d != member_dev.device_key())
+        .collect();
+    assert_eq!(recipients.len(), 1);
+
+    let removal = build_member_removed_with_rotation(
+        &admin_id,
+        &admin_dev,
+        &room,
+        &member_id.identity_key(),
+        None,
+        None,
+        Some(2),
+        Some(&new_key),
+        &recipients,
+        &[frame_id(&join, room)],
+        T0 + 3,
+    )
+    .expect("build removal with rotation");
+    engine
+        .publish(&removal.to_bytes())
+        .expect("publish removal");
+
+    assert!(
+        engine.has_room_key(2),
+        "engine with admin seed must adopt epoch 2 key"
+    );
+    assert_eq!(
+        engine.room_key(2).expect("epoch 2 key").as_bytes(),
+        new_key.as_bytes(),
+        "adopted key must match the one wrapped in the rotation payload"
+    );
+    assert_eq!(engine.snapshot().active_member_count(), 1);
+}
+
+#[test]
+fn standalone_key_distribution_adopts_epoch_key() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+
+    let new_key = RoomKey::generate();
+    let distribution = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &new_key,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("build key distribution");
+    engine
+        .publish(&distribution.to_bytes())
+        .expect("publish key distribution");
+
+    assert!(
+        engine.has_room_key(2),
+        "standalone distribution must be adopted"
+    );
+    assert_eq!(
+        engine.room_key(2).expect("epoch 2 key").as_bytes(),
+        new_key.as_bytes()
+    );
+}
+
+#[test]
+fn conflicting_keys_for_same_epoch_poison_epoch() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+
+    // Two distinct keys for the same epoch, both wrapped for the admin device.
+    let key_a = RoomKey::from_bytes([0xAA; 32]);
+    let key_b = RoomKey::from_bytes([0xBB; 32]);
+
+    let dist_a = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_a,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("build distribution A");
+    let dist_b = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_b,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 2,
+    )
+    .expect("build distribution B");
+
+    let id_a = frame_id(&dist_a.to_bytes(), room);
+    let id_b = frame_id(&dist_b.to_bytes(), room);
+    let expected_winner = if id_a.as_bytes() < id_b.as_bytes() {
+        &key_a
+    } else {
+        &key_b
+    };
+
+    engine.publish(&dist_a.to_bytes()).expect("publish A");
+    engine.publish(&dist_b.to_bytes()).expect("publish B");
+
+    // D5a: conflicting keys trigger deterministic resolution. The candidate with
+    // the lexicographically smallest event_id wins.
+    assert!(
+        engine.has_room_key(2),
+        "deterministic resolution must leave a usable epoch 2 key"
+    );
+    assert!(
+        !engine.is_room_key_poisoned(2),
+        "resolution must un-poison the epoch"
+    );
+    assert_eq!(
+        engine.room_key(2).expect("epoch 2 key").as_bytes(),
+        expected_winner.as_bytes(),
+        "smallest-event-id candidate must win"
+    );
+}
+
+#[test]
+fn adopted_keys_survive_engine_restart() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+
+    let new_key = RoomKey::from_bytes([0xCC; 32]);
+    let distribution = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &new_key,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("build key distribution");
+    engine
+        .publish(&distribution.to_bytes())
+        .expect("publish key distribution");
+    assert!(engine.has_room_key(2));
+
+    // Restart: store is durable, the in-memory key store is not.
+    let store = engine.into_store();
+    let reopened = SyncEngine::open_with_local_device(
+        store,
+        room,
+        SyncConfig::default(),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+
+    assert!(
+        reopened.has_room_key(2),
+        "epoch 2 key must reload from persisted room_keys table"
+    );
+    assert_eq!(
+        reopened.room_key(2).expect("epoch 2 key").as_bytes(),
+        new_key.as_bytes()
     );
 }

@@ -477,6 +477,9 @@ fn content_summary(content: &Content) -> String {
             c.inner_type.as_str(),
             c.key_epoch
         ),
+        Content::MemberKeyDistribution(c) => {
+            format!("epoch={} recipients={}", c.new_epoch, c.wrapped_keys.len())
+        }
     }
 }
 
@@ -560,6 +563,10 @@ fn content_fields(content: &Content) -> Map<String, Value> {
             m.insert("inner_type".into(), json!(c.inner_type.as_str()));
             m.insert("key_epoch".into(), json!(c.key_epoch));
             m.insert("unreadable".into(), json!(true));
+        }
+        Content::MemberKeyDistribution(c) => {
+            m.insert("new_epoch".into(), json!(c.new_epoch));
+            m.insert("recipient_count".into(), json!(c.wrapped_keys.len()));
         }
     }
     m
@@ -1333,6 +1340,7 @@ mod tests {
             removed_by: IdentityKey::from_bytes([0x08; 32]),
             reason: None,
             device_binding: None,
+            rotation: None,
         });
         let fields = content_fields(&content);
         assert!(
@@ -1356,6 +1364,7 @@ mod tests {
             removed_by: IdentityKey::from_bytes([0x08; 32]),
             reason: Some("policy violation".to_string()),
             device_binding: None,
+            rotation: None,
         });
         let fields = content_fields(&content);
         assert_eq!(fields["reason"].as_str(), Some("policy violation"));
@@ -1517,6 +1526,7 @@ mod tests {
             removed_by: IdentityKey::from_bytes([0x08; 32]),
             reason: None,
             device_binding: None,
+            rotation: None,
         });
         let summary = content_summary(&content);
         assert!(
@@ -1536,6 +1546,7 @@ mod tests {
             removed_by: IdentityKey::from_bytes([0x08; 32]),
             reason: Some("abuse".to_string()),
             device_binding: None,
+            rotation: None,
         });
         let summary = content_summary(&content);
         assert!(

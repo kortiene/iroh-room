@@ -31,7 +31,10 @@
 //! * [`left`] — pure assembly of a signed [`content::MemberLeft`] self-departure
 //!   event ([`left::build_member_left`], §7).
 //! * [`removed`] — pure assembly of a signed admin [`content::MemberRemoved`]
-//!   removal event ([`removed::build_member_removed`], §7).
+//!   event ([`removed::build_member_removed`], §7).
+//! * [`distribution`] — pure assembly of `member.key_distribution` and
+//!   rotation-bearing `member.removed` events (spec `content-key-rotation.md`
+//!   D4/D5/D6, #191 step 6).
 //! * [`file`] — pure assembly of a signed member [`content::FileShared`] blob
 //!   reference event ([`file::build_file_shared`], §7).
 //! * [`status`] — pure assembly of a signed member [`content::AgentStatus`]
@@ -50,6 +53,7 @@ pub mod binding;
 pub mod cbor;
 pub mod constants;
 pub mod content;
+pub mod distribution;
 pub mod encrypted;
 pub mod file;
 pub mod genesis;
@@ -70,6 +74,10 @@ pub mod wire;
 // Convenience re-exports of the most-used types.
 pub use binding::DeviceBinding;
 pub use content::{capability_hash, Content, EventType};
+pub use distribution::{
+    build_key_distribution_content, build_member_key_distribution,
+    build_member_removed_with_rotation, DistributionError,
+};
 pub use encrypted::{build_content_encrypted, open_encrypted_content, SealError, UnreadableReason};
 pub use file::build_file_shared;
 pub use genesis::build_room_created;

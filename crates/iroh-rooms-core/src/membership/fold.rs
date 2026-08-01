@@ -385,9 +385,9 @@ impl RoomMembership {
             // Genesis: structure already verified statelessly; it seeds the admin.
             Content::RoomCreated(_) => Ok(()),
             // Admin-only authorization writes.
-            Content::MemberInvited(_) | Content::MemberRemoved(_) => {
-                Self::gate_admin_action(event, &view)
-            }
+            Content::MemberInvited(_)
+            | Content::MemberRemoved(_)
+            | Content::MemberKeyDistribution(_) => Self::gate_admin_action(event, &view),
             // Self-departure is always valid (may be a no-op / inert).
             Content::MemberLeft(_) => Ok(()),
             // The full key-bound join gate (spec D4 / §3.5).
@@ -916,7 +916,11 @@ impl MembershipOracle for AncestorView {
             // Genesis authorizes itself structurally (no prior state).
             Some(EventType::RoomCreated) => Ok(()),
             // Admin-only authorization writes.
-            Some(EventType::MemberInvited | EventType::MemberRemoved) => {
+            Some(
+                EventType::MemberInvited
+                | EventType::MemberRemoved
+                | EventType::MemberKeyDistribution,
+            ) => {
                 if self.snapshot.admin() == Some(sender_id) {
                     Ok(())
                 } else {
