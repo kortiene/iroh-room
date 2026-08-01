@@ -243,6 +243,15 @@ Design:
    - subscribes/unsubscribes the room gossip topic as the snapshot's Active set changes (so a
      newly-Active member's device joins the topic and a Removed member's device is unsubscribed
      + its ALPN connection torn down via the existing deauthorize path, `manager.rs:136-154`).
+   - **Self-removal (added in the PR #195 follow-up):** `desired_devices` excludes the local
+     device by construction, so the reconciler's `revoked` diff over that set can never observe
+     this node's *own* removal. `GossipReconciler::reconcile` therefore checks the local
+     device's own standing first and, when the fold no longer marks self `Active`, drops its
+     own mesh and blocks re-subscribe; independently, the receiver task re-checks the local
+     device's admission at delivery time and drops inbound frames while self is not `Admit`.
+     Together these stop an honest-but-removed device from continuing to read room fan-out.
+     Defeating a *malicious* removed device (one that patches its own transport) requires
+     content-key rotation on removal and is the separate #191 security-design epic (T27).
 4. Pull/query variants (`WantMembership`, `WantRecentChat`, `WantEvents`) target a specific
    peer. Two cases:
    - **Target is a warm seed** — the frame rides the existing per-peer queue on the warm link.
