@@ -436,10 +436,68 @@ mod engine {
         .expect("live seal succeeds")
     }
 
+    /// An alice-authored plaintext event of the given type, parented on the
+    /// live genesis (stateless-valid, so a refusal can only be the gate).
+    fn plaintext_event(content: Content) -> SignedEvent {
+        SignedEvent {
+            schema_version: 1,
+            room_id: room_a(),
+            sender_id: alice_identity(),
+            device_id: alice_device_secret().device_key(),
+            event_type: content.event_type(),
+            created_at: ENCRYPTED_CREATED_AT,
+            prev_events: vec![genesis_event().event_id()],
+            content,
+        }
+    }
+
+    /// One stateless-valid plaintext body per encryptable content type — the
+    /// full set the floor must refuse (a gate covering fewer than all five
+    /// would leak the others in cleartext after the opt-in).
+    fn all_plaintext_content_bodies() -> Vec<Content> {
+        use iroh_rooms_core::event::content::{AgentStatus, FileShared, PipeClosed, PipeOpened};
+        use iroh_rooms_core::event::ids::HashRef;
+        vec![
+            golden_inner(),
+            Content::FileShared(FileShared {
+                file_id: [0x31; 16],
+                name: "notes.txt".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                size_bytes: 12,
+                blob_hash: HashRef::from_bytes([0x32; 32]),
+                blob_format: None,
+                providers: None,
+            }),
+            Content::PipeOpened(PipeOpened {
+                pipe_id: [0x21; 16],
+                owner_id: alice_identity(),
+                owner_endpoint: alice_device_secret().device_key(),
+                kind: "tcp".to_owned(),
+                label: "db".to_owned(),
+                target_hint: "localhost:5432".to_owned(),
+                alpn: "iroh-rooms/pipe/0".to_owned(),
+                allowed_members: vec![alice_identity()],
+                expires_at: None,
+            }),
+            Content::PipeClosed(PipeClosed {
+                pipe_id: [0x21; 16],
+                reason: None,
+            }),
+            Content::AgentStatus(AgentStatus {
+                status: "running".to_owned(),
+                message: None,
+                related_artifact_ids: None,
+                progress_pct: None,
+            }),
+        ]
+    }
+
     /// The floor gate is two-sided: with `encrypted_content_writes` on, the
     /// engine accepts a locally-authored envelope, refuses a locally-authored
-    /// plaintext content-class event, and keeps accepting membership events
-    /// (D1 — those must stay plaintext).
+    /// plaintext event of **every** encryptable content type, and keeps
+    /// accepting membership events — the genesis AND ordinary membership like
+    /// `member.invited` (D1 — those must stay plaintext, and a gate that
+    /// over-matched them would lock members out of floor-on rooms).
     #[test]
     fn floor_on_gates_plaintext_and_admits_encrypted() {
         let mut engine = engine_with(floor_on());
@@ -447,38 +505,60 @@ mod engine {
             .insert_room_key(KEY_EPOCH, room_key())
             .expect("fresh key");
 
-        // Membership (genesis) publishes regardless of the floor.
+        // Membership publishes regardless of the floor: the genesis and an
+        // ordinary admin-authored invite (the non-genesis validation path).
         engine
             .publish(&seal(&genesis_event()))
             .expect("membership events are never encrypted (D1)");
-
-        // A plaintext message is refused fail-closed.
-        let plaintext_msg = SignedEvent {
-            schema_version: 1,
-            room_id: room_a(),
-            sender_id: alice_identity(),
-            device_id: alice_device_secret().device_key(),
-            event_type: EventType::MessageText,
-            created_at: ENCRYPTED_CREATED_AT,
-            prev_events: vec![genesis_event().event_id()],
-            content: golden_inner(),
-        };
-        let refused_id = plaintext_msg.event_id();
-        let err = engine
-            .publish(&seal(&plaintext_msg))
-            .expect_err("plaintext content must be refused after the opt-in");
+        let invite_id = [0x01; 16];
+        let invite = plaintext_event(Content::MemberInvited(
+            iroh_rooms_core::event::content::MemberInvited {
+                invite_id,
+                capability_hash: iroh_rooms_core::event::capability_hash(
+                    &room_a(),
+                    &invite_id,
+                    &[0x41; 16],
+                ),
+                role: "member".to_owned(),
+                invitee_key: SigningKey::from_seed(&[0x10; 32]).identity_key(),
+                expires_at: None,
+                invitee_hint: None,
+            },
+        ));
+        let invite_event_id = invite.event_id();
+        engine
+            .publish(&seal(&invite))
+            .expect("ordinary membership events pass the floor too (D1)");
         assert!(
-            matches!(err, SyncError::PlaintextWritesDisabled),
-            "expected the plaintext-writes-disabled error, got: {err}"
-        );
-        assert!(
-            !engine
+            engine
                 .digest()
                 .expect("digest")
                 .event_ids
-                .contains(&refused_id),
-            "a refused plaintext event must not be persisted"
+                .contains(&invite_event_id),
+            "the invite must be persisted under floor-on"
         );
+
+        // Every plaintext content-class type is refused fail-closed.
+        for content in all_plaintext_content_bodies() {
+            let plaintext = plaintext_event(content);
+            let type_str = plaintext.event_type.as_str();
+            let refused_id = plaintext.event_id();
+            let Err(err) = engine.publish(&seal(&plaintext)) else {
+                panic!("plaintext {type_str} must be refused after the opt-in")
+            };
+            assert!(
+                matches!(err, SyncError::PlaintextWritesDisabled),
+                "{type_str}: expected the plaintext-writes-disabled error, got: {err}"
+            );
+            assert!(
+                !engine
+                    .digest()
+                    .expect("digest")
+                    .event_ids
+                    .contains(&refused_id),
+                "a refused plaintext {type_str} must not be persisted"
+            );
+        }
 
         // The encrypted equivalent publishes, sealed with the engine-held key.
         let epoch = KEY_EPOCH;
@@ -583,20 +663,63 @@ mod engine {
             .publish(&encrypted.to_bytes())
             .expect("the floor admits the encrypted publish");
 
+        // A not-yet-migrated peer authors a PLAINTEXT message. The floor-on
+        // node must still ingest it from the mesh — the gate is local
+        // authoring only, and dropping remote plaintext would partition every
+        // mixed room (the exact failure D8's reader-first rollout prevents).
+        let plaintext_remote = SignedEvent {
+            schema_version: 1,
+            room_id: room_a(),
+            sender_id: alice_identity(),
+            device_id: alice_device_secret().device_key(),
+            event_type: EventType::MessageText,
+            created_at: ENCRYPTED_CREATED_AT + 1,
+            prev_events: vec![genesis_event().event_id()],
+            content: golden_inner(),
+        };
+        let plaintext_id = plaintext_remote.event_id();
+        net.engine_mut(READER_NO_KEY)
+            .publish(&seal(&genesis_event()))
+            .expect("genesis publishes on the plaintext author too");
+        net.engine_mut(READER_NO_KEY)
+            .publish(&seal(&plaintext_remote))
+            .expect("a default-config (floor-off) peer still writes plaintext");
+
         net.connect_all();
         net.run_to_quiescence();
         net.assert_converged(&[WRITER, READER_WITH_KEY, READER_NO_KEY]);
 
         for node in [WRITER, READER_WITH_KEY, READER_NO_KEY] {
+            let digest = net.engine(node).digest().expect("digest");
             assert!(
-                net.engine(node)
-                    .digest()
-                    .expect("digest")
-                    .event_ids
-                    .contains(&encrypted_id),
+                digest.event_ids.contains(&encrypted_id),
                 "{node:?} must hold the encrypted event"
             );
+            assert!(
+                digest.event_ids.contains(&plaintext_id),
+                "{node:?} must hold the remote plaintext event — the floor \
+                 gate is local-only and must never drop remote plaintext"
+            );
         }
+
+        // The plaintext passthrough of the engine read surface: the floor-on
+        // node surfaces the remote plaintext body as-is (no key involved).
+        let writer_plaintext = net
+            .engine(WRITER)
+            .room_tail(16)
+            .expect("tail")
+            .iter()
+            .filter(|se| se.event_type == EventType::MessageText)
+            .map(|se| SignedEvent::decode(&se.wire.signed).expect("decodes"))
+            .find(|ev| ev.event_id() == plaintext_id)
+            .expect("the floor-on node holds the plaintext message");
+        assert_eq!(
+            net.engine(WRITER)
+                .readable_content(&writer_plaintext)
+                .expect("plaintext is always readable"),
+            golden_inner(),
+            "read_content must pass a plaintext body through unchanged"
+        );
 
         let stored_event = |net: &SimNet, node| {
             let tail = net.engine(node).room_tail(16).expect("tail");

@@ -732,11 +732,14 @@ impl SyncEngine {
     /// accept, fan it out to every connected peer.
     ///
     /// # Errors
-    /// [`SyncError::InvalidFrame`] if the bytes fail stateless validation, or
+    /// [`SyncError::InvalidFrame`] if the bytes fail stateless validation;
     /// [`SyncError::OversizedFrame`] if the frame could never fit a wire frame
     /// even as a single-frame `Events` message (a locally-authored event several
     /// content fields of which are unbounded could otherwise enter the log yet be
-    /// undeliverable to every peer — permanent silent divergence, issue #113).
+    /// undeliverable to every peer — permanent silent divergence, issue #113);
+    /// [`SyncError::EncryptedWritesDisabled`] /
+    /// [`SyncError::PlaintextWritesDisabled`] from the rollout writer gate
+    /// (#191 D8 — see [`SyncConfig::encrypted_content_writes`]).
     pub fn publish(&mut self, bytes: &[u8]) -> Result<Vec<Outgoing>, SyncError> {
         if bytes
             .len()

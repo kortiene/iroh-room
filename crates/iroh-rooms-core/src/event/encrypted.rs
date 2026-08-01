@@ -528,4 +528,68 @@ mod tests {
             UnreadableReason::NotEncrypted
         );
     }
+
+    /// Seal arbitrary raw bytes (bypassing the builder) under the correct AAD
+    /// for a hand-built envelope event — the cheapest payload a malicious
+    /// Active key holder can produce.
+    fn sealed_raw(plaintext: &[u8]) -> SignedEvent {
+        let (id, dev) = keys();
+        let sender_id = id.identity_key();
+        let device_id = dev.device_key();
+        let aad = super::encrypted_content_aad(
+            crate::event::constants::SCHEMA_VERSION,
+            &room_id(),
+            &sender_id,
+            &device_id,
+            CREATED_AT,
+            &heads(),
+            crate::event::content::EventType::MessageText,
+            KEY_EPOCH,
+            crate::event::constants::ENCRYPTED_SUITE_V1,
+        );
+        let ciphertext = iroh_rooms_crypto::seal_content(&room_key(), &NONCE, plaintext, &aad)
+            .expect("raw seal succeeds");
+        SignedEvent {
+            schema_version: crate::event::constants::SCHEMA_VERSION,
+            room_id: room_id(),
+            sender_id,
+            device_id,
+            event_type: crate::event::content::EventType::ContentEncrypted,
+            created_at: CREATED_AT,
+            prev_events: heads(),
+            content: Content::Encrypted(crate::event::content::EncryptedContent {
+                inner_type: crate::event::content::EventType::MessageText,
+                key_epoch: KEY_EPOCH,
+                suite: crate::event::constants::ENCRYPTED_SUITE_V1,
+                nonce: NONCE,
+                ciphertext,
+            }),
+        }
+    }
+
+    #[test]
+    fn authentic_non_cbor_plaintext_is_malformed_not_a_panic() {
+        // The AEAD opens (authentic key holder), but the recovered bytes are
+        // not CBOR at all: the distinct `malformed_plaintext` code preserves
+        // the audit split between "tampered/wrong key" and "authentic but
+        // garbage from a key holder" (spec §5 "dropped, logged").
+        let event = sealed_raw(&[0xFF]);
+        assert_eq!(
+            open_encrypted_content(&event, &room_key()).expect_err("must not surface"),
+            UnreadableReason::MalformedPlaintext
+        );
+    }
+
+    #[test]
+    fn authentic_trailing_garbage_plaintext_is_malformed() {
+        // A valid CBOR item followed by trailing bytes is not ONE canonical
+        // item; the strict decoder's full-consumption rule must refuse it.
+        let mut plaintext = crate::event::cbor::encode(&message("Hello room").to_cbor());
+        plaintext.push(0x00);
+        let event = sealed_raw(&plaintext);
+        assert_eq!(
+            open_encrypted_content(&event, &room_key()).expect_err("must not surface"),
+            UnreadableReason::MalformedPlaintext
+        );
+    }
 }
