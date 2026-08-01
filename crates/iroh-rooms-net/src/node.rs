@@ -207,6 +207,31 @@ impl GossipReconciler {
     }
 
     fn reconcile(&mut self, snapshot: &MembershipSnapshot) {
+        // Self-removal (the gossip-plane leak): `admitted_devices` excludes
+        // `self_device` by construction, so the `revoked` diff below can never
+        // observe this device's own removal — its mesh would stay subscribed and
+        // keep receiving fan-out indefinitely. Check the local device's own
+        // standing first: if the fold no longer marks self Active, drop the mesh
+        // and do not re-subscribe until self is Active again.
+        let self_device_key = DeviceKey::from_bytes(*self.self_device.as_bytes());
+        let self_active = snapshot
+            .identity_of_device(&self_device_key)
+            .is_some_and(|identity| snapshot.is_active(identity));
+        if !self_active {
+            if let Some(attempt) = self.attempt.take() {
+                attempt.abort();
+            }
+            self.last_admitted.clear();
+            // Invalidate the mesh epoch, not just drop the mesh: an aborted join
+            // can still reach `install_mesh_if_current` after this removal, and a
+            // plain `remove_mesh` leaves its epoch current so the stale task would
+            // reinstall the removed device's subscription. `begin_mesh_attempt`
+            // advances the epoch under the same lock used by installation,
+            // serializing this removal against any in-flight join (the same path
+            // the peer-revocation branch below uses).
+            self.shared.gossip_state.begin_mesh_attempt(self.room_id);
+            return;
+        }
         let admitted = self.admitted_devices(snapshot);
         let revoked = self
             .last_admitted
@@ -2322,5 +2347,274 @@ mod admission_refresher_tests {
             ),
             "a removed device must be rejected as NotActive after the removal fold"
         );
+    }
+}
+
+/// Test for the gossip-plane self-removal revocation (PR #195 follow-up, the
+/// "removed device keeps receiving" leak). `GossipReconciler::admitted_devices`
+/// builds its set from `desired_devices`, which excludes `self_device` — so
+/// without the explicit self-standing check, the reconciler's `revoked` diff can
+/// never observe this node's own removal and its mesh would stay subscribed.
+/// This drives `reconcile` directly through a fold that removes the local
+/// device and asserts its mesh is dropped and not re-subscribed.
+#[cfg(all(test, feature = "gossip_overlay"))]
+mod gossip_self_removal_tests {
+    use std::sync::Arc;
+
+    use iroh::{Endpoint, EndpointId, SecretKey};
+    use iroh_rooms_core::event::binding::DeviceBinding;
+    use iroh_rooms_core::event::content::{
+        capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved,
+        RoomCreated,
+    };
+    use iroh_rooms_core::event::ids::EventId;
+    use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+    use iroh_rooms_core::event::signed::{self, SignedEvent};
+    use iroh_rooms_core::event::validate::{
+        validate_wire_bytes, ValidatedEvent, ValidationContext,
+    };
+    use iroh_rooms_core::event::wire::WireEvent;
+    use iroh_rooms_core::membership::RoomMembership;
+
+    use super::GossipReconciler;
+    use crate::admission::AllowlistAdmission;
+    use crate::gossip::{spawn_gossip_actor, GossipMesh};
+    use crate::transport::Shared;
+
+    const NONCE: [u8; 16] = [0xef; 16];
+    const T0: u64 = 1_770_000_000_000;
+
+    struct Actor {
+        id: SigningKey,
+        dev: SigningKey,
+    }
+
+    impl Actor {
+        fn new(seed: u8) -> Self {
+            Self {
+                id: SigningKey::from_seed(&[seed; 32]),
+                dev: SigningKey::from_seed(&[seed.wrapping_add(0x80); 32]),
+            }
+        }
+        fn identity(&self) -> IdentityKey {
+            self.id.identity_key()
+        }
+        fn endpoint_id(&self) -> EndpointId {
+            SecretKey::from_bytes(&self.dev.to_seed()).public()
+        }
+    }
+
+    /// Seal a `SignedEvent` and run it through the stateless validator, producing
+    /// the `ValidatedEvent` `RoomMembership::from_events` consumes.
+    fn validate(
+        ev: &SignedEvent,
+        dev: &SigningKey,
+        room_id: iroh_rooms_core::event::ids::RoomId,
+    ) -> ValidatedEvent {
+        let csb = ev.to_csb();
+        let sig = signed::sign_csb(&csb, dev);
+        let bytes = WireEvent::seal(csb, sig).to_bytes();
+        validate_wire_bytes(&bytes, &ValidationContext::for_room(room_id))
+            .expect("test event must be stateless-valid")
+    }
+
+    fn genesis(host: &Actor) -> (iroh_rooms_core::event::ids::RoomId, EventId, SignedEvent) {
+        let room = signed::derive_room_id(&host.identity(), &NONCE, T0);
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: host.identity(),
+            device_id: host.dev.device_key(),
+            event_type: EventType::RoomCreated,
+            created_at: T0,
+            prev_events: vec![],
+            content: Content::RoomCreated(RoomCreated {
+                room_name: "gossip-self-removal".to_owned(),
+                room_nonce: NONCE,
+                admins: vec![host.identity()],
+                device_binding: DeviceBinding::create(&room, &host.id, host.dev.device_key()),
+            }),
+        };
+        (room, ev.event_id(), ev)
+    }
+
+    /// A `Shared` whose `gossip_state` carries a live actor, so a real mesh can
+    /// be installed. `admission` is the gate the receiver task + reconciler
+    /// consult.
+    fn gossip_shared(me: EndpointId, actor: iroh_gossip::net::Gossip) -> Arc<Shared> {
+        Shared::for_overlay_test(
+            me,
+            Arc::new(AllowlistAdmission::new()),
+            crate::gossip::GossipState::with_actor(actor),
+        )
+    }
+
+    /// The removed device's own reconcile must drop its mesh even though the
+    /// `revoked` diff over `desired_devices` (which excludes self) cannot see it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // full genesis→invite→join→remove fold fixture
+    async fn self_removal_drops_own_mesh_and_blocks_resubscribe() {
+        let admin = Actor::new(0x51);
+        let member = Actor::new(0x52);
+        let (room, genesis_id, genesis) = genesis(&admin);
+
+        // Fold: genesis + invite + join (member Active) → then removal of member.
+        let invite_id = [0x21; 16];
+        let secret = [0x31; 16];
+        let invite = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::MemberInvited,
+            created_at: T0 + 1,
+            prev_events: vec![genesis_id],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: capability_hash(&room, &invite_id, &secret),
+                role: "member".to_owned(),
+                invitee_key: member.identity(),
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        let invite_ev = invite.event_id();
+        let join = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: member.identity(),
+            device_id: member.dev.device_key(),
+            event_type: EventType::MemberJoined,
+            created_at: T0 + 2,
+            prev_events: vec![invite_ev],
+            content: Content::MemberJoined(MemberJoined {
+                via_invite_id: invite_id,
+                capability_secret: secret,
+                role: "member".to_owned(),
+                device_binding: DeviceBinding::create(&room, &member.id, member.dev.device_key()),
+                display_name: None,
+            }),
+        };
+        let join_ev = join.event_id();
+        let active_snapshot = RoomMembership::from_events(
+            room,
+            [
+                validate(&genesis, &admin.dev, room),
+                validate(&invite, &admin.dev, room),
+                validate(&join, &member.dev, room),
+            ],
+        )
+        .snapshot();
+
+        let remove = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: admin.identity(),
+            device_id: admin.dev.device_key(),
+            event_type: EventType::MemberRemoved,
+            created_at: T0 + 3,
+            prev_events: vec![join_ev],
+            content: Content::MemberRemoved(MemberRemoved {
+                member_id: member.identity(),
+                removed_by: admin.identity(),
+                reason: None,
+                device_binding: None,
+            }),
+        };
+        let removed_snapshot = RoomMembership::from_events(
+            room,
+            [
+                validate(&genesis, &admin.dev, room),
+                validate(&invite, &admin.dev, room),
+                validate(&join, &member.dev, room),
+                validate(&remove, &admin.dev, room),
+            ],
+        )
+        .snapshot();
+
+        // The removed member's own node: a gossip actor over a loopback endpoint.
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&member.dev.to_seed()))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("endpoint bind");
+        let actor = spawn_gossip_actor(endpoint.clone());
+        let shared = gossip_shared(member.endpoint_id(), actor.clone());
+
+        // Install a real mesh for the room (the member was Active). Empty
+        // bootstrap: the first-member path needs no seed to spawn.
+        let mesh = GossipMesh::spawn(shared.clone(), actor, room, vec![])
+            .await
+            .expect("spawn mesh");
+        shared.gossip_state.install_mesh(room, mesh);
+        assert!(shared.gossip_state.has_mesh(&room));
+
+        let mut reconciler = GossipReconciler {
+            shared: shared.clone(),
+            actor: shared.gossip_state.actor().cloned().expect("actor present"),
+            room_id: room,
+            self_device: member.endpoint_id(),
+            last_admitted: super::BTreeSet::new(),
+            attempt: None,
+        };
+
+        // Reconcile against the Active snapshot first (member is a member) — this
+        // would normally (re)spawn the mesh, but one is already installed, so it
+        // is a no-op that keeps the mesh.
+        reconciler.reconcile(&active_snapshot);
+        assert!(
+            shared.gossip_state.has_mesh(&room),
+            "active member keeps its mesh"
+        );
+
+        // Simulate an in-flight join that started before the removal: it captured
+        // this epoch at its `begin_mesh_attempt` and will validate against it at
+        // `install_mesh_if_current` time. (This also drops the mesh installed
+        // above, mirroring a real retry; the removal below must still hold.)
+        let stale_epoch = shared.gossip_state.begin_mesh_attempt(room);
+
+        // Reconcile against the removal fold: the member is no longer Active, so
+        // its own mesh must be dropped and not re-subscribed. The reconcile must
+        // also ADVANCE the epoch (not merely drop the mesh), so a stale in-flight
+        // join holding `stale_epoch` can no longer install.
+        reconciler.reconcile(&removed_snapshot);
+        assert!(
+            !shared.gossip_state.has_mesh(&room),
+            "a removed device's own reconcile must drop its mesh (the leak fix)"
+        );
+
+        // The epoch race (PR #196 review): a background join that started before
+        // the removal can reach `install_mesh_if_current` after
+        // `JoinHandle::abort()` returns (abort is not synchronous). With the epoch
+        // advanced by the removal, that stale install is rejected; with a plain
+        // `remove_mesh` it would reinstall the removed device's subscription.
+        let stale_mesh = GossipMesh::spawn(
+            shared.clone(),
+            shared.gossip_state.actor().cloned().expect("actor present"),
+            room,
+            vec![],
+        )
+        .await
+        .expect("spawn stale mesh");
+        assert!(
+            !shared
+                .gossip_state
+                .install_mesh_if_current(room, stale_epoch, stale_mesh),
+            "a stale pre-removal epoch must not install after the removal"
+        );
+        assert!(
+            !shared.gossip_state.has_mesh(&room),
+            "the stale join must not reinstall the removed device's mesh"
+        );
+
+        // A further reconcile must NOT re-subscribe while self is still removed.
+        reconciler.reconcile(&removed_snapshot);
+        assert!(
+            !shared.gossip_state.has_mesh(&room),
+            "a removed device must not re-subscribe to the room topic"
+        );
+
+        endpoint.close().await;
     }
 }

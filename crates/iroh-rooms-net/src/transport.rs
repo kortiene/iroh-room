@@ -441,6 +441,40 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manager);
     }
 
+    /// Build a minimal `Shared` for cross-module tests (e.g. the gossip
+    /// reconciler's self-removal test in `node.rs`) with empty routing tables
+    /// and a caller-supplied gossip state. Production code binds via
+    /// [`NetTransport::bind`]; this exists because the field set is private to
+    /// this module.
+    #[cfg(all(test, feature = "gossip_overlay"))]
+    pub(crate) fn for_overlay_test(
+        me: EndpointId,
+        admission: Arc<dyn Admission>,
+        gossip_state: crate::gossip::GossipState,
+    ) -> Arc<Self> {
+        let (inbound, _rx) = BytePriorityQueue::channel(
+            DEFAULT_PER_PEER_QUEUE_BYTES,
+            DEFAULT_PER_STREAM_QUEUE_BYTES,
+        );
+        Arc::new(Self {
+            me,
+            admission,
+            audit: Arc::new(crate::audit::TracingAudit),
+            table: PeerTable::new(8),
+            outbound: Mutex::new(HashMap::new()),
+            outbound_peer_queue_bytes: DEFAULT_PER_PEER_QUEUE_BYTES,
+            stream_queue_bytes: DEFAULT_PER_STREAM_QUEUE_BYTES,
+            connections: Mutex::new(HashMap::new()),
+            terminal_confirmations: Mutex::new(HashMap::new()),
+            provisional: Mutex::new(HashSet::new()),
+            capability_proven: Mutex::new(HashSet::new()),
+            generations: Mutex::new(HashMap::new()),
+            inbound,
+            gossip_state,
+            peer_manager: Mutex::new(None),
+        })
+    }
+
     /// Register a peer's outbound frame queue (replaces any prior queue for the
     /// device — last writer wins on a double-connect, spec OQ-4). Closing the
     /// superseded queue wakes its writer task so it does not outlive the link

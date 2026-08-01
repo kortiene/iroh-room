@@ -435,6 +435,39 @@ impl Drop for GossipMesh {
     }
 }
 
+/// The delivery-time admission decision for one gossip-received frame. Both
+/// principals must currently be admitted for a frame to be ingested.
+enum DeliveredFrame {
+    /// Both the local device and the delivering neighbor are admitted; ingest.
+    Accept,
+    /// The local device itself is no longer admitted (self-removal): drop every
+    /// inbound frame even if a lingering mesh is still delivering.
+    LocalDeviceNotAdmitted,
+    /// The relaying neighbor is no longer admitted (peer revocation in flight).
+    NeighborNotAdmitted,
+}
+
+/// Decide whether a gossip-received frame from `delivered_from` may be ingested.
+/// Both principals must currently be admitted: the **local** device (self-standing
+/// — a removed device must stop reading room events even while its mesh lingers)
+/// and the **delivering neighbor** (the pre-existing revocation defense-in-depth).
+/// Factored out of `receiver_task` so the two-gate decision is unit-testable.
+fn accept_delivered_frame(shared: &Shared, delivered_from: EndpointId) -> DeliveredFrame {
+    if !matches!(
+        shared.admission.authorize(shared.me),
+        AdmissionDecision::Admit { .. }
+    ) {
+        return DeliveredFrame::LocalDeviceNotAdmitted;
+    }
+    if !matches!(
+        shared.admission.authorize(delivered_from),
+        AdmissionDecision::Admit { .. }
+    ) {
+        return DeliveredFrame::NeighborNotAdmitted;
+    }
+    DeliveredFrame::Accept
+}
+
 /// The receiver task: drain `Event`s from the gossip topic and feed them into
 /// the existing inbound sink, so the engine pump runs the same `on_message` /
 /// `provisional_allows` / counter / audit path as for a point-to-point frame
@@ -471,20 +504,31 @@ async fn receiver_task(
                     );
                     continue;
                 }
-                // Admission is re-checked at delivery time as defense in depth.
-                // The room reconciler also drops/re-subscribes the topic when a
-                // member is revoked, which tears down the actual gossip link;
-                // this check closes the small interval while that async leave is
-                // being processed by iroh-gossip.
-                if !matches!(
-                    shared.admission.authorize(msg.delivered_from),
-                    AdmissionDecision::Admit { .. }
-                ) {
-                    tracing::debug!(
-                        peer = %msg.delivered_from,
-                        "gossip: dropped frame from no-longer-admitted neighbor"
-                    );
-                    continue;
+                match accept_delivered_frame(&shared, msg.delivered_from) {
+                    DeliveredFrame::Accept => {}
+                    // Self-standing recheck (the gossip-plane leak, PR #195
+                    // follow-up): the reconciler drops this device's mesh on
+                    // self-removal, but a lingering mesh (async topic-leave in
+                    // flight, or a stalled reconcile) would otherwise keep feeding
+                    // room events to a device the fold has already removed.
+                    DeliveredFrame::LocalDeviceNotAdmitted => {
+                        tracing::debug!(
+                            "gossip: dropped inbound frame; local device is no longer admitted"
+                        );
+                        continue;
+                    }
+                    // Admission is re-checked at delivery time as defense in depth.
+                    // The room reconciler also drops/re-subscribes the topic when a
+                    // member is revoked, which tears down the actual gossip link;
+                    // this check closes the small interval while that async leave is
+                    // being processed by iroh-gossip.
+                    DeliveredFrame::NeighborNotAdmitted => {
+                        tracing::debug!(
+                            peer = %msg.delivered_from,
+                            "gossip: dropped frame from no-longer-admitted neighbor"
+                        );
+                        continue;
+                    }
                 }
                 // The same inbound sink the mesh reader task uses. The engine
                 // pump re-decodes, runs `provisional_allows`, re-validates
@@ -798,5 +842,74 @@ mod tests {
     #[test]
     fn gossip_alpn_constant_matches_alpn_module() {
         assert_eq!(super::GOSSIP_ALPN, crate::alpn::GOSSIP_ALPN);
+    }
+
+    /// The two-gate delivery decision (`accept_delivered_frame`): a frame is
+    /// ingested only when BOTH the local device and the delivering neighbor are
+    /// admitted. The self-standing gate is the leak fix — a removed device must
+    /// stop reading room events even while its mesh lingers.
+    #[test]
+    fn delivered_frame_requires_local_and_neighbor_admitted() {
+        use crate::admission::AllowlistAdmission;
+        use crate::transport::Shared;
+        use iroh::{EndpointId, SecretKey};
+        use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
+
+        fn device(seed: u8) -> EndpointId {
+            SecretKey::from_bytes(&[seed; 32]).public()
+        }
+        fn identity(seed: u8) -> IdentityKey {
+            SigningKey::from_seed(&[seed; 32]).identity_key()
+        }
+
+        let me = device(0x01);
+        let neighbor = device(0x02);
+        let me_id = identity(0x81);
+        let neighbor_id = identity(0x82);
+
+        // Both admitted → Accept.
+        let both = AllowlistAdmission::new()
+            .bind_device(me, me_id)
+            .set_active(me_id)
+            .bind_device(neighbor, neighbor_id)
+            .set_active(neighbor_id);
+        let shared =
+            Shared::for_overlay_test(me, std::sync::Arc::new(both), super::GossipState::inert());
+        assert!(matches!(
+            super::accept_delivered_frame(&shared, neighbor),
+            super::DeliveredFrame::Accept
+        ));
+
+        // Local device no longer Active (self-removal) → LocalDeviceNotAdmitted,
+        // even though the neighbor is still admitted.
+        let self_removed = AllowlistAdmission::new()
+            .bind_device(me, me_id)
+            .bind_device(neighbor, neighbor_id)
+            .set_active(neighbor_id);
+        let shared = Shared::for_overlay_test(
+            me,
+            std::sync::Arc::new(self_removed),
+            super::GossipState::inert(),
+        );
+        assert!(matches!(
+            super::accept_delivered_frame(&shared, neighbor),
+            super::DeliveredFrame::LocalDeviceNotAdmitted
+        ));
+
+        // Neighbor no longer Active (peer revocation), self still Active →
+        // NeighborNotAdmitted.
+        let neighbor_removed = AllowlistAdmission::new()
+            .bind_device(me, me_id)
+            .set_active(me_id)
+            .bind_device(neighbor, neighbor_id);
+        let shared = Shared::for_overlay_test(
+            me,
+            std::sync::Arc::new(neighbor_removed),
+            super::GossipState::inert(),
+        );
+        assert!(matches!(
+            super::accept_delivered_frame(&shared, neighbor),
+            super::DeliveredFrame::NeighborNotAdmitted
+        ));
     }
 }
