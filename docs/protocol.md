@@ -595,9 +595,12 @@ fail-open: an unreadable `file.shared` serves no blob hash; an unreadable `pipe.
 the pipe unknown (unauthorized); and an unreadable close-typed envelope — whose `pipe_id` is
 sealed inside the ciphertext and so cannot be attributed — conservatively closes **every** pipe
 on that node until the epoch key arrives, because a close that might target a given pipe must
-never be missed. A keyless node deterministically sees *fewer* capabilities than a keyed one,
-never different ones; the governing `pipe.opened` stays the lowest `(lamport, event_id)` across
-plaintext and readable-encrypted candidates.
+never be missed. A keyless node deterministically sees *fewer* capabilities than a keyed one —
+with one scoped asymmetry: a `pipe_id` deliberately reused across a plaintext and an encrypted
+`pipe.opened` can govern by a different candidate depending on key possession (both candidates
+are field-rule-bound to the same owner, so an owner can confuse enforcement of its *own* pipe
+only, never surface another member's). The governing `pipe.opened` stays the lowest
+`(lamport, event_id)` across plaintext and readable-encrypted candidates.
 
 **Revocation-on-learn.** Live connections are torn down as soon as the enforcing peer learns of
 a removal, `pipe.closed`, or expiry. Exposure is bounded by *removal-event reachability*, not by

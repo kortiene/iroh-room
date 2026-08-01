@@ -1130,6 +1130,14 @@ impl SyncEngine {
     /// (mirroring `by_type`'s `lamport IS NULL, lamport, event_id` order) and
     /// its authenticated-decryption outcome — the shared walk under the D9
     /// key-aware authorization reads (#191 step 5).
+    ///
+    /// Cost: O(all stored `content.encrypted` rows) per call — the store has
+    /// no `inner_type` column, so every envelope is CBOR-decoded before the
+    /// `inner_type` filter (no signature or AEAD work for filtered-out rows).
+    /// Acceptable at the MVP bounds while writers are gated behind the
+    /// unexposed floor flag; the rotation lifecycle (§7 step 6) is the point
+    /// to add a store-level `inner_type` index, when encrypted volume becomes
+    /// real.
     #[allow(clippy::type_complexity)] // one row per envelope: (sort key, read outcome)
     fn encrypted_bodies(
         &self,
@@ -1169,8 +1177,13 @@ impl SyncEngine {
     ///
     /// The governing event is the lowest `(lamport, event_id)` across the
     /// plaintext and readable-encrypted candidates — deterministic for any two
-    /// nodes holding the same validated set *and* the same epoch keys (a
-    /// keyless node deterministically sees fewer pipes, never different ones).
+    /// nodes holding the same validated set *and* the same epoch keys. A
+    /// keyless node sees fewer *pipes*; the one asymmetry: when a `pipe_id`
+    /// is deliberately reused across a plaintext and an encrypted open, key
+    /// possession can change *which* candidate governs. Both candidates are
+    /// the same owner's (the field rules bind `owner_id` to the sender of
+    /// each), so this lets an owner confuse enforcement of its *own* pipe
+    /// only — it never surfaces another member's pipe.
     ///
     /// # Errors
     /// [`SyncError::Store`] on a store read or decode failure.

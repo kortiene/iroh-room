@@ -147,21 +147,31 @@ fn pipe_closed_body(pipe_id: [u8; SHORT_ID_LEN]) -> Content {
     })
 }
 
-fn file_shared_body() -> Content {
+fn file_shared_body_with(tag: u8) -> Content {
     Content::FileShared(FileShared {
-        file_id: [0x31; 16],
-        name: "notes.txt".to_owned(),
+        file_id: [tag; 16],
+        name: format!("notes-{tag:02x}.txt"),
         mime_type: "text/plain".to_owned(),
         size_bytes: 12,
-        blob_hash: HashRef::from_bytes(BLOB_HASH),
+        blob_hash: HashRef::from_bytes([tag; 32]),
         blob_format: None,
         providers: None,
     })
 }
 
+fn file_shared_body() -> Content {
+    file_shared_body_with(BLOB_HASH[0])
+}
+
 /// An alice-authored encrypted event sealing `inner` under `key`, parented on
-/// the live genesis via the real writer.
-fn sealed(inner: &Content, key: &RoomKey, nonce_tag: u8, created_at: u64) -> WireEvent {
+/// `parent` via the real writer.
+fn sealed_with_parent(
+    inner: &Content,
+    key: &RoomKey,
+    nonce_tag: u8,
+    created_at: u64,
+    parent: iroh_rooms_core::event::ids::EventId,
+) -> WireEvent {
     build_content_encrypted(
         &alice_identity_secret(),
         &alice_device_secret(),
@@ -170,10 +180,21 @@ fn sealed(inner: &Content, key: &RoomKey, nonce_tag: u8, created_at: u64) -> Wir
         KEY_EPOCH,
         key,
         &nonce(nonce_tag),
-        &[genesis_event().event_id()],
+        &[parent],
         created_at,
     )
     .expect("seal succeeds")
+}
+
+/// [`sealed_with_parent`] on the live genesis.
+fn sealed(inner: &Content, key: &RoomKey, nonce_tag: u8, created_at: u64) -> WireEvent {
+    sealed_with_parent(
+        inner,
+        key,
+        nonce_tag,
+        created_at,
+        genesis_event().event_id(),
+    )
 }
 
 /// Seal arbitrary raw bytes as a hand-built envelope claiming `inner_type` —
@@ -548,4 +569,210 @@ fn governing_pipe_open_is_deterministic_when_plaintext_wins() {
 #[test]
 fn governing_pipe_open_is_deterministic_when_encrypted_wins() {
     assert_governing_open_for_ordering(true);
+}
+
+/// The governing pick orders by lamport FIRST, `event_id` second: an encrypted
+/// candidate one causal step deeper (parented on the plaintext open) must
+/// lose to the plaintext open even when its `event_id` is hash-luckily
+/// smaller — an event_id-only comparison would wrongly govern by it.
+#[test]
+fn governing_pick_prefers_lower_lamport_over_lower_event_id() {
+    let mut engine = engine_with(SyncConfig::default());
+    engine
+        .insert_room_key(KEY_EPOCH, room_key())
+        .expect("key held");
+    engine
+        .publish(&seal(&genesis_event()))
+        .expect("genesis publishes");
+
+    let plain = SignedEvent {
+        schema_version: 1,
+        room_id: room_a(),
+        sender_id: alice_identity(),
+        device_id: alice_device_secret().device_key(),
+        event_type: EventType::PipeOpened,
+        created_at: T,
+        prev_events: vec![genesis_event().event_id()],
+        content: pipe_opened_body(PIPE_ID, "plain"),
+    };
+    let plain_id = plain.event_id();
+
+    // Deeper lamport (parent = the plaintext open), smaller event_id
+    // (self-adjusting created_at search, as in the tie-break tests).
+    let deeper = (0u8..=255)
+        .map(|offset| {
+            sealed_with_parent(
+                &pipe_opened_body(PIPE_ID, "deep-enc"),
+                &room_key(),
+                offset,
+                T + 1 + u64::from(offset),
+                plain_id,
+            )
+        })
+        .find(|wire| signed::event_id_from_bytes(&wire.signed) < plain_id)
+        .expect("some offset must yield a smaller event_id");
+
+    engine
+        .publish(&seal(&plain))
+        .expect("plaintext open publishes");
+    engine.ingest_frame(REMOTE, &deeper.to_bytes());
+
+    let governing = engine
+        .pipe_opened(&PIPE_ID)
+        .expect("lookup")
+        .expect("the pipe is known");
+    assert_eq!(
+        governing.label, "plain",
+        "the lower LAMPORT must govern even against a smaller event_id"
+    );
+}
+
+// --- Readable encrypted pipe events must discriminate on pipe_id. ------------
+
+/// A READABLE encrypted close closes exactly its own `pipe_id` (unlike the
+/// unattributable-unreadable case), and a readable encrypted open surfaces
+/// only for its own id — never as the governing open of some other pipe.
+#[test]
+fn readable_encrypted_pipe_events_discriminate_on_pipe_id() {
+    let mut engine = engine_with(SyncConfig::default());
+    engine
+        .insert_room_key(KEY_EPOCH, room_key())
+        .expect("key held");
+    engine
+        .publish(&seal(&genesis_event()))
+        .expect("genesis publishes");
+
+    // A readable encrypted open for PIPE_ID and a readable encrypted close
+    // for OTHER_PIPE_ID.
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&pipe_opened_body(PIPE_ID, "db"), &room_key(), 0x20, T).to_bytes(),
+    );
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&pipe_closed_body(OTHER_PIPE_ID), &room_key(), 0x21, T + 1).to_bytes(),
+    );
+
+    assert!(
+        engine.pipe_opened(&PIPE_ID).expect("lookup").is_some(),
+        "the readable encrypted open is known under its own id"
+    );
+    assert!(
+        engine
+            .pipe_opened(&OTHER_PIPE_ID)
+            .expect("lookup")
+            .is_none(),
+        "PIPE_ID's open must never surface as the governing open of another id"
+    );
+    assert!(
+        !engine.pipe_is_closed(&PIPE_ID).expect("closed?"),
+        "a READABLE close for another pipe must not close this one"
+    );
+    assert!(
+        engine.pipe_is_closed(&OTHER_PIPE_ID).expect("closed?"),
+        "the readable close closes exactly its own pipe_id"
+    );
+}
+
+// --- Accumulation: encrypted hashes union with plaintext ones. ---------------
+
+/// Two readable encrypted `file.shared` and one plaintext one all contribute:
+/// the projection is a union, not a first-match (a scan that stopped at the
+/// first readable envelope would silently under-serve).
+#[test]
+fn encrypted_file_shares_accumulate_with_plaintext() {
+    let mut engine = engine_with(SyncConfig::default());
+    engine
+        .insert_room_key(KEY_EPOCH, room_key())
+        .expect("key held");
+    engine
+        .publish(&seal(&genesis_event()))
+        .expect("genesis publishes");
+
+    let plain_share = SignedEvent {
+        schema_version: 1,
+        room_id: room_a(),
+        sender_id: alice_identity(),
+        device_id: alice_device_secret().device_key(),
+        event_type: EventType::FileShared,
+        created_at: T,
+        prev_events: vec![genesis_event().event_id()],
+        content: file_shared_body_with(0x41),
+    };
+    engine
+        .publish(&seal(&plain_share))
+        .expect("plaintext file.shared publishes");
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&file_shared_body_with(0x42), &room_key(), 0x30, T + 1).to_bytes(),
+    );
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&file_shared_body_with(0x43), &room_key(), 0x31, T + 2).to_bytes(),
+    );
+
+    assert_eq!(
+        engine.file_shared_hashes().expect("hashes"),
+        BTreeSet::from([[0x41; 32], [0x42; 32], [0x43; 32]]),
+        "plaintext and every readable encrypted share must union"
+    );
+}
+
+// --- A poisoned epoch (D5a) fails closed through every projection. -----------
+
+/// After a same-epoch key conflict poisons the epoch, envelopes sealed under
+/// it read as `EpochConflicted` and every projection fails closed: no blob
+/// hash is served, the pipe is unknown, and a close-typed envelope still
+/// triggers the conservative close-everything rule (the `EpochConflicted`
+/// reason must not be exempted from it).
+#[test]
+fn poisoned_epoch_fails_closed_through_all_three_reads() {
+    let mut engine = engine_with(SyncConfig::default());
+    engine
+        .insert_room_key(KEY_EPOCH, room_key())
+        .expect("fresh key");
+    engine
+        .publish(&seal(&genesis_event()))
+        .expect("genesis publishes");
+
+    // Envelopes sealed under the original key, ingested BEFORE the conflict —
+    // proving a poison also revokes readability retroactively.
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&file_shared_body_with(0x42), &room_key(), 0x40, T).to_bytes(),
+    );
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&pipe_opened_body(PIPE_ID, "db"), &room_key(), 0x41, T + 1).to_bytes(),
+    );
+    assert!(!engine.file_shared_hashes().expect("hashes").is_empty());
+    assert!(engine.pipe_opened(&PIPE_ID).expect("lookup").is_some());
+
+    engine
+        .insert_room_key(KEY_EPOCH, RoomKey::from_bytes([0xBB; 32]))
+        .expect_err("the conflicting offer poisons the epoch (D5a)");
+
+    assert!(
+        engine.file_shared_hashes().expect("hashes").is_empty(),
+        "a poisoned epoch serves no blob hashes"
+    );
+    assert!(
+        engine.pipe_opened(&PIPE_ID).expect("lookup").is_none(),
+        "a poisoned epoch surfaces no pipes"
+    );
+    assert!(
+        !engine.pipe_is_closed(&PIPE_ID).expect("closed?"),
+        "no close-typed envelope exists yet"
+    );
+
+    // A close-typed envelope under the poisoned epoch: EpochConflicted must
+    // flow into the conservative close-everything arm, not be skipped.
+    engine.ingest_frame(
+        REMOTE,
+        &sealed(&pipe_closed_body(OTHER_PIPE_ID), &room_key(), 0x42, T + 2).to_bytes(),
+    );
+    assert!(
+        engine.pipe_is_closed(&PIPE_ID).expect("closed?"),
+        "an EpochConflicted close conservatively closes every pipe"
+    );
 }
