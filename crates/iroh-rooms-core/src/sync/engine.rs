@@ -60,6 +60,15 @@ pub enum SyncError {
         /// The encoded `WireEvent` length.
         frame_len: usize,
     },
+    /// A locally-authored `content.encrypted` event was handed to
+    /// [`SyncEngine::publish`] during rollout Phase R1 (spec
+    /// `content-key-rotation.md` D8): every upgraded peer *tolerates* the
+    /// envelope, but **writers are disabled** until the R2 compatibility floor
+    /// proves all Active peers can parse it — a premature writer would
+    /// partition pre-R1 rooms. Like [`SyncError::OversizedFrame`], this is a
+    /// **local authoring** rule only: remote `content.encrypted` frames are
+    /// ingested normally.
+    EncryptedWritesDisabled,
 }
 
 impl core::fmt::Display for SyncError {
@@ -70,6 +79,9 @@ impl core::fmt::Display for SyncError {
             Self::Config(c) => write!(f, "sync_config_error: {c}"),
             Self::OversizedFrame { frame_len } => {
                 write!(f, "sync_oversized_frame: {frame_len}")
+            }
+            Self::EncryptedWritesDisabled => {
+                f.write_str("sync_encrypted_writes_disabled: content.encrypted writers are disabled in rollout phase R1")
             }
         }
     }
@@ -698,6 +710,13 @@ impl SyncEngine {
         }
         let ctx = ValidationContext::for_room(self.room_id);
         let ev = validate_wire_bytes(bytes, &ctx).map_err(SyncError::InvalidFrame)?;
+        // Rollout Phase R1 writer gate (spec `content-key-rotation.md` D8):
+        // locally-authored `content.encrypted` events are refused until the R2
+        // compatibility floor lands (§7 step 4). Remote frames are unaffected —
+        // `ingest_frame` accepts the envelope as opaque-but-valid.
+        if ev.event.event_type == super::super::event::EventType::ContentEncrypted {
+            return Err(SyncError::EncryptedWritesDisabled);
+        }
         let mut out = Vec::new();
         self.deliver(ev, None, &mut out);
         // Issue #143: flush + wake_park before returning.
@@ -2836,6 +2855,11 @@ fn trust_row_to_decision(tr: &TrustRow) -> Result<TrustDecision, StoreError> {
 /// **not** admin-authored. Admin-authored events (any type) carry an `admin_seq`
 /// and belong to the never-windowed authorization class.
 fn is_chat_class(se: &crate::store::StoredEvent) -> bool {
+    // `content.encrypted` is chat-class from the reader-first phase onward
+    // (spec `content-key-rotation.md` D8): it wraps exactly the five chat-class
+    // bodies, so an R1 reader must already pull it over the bounded chat
+    // window — otherwise the first R2 writer's events would only reach peers
+    // via live fanout / parent-chasing and window pulls would miss them.
     let chat_ty = matches!(
         se.event_type,
         EventType::MessageText
@@ -2843,6 +2867,7 @@ fn is_chat_class(se: &crate::store::StoredEvent) -> bool {
             | EventType::PipeOpened
             | EventType::PipeClosed
             | EventType::AgentStatus
+            | EventType::ContentEncrypted
     );
     chat_ty && se.admin_seq.is_none()
 }

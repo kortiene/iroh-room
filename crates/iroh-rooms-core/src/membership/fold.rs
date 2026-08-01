@@ -395,11 +395,15 @@ impl RoomMembership {
                 self.gate_join(id, event, content, membership_ancestors, &view)
             }
             // Non-membership writes: author must be Active in the ancestor view.
+            // `content.encrypted` gets the same gate from its cleartext envelope
+            // alone — the verdict must be key-independent (spec
+            // `content-key-rotation.md` D2b), so no inner-body rule can apply.
             Content::MessageText(_)
             | Content::FileShared(_)
             | Content::PipeOpened(_)
             | Content::PipeClosed(_)
-            | Content::AgentStatus(_) => Self::gate_active_member(event, &view),
+            | Content::AgentStatus(_)
+            | Content::Encrypted(_) => Self::gate_active_member(event, &view),
         };
 
         // Membership-derived device binding (step 7), after authorization (step 8)
@@ -924,13 +928,16 @@ impl MembershipOracle for AncestorView {
             // The capability check is membership-internal (spec Open Q1); the
             // trait deliberately does not gate joins on its own.
             Some(EventType::MemberJoined) => Ok(()),
-            // Non-membership writes require an Active author.
+            // Non-membership writes require an Active author. `content.encrypted`
+            // is gated on its cleartext envelope alone (key-independent verdict,
+            // spec `content-key-rotation.md` D2b).
             Some(
                 EventType::MessageText
                 | EventType::FileShared
                 | EventType::PipeOpened
                 | EventType::PipeClosed
-                | EventType::AgentStatus,
+                | EventType::AgentStatus
+                | EventType::ContentEncrypted,
             ) => {
                 if self.snapshot.is_active(sender_id) {
                     Ok(())

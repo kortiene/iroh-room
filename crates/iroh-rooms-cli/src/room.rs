@@ -469,6 +469,14 @@ fn content_summary(content: &Content) -> String {
                 .map_or_else(String::new, |a| format!(" artifacts={}", a.len()));
             format!("state={}{msg}{progress}{artifacts}", c.status)
         }
+        // Phase R1 (spec `content-key-rotation.md` D8): the body is sealed and
+        // no reader holds keys yet — surface only cleartext envelope facts,
+        // which an observer learns regardless (D2 metadata posture).
+        Content::Encrypted(c) => format!(
+            "inner={} epoch={} unreadable",
+            c.inner_type.as_str(),
+            c.key_epoch
+        ),
     }
 }
 
@@ -545,6 +553,13 @@ fn content_fields(content: &Content) -> Map<String, Value> {
                     m.insert("artifacts".into(), json!(handles));
                 }
             }
+        }
+        // Phase R1 (spec `content-key-rotation.md` D8): cleartext envelope
+        // facts only; the sealed body is never surfaced.
+        Content::Encrypted(c) => {
+            m.insert("inner_type".into(), json!(c.inner_type.as_str()));
+            m.insert("key_epoch".into(), json!(c.key_epoch));
+            m.insert("unreadable".into(), json!(true));
         }
     }
     m

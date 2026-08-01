@@ -31,10 +31,14 @@ use std::path::Path;
 
 use iroh_rooms_core::event::cbor::{decode_canonical, CborValue};
 use iroh_rooms_core::event::constants::{
-    BIND_CONTEXT, CLOCK_SKEW_FUTURE_MS, DIGEST_LEN, EVENT_CONTEXT, INVITE_CONTEXT,
-    MAX_ARTIFACT_REFS, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MESSAGE_BODY_BYTES,
-    MAX_MIME_TYPE_BYTES, MAX_PREV_EVENTS, MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES,
-    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, ROOMID_CONTEXT, SHORT_ID_LEN, SIGNATURE_LEN,
+    BIND_CONTEXT, CLOCK_SKEW_FUTURE_MS, DIGEST_LEN, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1,
+    ENCRYPTED_TAG_LEN, EVENT_CONTEXT, INVITE_CONTEXT, MAX_ARTIFACT_REFS,
+    MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
+    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
+    MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
+    MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_PREV_EVENTS, MAX_SHARED_FILE_BYTES,
+    MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, ROOMID_CONTEXT, SHORT_ID_LEN,
+    SIGNATURE_LEN,
 };
 use iroh_rooms_core::event::content::EventType;
 use iroh_rooms_core::event::reject::{Flag, RejectReason};
@@ -83,9 +87,9 @@ const ALL_FLAGS: &[Flag] = &[Flag::ClockSkew, Flag::Equivocation, Flag::FromRemo
 /// The `duplicate` ignored-outcome is neither a `RejectReason` nor a `Flag`.
 const DUPLICATE_CODE: &str = "duplicate";
 
-/// Every `EventType` (10) in the closed MVP registry, hand-mirrored (the enum is
+/// Every `EventType` (11) in the closed registry, hand-mirrored (the enum is
 /// a plain closed enum, but an external test crate still cannot iterate it). The
-/// count is pinned below, so adding an 11th type forces an update here — which
+/// count is pinned below, so adding a 12th type forces an update here — which
 /// then trips the §6-registry doc-coverage assert unless the doc is updated too.
 /// Mirrors `event::content::EventType`.
 const ALL_EVENT_TYPES: &[EventType] = &[
@@ -99,6 +103,7 @@ const ALL_EVENT_TYPES: &[EventType] = &[
     EventType::PipeOpened,
     EventType::PipeClosed,
     EventType::AgentStatus,
+    EventType::ContentEncrypted,
 ];
 
 /// Every taxonomy code the doc's reason/flag section must account for.
@@ -205,6 +210,30 @@ fn context_strings_and_structural_bounds_match_constants() {
         ("SIGNATURE_LEN", SIGNATURE_LEN as u64),
         ("DIGEST_LEN", DIGEST_LEN as u64),
         ("SHORT_ID_LEN", SHORT_ID_LEN as u64),
+        // `content.encrypted` envelope bounds (#191 step 3, spec D2a/D3).
+        ("ENCRYPTED_SUITE_V1", u64::from(ENCRYPTED_SUITE_V1)),
+        ("ENCRYPTED_NONCE_LEN", ENCRYPTED_NONCE_LEN as u64),
+        ("ENCRYPTED_TAG_LEN", ENCRYPTED_TAG_LEN as u64),
+        (
+            "MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT",
+            MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT as u64,
+        ),
+        (
+            "MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT",
+            MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT as u64,
+        ),
+        (
+            "MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT",
+            MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT as u64,
+        ),
+        (
+            "MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT",
+            MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT as u64,
+        ),
+        (
+            "MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT",
+            MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT as u64,
+        ),
     ];
     for (name, value) in bounds {
         assert!(
@@ -313,8 +342,9 @@ fn event_type_registry_table_matches_enum() {
     // this module and the doc's §6 table need review.
     assert_eq!(
         ALL_EVENT_TYPES.len(),
-        10,
-        "the MVP event-type registry has exactly 10 types"
+        11,
+        "the closed event-type registry has exactly 11 types (10 MVP + \
+         content.encrypted, #191 step 3)"
     );
 
     let want: BTreeSet<&str> = ALL_EVENT_TYPES.iter().map(EventType::as_str).collect();

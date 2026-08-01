@@ -61,6 +61,49 @@ pub const MAX_STATUS_MESSAGE_BYTES: usize = 4096;
 /// Protocol §7). Mirrors [`MAX_FILE_PROVIDERS`].
 pub const MAX_ARTIFACT_REFS: usize = 16;
 
+/// The single pinned cryptographic suite id for `content.encrypted` envelopes
+/// (spec `content-key-rotation.md` D3, `SUITE_V1`). Any other `suite` value is
+/// rejected at parse, fail-closed. Pinned equal to
+/// `iroh_rooms_crypto::SUITE_V1` by a dev-dependency cross-check test so the
+/// two crates can never drift.
+pub const ENCRYPTED_SUITE_V1: u8 = 0x01;
+
+/// AEAD nonce length of a `content.encrypted` envelope (AES-256-GCM, 96-bit —
+/// spec D3). Cross-pinned to `iroh_rooms_crypto::NONCE_LEN`.
+pub const ENCRYPTED_NONCE_LEN: usize = 12;
+
+/// AEAD authentication-tag length (AES-256-GCM — spec D3). AEAD preserves
+/// plaintext length apart from this tag, which is what makes the D2a
+/// ciphertext bound (`plaintext cap + tag`) exact. Cross-pinned to
+/// `iroh_rooms_crypto::TAG_LEN`.
+pub const ENCRYPTED_TAG_LEN: usize = 16;
+
+/// Maximum canonical-CBOR plaintext bytes for an encrypted `message.text`
+/// body (spec D2a): the §7 body cap plus headroom for `format`,
+/// `in_reply_to`, `mentions` at the v1 room ceiling (N≤40 → ~1.4 KiB), and
+/// map overhead.
+pub const MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT: usize = MAX_MESSAGE_BODY_BYTES + 4096;
+
+/// Maximum canonical-CBOR plaintext bytes for an encrypted `file.shared` body
+/// (spec D2a): name (255) + mime (255) + 16 providers (~544) + fixed fields
+/// ≈ 1.3 KiB, with ~3× headroom.
+pub const MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT: usize = 4096;
+
+/// Maximum canonical-CBOR plaintext bytes for an encrypted `pipe.opened` body
+/// (spec D2a). `label`/`target_hint`/`alpn` carry no per-field cap today, so
+/// this is a deliberate new authoring bound for the encrypted form; the R2
+/// writer must keep the plaintext under it before sealing.
+pub const MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT: usize = 8192;
+
+/// Maximum canonical-CBOR plaintext bytes for an encrypted `pipe.closed` body
+/// (spec D2a): a 16-byte id plus an enum reason.
+pub const MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT: usize = 1024;
+
+/// Maximum canonical-CBOR plaintext bytes for an encrypted `agent.status`
+/// body (spec D2a): status (64) + message (4096) + 16 artifact ids (~288)
+/// with headroom.
+pub const MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT: usize = 8192;
+
 /// The only accepted logical `schema_version` for MVP (Event Protocol §2).
 pub const SCHEMA_VERSION: u64 = 1;
 

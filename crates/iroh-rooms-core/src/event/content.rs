@@ -18,7 +18,10 @@ use blake3::Hasher;
 use super::binding::DeviceBinding;
 use super::cbor::CborValue;
 use super::constants::{
-    DIGEST_LEN, INVITE_CONTEXT, MAX_ARTIFACT_REFS, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
+    DIGEST_LEN, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN, INVITE_CONTEXT,
+    MAX_ARTIFACT_REFS, MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
+    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
+    MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
     MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES,
     MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
 };
@@ -59,6 +62,12 @@ pub enum EventType {
     PipeClosed,
     /// `agent.status` — agent progress/status update.
     AgentStatus,
+    /// `content.encrypted` — an encrypted-content envelope wrapping one of the
+    /// five content bodies under a rotating room key (spec
+    /// `content-key-rotation.md` D2). Phase R1 (D8): parsed and persisted as
+    /// opaque-but-valid; **writers are disabled** until the R2 compatibility
+    /// floor.
+    ContentEncrypted,
 }
 
 impl EventType {
@@ -76,6 +85,7 @@ impl EventType {
             Self::PipeOpened => "pipe.opened",
             Self::PipeClosed => "pipe.closed",
             Self::AgentStatus => "agent.status",
+            Self::ContentEncrypted => "content.encrypted",
         }
     }
 
@@ -99,9 +109,36 @@ impl EventType {
                 | Self::PipeOpened
                 | Self::PipeClosed
                 | Self::AgentStatus
+                | Self::ContentEncrypted
                 | Self::MemberInvited
                 | Self::MemberLeft
         )
+    }
+
+    /// The D2a plaintext cap for this type **as the `inner_type` of a
+    /// `content.encrypted` envelope**: the maximum canonical-CBOR byte length
+    /// of the wrapped body. `None` means the type is not encryptable —
+    /// membership bodies stay plaintext (spec D1), and an envelope cannot wrap
+    /// another envelope.
+    ///
+    /// The envelope parser enforces `ciphertext.len() ≤ cap +`
+    /// [`ENCRYPTED_TAG_LEN`] (AEAD preserves length apart from the tag), and
+    /// the R2 writer must keep the plaintext under the cap before sealing.
+    #[must_use]
+    pub fn max_encrypted_plaintext_bytes(&self) -> Option<usize> {
+        match self {
+            Self::MessageText => Some(MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT),
+            Self::FileShared => Some(MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT),
+            Self::PipeOpened => Some(MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT),
+            Self::PipeClosed => Some(MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT),
+            Self::AgentStatus => Some(MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT),
+            Self::RoomCreated
+            | Self::MemberInvited
+            | Self::MemberJoined
+            | Self::MemberLeft
+            | Self::MemberRemoved
+            | Self::ContentEncrypted => None,
+        }
     }
 
     /// Parse a registry string, or `None` for an unknown type.
@@ -118,6 +155,7 @@ impl EventType {
             "pipe.opened" => Self::PipeOpened,
             "pipe.closed" => Self::PipeClosed,
             "agent.status" => Self::AgentStatus,
+            "content.encrypted" => Self::ContentEncrypted,
             _ => return None,
         };
         Some(ty)
@@ -274,6 +312,32 @@ pub struct AgentStatus {
     pub progress_pct: Option<u64>,
 }
 
+/// `content.encrypted` content — the encrypted-content envelope (spec
+/// `content-key-rotation.md` D2). The wrapped body is the deterministic-CBOR
+/// encoding of one of the five plaintext content bodies, sealed with
+/// AES-256-GCM under `room_key[key_epoch]`; only the envelope is visible to
+/// non-key-holders. In Phase R1 every field is parsed and bounds-checked, the
+/// event persists per the ordinary envelope verdict, and the body is never
+/// decrypted (no reader holds keys yet) — opaque, valid-but-unreadable (D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedContent {
+    /// The plaintext body's real type (`message.text` / `file.shared` /
+    /// `pipe.opened` / `pipe.closed` / `agent.status`). Cleartext, like
+    /// `event_type`, for routing and the key-aware authorization reads (D9).
+    /// Membership types and nested envelopes are rejected at parse (D1).
+    pub inner_type: EventType,
+    /// Which room-content-key epoch sealed this body.
+    pub key_epoch: u64,
+    /// Cryptographic-suite id; MUST be [`ENCRYPTED_SUITE_V1`] (`0x01`) — any
+    /// other value is rejected at parse, fail-closed (D3).
+    pub suite: u8,
+    /// AEAD nonce, unique per `(key_epoch, event)` on the writer side.
+    pub nonce: [u8; ENCRYPTED_NONCE_LEN],
+    /// `AES-256-GCM(room_key[key_epoch], nonce, plaintext_cbor, aad)`;
+    /// bounded by the inner type's plaintext cap + tag (D2a).
+    pub ciphertext: Vec<u8>,
+}
+
 /// Typed, strictly-validated event content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
@@ -297,6 +361,8 @@ pub enum Content {
     PipeClosed(PipeClosed),
     /// See [`AgentStatus`].
     AgentStatus(AgentStatus),
+    /// See [`EncryptedContent`].
+    Encrypted(EncryptedContent),
 }
 
 impl Content {
@@ -314,6 +380,7 @@ impl Content {
             Self::PipeOpened(_) => EventType::PipeOpened,
             Self::PipeClosed(_) => EventType::PipeClosed,
             Self::AgentStatus(_) => EventType::AgentStatus,
+            Self::Encrypted(_) => EventType::ContentEncrypted,
         }
     }
 
@@ -335,6 +402,7 @@ impl Content {
             EventType::PipeOpened => Self::PipeOpened(parse_pipe_opened(&mut f)?),
             EventType::PipeClosed => Self::PipeClosed(parse_pipe_closed(&mut f)?),
             EventType::AgentStatus => Self::AgentStatus(parse_agent_status(&mut f)?),
+            EventType::ContentEncrypted => Self::Encrypted(parse_encrypted(&mut f)?),
         };
         // Reject any leftover (unknown) keys.
         f.finish()?;
@@ -448,6 +516,16 @@ impl Content {
                 push_opt_uint(&mut m, "progress_pct", c.progress_pct);
                 sort_into_map(&mut m)
             }
+            Self::Encrypted(c) => {
+                let mut m = vec![
+                    text_entry("inner_type", c.inner_type.as_str()),
+                    ("key_epoch".to_owned(), CborValue::Uint(c.key_epoch)),
+                    ("suite".to_owned(), CborValue::Uint(u64::from(c.suite))),
+                    bytes_entry("nonce", &c.nonce),
+                    bytes_entry("ciphertext", &c.ciphertext),
+                ];
+                sort_into_map(&mut m)
+            }
         }
     }
 }
@@ -555,12 +633,15 @@ pub fn check_field_rules(content: &Content, sender_id: &IdentityKey) -> Result<(
                 return Err(RejectReason::InvalidContent);
             }
         }
+        // `content.encrypted` has no sender-dependent cleartext rules: the body
+        // is opaque and the DAG verdict must stay key-independent (spec D2b).
         Content::MemberInvited(_)
         | Content::MemberJoined(_)
         | Content::MessageText(_)
         | Content::FileShared(_)
         | Content::PipeClosed(_)
-        | Content::AgentStatus(_) => {}
+        | Content::AgentStatus(_)
+        | Content::Encrypted(_) => {}
     }
     Ok(())
 }
@@ -784,6 +865,55 @@ fn parse_pipe_closed(f: &mut Fields<'_>) -> Result<PipeClosed, RejectReason> {
     Ok(PipeClosed {
         pipe_id: f.require_bytes::<SHORT_ID_LEN>("pipe_id")?,
         reason: f.opt_enum("reason", PIPE_CLOSE_REASONS)?,
+    })
+}
+
+/// Strictly parse a `content.encrypted` envelope (spec D2, Phase R1).
+///
+/// Everything here is a *cleartext* structural check so every node reaches the
+/// same verdict regardless of key possession (D2b):
+///
+/// * `inner_type` must be a registered, **encryptable** content type — a
+///   membership body (D1) or a nested envelope is `invalid_content`;
+/// * `suite` must be exactly [`ENCRYPTED_SUITE_V1`] (D3, fail-closed);
+/// * `nonce` is exactly [`ENCRYPTED_NONCE_LEN`] bytes;
+/// * `ciphertext` must be at least a bare AEAD tag and at most the inner
+///   type's plaintext cap + tag (D2a), keeping every per-type size invariant
+///   intact end-to-end without decrypting anything.
+fn parse_encrypted(f: &mut Fields<'_>) -> Result<EncryptedContent, RejectReason> {
+    let inner_type = EventType::from_registry(f.require_text("inner_type")?)
+        .ok_or(RejectReason::InvalidContent)?;
+    let Some(plaintext_cap) = inner_type.max_encrypted_plaintext_bytes() else {
+        return Err(RejectReason::InvalidContent);
+    };
+
+    let key_epoch = f.require_uint("key_epoch")?;
+
+    let suite = f.require_uint("suite")?;
+    if suite != u64::from(ENCRYPTED_SUITE_V1) {
+        return Err(RejectReason::InvalidContent);
+    }
+    // Bounded by the check above; documents the envelope's one-byte suite id.
+    #[allow(clippy::cast_possible_truncation)]
+    let suite = suite as u8;
+
+    let nonce = f.require_bytes::<ENCRYPTED_NONCE_LEN>("nonce")?;
+
+    let ciphertext = f
+        .require("ciphertext")?
+        .as_bytes()
+        .ok_or(RejectReason::InvalidContent)?;
+    if ciphertext.len() < ENCRYPTED_TAG_LEN || ciphertext.len() > plaintext_cap + ENCRYPTED_TAG_LEN
+    {
+        return Err(RejectReason::InvalidContent);
+    }
+
+    Ok(EncryptedContent {
+        inner_type,
+        key_epoch,
+        suite,
+        nonce,
+        ciphertext: ciphertext.to_vec(),
     })
 }
 

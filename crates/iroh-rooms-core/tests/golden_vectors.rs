@@ -1140,6 +1140,7 @@ fn all_event_types_round_trip_registry_string() {
         (EventType::PipeOpened, "pipe.opened"),
         (EventType::PipeClosed, "pipe.closed"),
         (EventType::AgentStatus, "agent.status"),
+        (EventType::ContentEncrypted, "content.encrypted"),
     ];
     for (ty, s) in &types {
         assert_eq!(ty.as_str(), *s, "as_str mismatch for {s}");
