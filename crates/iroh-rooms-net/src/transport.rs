@@ -172,6 +172,11 @@ pub struct Inbound {
     pub peer: PeerId,
     /// Verbatim frame body (a canonical-CBOR `SyncMessage`).
     pub bytes: Vec<u8>,
+    /// Whether this frame arrived via the gossip overlay (charged to the gossip
+    /// ledger) rather than a direct `EVENT_ALPN` link. The pump uses this to
+    /// apply the self-standing admission recheck to gossip-origin frames at the
+    /// dequeue boundary, where fold mutation and ingestion are serialized.
+    pub via_gossip: bool,
 }
 
 /// The byte-bounded, priority-aware outbound frame queue for one peer (issue
@@ -400,6 +405,7 @@ impl InboundReceiver {
         self.rx.recv().await.map(|f| Inbound {
             peer: f.peer,
             bytes: f.body,
+            via_gossip: f.gossip,
         })
     }
 }

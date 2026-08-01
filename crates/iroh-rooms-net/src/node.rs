@@ -1578,6 +1578,29 @@ async fn pump(
                             continue;
                         }
 
+                        // Self-standing recheck for gossip-origin frames (the
+                        // gossip-plane leak, PR #197 review). The gossip receiver
+                        // task authorizes `shared.me` *before* enqueueing, but it
+                        // runs concurrently with this pump: if the pump folds a
+                        // self-removal between that authorize and this dequeue, the
+                        // queued frame would still be ingested while the local
+                        // device is already removed. Re-checking here — on the
+                        // single pump task, where fold mutation and ingestion are
+                        // serialized — closes that in-flight race. Direct-link
+                        // frames are unaffected: their accept gate already rejects
+                        // a removed peer's connection.
+                        if inbound.via_gossip
+                            && matches!(
+                                shared.admission.authorize(shared.me),
+                                AdmissionDecision::Reject(_)
+                            )
+                        {
+                            tracing::debug!(
+                                "pump: dropping gossip frame; local device is no longer admitted"
+                            );
+                            continue;
+                        }
+
                         // Join-bootstrap restriction (IR-0104, Approach A): a
                         // *provisional* peer is served the membership sub-DAG only,
                         // and — since #111 lets that closure carry chat ancestry —
@@ -2833,5 +2856,143 @@ mod gossip_self_removal_tests {
         );
 
         endpoint.close().await;
+    }
+}
+
+/// Test for the pump-boundary self-standing recheck on gossip-origin frames
+/// (PR #197 review). The gossip receiver task authorizes `shared.me` *before*
+/// enqueueing, but it runs concurrently with the pump: a self-removal folded
+/// between that authorize and the pump's dequeue would otherwise let a queued
+/// gossip frame be ingested while the local device is already removed. The
+/// pump's dequeue gate re-checks `shared.me` for gossip-origin frames, closing
+/// the in-flight race. This drives `pump` directly with a gossip-ledger frame
+/// while the local device is NOT admitted, asserting the engine never ingests.
+#[cfg(all(test, feature = "gossip_overlay"))]
+mod pump_gossip_self_check_tests {
+    use std::sync::Arc;
+
+    use iroh_rooms_core::event::ids::RoomId;
+    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms_core::sync::{PeerId, SyncConfig, SyncEngine, SyncMessage};
+    use tokio::sync::{broadcast, mpsc};
+
+    use super::pump;
+    use crate::admission::{Admission, AdmissionDecision, AllowlistAdmission};
+    use crate::audit::TracingAudit;
+    use crate::demo;
+    use crate::transport::{NetConfig, NetTransport};
+
+    /// An admission gate that admits everyone EXCEPT the local device `me` —
+    /// standing in for the post-self-removal view: the neighbor is admitted,
+    /// the local device is not.
+    struct NotSelf {
+        me: iroh::EndpointId,
+        inner: AllowlistAdmission,
+    }
+
+    impl Admission for NotSelf {
+        fn authorize(&self, device: iroh::EndpointId) -> AdmissionDecision {
+            if device == self.me {
+                return AdmissionDecision::Reject(crate::admission::RejectCause::NotActive);
+            }
+            self.inner.authorize(device)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_drops_gossip_frame_when_self_not_admitted() {
+        let host = demo::Participant::new(0x21);
+        let neighbor = demo::Participant::new(0x22);
+        let (room, genesis_id, genesis_wire) = demo::genesis(&host);
+
+        // Bind a transport whose admission rejects the local device (self) but
+        // admits the neighbor. `me` is derived from the host's device secret.
+        let host_secret = host.iroh_secret();
+        let me = host_secret.public();
+        // Admit the neighbor in the inner gate so the frame passes the
+        // neighbor-admission check; ONLY the self-standing gate can drop it.
+        let neighbor_gate = AllowlistAdmission::new()
+            .bind_device(neighbor.endpoint_id(), neighbor.identity())
+            .set_active(neighbor.identity());
+        let admission: Arc<dyn Admission> = Arc::new(NotSelf {
+            me,
+            inner: neighbor_gate,
+        });
+        let mut transport = NetTransport::bind(
+            host_secret,
+            admission,
+            Arc::new(TracingAudit),
+            NetConfig::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("bind transport");
+        let inbound_rx = transport.take_inbound().expect("take inbound");
+        let conn_rx = transport.conn_events();
+        let shared = transport.shared();
+
+        let store = EventStore::open_in_memory().expect("in-memory store");
+        let engine_room: RoomId = room;
+        let engine =
+            SyncEngine::open(store, engine_room, SyncConfig::default()).expect("open engine");
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_pipe_query_tx, pipe_query_rx) = mpsc::channel(8);
+        let (room_event_tx, mut room_event_rx) = broadcast::channel(16);
+
+        // Drive the real pump (unmanaged: no room reconciler, no live cell).
+        let pump_handle = tokio::spawn(pump(
+            engine,
+            inbound_rx,
+            conn_rx,
+            shared.clone(),
+            cmd_rx,
+            pipe_query_rx,
+            std::time::Duration::from_millis(50),
+            None,
+            room_event_tx,
+            None,
+            None,
+        ));
+
+        // Enqueue a gossip-origin Events frame carrying the (valid) genesis,
+        // delivered by the admitted neighbor. The neighbor passes the
+        // neighbor-admission gate; only the self-standing gate can drop it.
+        let frame = SyncMessage::Events {
+            room_id: room,
+            frames: vec![genesis_wire.clone()],
+        }
+        .encode();
+        shared
+            .try_enqueue_inbound_gossip(
+                PeerId::from_bytes(*neighbor.endpoint_id().as_bytes()),
+                frame,
+            )
+            .expect("enqueue gossip frame");
+
+        // Give the pump a few ticks to drain the inbound queue. If the frame
+        // were ingested, the genesis would be drained onto the room-events
+        // broadcast; it must NOT appear because the self-standing gate drops it.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut ingested = false;
+        while let Ok(ev) = room_event_rx.try_recv() {
+            if ev.event_id == genesis_id {
+                ingested = true;
+            }
+        }
+        assert!(
+            !ingested,
+            "a gossip frame must not be ingested while the local device is not admitted"
+        );
+
+        // Shut the pump down via its command channel (the only exit path).
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(super::Cmd::Shutdown(shutdown_tx))
+            .expect("send shutdown");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_rx).await;
+        pump_handle.await.expect("pump task joins");
+        transport.shutdown().await.expect("transport shutdown");
     }
 }
