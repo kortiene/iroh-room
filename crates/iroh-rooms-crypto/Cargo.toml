@@ -39,7 +39,12 @@ curve25519-dalek = "=5.0.0-rc.0"
 # HKDF-SHA-256 wrap KDF (spec D3: salt = room_id, no salt-less shortcut).
 # 0.13 is the digest-0.11 line matching the in-tree `sha2 0.11`.
 hkdf = "0.13"
-sha2 = "0.11"
+# sha2's `zeroize` feature makes every SHA-256 core self-wipe on drop and
+# (via digest/zeroize → block-buffer/zeroize) wipes hash block buffers too.
+# hkdf/hmac hold those cores as plain fields, so ordinary drop glue then
+# wipes the PRK-keyed HMAC state inside a dropped `Hkdf` — hkdf itself has
+# no zeroize feature; this is the activation that covers it.
+sha2 = { version = "0.11", features = ["zeroize"] }
 # AES-256-GCM (key 32 B, nonce 12 B, tag 16 B) for wrap + content AEAD.
 # Default features minus `getrandom`: that feature would drag aead's legacy
 # rand_core 0.6 / getrandom 0.2 stack into the lock for RNG APIs this crate
