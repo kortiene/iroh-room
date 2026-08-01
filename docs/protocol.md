@@ -586,6 +586,22 @@ authored by an `Active` member; verify fetched bytes' BLAKE3-256 against `blob_h
 > **Security invariant:** step 5 is the **one place** a local wall clock is consulted, and only
 > to **deny** (fail-closed) — never to accept an otherwise-invalid connection.
 
+**Key-aware reads (spec `content-key-rotation.md` D9, #191 step 5).** When `file.shared`,
+`pipe.opened`, or `pipe.closed` arrives wrapped in a `content.encrypted` envelope, the gate
+lookups (`file_shared_hashes`, `pipe_opened`, `pipe_is_closed`) use **authenticated
+decryption**: an envelope feeds a projection only if it opens under a held epoch key AND the
+recovered body survives the strict per-type parse and the owner field rules. Fail-closed, never
+fail-open: an unreadable `file.shared` serves no blob hash; an unreadable `pipe.opened` leaves
+the pipe unknown (unauthorized); and an unreadable close-typed envelope — whose `pipe_id` is
+sealed inside the ciphertext and so cannot be attributed — conservatively closes **every** pipe
+on that node until the epoch key arrives, because a close that might target a given pipe must
+never be missed. A keyless node deterministically sees *fewer* capabilities than a keyed one —
+with one scoped asymmetry: a `pipe_id` deliberately reused across a plaintext and an encrypted
+`pipe.opened` can govern by a different candidate depending on key possession (both candidates
+are field-rule-bound to the same owner, so an owner can confuse enforcement of its *own* pipe
+only, never surface another member's). The governing `pipe.opened` stays the lowest
+`(lamport, event_id)` across plaintext and readable-encrypted candidates.
+
 **Revocation-on-learn.** Live connections are torn down as soon as the enforcing peer learns of
 a removal, `pipe.closed`, or expiry. Exposure is bounded by *removal-event reachability*, not by
 "briefly" — see [§11](#11-mvp-limitations-vs-roadmap).

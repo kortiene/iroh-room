@@ -1125,13 +1125,65 @@ impl SyncEngine {
         self.read_content(event).ok()
     }
 
+    /// Scan the stored `content.encrypted` envelopes whose cleartext
+    /// `inner_type` is `inner`, yielding each envelope's canonical sort key
+    /// (mirroring `by_type`'s `lamport IS NULL, lamport, event_id` order) and
+    /// its authenticated-decryption outcome — the shared walk under the D9
+    /// key-aware authorization reads (#191 step 5).
+    ///
+    /// Cost: O(all stored `content.encrypted` rows) per call — the store has
+    /// no `inner_type` column, so every envelope is CBOR-decoded before the
+    /// `inner_type` filter (no signature or AEAD work for filtered-out rows).
+    /// Acceptable at the MVP bounds while writers are gated behind the
+    /// unexposed floor flag; the rotation lifecycle (§7 step 6) is the point
+    /// to add a store-level `inner_type` index, when encrypted volume becomes
+    /// real.
+    #[allow(clippy::type_complexity)] // one row per envelope: (sort key, read outcome)
+    fn encrypted_bodies(
+        &self,
+        inner: EventType,
+    ) -> Result<Vec<((bool, u64, EventId), Result<Content, UnreadableReason>)>, SyncError> {
+        let mut out = Vec::new();
+        for se in self
+            .store
+            .by_type(&self.room_id, EventType::ContentEncrypted)?
+        {
+            let event = SignedEvent::decode(&se.wire.signed)
+                .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            let Content::Encrypted(env) = &event.content else {
+                // Unreachable for a stored `content.encrypted` row (decode ties
+                // content to event_type); tolerated as a skip, never a panic.
+                continue;
+            };
+            if env.inner_type != inner {
+                continue;
+            }
+            let key = (se.lamport.is_none(), se.lamport.unwrap_or(0), se.event_id);
+            out.push((key, self.read_content(&event)));
+        }
+        Ok(out)
+    }
+
     /// The governing `pipe.opened` for `pipe_id` from the **validated** set, or
     /// `None` if no such pipe is known locally (the Pipe plane's stage-2 lookup,
     /// spec §6.5.1). Read-only over the store, like [`room_tail`](Self::room_tail);
     /// the access decision against the **current** snapshot belongs to the caller.
     ///
-    /// On the (cryptographically improbable) event of two `pipe.opened` sharing a
-    /// `pipe_id`, the lowest-`event_id` one is returned for determinism.
+    /// **Key-aware (spec `content-key-rotation.md` D9, #191 step 5):** an
+    /// encrypted envelope wrapping a `pipe.opened` feeds this lookup only if it
+    /// opens under a held epoch key AND survives the D2b strict parse + owner
+    /// field rule. An unreadable envelope contributes **nothing** — an unknown
+    /// pipe stays unauthorized (fail-closed, never fail-open).
+    ///
+    /// The governing event is the lowest `(lamport, event_id)` across the
+    /// plaintext and readable-encrypted candidates — deterministic for any two
+    /// nodes holding the same validated set *and* the same epoch keys. A
+    /// keyless node sees fewer *pipes*; the one asymmetry: when a `pipe_id`
+    /// is deliberately reused across a plaintext and an encrypted open, key
+    /// possession can change *which* candidate governs. Both candidates are
+    /// the same owner's (the field rules bind `owner_id` to the sender of
+    /// each), so this lets an owner confuse enforcement of its *own* pipe
+    /// only — it never surfaces another member's pipe.
     ///
     /// # Errors
     /// [`SyncError::Store`] on a store read or decode failure.
@@ -1139,24 +1191,57 @@ impl SyncEngine {
         &self,
         pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
     ) -> Result<Option<crate::event::content::PipeOpened>, SyncError> {
-        // `by_type` is ordered `(lamport, event_id)`, so the first match is the
-        // deterministic governing event.
+        // `by_type` is ordered `(lamport IS NULL, lamport, event_id)`, so the
+        // first plaintext match is the governing plaintext candidate.
+        let mut governing: Option<((bool, u64, EventId), crate::event::content::PipeOpened)> = None;
         for se in self.store.by_type(&self.room_id, EventType::PipeOpened)? {
-            let event = crate::event::signed::SignedEvent::decode(&se.wire.signed)
+            let event = SignedEvent::decode(&se.wire.signed)
                 .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
             if let Content::PipeOpened(opened) = event.content {
                 if &opened.pipe_id == pipe_id {
-                    return Ok(Some(opened));
+                    governing = Some((
+                        (se.lamport.is_none(), se.lamport.unwrap_or(0), se.event_id),
+                        opened,
+                    ));
+                    break;
                 }
             }
         }
-        Ok(None)
+        for (key, body) in self.encrypted_bodies(EventType::PipeOpened)? {
+            let Ok(Content::PipeOpened(opened)) = body else {
+                continue; // unreadable feeds nothing (D9 fail-closed)
+            };
+            if &opened.pipe_id != pipe_id {
+                continue;
+            }
+            let improves = match &governing {
+                None => true,
+                Some((best, _)) => key < *best,
+            };
+            if improves {
+                governing = Some((key, opened));
+            }
+        }
+        Ok(governing.map(|(_, opened)| opened))
     }
 
-    /// Whether a `pipe.closed` for `pipe_id` is present in the validated set (the
-    /// `pipe.closed`-causally-known check the Pipe plane composes with the gate,
-    /// spec §5). Fail-closed: any decode failure surfaces as an error the caller
-    /// treats as "closed".
+    /// Whether a `pipe.closed` for `pipe_id` is causally known (the
+    /// `pipe.closed` check the Pipe plane composes with the gate, spec §5).
+    /// Fail-closed: any decode failure surfaces as an error the caller treats
+    /// as "closed".
+    ///
+    /// **Key-aware (spec `content-key-rotation.md` D9, #191 step 5):** a
+    /// *readable* encrypted `pipe.closed` closes its `pipe_id` exactly like a
+    /// plaintext one. An **unreadable** close-typed envelope hides its
+    /// `pipe_id` inside the ciphertext, so it cannot be attributed to any one
+    /// pipe — and a close that might target *this* pipe must never be missed
+    /// (a missed close leaves a closed pipe authorized, the fail-open D9
+    /// forbids). The unattributable close is therefore treated conservatively:
+    /// it closes **every** pipe on this node until the epoch key arrives
+    /// (join-time transfer / rotation, §7 step 6) and the close becomes
+    /// readable. Deny-while-keyless is the documented cost of fail-closed —
+    /// the same posture as the blob gate serving nothing for unreadable
+    /// `file.shared` events.
     ///
     /// # Errors
     /// [`SyncError::Store`] on a store read or decode failure.
@@ -1165,12 +1250,26 @@ impl SyncEngine {
         pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
     ) -> Result<bool, SyncError> {
         for se in self.store.by_type(&self.room_id, EventType::PipeClosed)? {
-            let event = crate::event::signed::SignedEvent::decode(&se.wire.signed)
+            let event = SignedEvent::decode(&se.wire.signed)
                 .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
             if let Content::PipeClosed(closed) = event.content {
                 if &closed.pipe_id == pipe_id {
                     return Ok(true);
                 }
+            }
+        }
+        for (_, body) in self.encrypted_bodies(EventType::PipeClosed)? {
+            match body {
+                Ok(Content::PipeClosed(closed)) => {
+                    if &closed.pipe_id == pipe_id {
+                        return Ok(true);
+                    }
+                }
+                // A readable close-typed envelope can only recover PipeClosed
+                // (parse is keyed to inner_type); anything else is unreachable.
+                Ok(_) => {}
+                // Unattributable close: conservatively closes every pipe.
+                Err(_) => return Ok(true),
             }
         }
         Ok(false)
@@ -1181,14 +1280,25 @@ impl SyncEngine {
     /// (IR-0204 spec §5.3). Read-only over the store, like [`pipe_opened`](Self::pipe_opened);
     /// the gate decision itself belongs to the caller.
     ///
+    /// **Key-aware (spec `content-key-rotation.md` D9, #191 step 5):** an
+    /// encrypted envelope wrapping a `file.shared` contributes its `blob_hash`
+    /// only if it opens under a held epoch key and survives the D2b strict
+    /// parse. An unreadable envelope contributes **nothing**: its blob is not
+    /// served (fail-closed, never fail-open).
+    ///
     /// # Errors
     /// [`SyncError::Store`] on a store read or decode failure.
     pub fn file_shared_hashes(&self) -> Result<BTreeSet<[u8; 32]>, SyncError> {
         let mut hashes = BTreeSet::new();
         for se in self.store.by_type(&self.room_id, EventType::FileShared)? {
-            let event = crate::event::signed::SignedEvent::decode(&se.wire.signed)
+            let event = SignedEvent::decode(&se.wire.signed)
                 .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
             if let Content::FileShared(f) = event.content {
+                hashes.insert(*f.blob_hash.as_bytes());
+            }
+        }
+        for (_, body) in self.encrypted_bodies(EventType::FileShared)? {
+            if let Ok(Content::FileShared(f)) = body {
                 hashes.insert(*f.blob_hash.as_bytes());
             }
         }
