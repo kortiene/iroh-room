@@ -29,8 +29,10 @@ that patches its own transport: such a device can keep a process subscribed to t
 gossip topic (derived from the public `room_id`, spec `gossip-overlay-events-fan-out.md` D5 —
 a rendezvous point, not a secret) and read every content event it can reach, indefinitely.
 
-Closing that requires **forward secrecy**: rotating a room **content key** at each removal so
-post-removal content is unreadable to the removed device even if it receives the ciphertext.
+Closing that requires **forward secrecy**: rotating a room **content key** whenever an Active
+member leaves the Active set (an admin `member.removed` or a voluntary `member.left`) so
+post-departure content is unreadable to the departed device even if it receives the
+ciphertext.
 
 The non-negotiable constraints, repeated throughout this document:
 
@@ -67,20 +69,27 @@ full group E2EE ratchet (which stays out of scope, §12).
 
 **Goals**
 
-- **G1.** After a `member.removed(D)` is folded, content events authored in subsequent epochs
-  are unreadable to `D` even if `D` receives the ciphertext (forward secrecy, post-removal).
+- **G1.** After a `member.removed(D)` or `member.left(D)` is folded, content events authored
+  in subsequent epochs are unreadable to `D` even if `D` receives the ciphertext (forward
+  secrecy, post-departure).
 - **G2.** Membership events remain plaintext and the fold, join bootstrap, signature
   verification, dedup, and causal ordering are byte-for-byte unchanged.
-- **G3.** Rotation is atomic with the fold: every honest member rotates to the new epoch at
-  the same causal point, and `D` is excluded from the new key.
-- **G4.** A newly-joined invitee can read room backlog after receiving the epoch keys on join.
+- **G3.** For an admin `member.removed`, removal and rotation are a **single atomic fold
+  transition** (the rotation payload rides in the removal event), so every honest member
+  rotates to the new epoch at the same causal point and `D` is excluded — no intermediate
+  state where the removal is folded but the new key is not yet durable. For a voluntary
+  `member.left`, the departure folds immediately and the admin's next event excludes the
+  departed member from future epochs (a bounded window, T29).
+- **G4.** A newly-joined invitee can read room backlog after a bounded, chunked join-time key
+  transfer.
 - **G5.** The threat model moves T27 from "Partial — honest transport only" to "Controlled"
   for the malicious-reader case, with the residual risks recorded as new rows.
 
 **Non-goals** (see §12)
 
 - Full group E2EE ratchet / per-message forward secrecy (MLS-style).
-- Metadata privacy (an observer still learns that a content event of a given type occurred).
+- Metadata privacy (an observer still learns event existence, type, timing, DAG, and body
+  length).
 - Multi-admin rotation, admin-offline rotation, or protection against a compromised admin.
 - Encrypting membership events, blobs at rest, or `audit.ndjson`.
 
@@ -101,103 +110,243 @@ membership closure it needs to join) and the fold's cross-device membership read
 
 ### D2 — Encryption is inside `content`; the signed envelope stays cleartext
 
-A content event's body is replaced by an **encrypted-content envelope**:
+A content event's body is replaced by an **encrypted-content envelope**. The envelope is a new
+`Content` variant so the closed content registry (`Content::parse`, which rejects any unknown
+key as `InvalidContent`) stays closed and the rollout can be made reader-first (D8):
 
 ```
-EncryptedContent {
+Content::Encrypted {
+    inner_type: EventType,   // the plaintext body's real type (MessageText / FileShared / …)
     key_epoch: u64,          // which room-content-key epoch encrypted this body
+    suite: u8,               // cryptographic-suite identifier (D3) — 0x01 for SUITE_V1
     nonce: [u8; 12],         // AEAD nonce, unique per (key_epoch, event)
-    ciphertext: Vec<u8>,     // AEAD(room_key[key_epoch], plaintext_cbor, aad)
+    ciphertext: Vec<u8>,     // AEAD(room_key[key_epoch], plaintext_cbor, aad) — bounded (D2a)
 }
 ```
 
 - `plaintext_cbor` is the deterministic-CBOR encoding of the original content body.
 - **Associated data (AAD):** the event's cleartext signed prefix — `schema_version ‖ room_id ‖
-  sender_id ‖ device_id ‖ event_type ‖ created_at ‖ prev_events` — binds the ciphertext to
-  this exact event so it cannot be transplanted onto another event or room.
+  sender_id ‖ device_id ‖ event_type ‖ created_at ‖ prev_events ‖ inner_type ‖ key_epoch ‖
+  suite` — binds the ciphertext to this exact event, type, epoch, and suite so it cannot be
+  transplanted onto another event, room, type, or epoch.
 - The eight signed fields, `event_id`, and the signature remain cleartext and computed over
   the **envelope** form (the event as transmitted). Signature verification, `event_id`
   derivation, dedup, and the fold all operate on the envelope unchanged; only a holder of
   `room_key[key_epoch]` can recover the body.
+- **`inner_type` stays cleartext** (like `event_type`) for routing and the key-aware
+  authorization reads in D9. An observer learns event existence, `inner_type`, and ciphertext
+  **length** (D6 metadata, §6/T30).
 
-*Consequence (metadata):* `event_type` stays cleartext for routing/fold classification, so an
-observer learns *that* a chat/file/pipe/agent event occurred, not its content. This matches
-the accepted "no full metadata privacy" posture (§13.5). Recorded in §6.
+#### D2a — Ciphertext and decrypted-body bounds
 
-*Schema detail to pin at build time:* whether `EncryptedContent` is a new `Content` variant
-(`Content::Encrypted { inner_type, .. }`) or a per-type ciphertext field. A single
-`Content::Encrypted` variant carrying `inner_type` is simpler and keeps the closed content
-registry closed; the exact shape is OQ-2 (§10).
+`ciphertext` is bounded so a single envelope still fits the 1 MiB wire frame
+(`MAX_FRAME_BYTES`) and the per-type size invariants survive encryption:
 
-### D3 — Key wrap: X25519 ECDH → HKDF → AEAD, in a pure crate
+- `ciphertext.len() ≤ inner_type`'s existing plaintext cap **+ AEAD tag** (16 bytes). Because
+  AEAD preserves length, capping the ciphertext at the plaintext cap + tag keeps every
+  per-type size invariant intact end-to-end.
+- The recovered body, once decrypted, MUST pass the **original strict `Content::parse` for
+  `inner_type`** (exact key set, byte/count caps, enums) before it is used for anything. A
+  body that fails strict parsing after a successful AEAD open is treated as *unreadable*
+  (dropped, logged) — **not** as a fold rejection: the DAG verdict must not depend on whether
+  the local node holds the key, or convergence forks. See D2b.
 
-Each member's Ed25519 device key converts to a Montgomery (X25519) key
-(`curve25519-dalek` is already in-tree). The admin wraps `room_key[epoch]` to each remaining
-Active member's device:
+#### D2b — Decrypted-content validation does not change the DAG verdict
 
-1. `shared = X25519(admin_static, member_device_pub)` — or ephemeral-X25519 for
-   recipient-only forward secrecy of the *channel* (OQ-3).
-2. `wrap_key = HKDF-BLAKE3/sha2(shared, info = "iroh-rooms/content-key-wrap/v1" ‖ room_id ‖ epoch)`.
-3. `wrapped = AEAD(wrap_key, room_key[epoch], aad = room_id ‖ epoch ‖ member_device)`.
+A malicious **Active** key holder can encrypt a structurally invalid inner body (oversized
+`message.text`, malformed `file.shared`). The DAG verdict (accept/park/reject) for an
+`Encrypted` event is computed **only from the cleartext envelope and the shared fold inputs**
+— never from the decrypted body — so every node reaches the same verdict regardless of key
+possession. The decrypted body's only consumer is *surfacing* (display, authorization
+projection), and it is gated independently:
 
-Primitives live in a **pure, deterministic, sans-IO crate** (same invariants as
-`iroh-rooms-v2-core`): no transports, no async, no storage. Add `hkdf` and `x25519-dalek`
-(or `crypto_box`) as dependencies of *that* crate only. Whether this is a new sibling crate
-or a relaxation of `iroh-rooms-v2-core`'s exclusion is **OQ-1** (§10) — a new sibling keeps
-the v2-core purity tripwire intact and is the default recommendation.
+1. AEAD open fails → body unreadable (§5).
+2. AEAD opens but the recovered body fails strict `Content::parse(inner_type)` → body
+   unreadable (§5); the event is still accepted/persisted per the envelope verdict.
+3. Only a body that both opens and strictly parses is surfaced or fed to the key-aware
+   authorization reads (D9).
 
-### D4 — Rotation is admin-driven, atomic with the fold
+This preserves the strict-validation trust boundary for *what users and the pipe/blob gates
+act on*, without making convergence key-dependent.
 
-v1 has a **single immutable admin** (`MembershipSnapshot::admin()`). Rotation:
+### D3 — One pinned cryptographic suite (SUITE_V1)
 
-1. The admin folds `member.removed(D)` and, in the **same causal batch immediately after**,
-  emits a new **`MemberKeyDistribution`** record (see D5) carrying `{ new_epoch,
-  wrapped_keys: { device → wrapped_key } }` for every *remaining* Active member device.
-2. `D` is **excluded** from the wrapped set, so `D` never receives `room_key[new_epoch]`.
-3. Honest members rotate to `new_epoch` at the fold point of the distribution record — the
-  same causal point on every converged node, so content authored after it uses the new key.
+To be interoperable, the design pins **one** suite; no algorithm is left to implementer
+choice. `suite = 0x01` (`SUITE_V1`) means exactly:
 
-The admin's own pre-existing `room_key[old_epoch]` is retained for reading historical content
-(D7); only *new* content uses the new epoch.
+| Primitive | Pinned choice |
+|---|---|
+| Key agreement (wrap) | **X25519** (RFC 7748), device Ed25519 keys converted to Montgomery (`curve25519-dalek`). Ephemeral sender key per wrap (D3a). |
+| Wrap KDF | **HKDF-SHA-256** (RFC 5869), `salt = room_id`, `info = "iroh-rooms/content-key-wrap/v1" ‖ key_epoch ‖ recipient_device`. No salt-less shortcut. |
+| Wrap AEAD | **AES-256-GCM** (key 32 B, nonce 12 B, tag 16 B), `aad = room_id ‖ key_epoch ‖ recipient_device`. |
+| Content AEAD | **AES-256-GCM** (key 32 B = `room_key[epoch]`, nonce 12 B unique per `(key_epoch, event)`, tag 16 B), `aad` per D2. |
+| Content key | `room_key[epoch]` = 32 bytes from `getrandom` (CSPRNG), generated by the admin at rotation. |
+| Suite id | `0x01`; any other `suite` value is rejected at parse (fail-closed). |
+
+HKDF-SHA-256 (add `hkdf`) and X25519 (add `x25519-dalek`) are new dependencies of the pure
+crate only. Golden vectors (§7 step 2) pin a known-answer wrap + content encryption so two
+implementations must agree byte-for-byte. Primitives live in a **pure, deterministic, sans-IO
+crate** (same invariants as `iroh-rooms-v2-core`): no transports, no async, no storage.
+Whether this is a new sibling crate or a relaxation of `iroh-rooms-v2-core`'s exclusion is
+**OQ-1** (§10) — a new sibling keeps the v2-core purity tripwire intact and is the default
+recommendation.
+
+#### D3a — Ephemeral wrap channel
+
+Each wrap uses a fresh ephemeral X25519 keypair from the admin; the ephemeral public key rides
+in the `MemberKeyDistribution` record next to the wrapped key. This gives
+recipient-forward-secrecy of the wrap *channel*: compromising the admin's long-term key later
+does not retroactively unwrap past distributions. (Static-static is the simpler fallback, OQ-3.)
+
+### D4 — Rotation is a single protocol transition, triggered by every Active→Removed change
+
+v1 has a **single immutable admin** (`MembershipSnapshot::admin()`). The rotation trigger is
+**any** transition that moves an Active key holder out of the Active set — an admin-authored
+`member.removed(D)` **or** a voluntary `member.left(D)` (both land the subject in `Removed`).
+A member that leaves voluntarily while retaining its old key and a patched gossip subscription
+must be excluded from future epochs exactly like a removed member; otherwise it reads future
+content indefinitely.
+
+The `SyncEngine::publish` path accepts, persists, and fans out **one** event per call, so a
+"same causal batch" of two separate publishes (removal, then distribution) provides **no
+atomicity**: if the admin process or the second publish fails after the removal is
+distributed, remaining peers have folded the removal but keep encrypting new content with the
+old key the departed device still holds — defeating G3. Rotation is therefore made atomic by
+**carrying the rotation in the departure transition itself**, not as a separate publish. The
+mechanism differs by who authors the departure:
+
+- **Admin-authored `member.removed`:** the removal event **must** carry the rotation payload
+  (D5) — one event, one publish, one atomic fold transition. The admin wraps the new epoch's
+  keys at removal time, so there is no intermediate state. A `member.removed` *without* a
+  rotation payload is a pre-#191 (or non-rotating) event; peers treat it as "no rotation
+  performed" and keep the old epoch (the honest pre-rotation posture).
+- **Voluntary `member.left`:** the departing member authors the leave but **cannot** wrap keys
+  (only the admin holds the wrap role). A leave therefore **cannot** carry the rotation
+  itself. Instead, the leave folds the departure immediately (access revocation via #196/#197
+  applies at once), and the **admin's next event** (its next `member.removed`, a dedicated
+  rotation event, or its next content publish) carries the rotation payload that excludes the
+  departed member. Until that admin rotation lands, new content is still encrypted under the
+  old epoch the departed member holds — a bounded window bounded by the admin's next online
+  event, recorded honestly in T29. The departee cannot force earlier rotation; that would
+  require delegating wrap authority, which is out of scope (§12).
+
+So "atomic" (G3) is precise for **admin removals** (single event), and **bounded-but-not-
+instant** for **voluntary leaves** (departure folds immediately; key exclusion lands at the
+admin's next event). Both are stated without claiming more than the mechanism provides.
+
+*Why not a fail-closed intermediate state instead?* An alternative — block old-epoch
+publishing until the distribution is durable — adds a liveness dependency and a new failure
+mode (stalled rooms) without closing the gap better than embedding the rotation in the
+admin's departure/rotation event. Embedding is simpler and keeps one event per transition for
+the common (admin-removal) case. Recorded as the considered alternative; embedding chosen
+(OQ-7 confirms).
 
 *Admin-offline stall:* if the admin is offline when a removal is needed, rotation (and thus
 forward secrecy) stalls until the admin returns — the removal still revokes *access* via
-#196/#197, but new content keeps using the old epoch. This is an accepted v1 constraint given
-the single-admin model; recorded in §6 and §10 OQ-4.
+#196/#197, but new content keeps using the old epoch. The same stall applies to the
+post-leave rotation above. Accepted v1 constraints given the single-admin model; §6/T29,
+§10 OQ-4.
 
-### D5 — `MemberKeyDistribution` is a membership-adjacent cleartext-envelope record
+### D5 — `MemberKeyDistribution` rides in an admin-authored event, with a key commitment
 
-The distribution record must be fold-visible (so every node learns `new_epoch` and rotates at
-the same causal point) but its per-recipient wrapped-key blobs are openable only by that
-recipient. It is a new record type with:
+The distribution payload is always **admin-authored** (only the admin wraps keys): embedded in
+the admin's `member.removed` (atomic with the removal, D4) or in the admin's next event after
+a voluntary `member.left`. Being in the causal DAG, it is fold-visible at the same causal
+point on every node. It carries:
 
-- **Cleartext envelope:** `room_id`, `new_epoch`, the admin's signature, `prev_events` (so it
-  enters the causal DAG and the fold).
+- **Cleartext envelope:** `new_epoch`, a **key commitment** `BLAKE3(room_key[new_epoch])`, the
+  admin's ephemeral wrap public key (D3a), and `prev_events` (part of the departure event).
 - **Per-recipient ciphertext:** a map `device_id → wrapped_key` (D3). A recipient opens only
   its own entry.
 
-Because membership stays plaintext and this record's *envelope* is cleartext, the fold can
-process it on every node; because the wrapped keys are per-recipient ciphertext, `D` learns
-nothing useful even though it receives the record.
+Every node learns `new_epoch` and the **commitment** (but not the key) from the cleartext
+envelope; only wrapped recipients recover `room_key[new_epoch]` and can verify it against the
+commitment. The removed/departed device is excluded from the wrapped set, so it learns the
+commitment but never the key.
 
-*Schema to pin:* whether `MemberKeyDistribution` is a `Content` variant processed by the fold
-(preferred — it is membership-adjacent and must rotate the fold's epoch) or a separate
-side-channel record. Fold-integrated is recommended so rotation is causal and convergent (OQ-2).
+#### D5a — Conflicting distributions for the same epoch fail closed
 
-### D6 — Join-time key wrap gates backlog reads
+Concurrent admin departures can legitimately fork from the same prior head and choose the same
+incremented `new_epoch` while generating **different** random keys (the fold currently flags
+admin equivocation but does not structurally prevent it). Treating the second same-epoch
+distribution as idempotent would make the chosen key arrival-order-dependent, so different
+peers would decrypt different branches and convergence is lost. The rule is therefore:
 
-A newly-joined invitee needs current + historical epoch keys to read backlog. On its
-`member.joined` folding, the admin wraps the full `epoch → room_key` map to the new device
-(same D3 mechanism, one `MemberKeyDistribution` targeting the invitee). Until then the
-invitee can read membership (plaintext) but **not** historical content — a deliberate UX
-change from "read backlog immediately," recorded in §6 and §10 OQ-5.
+- A distribution for an epoch the node already has is **idempotent only if its key commitment
+  matches** the already-accepted one (bit-for-bit). Re-seeing the same commitment is a no-op.
+- A distribution for an already-accepted epoch with a **different** commitment is a
+  **fail-closed conflict**: the node refuses to adopt either key for that epoch, surfaces a
+  loud admin-equivocation error, and treats new content in that epoch as unreadable until the
+  fork is resolved by the deterministic fork-resolution rule (the existing admin-chain fork
+  handling picks one branch; the winning branch's commitment becomes the epoch's key). This is
+  deterministic and convergent, never arrival-order-dependent.
+
+### D6 — Join-time key transfer is chunked and bounded
+
+A newly-joined invitee needs current + historical epoch keys to read backlog. The full
+`epoch → room_key` map grows without a protocol bound, and the sync contract caps a wire frame
+at 1 MiB (`MAX_FRAME_BYTES`) with `SyncEngine::publish` rejecting any single event that cannot
+fit — so a long-lived, high-churn room would eventually be unable to add a member. The
+join-time transfer is therefore **chunked** exactly like ordinary membership history:
+
+- The admin serves the invitee's key history as a **sequence of bounded
+  `MemberKeyDistribution`-style records** (each carrying at most `KEY_HISTORY_CHUNK` epochs —
+  sized so one record + overhead fits well under 1 MiB), riding the same chunked-pull path as
+  the membership sub-DAG, not a single monolithic publish.
+- **Bounded-history alternative (OQ-5):** cap how many historical epochs a new invitee receives
+  (forward-only from `current_epoch − KEY_HISTORY_WINDOW`). This bounds the transfer to a
+  constant but changes "read full backlog" to "read recent backlog." The default keeps full
+  history via chunking; OQ-5 decides whether a window is also offered.
+
+Until the join-time transfer completes, the invitee reads membership (plaintext) but not
+historical content — a deliberate UX change from "read backlog immediately" (§6, §10 OQ-5).
 
 ### D7 — Old epochs stay decryptable; forward secrecy is post-removal only
 
-A removed device already had access to content up to its removal; rotating keys does not
-(clock cannot) make that history unreadable, and that is **not** a goal. The per-node key
-store is a small `epoch → room_key` map retained for reading backlog. Forward secrecy is
-*post-removal*: only content authored in epochs after `D`'s removal is unreadable to `D`.
+A removed/departed device already had access to content up to its departure; rotating keys
+does not (and cannot) make that history unreadable, and that is **not** a goal. The per-node
+key store is a small `epoch → room_key` map retained for reading backlog. Forward secrecy is
+*post-departure*: only content authored in epochs after `D`'s departure is unreadable to `D`.
+
+### D8 — Rollout is reader-first; writers enable only after a compatibility floor
+
+`SignedEvent::from_canonical_value` runs the closed, strict `Content::parse`, whose per-type
+parsers reject unknown keys as `InvalidContent`. A peer that predates `Content::Encrypted`
+therefore does **not** see the envelope as merely unreadable — it **rejects the event
+entirely** and can park its causal descendants as missing, partitioning the room. Rollout
+must therefore be reader-first:
+
+1. **Phase R1 (reader):** ship a release whose `Content::parse` recognizes the
+   `Content::Encrypted` envelope as an **opaque, valid-but-unreadable** variant (parses and
+   persists it, surfaces nothing), with **writers disabled**. No encrypted event is emitted
+   yet, but every upgraded peer tolerates one.
+2. **Phase R2 (writer):** after a declared compatibility floor (a version string / room
+   capability flag proving all Active peers are ≥ R1), writers begin emitting
+   `Content::Encrypted`. A room opts in explicitly; mixed rooms without the floor keep
+   plaintext.
+3. **Hard cutover (optional, later):** a schema-version bump can make encrypted the default
+   for new rooms once the ecosystem is past R1. Recorded as OQ-6.
+
+### D9 — Pipe/blob authorization reads become key-aware
+
+Encrypting `FileShared`, `PipeOpened`, and `PipeClosed` replaces the concrete `Content`
+variants that authorization helpers inspect directly: `SyncEngine::file_shared_hashes`,
+`SyncEngine::pipe_opened`, and `SyncEngine::pipe_is_closed` currently match the plaintext
+variants. These reads are **authorization decisions** (blob fetch ACL, pipe open/close state)
+and must not silently break: without them, blob fetches are denied, pipe opens disappear, and
+an encrypted `PipeClosed` is missed — potentially leaving a closed pipe authorized
+(fail-open). The implementation therefore converts these reads to **authenticated
+decryption**:
+
+- Each helper (`file_shared_hashes`, `pipe_opened`, `pipe_is_closed`) gains an encrypted path:
+  on an `Encrypted` event with the matching `inner_type`, attempt AEAD open + strict
+  `Content::parse(inner_type)` (D2b); only a body that passes both feeds the projection.
+- **Fail-closed, never fail-open:** if the local node lacks the epoch key or decryption/parse
+  fails, the event contributes **nothing** to the authorization projection (a blob hash is not
+  added, a pipe is not marked open, a close is honored only when a *readable* close is seen —
+  and an unreadable close is treated conservatively as still-closed, not reopened).
+- The implementation plan (§7) includes these helpers and their fail-closed tests explicitly,
+  not only `MessageText` rotation.
 
 ---
 
@@ -206,18 +355,28 @@ store is a small `epoch → room_key` map retained for reading backlog. Forward 
 - **Signature/CSB invariants preserved.** `event_id = BLAKE3(CSB)` and the Ed25519 signature
   are computed over the transmitted (envelope) event. Golden-vector tests must pin an
   encrypted-content event's exact bytes and signature (mirroring `v2-signed-record-golden-vectors`).
-- **Decryption is fold-read-time, best-effort.** A node that lacks `room_key[epoch]` for a
-  content event treats the body as *unreadable*, not *invalid*: the event still validates,
-  folds (if membership), and persists — it is simply not surfaced to the user. This must not
-  wedge convergence or the fold.
-- **AEAD failure = drop, never crash.** A tampered `ciphertext`/`nonce`/AAD fails AEAD open;
-  the body is dropped (logged) and the event is treated as unreadable. No panic on peer bytes
-  (spec §9 discipline, unchanged).
-- **Replay of an old distribution record** is harmless: rotating *to* an already-known epoch
-  is idempotent; rotating *backward* (lower epoch) is rejected.
-- **Unknown `key_epoch`** (a content event from a future epoch the node has not yet received
-  keys for) is unreadable until the distribution record arrives — convergent because the
-  distribution is in the same causal history.
+- **Envelope validation is key-independent.** The DAG verdict (accept/park/reject) for an
+  `Encrypted` event is computed only from the cleartext envelope + shared fold inputs, never
+  from the decrypted body (D2b), so every node converges on the same verdict regardless of key
+  possession.
+- **Decryption is fold-read-time, best-effort, and strictly parsed.** A node that lacks
+  `room_key[epoch]`, fails AEAD open, or recovers a body that fails strict
+  `Content::parse(inner_type)` treats the body as *unreadable* (dropped, logged), never
+  *invalid*: the event still validates and persists per the envelope verdict — it is simply
+  not surfaced and feeds nothing into the key-aware authorization projections (D9). This must
+  not wedge convergence or the fold, and never panics on peer bytes (spec §9 discipline).
+- **Ciphertext is bounded.** `ciphertext.len() ≤ inner_type`'s plaintext cap + 16-byte tag
+  (D2a); an oversized ciphertext is rejected at envelope parse (fail-closed), keeping the
+  1 MiB wire frame and per-type size invariants intact.
+- **Same-epoch distribution conflict fails closed.** A repeated `new_epoch` distribution is
+  idempotent only when its key commitment matches bit-for-bit; a conflicting commitment is a
+  fail-closed admin-equivocation error resolved deterministically by the admin-chain fork
+  rule, never by arrival order (D5a).
+- **Backward-epoch distribution is rejected.** Rotating to a lower or already-superseded epoch
+  is a protocol violation and ignored (logged).
+- **Unknown future `key_epoch`** (content from an epoch the node has not yet received keys
+  for) is unreadable until the distribution for it folds — convergent because the distribution
+  rides in the causal DAG in an admin-authored event (D4/D5).
 
 ---
 
@@ -235,9 +394,13 @@ store is a small `epoch → room_key` map retained for reading backlog. Forward 
   - **T29 — rotation latency / admin-offline stall.** A removed device reads content until the
     removal + distribution batch propagates (compounds T18 availability), and rotation stalls
     entirely if the single admin is offline. Small-room/online-peer scoping; Partial.
-  - **T30 — metadata leakage.** `event_type`, `sender_id`, `device_id`, timing, and the causal
-    DAG remain cleartext; an observer learns event existence/type, not content. Accepted
-    (matches §13.5 no-full-metadata-privacy).
+  - **T30 — metadata leakage (incl. length).** `event_type`/`inner_type`, `sender_id`,
+    `device_id`, timing, the causal DAG, **and the deterministic-CBOR body's length** (AEAD
+    preserves plaintext length apart from the 16-byte tag) remain cleartext. An observer or
+    removed device learns event existence, type, and an often-effectively-exact body size —
+    enough to gauge message length, distinguish short status updates, and aid traffic
+    correlation. Accepted (matches §13.5 no-full-metadata-privacy); padding to hide length is
+    **not** in v1 scope (§12) and would be a separate decision if ever wanted.
 - **Removed-device key retention.** A malicious removed device keeps every epoch key it
   already held; rotation only withholds *future* keys. Correct and sufficient for G1.
 
@@ -245,37 +408,53 @@ store is a small `epoch → room_key` map retained for reading backlog. Forward 
 removed device and, at rest, a reader of `rooms.db` without the key store). Metadata (D2) is
 unchanged.
 
-**Reliability.** Rotation is causal and convergent (distribution in the DAG). Unreadable
-content never blocks the fold or convergence (§5). Admin-offline stall (T29) is the main
-availability caveat.
+**Reliability.** An admin removal and its rotation are a single atomic fold transition
+(rotation embedded in the removal event, D4), so there is no intermediate state where the
+removal is folded but the key is not yet durable. Unreadable content never blocks the fold or
+convergence (§5). Admin-offline stall (T29) and the bounded voluntary-leave rotation window
+are the main availability
+caveats.
 
-**Performance.** One AEAD op per content publish/read; one X25519+AEAD wrap per Active member
-per rotation. At the v1 ceiling (N≤40, single admin) this is negligible. The key store is
-O(epochs) — one 32-byte key per removal.
+**Performance.** One AEAD op per content publish/read; one ephemeral-X25519 + AEAD wrap per
+remaining Active member per departure. At the v1 ceiling (N≤40, single admin) this is
+negligible. The key store is O(epochs) — one 32-byte key per departure; the join-time transfer
+is chunked (D6) so a long-lived room stays joinable.
 
-**Migration.** This is a wire-format addition: a new `Content::Encrypted` envelope and a new
-`MemberKeyDistribution` record. Older peers cannot decrypt (they see unreadable content) and
-must not reject the envelope outright — a mixed-version window needs a compatibility decision
-(§10 OQ-6). At-rest `rooms.db` content becomes ciphertext for *new* events; existing plaintext
-history is unchanged.
+**Migration.** This is a wire-format addition: a new `Content::Encrypted` envelope and the
+departure-embedded `MemberKeyDistribution` payload. Rollout is **reader-first** (D8): a reader
+release that parses the envelope as opaque-but-valid lands **before** any writer emits it,
+with an explicit compatibility floor (room capability flag) gating writers. Without R1-first,
+pre-`Encrypted` peers reject the event entirely and the room partitions. At-rest `rooms.db`
+content becomes ciphertext for *new* events; existing plaintext history is unchanged.
 
 ---
 
 ## 7. Implementation steps (ordered, phased)
 
-1. **Design sign-off (this document).** Pin the wire schema (OQ-2), the wrap channel (OQ-3),
-   and the threat-model delta (§6) *before* any crypto lands.
-2. **Pure crypto crate.** X25519 conversion, HKDF, AEAD wrap/unwrap — deterministic, sans-IO,
-   golden-vector tested (mirrors the v2-core purity discipline). OQ-1 decides new sibling vs.
-   v2-core relaxation.
-3. **Encrypted-content wire schema** in `iroh-rooms-core`: `Content::Encrypted` envelope +
-   AAD binding + encrypt-on-publish / decrypt-on-read, preserving signature/`event_id`/fold.
-4. **Rotation lifecycle:** admin key-gen on removal, `MemberKeyDistribution` fold record,
-   per-epoch key store, join-time key wrap (D6).
-5. **Tests:** golden vectors (encrypted event + distribution record), rotation convergence
-   (two-node removal → post-removal content unreadable to the removed device), AEAD-failure
-   no-panic, replay/backward-epoch rejection, join-time backlog gating.
-6. **Threat-model sign-off:** T27 → Controlled, add T28/T29/T30; update
+1. **Design sign-off (this document).** Pin the wire schema (OQ-2), the crypto suite (D3 —
+   SUITE_V1 is pinned here, not open), the wrap channel (OQ-3), the rotation-atomicity
+   mechanism (D4/OQ-7), and the threat-model delta (§6) *before* any crypto lands.
+2. **Pure crypto crate.** X25519 conversion, HKDF-SHA-256, AES-256-GCM wrap/unwrap,
+   ephemeral-sender wrap channel (D3a) — deterministic, sans-IO, golden-vector tested
+   (mirrors the v2-core purity discipline). OQ-1 decides new sibling vs. v2-core relaxation.
+3. **Reader-first envelope (Phase R1, D8).** `Content::parse` recognizes `Content::Encrypted`
+   as an opaque valid-but-unreadable variant with **writers disabled**, plus the D2a
+   ciphertext bound. Lands before any writer.
+4. **Encrypted-content write path (Phase R2, D8).** `Content::Encrypted` envelope + AAD
+   binding + encrypt-on-publish / decrypt-on-read with D2b post-decryption strict parse,
+   preserving signature/`event_id`/fold, gated behind the room compatibility floor.
+5. **Key-aware authorization reads (D9).** Convert `SyncEngine::file_shared_hashes`,
+   `pipe_opened`, `pipe_is_closed` to authenticated decryption with fail-closed semantics +
+   their tests.
+6. **Rotation lifecycle (D4/D5/D6):** rotation payload embedded in `member.removed` /
+   `member.left` (single publish), key commitment + same-epoch conflict fail-closed (D5a),
+   per-epoch key store, chunked join-time key transfer (D6).
+7. **Tests:** golden vectors (SUITE_V1 wrap + encrypted event + distribution payload), rotation
+   convergence (two-node removal → post-removal content unreadable to the removed device),
+   D2b malicious-inner-body (valid DAG verdict, body unreadable), AEAD-failure no-panic,
+   same-epoch conflict fail-closed, backward-epoch rejection, join-time chunked transfer,
+   pipe/blob fail-closed reads.
+8. **Threat-model sign-off:** T27 → Controlled, add T28/T29/T30; update
    `docs/security/threat-model.md` and the release-notes limitation list.
 
 Each step is independently reviewable; do not start step 2 before step 1 sign-off.
@@ -292,11 +471,27 @@ Each step is independently reviewable; do not start step 2 before step 1 sign-of
   membership fold are byte-for-byte unchanged for encrypted-content events (golden vectors).
 - **AC3.** Membership events (incl. join bootstrap) work unchanged on plaintext.
 - **AC4.** A newly-joined invitee reads membership immediately and backlog content only after
-  receiving the join-time key wrap.
+  the chunked join-time key transfer completes; a long-lived room stays joinable within the
+  1 MiB frame bound.
 - **AC5.** AEAD failure / unknown epoch / backward-epoch inputs are dropped or unreadable,
   never a panic and never a fold wedge.
 - **AC6.** Threat model updated (T27 → Controlled; T28/T29/T30 recorded) and the
   release-notes limitation list reflects the new posture.
+- **AC7.** A voluntary `member.left` folds the departure immediately (access revoked at once),
+  and the admin's next event carries the rotation excluding the departed member: from that
+  fold point the departed member receives no new-epoch key. The window between leave and the
+  admin's next event is honestly bounded (T29).
+- **AC8.** A malicious Active key holder's encrypted-but-invalid inner body (oversized
+  `message.text`, malformed `file.shared`) yields the **same** DAG verdict on every node
+  (key-independent), is persisted, and is surfaced as unreadable — never a fold wedge and
+  never a per-type validation bypass.
+- **AC9.** Pipe/blob authorization reads (`file_shared_hashes`, `pipe_opened`,
+  `pipe_is_closed`) are key-aware and fail-closed: an encrypted `PipeClosed` is honored, an
+  unreadable one never reopens a closed pipe, and blob hashes from unreadable `FileShared`
+  events are not served.
+- **AC10.** Rollout is reader-first: a pre-writer peer parses `Content::Encrypted` as
+  opaque-but-valid (no event rejection, no room partition); writers emit only behind the room
+  compatibility floor.
 
 ---
 
@@ -306,31 +501,43 @@ Each step is independently reviewable; do not start step 2 before step 1 sign-of
 |---|---|---|
 | Key store compromised | All covered room history readable | T28: protect ≥ identity keys; storage-encryption follow-up. |
 | Admin offline at removal | Rotation stalls; new content uses old epoch | T29: documented v1 constraint; removal still revokes access (#196/#197). |
-| Wire-schema churn breaks old peers | Mixed-version rooms fail to read each other | OQ-6: compatibility decision + version tag on the envelope (`/v1`). |
-| Join-bootstrap UX regression (no instant backlog) | New member sees empty history until key wrap | D6 + OQ-5: wrap keys on join; surface "syncing" state in CLI. |
-| Envelope/AAD transplant attack | Ciphertext moved to another event/room | D2: AAD binds ciphertext to the exact event prefix + room. |
+| Voluntary leave without prompt rotation | Departed member reads content until the admin's next event | D4: leave folds immediately (access revoked); the admin's next event carries the rotation. Bounded window (T29). |
+| Non-atomic removal+rotation | Peers fold removal, keep encrypting old-epoch | D4: rotation embedded in the departure event (single publish), not a second publish. |
+| Pre-writer peers reject envelope | Room partitions on mixed versions | D8: reader-first rollout + room capability floor before writers. |
+| Malicious Active key holder encrypts invalid body | Per-type validation bypass | D2b: key-independent DAG verdict + post-decryption strict parse → unreadable. |
+| Same-epoch conflicting keys (admin fork) | Peers decrypt different branches | D5a: commitment-match idempotence; conflict fails closed, resolved by fork rule. |
+| Join-time key history exceeds frame | Long-lived room becomes unjoinable | D6: chunked join-time transfer (or OQ-5 bounded window). |
+| Envelope/AAD transplant attack | Ciphertext moved to another event/room | D2: AAD binds ciphertext to the exact event prefix + room + epoch + suite. |
 | Backward-epoch rotation (replay) | Node rotates to an old key | §5: reject epoch < current. |
 
 ---
 
 ## 10. Open questions
 
+The crypto suite (SUITE_V1, D3) is **pinned**, not open. These remain for build time:
+
 - **OQ-1.** New sibling pure crate for wrap/unwrap vs. relaxing `iroh-rooms-v2-core`'s
   "no payload encryption" invariant? (Default: new sibling — keeps the v2-core tripwire.)
-- **OQ-2.** Exact wire shapes: `Content::Encrypted { inner_type, key_epoch, nonce, ciphertext }`
-  as a single variant, and `MemberKeyDistribution` as a fold-integrated `Content` variant vs.
-  a side-channel record. (Default: single `Content::Encrypted`; fold-integrated distribution.)
-- **OQ-3.** Key-wrap channel: static-static X25519 (admin static ↔ device) vs. ephemeral
-  X25519 for recipient-forward-secrecy of the channel. (Default: ephemeral; static is the
-  simpler fallback.)
+- **OQ-2.** Exact field-level wire shapes of `Content::Encrypted` and the distribution payload
+  (field names/order, `inner_type` encoding). The *structure* is decided (single
+  `Content::Encrypted` variant; rotation in an admin-authored event); only the concrete field
+  layout remains.
+- **OQ-2b.** Where the post-`member.left` rotation lives: a dedicated admin rotation event vs.
+  piggybacked on the admin's next ordinary event. (Default: a dedicated rotation event for
+  clarity; piggybacking is the optimization.)
+- **OQ-3.** Key-wrap channel: ephemeral X25519 (D3a, default) vs. static-static (simpler,
+  loses channel forward-secrecy). (Default: ephemeral.)
 - **OQ-4.** Admin-offline rotation: accept the v1 stall, or pre-stage a delegation/recovery
   path? (Default: accept + document for v1; revisit with multi-admin.)
-- **OQ-5.** Should a new invitee get *all* historical epoch keys (full backlog) or only the
-  current epoch (forward-only)? Full-history is the Matrix-like default but widens the
-  join-time secret. (Default: all epochs, matching current "read full backlog" behavior.)
-- **OQ-6.** Mixed-version rooms during rollout: do old peers reject `Content::Encrypted`
-  (fail-closed) or treat it as unreadable (fail-open-but-readable-later)? (Default:
-  unreadable, matching §5; needs a version tag for a future hard cutover.)
+- **OQ-5.** Join-history breadth: full history via chunked transfer (D6, default) vs. also
+  offering a bounded `KEY_HISTORY_WINDOW` (forward-only from `current_epoch − window`). Full
+  history matches current "read full backlog" but widens the join-time secret.
+- **OQ-6.** Hard cutover: after the reader-first floor (D8), does a future schema-version bump
+  make encrypted the default for *new* rooms? (Default: keep opt-in per room for v1.)
+- **OQ-7.** Confirm rotation-atomicity mechanism for admin removals: embedding the rotation
+  payload in the removal event (D4, chosen) vs. a fail-closed intermediate that blocks
+  old-epoch publish until the distribution is durable. Embedding is simpler and adds no
+  liveness dependency; confirm at sign-off.
 
 ---
 
@@ -350,7 +557,9 @@ Each step is independently reviewable; do not start step 2 before step 1 sign-of
 ## 12. Out of scope (explicit)
 
 - Full group E2EE ratchet / per-message (MLS-style) forward secrecy.
-- Metadata privacy beyond the current posture (event type/timing/DAG stay cleartext).
+- Metadata privacy beyond the current posture: event existence, `event_type`/`inner_type`,
+  timing, the causal DAG, and **ciphertext length** stay cleartext. **Length-hiding padding
+  is not in v1 scope** (would be a separate decision; see T30).
 - Multi-admin rotation, admin-offline rotation mechanisms, compromised-admin defense.
 - Encrypting membership events, blobs at rest, or `audit.ndjson`.
 - Multi-device key recovery / recovery phrases (PRD §13.5 separate items).
