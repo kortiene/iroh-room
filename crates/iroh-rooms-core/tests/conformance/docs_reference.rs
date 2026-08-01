@@ -31,8 +31,8 @@ use std::path::Path;
 
 use iroh_rooms_core::event::cbor::{decode_canonical, CborValue};
 use iroh_rooms_core::event::constants::{
-    BIND_CONTEXT, CLOCK_SKEW_FUTURE_MS, DIGEST_LEN, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1,
-    ENCRYPTED_TAG_LEN, EVENT_CONTEXT, INVITE_CONTEXT, MAX_ARTIFACT_REFS,
+    BIND_CONTEXT, CLOCK_SKEW_FUTURE_MS, DIGEST_LEN, ENCRYPTED_AAD_CONTEXT, ENCRYPTED_NONCE_LEN,
+    ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN, EVENT_CONTEXT, INVITE_CONTEXT, MAX_ARTIFACT_REFS,
     MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
     MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
     MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
@@ -183,8 +183,15 @@ fn core_taxonomy_tables_name_no_unknown_code() {
 #[test]
 fn context_strings_and_structural_bounds_match_constants() {
     // Domain-separation context strings: the exact ASCII bytes an interoperable
-    // peer must prepend. A wrong byte here yields a non-interoperable signer.
-    for ctx in [EVENT_CONTEXT, ROOMID_CONTEXT, BIND_CONTEXT, INVITE_CONTEXT] {
+    // peer must prepend. A wrong byte here yields a non-interoperable signer
+    // (for `ENCRYPTED_AAD_CONTEXT`, a non-interoperable AEAD — #191 step 4).
+    for ctx in [
+        EVENT_CONTEXT,
+        ROOMID_CONTEXT,
+        BIND_CONTEXT,
+        INVITE_CONTEXT,
+        ENCRYPTED_AAD_CONTEXT,
+    ] {
         let s = std::str::from_utf8(ctx).expect("context strings are ASCII");
         assert!(
             DOC.contains(s),

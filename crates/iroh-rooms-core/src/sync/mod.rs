@@ -32,6 +32,7 @@ pub mod config;
 pub mod engine;
 #[cfg(test)]
 mod engine_tests;
+mod keys;
 pub mod message;
 pub mod sim;
 pub mod transport;

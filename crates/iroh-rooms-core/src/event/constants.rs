@@ -20,6 +20,14 @@ pub const BIND_CONTEXT: &[u8] = b"iroh-rooms:device-binding:v1";
 /// `capability_hash = BLAKE3-256(INVITE_CONTEXT ‖ room_id ‖ invite_id ‖ secret)`.
 pub const INVITE_CONTEXT: &[u8] = b"iroh-rooms:invite:v1";
 
+/// Domain separator for the normative `content.encrypted` AAD (spec
+/// `content-key-rotation.md` D2, pinned by #191 step 4):
+/// `aad = ENCRYPTED_AAD_CONTEXT ‖ canonical-CBOR array of the ten cleartext
+/// signed-prefix fields` (see `event::encrypted::encrypted_content_aad`).
+/// Colon-style like the other event-layer contexts above; the crypto crate's
+/// slash-style `WRAP_INFO_CONTEXT` is a D3 suite literal, a deliberate split.
+pub const ENCRYPTED_AAD_CONTEXT: &[u8] = b"iroh-rooms:content-aad:v1";
+
 /// Maximum number of causal parents an event may declare (Event Protocol §2/§6
 /// step 9). Bounds DAG fan-in and inbound allocation.
 pub const MAX_PREV_EVENTS: usize = 20;

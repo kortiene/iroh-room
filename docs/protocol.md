@@ -403,8 +403,8 @@ device; verified when present, [§1](#1-identity--key-model)).
 `related_artifact_ids: opt [bstr[16]]` (≤ `MAX_ARTIFACT_REFS` = 16) ·
 `progress_pct: opt uint` (0..=100, integer — no floats).
 
-**`content.encrypted`** *(spec `content-key-rotation.md` D2/D2a/D3; rollout D8 phase R1 — readers
-only, writers disabled until the R2 compatibility floor)*
+**`content.encrypted`** *(spec `content-key-rotation.md` D2/D2a/D3; rollout D8 — writers gate
+behind the room's declared R2 compatibility floor, `SyncConfig::encrypted_content_writes`)*
 `inner_type: tstr` (the wrapped body's registry string — one of the five content types above;
 membership types and nested envelopes are rejected) · `key_epoch: uint` ·
 `suite: uint` (MUST be `ENCRYPTED_SUITE_V1` = 1; anything else fails closed) ·
@@ -418,6 +418,35 @@ membership types and nested envelopes are rejected) · `key_epoch: uint` ·
 `MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT` = 8,192). The envelope's DAG verdict is computed from
 these cleartext fields only — never from the sealed body — so every node converges on the same
 verdict regardless of key possession.
+
+**Normative `content.encrypted` AAD** *(spec D2, pinned by #191 step 4 — resolves OQ-2; code:
+`event/encrypted.rs`, frozen by the `encrypted_write_path` golden vectors)*. The AEAD associated
+data binds a sealed body to its exact event, room, type, epoch, and suite so ciphertext cannot
+be transplanted:
+
+```
+aad = ENCRYPTED_AAD_CONTEXT ‖ canonical-CBOR array [
+    uint schema_version, bstr32 room_id, bstr32 sender_id, bstr32 device_id,
+    tstr event_type ("content.encrypted"), uint created_at,
+    array [ bstr32 prev_event … ],          # the event's prev_events, signed order
+    tstr inner_type, uint key_epoch, uint suite,
+]
+```
+
+with `ENCRYPTED_AAD_CONTEXT` = `iroh-rooms:content-aad:v1`. A CBOR **array** (not a map — the
+canonical encoder re-sorts map keys) preserves the spec D2 field order and is self-delimiting
+for the variable-length `prev_events`. Deliberate omissions: the **nonce** (an authenticated
+AES-GCM cipher input already — flipping it fails the tag on its own) and the **D5 epoch key
+commitment** (GCM's GHASH is not key-committing regardless of AAD contents; commitments are
+verified at key *adoption* per D5/D5a, where conflicting same-epoch keys fail closed). Note
+`key_epoch` is a CBOR uint here, while the crypto crate's *wrap* KDF/AAD pins 8-byte big-endian
+— two independently frozen conventions; do not "harmonize" them. The sealed plaintext is the
+inner body's canonical-CBOR map; after a successful open, the body MUST still pass the strict
+`Content::parse(inner_type)` **and** the sender field rules before anything surfaces (spec D2b
+— a failure is *unreadable*, logged with a stable `UnreadableReason` code, never a fold
+rejection). Writers publish only behind the room's declared floor; with the floor on,
+locally-authored **plaintext** content-class events are refused instead
+(`sync_plaintext_writes_disabled`) so the opt-in cannot leak cleartext by accident.
 
 ### Structural sizes (from `event/constants.rs`)
 
