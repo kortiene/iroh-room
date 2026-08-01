@@ -129,6 +129,15 @@ Content::Encrypted {
   sender_id ‖ device_id ‖ event_type ‖ created_at ‖ prev_events ‖ inner_type ‖ key_epoch ‖
   suite` — binds the ciphertext to this exact event, type, epoch, and suite so it cannot be
   transplanted onto another event, room, type, or epoch.
+  *Normative encoding (pinned at §7 step 4, resolving OQ-2):* `aad =
+  ENCRYPTED_AAD_CONTEXT ‖ canonical-CBOR(array)` of those ten fields in that order, with
+  `ENCRYPTED_AAD_CONTEXT = "iroh-rooms:content-aad:v1"`; a CBOR *array* (not the canonical
+  map, which would re-sort keys) preserves the field order and self-delimits the
+  variable-length `prev_events`. The nonce is deliberately absent (an authenticated AES-GCM
+  cipher input already); the D5 key commitment is deliberately absent (GHASH is not
+  key-committing regardless of AAD contents — commitments are enforced at key adoption,
+  D5/D5a). See `docs/protocol.md` §6 for the byte layout and `event/encrypted.rs` for the
+  golden-vector-frozen implementation.
 - The eight signed fields, `event_id`, and the signature remain cleartext and computed over
   the **envelope** form (the event as transmitted). Signature verification, `event_id`
   derivation, dedup, and the fold all operate on the envelope unchanged; only a holder of
@@ -323,7 +332,11 @@ must therefore be reader-first:
 2. **Phase R2 (writer):** after a declared compatibility floor (a version string / room
    capability flag proving all Active peers are ≥ R1), writers begin emitting
    `Content::Encrypted`. A room opts in explicitly; mixed rooms without the floor keep
-   plaintext.
+   plaintext. *v1 mechanism (§7 step 4):* the floor is an operator-asserted per-engine
+   declaration (`SyncConfig::encrypted_content_writes`, default off and not yet exposed to
+   CLI/net configuration); while it is on, locally-authored **plaintext** content-class
+   publishes are refused fail-closed so the opt-in cannot leak cleartext by accident. The
+   room-scoped capability/opt-in surface lands with the rotation lifecycle (§7 step 6).
 3. **Hard cutover (optional, later):** a schema-version bump can make encrypted the default
    for new rooms once the ecosystem is past R1. Recorded as OQ-6.
 
@@ -521,7 +534,9 @@ The crypto suite (SUITE_V1, D3) is **pinned**, not open. These remain for build 
 - **OQ-2.** Exact field-level wire shapes of `Content::Encrypted` and the distribution payload
   (field names/order, `inner_type` encoding). The *structure* is decided (single
   `Content::Encrypted` variant; rotation in an admin-authored event); only the concrete field
-  layout remains.
+  layout remains. *Resolved for the envelope + AAD:* the envelope field layout was frozen by
+  the §7 step 3 golden vectors, and the normative AAD encoding by step 4 (see D2). The
+  distribution payload's layout remains open for step 6.
 - **OQ-2b.** Where the post-`member.left` rotation lives: a dedicated admin rotation event vs.
   piggybacked on the admin's next ordinary event. (Default: a dedicated rotation event for
   clarity; piggybacking is the optimization.)

@@ -23,11 +23,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use iroh_rooms_crypto::RoomKey;
+
 use crate::event::content::{Content, EventType};
+use crate::event::encrypted::{open_encrypted_content, UnreadableReason};
 use crate::event::ids::{EventId, RoomId};
 use crate::event::keys::IdentityKey;
 use crate::event::reject::RejectReason;
-use crate::event::signed;
+use crate::event::signed::{self, SignedEvent};
 use crate::event::validate::{validate_wire_bytes, ValidatedEvent, ValidationContext};
 use crate::event::wire::WireEvent;
 use crate::membership::{MembershipSnapshot, RoomMembership, Status};
@@ -36,6 +39,7 @@ use crate::store::{
 };
 
 use super::config::SyncConfig;
+use super::keys::EpochKeyStore;
 use super::message::{id_set, Outgoing, PeerId, SyncMessage, Window};
 
 /// An engine-level fault (never a single invalid event — those are logged drops,
@@ -61,14 +65,34 @@ pub enum SyncError {
         frame_len: usize,
     },
     /// A locally-authored `content.encrypted` event was handed to
-    /// [`SyncEngine::publish`] during rollout Phase R1 (spec
-    /// `content-key-rotation.md` D8): every upgraded peer *tolerates* the
-    /// envelope, but **writers are disabled** until the R2 compatibility floor
-    /// proves all Active peers can parse it — a premature writer would
-    /// partition pre-R1 rooms. Like [`SyncError::OversizedFrame`], this is a
-    /// **local authoring** rule only: remote `content.encrypted` frames are
-    /// ingested normally.
+    /// [`SyncEngine::publish`] while the room's R2 compatibility floor is not
+    /// declared (spec `content-key-rotation.md` D8,
+    /// [`SyncConfig::encrypted_content_writes`] `== false`): every upgraded
+    /// peer *tolerates* the envelope, but writers stay disabled until the
+    /// operator asserts all Active peers can parse it — a premature writer
+    /// would partition pre-R1 rooms. Like [`SyncError::OversizedFrame`], this
+    /// is a **local authoring** rule only: remote `content.encrypted` frames
+    /// are ingested normally.
     EncryptedWritesDisabled,
+    /// A locally-authored **plaintext content-class** event (one of the five
+    /// encryptable types) was handed to [`SyncEngine::publish`] while
+    /// [`SyncConfig::encrypted_content_writes`] is on (#191 step 4): after the
+    /// explicit confidentiality opt-in, an unencrypted `message.text` /
+    /// `file.shared` / pipe / status publish is exactly the accidental
+    /// cleartext leak the opt-in exists to prevent, so it fails closed.
+    /// Membership and genesis events are unaffected (spec D1), and so is
+    /// remote ingest — plaintext frames from peers are still accepted.
+    PlaintextWritesDisabled,
+    /// [`SyncEngine::insert_room_key`] was offered a key that conflicts with
+    /// the epoch's held key (spec `content-key-rotation.md` D5a): the epoch is
+    /// now **poisoned** — the engine adopts *neither* key, reads for the epoch
+    /// return unreadable, and further offers are refused. Resolution is the
+    /// rotation lifecycle's deterministic fork rule (§7 step 6), never
+    /// arrival order.
+    EpochKeyConflict {
+        /// The poisoned epoch.
+        epoch: u64,
+    },
 }
 
 impl core::fmt::Display for SyncError {
@@ -81,7 +105,13 @@ impl core::fmt::Display for SyncError {
                 write!(f, "sync_oversized_frame: {frame_len}")
             }
             Self::EncryptedWritesDisabled => {
-                f.write_str("sync_encrypted_writes_disabled: content.encrypted writers are disabled in rollout phase R1")
+                f.write_str("sync_encrypted_writes_disabled: content.encrypted writers are disabled until the room's R2 floor (encrypted_content_writes) is declared")
+            }
+            Self::PlaintextWritesDisabled => {
+                f.write_str("sync_plaintext_writes_disabled: plaintext content-class writes are refused while encrypted_content_writes is on")
+            }
+            Self::EpochKeyConflict { epoch } => {
+                write!(f, "sync_epoch_key_conflict: conflicting keys offered for epoch {epoch}; epoch poisoned (adopts neither, spec D5a)")
             }
         }
     }
@@ -538,6 +568,14 @@ pub struct SyncEngine {
     /// events amortize `SQLite` transaction overhead without reordering observable
     /// post-commit side effects.
     pending_batch: PendingStoreBatch,
+
+    /// In-memory `epoch → room_key` store for `content.encrypted` bodies
+    /// (#191 step 4, spec D5a/D7). Session-only on purpose: persistence and
+    /// fold-driven key adoption are the rotation lifecycle (§7 step 6); until
+    /// then keys arrive via [`insert_room_key`](Self::insert_room_key) only.
+    /// `RoomKey` zeroizes on drop, so an engine drop wipes the keys (the T28
+    /// at-rest posture is step-6 material).
+    room_keys: EpochKeyStore,
 }
 
 /// How much of the responder's held set a `WantMembership` `have` ancestry
@@ -633,6 +671,7 @@ impl SyncEngine {
             pull_sweep_remaining: 0,
             dedup_cache,
             pending_batch: PendingStoreBatch::new(),
+            room_keys: EpochKeyStore::default(),
         };
         engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
@@ -710,12 +749,24 @@ impl SyncEngine {
         }
         let ctx = ValidationContext::for_room(self.room_id);
         let ev = validate_wire_bytes(bytes, &ctx).map_err(SyncError::InvalidFrame)?;
-        // Rollout Phase R1 writer gate (spec `content-key-rotation.md` D8):
-        // locally-authored `content.encrypted` events are refused until the R2
-        // compatibility floor lands (§7 step 4). Remote frames are unaffected —
-        // `ingest_frame` accepts the envelope as opaque-but-valid.
-        if ev.event.event_type == super::super::event::EventType::ContentEncrypted {
-            return Err(SyncError::EncryptedWritesDisabled);
+        // Rollout writer gate (spec `content-key-rotation.md` D8, #191 step 4).
+        // Local authoring only in both directions — `ingest_frame` accepts
+        // remote envelopes (opaque-but-valid) and remote plaintext alike:
+        // * floor undeclared: refuse `content.encrypted` (the R1 posture — a
+        //   premature writer would partition pre-R1 rooms);
+        // * floor declared: refuse *plaintext* content-class events instead
+        //   (fail-closed against an accidental cleartext leak after the
+        //   confidentiality opt-in; membership/genesis types stay plaintext
+        //   per D1 and pass either way).
+        let event_type = ev.event.event_type;
+        if event_type == EventType::ContentEncrypted {
+            if !self.config.encrypted_content_writes {
+                return Err(SyncError::EncryptedWritesDisabled);
+            }
+        } else if self.config.encrypted_content_writes
+            && event_type.max_encrypted_plaintext_bytes().is_some()
+        {
+            return Err(SyncError::PlaintextWritesDisabled);
         }
         let mut out = Vec::new();
         self.deliver(ev, None, &mut out);
@@ -1000,6 +1051,75 @@ impl SyncEngine {
     /// [`SyncError::Store`] on a store read failure.
     pub fn heads(&self) -> Result<Vec<EventId>, SyncError> {
         Ok(self.store.heads(&self.room_id)?)
+    }
+
+    // ------------------------------------------------------------------
+    // Epoch keys + decrypt-on-read (#191 step 4, spec D2b/D5a/D7)
+    // ------------------------------------------------------------------
+
+    /// Offer `room_key[epoch]` to the engine's in-memory key store. Idempotent
+    /// for identical bytes. A **conflicting** key for a held epoch poisons the
+    /// epoch (spec D5a: the engine adopts *neither* key; reads for the epoch
+    /// become unreadable; further offers are refused) — resolution belongs to
+    /// the rotation lifecycle's deterministic fork rule (§7 step 6), never to
+    /// arrival order. Until step 6 wires fold-driven distribution, this is the
+    /// only way keys enter the engine (a local provisioning API).
+    ///
+    /// # Errors
+    /// [`SyncError::EpochKeyConflict`] on a conflicting offer.
+    pub fn insert_room_key(&mut self, epoch: u64, key: RoomKey) -> Result<(), SyncError> {
+        self.room_keys
+            .insert(epoch, key)
+            .map_err(|c| SyncError::EpochKeyConflict { epoch: c.epoch })
+    }
+
+    /// Whether a usable key is held for `epoch` (a poisoned epoch ⇒ `false`).
+    #[must_use]
+    pub fn has_room_key(&self, epoch: u64) -> bool {
+        self.room_keys.has(epoch)
+    }
+
+    /// The held key for `epoch`, for authoring call sites that seal via
+    /// [`build_content_encrypted`](crate::event::encrypted::build_content_encrypted)
+    /// and then [`publish`](Self::publish). `None` when absent or poisoned.
+    #[must_use]
+    pub fn room_key(&self, epoch: u64) -> Option<&RoomKey> {
+        self.room_keys.get(epoch)
+    }
+
+    /// The surfacing view of an event's content (spec D2b): a plaintext body
+    /// is returned as-is; an encrypted body is opened with the epoch's held
+    /// key and must survive the strict post-decryption parse + sender field
+    /// rules. Every failure means *unreadable* — the event's DAG verdict and
+    /// persistence are unaffected, and the typed reason is the caller's to
+    /// log (spec §5 "dropped, logged"; the engine cannot, this is `&self`).
+    ///
+    /// # Errors
+    /// [`UnreadableReason`] — `NoEpochKey` / `EpochConflicted` when the store
+    /// holds no usable key for the envelope's epoch, otherwise whatever
+    /// [`open_encrypted_content`] reports.
+    pub fn read_content(&self, event: &SignedEvent) -> Result<Content, UnreadableReason> {
+        let Content::Encrypted(env) = &event.content else {
+            return Ok(event.content.clone());
+        };
+        if self.room_keys.is_poisoned(env.key_epoch) {
+            return Err(UnreadableReason::EpochConflicted {
+                epoch: env.key_epoch,
+            });
+        }
+        let Some(key) = self.room_keys.get(env.key_epoch) else {
+            return Err(UnreadableReason::NoEpochKey {
+                epoch: env.key_epoch,
+            });
+        };
+        open_encrypted_content(event, key)
+    }
+
+    /// [`read_content`](Self::read_content) collapsed to an `Option` for
+    /// callers that only display readable bodies and log nothing.
+    #[must_use]
+    pub fn readable_content(&self, event: &SignedEvent) -> Option<Content> {
+        self.read_content(event).ok()
     }
 
     /// The governing `pipe.opened` for `pipe_id` from the **validated** set, or

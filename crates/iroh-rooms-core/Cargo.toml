@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Not published: depends on the path-only, publish = false `iroh-rooms-crypto`
+# crate (whose dalek deps are pinned to `-rc` versions), so `cargo publish`
+# cannot resolve it. Mirrors the `iroh-rooms-net` / facade posture.
+publish = false
 
 [lib]
 path = "src/lib.rs"
@@ -63,15 +67,14 @@ zeroize = "1"
 # crate, so the workspace `unsafe_code = "forbid"` lint (which targets our code) is
 # unaffected. Optional + behind the `store` feature.
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+# The pure SUITE_V1 crypto crate (#191 step 2) — a production dependency since
+# the R2 write path (§7 step 4): `event::encrypted` seals/opens content bodies
+# with it and the engine's epoch key store holds its zeroizing `RoomKey`s. The
+# dependency edge is one-way (crypto imports nothing from core), so the crypto
+# crate's `banned_dependencies` purity tripwire is unaffected.
+iroh-rooms-crypto = { path = "../iroh-rooms-crypto" }
 
 [dev-dependencies]
-# The pure SUITE_V1 crypto crate (#191 step 2). Dev-only in phase R1: the
-# `content.encrypted` golden vector seals a real ciphertext with it, and a
-# cross-pin test asserts `ENCRYPTED_SUITE_V1`/`ENCRYPTED_NONCE_LEN`/
-# `ENCRYPTED_TAG_LEN` equal the crypto crate's canonical constants so the two
-# crates cannot drift. The production dependency edge lands with the R2 write
-# path (§7 step 4), not here.
-iroh-rooms-crypto = { path = "../iroh-rooms-crypto" }
 # Temporary directory / file creation for file-backed store e2e tests.
 tempfile = "3"
 # Property-based robustness/round-trip tests for the strict CBOR reader (risk

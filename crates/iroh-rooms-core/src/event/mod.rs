@@ -17,6 +17,10 @@
 //!   preservation (§3).
 //! * [`content`] — the §7 event-type registry and strict per-type content
 //!   validation (unknown-key rejection, length/enum bounds).
+//! * [`encrypted`] — the normative `content.encrypted` AAD, the R2 writer
+//!   ([`encrypted::build_content_encrypted`]), and authenticated
+//!   decrypt-on-read with the D2b strict post-decryption parse
+//!   (spec `content-key-rotation.md`, #191 step 4).
 //! * [`binding`] — self-contained `device_binding` certificate verification (§1).
 //! * [`genesis`] — pure assembly of a signed genesis [`content::RoomCreated`]
 //!   event ([`genesis::build_room_created`], §5/§6/§7).
@@ -46,6 +50,7 @@ pub mod binding;
 pub mod cbor;
 pub mod constants;
 pub mod content;
+pub mod encrypted;
 pub mod file;
 pub mod genesis;
 pub mod ids;
@@ -65,6 +70,7 @@ pub mod wire;
 // Convenience re-exports of the most-used types.
 pub use binding::DeviceBinding;
 pub use content::{capability_hash, Content, EventType};
+pub use encrypted::{build_content_encrypted, open_encrypted_content, SealError, UnreadableReason};
 pub use file::build_file_shared;
 pub use genesis::build_room_created;
 pub use ids::{EventId, HashRef, RoomId};

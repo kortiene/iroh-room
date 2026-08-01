@@ -126,6 +126,29 @@ pub struct SyncConfig {
     /// duplicate path. Values above `1_000_000` are rejected to avoid accidental
     /// memory blowups.
     pub early_event_id_dedup_cache_entries: usize,
+    /// The rollout-phase-R2 floor declaration for this room (#191 step 4, spec
+    /// `content-key-rotation.md` D8): the operator asserts every Active peer
+    /// is ≥ R1 (parses `content.encrypted` as opaque-but-valid) and opts the
+    /// room into encrypted content. A **local authoring gate only** — remote
+    /// ingest is unaffected in every combination:
+    ///
+    /// * `false` (default): a locally-authored `content.encrypted` publish is
+    ///   refused ([`EncryptedWritesDisabled`](super::SyncError::EncryptedWritesDisabled))
+    ///   — the R1 posture.
+    /// * `true`: encrypted publishes are allowed, and locally-authored
+    ///   **plaintext content-class** publishes (the five encryptable types)
+    ///   are refused instead
+    ///   ([`PlaintextWritesDisabled`](super::SyncError::PlaintextWritesDisabled)),
+    ///   fail-closed against an accidental cleartext leak after opt-in.
+    ///   Membership and genesis events always stay plaintext (spec D1).
+    ///
+    /// This bool is the step-4 stand-in for D8's room-level capability flag —
+    /// the room-scoped opt-in/rotation surface lands with the rotation
+    /// lifecycle (§7 step 6), and until then no production call site sets it
+    /// (CLI/net pass `SyncConfig::default()`). Flipping it on with an empty
+    /// [epoch key store](super::SyncEngine::insert_room_key) means **no**
+    /// content authoring at all: the writer needs a key to seal with.
+    pub encrypted_content_writes: bool,
 }
 
 impl Default for SyncConfig {
@@ -181,6 +204,9 @@ impl Default for SyncConfig {
             // sync windows; the cache holds raw 32-byte ids, so 4096 ≈ 128
             // KiB plus the FIFO overhead — modest for the guardrail value.
             early_event_id_dedup_cache_entries: 4096,
+            // Rollout phase R1 (#191 D8): writers stay disabled until the
+            // operator explicitly declares the R2 floor for a room.
+            encrypted_content_writes: false,
         }
     }
 }
