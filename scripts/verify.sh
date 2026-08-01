@@ -18,3 +18,8 @@ cargo test -p iroh-rooms --doc
 # one config that run does not exercise.
 cargo build -p iroh-rooms --examples
 
+
+# The pure crypto crate's lib docs carry a compilable wrap/unwrap example
+# (#191 step 2 acceptance: doctests green); only `--doc` exercises it, and
+# the `--all-targets` workspace run above skips doctests entirely.
+cargo test -p iroh-rooms-crypto --doc
