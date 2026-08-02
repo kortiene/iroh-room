@@ -652,7 +652,8 @@ Run the existing test suites unchanged and green:
 > delivery, zero saturations, and zero reconnect churn
 > (`crates/spike-N40/results/2026-07-31-gossip-matrix-fixed.json`). Step 7's
 > AC is met **on loopback**; Phase C remains gated on real-network overlay
-> evidence and the admin fail-closed recovery story (issue #191); see also
+> evidence (issue #214, the Gate A analog for the overlay) and the admin
+> fail-closed recovery story (issue #191); see also
 > issue #192 for the remaining mesh-lifecycle observability work.
 >
 > **Status 2026-07-31 (supersedes 2026-07-30): the 2026-07-30 failure was a
