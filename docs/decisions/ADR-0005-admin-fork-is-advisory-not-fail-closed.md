@@ -208,11 +208,33 @@ reader would trust it.
 2. **Phantom forks.** `admin_ids_by_seq` caches accept-time `admin_seq` values the
    store may later revise. Now cosmetic (it only mislabels an advisory alert), but
    it should be re-derived or invalidated.
-3. **No production consumer.** `completeness()` and `trust_decisions()` have no
-   production readers, so the CRITICAL alert reaches the durable audit trail but
-   is surfaced nowhere in the CLI. The alert should be operator-visible now that
-   it is the entire response.
+3. **The false verdict is externally visible.** `Completeness` is **not** internal:
+   `iroh-rooms-net`'s `Node::completeness()` (`node.rs:1054`, via
+   `Cmd::Completeness` dispatched at `node.rs:1810`) is a public async API, so an
+   embedder — the pinned downstream `jeliya` build among them — can read
+   `AdminForkDetected` and act on it. A benign stale-head publish therefore still
+   reports a fork to consumers even though nothing is denied. `trust_decisions()`
+   is the opposite case: it has no reader outside the engine, so the CRITICAL
+   alert reaches the durable `trust_decisions` table and is surfaced nowhere in
+   the CLI. Both want fixing now that alerting is the entire response.
 4. **Cross-partition detection is unimplemented.** The spec's advertisement-based
    fork detection (`PHASE-0-SPIKE.md:664`) does not exist; only the
    holds-both-branches variant does. Implementing it safely means solving the
    forgery problem `handle_admin_tip` documents.
+
+5. **The oracle is unsound in both directions and should be replaced.** This ADR
+   changes the *response*; the *signal* is still wrong. Same-`admin_seq`
+   co-occurrence over-fires on ordinary concurrency, and it also **misses real
+   equivocation**: conformance Vector 12 parents both admin branches on a
+   member-authored event, so both derive `admin_seq = None` and the oracle never
+   sees the fork it is named for. `admin_seq` is a DAG depth, not a chain length —
+   the self-parent MUST that would have made it one (`PHASE-0-SPIKE.md:526`) was
+   descoped and never landed. The successor is a fold-level **divergence**
+   detector: two causally concurrent events by one author with a conflicting
+   authorization effect on the same subject, using the existing `touch_events` /
+   `causal_heads` primitives, with `admin_ids_by_seq` deleted outright (which also
+   removes the phantom-fork vector in follow-up 2). Scope caveat for whoever takes
+   it: `touch_events` matches only the four membership content types, so anything
+   outside them becomes provably undetectable rather than unreliably detected —
+   conflicting `member.key_distribution` is already covered by the independent D5a
+   epoch-poisoning path, but the rest of the boundary needs enumerating.
