@@ -150,6 +150,16 @@ impl EpochKeyStore {
         }
     }
 
+    /// The held key for `epoch` together with the event that offered it;
+    /// `None` when absent **or** poisoned. Used to persist the outcome of a
+    /// deterministic D5a resolution with its winning `source_event_id`.
+    pub fn get_with_source(&self, epoch: u64) -> Option<(&RoomKey, EventId)> {
+        match self.epochs.get(&epoch) {
+            Some(EpochKeyState::Key(k, id)) => Some((k, *id)),
+            _ => None,
+        }
+    }
+
     /// Whether a usable key is held for `epoch` (poisoned ⇒ `false`).
     pub fn has(&self, epoch: u64) -> bool {
         self.get(epoch).is_some()

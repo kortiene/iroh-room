@@ -3206,6 +3206,7 @@ impl SyncEngine {
             );
             let resolved = self.room_keys.resolve(epoch);
             if resolved {
+                self.persist_resolved_room_key(epoch);
                 self.log(&format!("epoch_key_resolved epoch={epoch}"));
             } else {
                 self.log(&format!(
@@ -3229,6 +3230,7 @@ impl SyncEngine {
             );
             let resolved = self.room_keys.resolve(conflict_epoch);
             if resolved {
+                self.persist_resolved_room_key(conflict_epoch);
                 self.log(&format!("epoch_key_resolved epoch={conflict_epoch}"));
             } else {
                 self.log(&format!(
@@ -3265,6 +3267,22 @@ impl SyncEngine {
         {
             self.log(&format!("checkpoint failed: room_key epoch={epoch}: {e}"));
         }
+    }
+
+    /// Persist the outcome of a deterministic D5a resolution: the winning key
+    /// and its winning `source_event_id`, read back from the in-memory store
+    /// after `resolve`. Without this the `room_keys` row keeps the
+    /// first-adopted (possibly losing) key, so a restart would reload a stale
+    /// key that diverges from every peer that resolved to the winner.
+    fn persist_resolved_room_key(&mut self, epoch: u64) {
+        let Some((key, source_event_id)) = self
+            .room_keys
+            .get_with_source(epoch)
+            .map(|(k, id)| (k.clone(), id))
+        else {
+            return;
+        };
+        self.persist_room_key(epoch, &key, &source_event_id);
     }
 
     /// On open, seed the per-seq fork-detection state from the persisted, validated

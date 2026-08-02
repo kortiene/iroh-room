@@ -11,9 +11,14 @@
   semantics, key store), `crates/iroh-rooms-v2-core` **or a sibling pure crate** (X25519 /
   HKDF / AEAD key-wrap primitives), `crates/iroh-rooms-net` (key-distribution fan-out,
   decrypt-on-read), `crates/iroh-rooms-cli` (join-time key wrap, backlog-read UX change).
-- **Status:** **Step 6 (rotation lifecycle) implemented.** Steps 1–6 are landed; step 7
-  (broader test matrix) and step 8 (threat-model sign-off) are in progress. The distribution
-  payload layout is now fixed (OQ-2 resolved for step 6).
+- **Status:** **Steps 1–7 landed.** Step 7 (broader test matrix) is complete: multi-epoch
+  rotation, multi-member rooms, adversarial file-share/pipe reads, backward-epoch replay
+  rejection, cross-partition conflict convergence, multi-epoch/paginated/partial key
+  history, voluntary-leave rotation, and poisoned-epoch restart durability are all covered
+  (`sync_convergence.rs`, `engine_tests.rs`). Step 7 also surfaced and fixed a durability
+  gap in the D5a resolution path (the winning key + `source_event_id` is now persisted, so
+  a restart cannot reload a stale losing key). Step 8 (release-notes sign-off) is in
+  progress. The distribution payload layout is fixed (OQ-2 resolved for step 6).
 
 ---
 
@@ -470,9 +475,15 @@ content becomes ciphertext for *new* events; existing plaintext history is uncha
     convergence (two-node removal → post-removal content unreadable to the removed device),
     D2b malicious-inner-body (valid DAG verdict, body unreadable), AEAD-failure no-panic,
     same-epoch conflict fail-closed, backward-epoch rejection, join-time chunked transfer,
-    pipe/blob fail-closed reads.
+    pipe/blob fail-closed reads. **(Landed; broadened to the full step-7 matrix: multi-epoch
+    rotation, multi-member rooms, adversarial file-share/pipe ciphertext-only reads,
+    backward-epoch replay rejection, cross-partition D5a convergence, multi-epoch /
+    paginated / partial key-history transfers, voluntary-`member.left` rotation, and
+    poisoned-epoch restart durability. Step 7 also fixed the D5a resolution path to persist
+    the winning key + `source_event_id`.)**
 8. **Threat-model sign-off:** T27 → Controlled, add T28/T29/T30; update
-    `docs/security/threat-model.md` and the release-notes limitation list.
+    `docs/security/threat-model.md` and the release-notes limitation list. **(Threat-model
+    rows landed at step 6; release-notes limitation list lands here.)**
 
 Each step is independently reviewable; do not start step 2 before step 1 sign-off.
 

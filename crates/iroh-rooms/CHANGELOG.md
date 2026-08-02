@@ -30,6 +30,17 @@ where feasible); the **experimental** tier may change on any release.
   floor before enabling rotation (reader-first rollout, spec D8). The
   reader-first `Content::Encrypted` envelope (step 3) is the prior floor;
   this change adds the rotation events on top of it.
+- Fixed a restart-durability gap in the D5a conflict resolution (issue #191
+  step 7): a same-epoch key conflict resolved in memory to the smallest
+  `event_id`, but the `room_keys` table kept the first-adopted (possibly
+  losing) key, so a restart reloaded a stale key that diverged from every
+  peer that had resolved to the winner. The resolution path now persists the
+  winning key and its `source_event_id`, so the deterministically-chosen key
+  survives restart. Surfaced by the new poisoned-epoch restart-durability
+  test; the broader step-7 rotation test matrix (multi-epoch, multi-member,
+  adversarial file-share/pipe reads, backward-epoch replay, cross-partition
+  conflict convergence, paginated/partial key history, voluntary-leave
+  rotation) is landed alongside it.
 - Fixed the three stacked defects behind the N=40 gossip-overlay load collapse
   (the reason rc.4 held #171/#173 out of shipped binaries), isolated by a
   seven-step single-variable experiment ladder on the corrected spike-N40

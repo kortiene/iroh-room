@@ -1907,3 +1907,111 @@ fn adopted_keys_survive_engine_restart() {
         new_key.as_bytes()
     );
 }
+
+/// Restart durability with a D5a conflict (#191 step 7): a poisoned epoch's
+/// deterministic resolution (smallest `event_id` wins) is persisted via the
+/// winning key's `source_event_id`, so the resolved key — and its attribution —
+/// survive an engine restart. The reopened engine holds the same winning key
+/// and never re-adopts a losing candidate.
+#[test]
+fn poisoned_epoch_resolution_survives_restart() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+
+    // Two conflicting same-epoch (2) distributions, both wrapped for the admin
+    // device. The deterministic resolution picks the candidate with the
+    // lexicographically smallest event_id.
+    let key_a = RoomKey::from_bytes([0xAA; 32]);
+    let key_b = RoomKey::from_bytes([0xBB; 32]);
+    let dist_a = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_a,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("build distribution A");
+    let dist_b = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_b,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 2,
+    )
+    .expect("build distribution B");
+    let id_a = frame_id(&dist_a.to_bytes(), room);
+    let id_b = frame_id(&dist_b.to_bytes(), room);
+    let (winner_id, expected_winner) = if id_a.as_bytes() < id_b.as_bytes() {
+        (id_a, key_a.clone())
+    } else {
+        (id_b, key_b.clone())
+    };
+
+    engine.publish(&dist_a.to_bytes()).expect("publish A");
+    engine.publish(&dist_b.to_bytes()).expect("publish B");
+    assert!(engine.has_room_key(2), "resolution leaves a usable key");
+    assert!(!engine.is_room_key_poisoned(2));
+
+    // The persisted source_event_id for epoch 2 must be the winning
+    // distribution's event id (the resolution is durable).
+    let persisted = engine
+        .store_mut()
+        .load_room_keys(&room)
+        .expect("load room keys")
+        .into_iter()
+        .find(|(epoch, _)| *epoch == 2)
+        .map(|(_, (_, source_event_id))| source_event_id)
+        .expect("epoch 2 key persisted");
+    assert_eq!(
+        persisted, winner_id,
+        "the persisted source_event_id must be the winning distribution's event id"
+    );
+
+    // Restart: the in-memory poisoned state and candidates are gone; the
+    // resolved key reloads from the room_keys table with its attribution.
+    let store = engine.into_store();
+    let reopened = SyncEngine::open_with_local_device(
+        store,
+        room,
+        SyncConfig::default(),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+
+    assert!(
+        reopened.has_room_key(2),
+        "the resolved epoch 2 key must survive the restart"
+    );
+    assert!(
+        !reopened.is_room_key_poisoned(2),
+        "the reopened engine must not see a poisoned epoch (resolution was durable)"
+    );
+    assert_eq!(
+        reopened.room_key(2).expect("epoch 2 key").as_bytes(),
+        expected_winner.as_bytes(),
+        "the restarted engine holds the same deterministically-chosen winner"
+    );
+
+    // The attribution survived: the reloaded key's source_event_id is still the
+    // winning distribution.
+    let mut reopened = reopened;
+    let persisted_after = reopened
+        .store_mut()
+        .load_room_keys(&room)
+        .expect("load room keys")
+        .into_iter()
+        .find(|(epoch, _)| *epoch == 2)
+        .map(|(_, (_, source_event_id))| source_event_id)
+        .expect("epoch 2 key persisted after restart");
+    assert_eq!(
+        persisted_after, winner_id,
+        "the winning source_event_id must persist across the restart"
+    );
+}
