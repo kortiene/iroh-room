@@ -72,6 +72,11 @@ channel with the intended participant.
 
 Local storage is plaintext for this beta. Use trusted local machines only.
 
+Found something that looks like a vulnerability? Report it privately through
+[`SECURITY.md`](SECURITY.md) instead of the cohort feedback template. That
+document also lists the beta limitations we already accept, so you can tell
+quickly whether you have found something new.
+
 ## How To Participate
 
 1. Read [`docs/releases/v0.1.0-rc.5-release-notes.md`](docs/releases/v0.1.0-rc.5-release-notes.md).
@@ -103,3 +108,4 @@ If those happen, the project has a real community seed.
 - [Demo recipes](docs/community/demo-recipes.md)
 - [Outreach guide](docs/community/outreach.md)
 - [Production Beta sign-off](docs/releases/v0.1.0-rc.5-production-beta-signoff.md)
+- [Security policy and private reporting](SECURITY.md)
