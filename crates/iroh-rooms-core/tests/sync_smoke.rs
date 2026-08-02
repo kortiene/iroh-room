@@ -488,6 +488,84 @@ fn admin_stale_head_publish_does_not_wedge_the_room() {
     );
 }
 
+/// A fork must not mask an active missing-removal gate.
+///
+/// When a node both holds a same-`admin_seq` fork **and** learns of a higher
+/// admin tip it does not have, the two conditions are orthogonal: the fork is
+/// advisory, the missing tip denies. The verdict must report the one with the
+/// gate, and both trust decisions must be recorded — otherwise a consumer of the
+/// public `completeness()` API reads "advisory, nothing denied" at the exact
+/// moment subjects are failing closed.
+#[test]
+fn a_fork_does_not_mask_an_active_missing_tip_gate() {
+    let built = build_log(0, false);
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
+    seed(&mut net, NODE_A, &built.events);
+
+    // Manufacture the fork: two admin events from the same stale head.
+    for (i, body) in ["branch one", "branch two"].iter().enumerate() {
+        let msg = SignedEvent {
+            schema_version: 1,
+            room_id: built.room,
+            sender_id: built.alice.identity(),
+            device_id: built.alice.device(),
+            event_type: iroh_rooms_core::event::content::EventType::MessageText,
+            created_at: T0 + 200 + i as u64,
+            prev_events: vec![built.admin_tip_eid],
+            content: Content::MessageText(MessageText {
+                body: (*body).to_owned(),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        net.engine_mut(NODE_A)
+            .publish(&wire(&msg, &built.alice.dev))
+            .expect("stale-head publish");
+    }
+    assert_eq!(
+        net.engine(NODE_A).completeness(),
+        Completeness::AdminForkDetected,
+        "the fork alone is still detected and reported"
+    );
+    assert!(net.engine(NODE_A).fail_closed_subjects().is_empty());
+
+    // Now learn of a higher admin tip we do not hold: information IS missing.
+    let _ = net.engine_mut(NODE_A).on_message(
+        NODE_B,
+        SyncMessage::AdminTip {
+            room_id: built.room,
+            tip: Some((EventId::from_bytes([0x7e; 32]), 99)),
+        },
+    );
+
+    assert_eq!(
+        net.engine(NODE_A).completeness(),
+        Completeness::AdminViewSuspect,
+        "the state that actually gates must outrank the advisory fork"
+    );
+    assert!(
+        !net.engine(NODE_A).fail_closed_subjects().is_empty(),
+        "the missing-removal gate is active and must be visible"
+    );
+
+    let codes: Vec<&str> = net
+        .engine(NODE_A)
+        .trust_decisions()
+        .iter()
+        .map(|d| d.code)
+        .collect();
+    assert!(
+        codes.contains(&"equivocation"),
+        "the fork must still be recorded; got {codes:?}"
+    );
+    assert!(
+        codes.contains(&"admin_view_suspect"),
+        "the fork must not swallow the suspicion record; got {codes:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Security — stale admin tip fails closed, then recovers
 // ---------------------------------------------------------------------------

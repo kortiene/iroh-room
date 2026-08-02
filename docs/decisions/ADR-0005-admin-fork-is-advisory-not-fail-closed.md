@@ -194,9 +194,24 @@ reader would trust it.
 - A genuinely equivocating admin is no longer met with room-wide denial. This is
   a deliberate, documented reduction, justified above: it is alerting rather than
   enforcement, exactly as `PHASE-0-SPIKE.md:665` specifies.
+- **`behind` outranks `fork` in the reported verdict.** Before this ADR the order
+  was irrelevant because both states denied. Now only `behind` does, so a node
+  that holds a fork *and* is behind must report `AdminViewSuspect`: reporting the
+  advisory verdict while the gate is active would tell a consumer of the public
+  `Node::completeness()` API that nothing is denied at the exact moment subjects
+  are failing closed. The fork is still recorded as a durable CRITICAL trust
+  decision, and the two decisions are recorded independently so a fork cannot
+  swallow the suspicion record that explains the denial.
+- **`Completeness` is reporting, not the gate.** Its public Rustdoc now says so
+  explicitly, because an embedder that infers a gate from "verdict !=
+  `Complete`" would re-create the outage this ADR removes. The authoritative
+  gate is `fail_closed_subjects()`, which can legitimately be empty while the
+  verdict is `AdminForkDetected`.
 - Regression coverage: `sync_smoke.rs::admin_stale_head_publish_does_not_wedge_the_room`
-  pins the repro #191 asked for and never got. Before this change it failed with
-  both non-admin members denied.
+  pins the repro #191 asked for and never got — before this change it failed with
+  both non-admin members denied — and
+  `a_fork_does_not_mask_an_active_missing_tip_gate` pins the fork-plus-behind
+  interaction.
 
 ## Follow-Ups
 
