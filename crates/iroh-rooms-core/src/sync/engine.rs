@@ -3120,15 +3120,23 @@ impl SyncEngine {
                     // resolution. The current distribution's key is added below
                     // if this device can unwrap it.
                     commitment_conflict = true;
-                    // Retrieve the previously-held key BEFORE poisoning, because
-                    // `get` returns None for a poisoned epoch.
-                    let held_before = self.room_keys.get(epoch).cloned();
+                    // Retrieve the previously-held key (with its canonical —
+                    // minimum — source id) BEFORE poisoning, because `get`
+                    // returns None for a poisoned epoch. Attributing the
+                    // candidate by the held key's stored source (not the
+                    // commitment's first-seen id) keeps the resolution
+                    // arrival-order-independent when the same key was
+                    // re-offered under a smaller event id.
+                    let held_before = self
+                        .room_keys
+                        .get_with_source(epoch)
+                        .map(|(k, id)| (k.clone(), id));
                     self.room_keys.poison(epoch);
-                    if let Some(held) = held_before {
+                    if let Some((held, held_source_id)) = held_before {
                         self.room_keys.add_conflict_candidate(
                             epoch,
                             ConflictCandidate {
-                                event_id: *first_event_id,
+                                event_id: held_source_id,
                                 key: Some(held),
                             },
                         );

@@ -84,8 +84,11 @@ full group E2EE ratchet (which stays out of scope, §12).
   transition** (the rotation payload rides in the removal event), so every honest member
   rotates to the new epoch at the same causal point and `D` is excluded — no intermediate
   state where the removal is folded but the new key is not yet durable. For a voluntary
-  `member.left`, the departure folds immediately and the admin's next event excludes the
-  departed member from future epochs (a bounded window, T29).
+  `member.left`, the departure folds immediately; the departed member is excluded from
+  future epochs only once the admin authors a rotation-bearing event excluding them. v1
+  emits that rotation **only on an explicit admin rotation/removal, never automatically**,
+  so until the operator rotates the departed member keeps decrypting — an open-ended
+  window, honestly recorded in T29 (not a bounded one).
 - **G4.** A newly-joined invitee can read room backlog after a bounded, chunked join-time key
   transfer.
 - **G5.** The threat model moves T27 from "Partial — honest transport only" to "Controlled"
@@ -238,16 +241,19 @@ mechanism differs by who authors the departure:
 - **Voluntary `member.left`:** the departing member authors the leave but **cannot** wrap keys
   (only the admin holds the wrap role). A leave therefore **cannot** carry the rotation
   itself. Instead, the leave folds the departure immediately (access revocation via #196/#197
-  applies at once), and the **admin's next event** (its next `member.removed`, a dedicated
-  rotation event, or its next content publish) carries the rotation payload that excludes the
-  departed member. Until that admin rotation lands, new content is still encrypted under the
-  old epoch the departed member holds — a bounded window bounded by the admin's next online
-  event, recorded honestly in T29. The departee cannot force earlier rotation; that would
-  require delegating wrap authority, which is out of scope (§12).
+  applies at once), and the departed member is excluded from future epochs only when the admin
+  next authors a rotation-bearing event (a `member.removed` with a rotation payload, or a
+  dedicated `member.key_distribution`). Until that operator-driven rotation lands, new content
+  is still encrypted under the old epoch the departed member holds. **v1 emits no automatic
+  rotation**: an ordinary admin content publish does *not* rotate, so this window is
+  open-ended — bounded only by when an operator rotates, recorded honestly in T29. The
+  departee cannot force earlier rotation; that would require delegating wrap authority, which
+  is out of scope (§12).
 
-So "atomic" (G3) is precise for **admin removals** (single event), and **bounded-but-not-
-instant** for **voluntary leaves** (departure folds immediately; key exclusion lands at the
-admin's next event). Both are stated without claiming more than the mechanism provides.
+So "atomic" (G3) is precise for **admin removals** (single event), and **open-ended** for
+**voluntary leaves** (departure folds immediately; key exclusion lands only at an explicit
+admin rotation, which v1 never fires automatically). Both are stated without claiming more
+than the mechanism provides.
 
 *Why not a fail-closed intermediate state instead?* An alternative — block old-epoch
 publishing until the distribution is durable — adds a liveness dependency and a new failure
@@ -506,9 +512,10 @@ Each step is independently reviewable; do not start step 2 before step 1 sign-of
 - **AC6.** Threat model updated (T27 → Controlled; T28/T29/T30 recorded) and the
   release-notes limitation list reflects the new posture.
 - **AC7.** A voluntary `member.left` folds the departure immediately (access revoked at once),
-  and the admin's next event carries the rotation excluding the departed member: from that
-  fold point the departed member receives no new-epoch key. The window between leave and the
-  admin's next event is honestly bounded (T29).
+  and an admin-authored rotation event then excludes the departed member: from that fold point
+  the departed member receives no new-epoch key. v1 does **not** rotate automatically, so the
+  window between leave and the operator-driven rotation is open-ended and honestly recorded
+  (T29), not bounded by the protocol.
 - **AC8.** A malicious Active key holder's encrypted-but-invalid inner body (oversized
   `message.text`, malformed `file.shared`) yields the **same** DAG verdict on every node
   (key-independent), is persisted, and is surfaced as unreadable — never a fold wedge and
@@ -529,7 +536,7 @@ Each step is independently reviewable; do not start step 2 before step 1 sign-of
 |---|---|---|
 | Key store compromised | All covered room history readable | T28: protect ≥ identity keys; storage-encryption follow-up. |
 | Admin offline at removal | Rotation stalls; new content uses old epoch | T29: documented v1 constraint; removal still revokes access (#196/#197). |
-| Voluntary leave without prompt rotation | Departed member reads content until the admin's next event | D4: leave folds immediately (access revoked); the admin's next event carries the rotation. Bounded window (T29). |
+| Voluntary leave without prompt rotation | Departed member reads content until the admin rotates | D4: leave folds immediately (access revoked); the departed member keeps its old epoch key until an operator-driven rotation excludes it. Open-ended window — no automatic rotation in v1 (T29). |
 | Non-atomic removal+rotation | Peers fold removal, keep encrypting old-epoch | D4: rotation embedded in the departure event (single publish), not a second publish. |
 | Pre-writer peers reject envelope | Room partitions on mixed versions | D8: reader-first rollout + room capability floor before writers. |
 | Malicious Active key holder encrypts invalid body | Per-type validation bypass | D2b: key-independent DAG verdict + post-decryption strict parse → unreadable. |

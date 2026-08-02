@@ -2015,3 +2015,104 @@ fn poisoned_epoch_resolution_survives_restart() {
         "the winning source_event_id must persist across the restart"
     );
 }
+
+/// D5a attribution is arrival-order-independent (PR #204 review): when the
+/// same key is offered under several event ids and a conflicting key later
+/// appears, the deterministic resolution must attribute the winning key to its
+/// *minimum* source event id — not whichever same-key copy arrived first, and
+/// not the conflicting distribution's id. Scenario `A < C < B`: key K under A
+/// and B, conflicting key K' under C; the winning key K must resolve to source
+/// A (the minimum), regardless of B arriving before C.
+#[test]
+fn conflict_resolution_attributes_winner_to_minimum_source_id() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let admin_id = sk(1);
+    let admin_dev = sk(2);
+
+    // Keys: K = 0xAA offered under two ids (A, B), K' = 0xBB under C.
+    let key_k = RoomKey::from_bytes([0xAA; 32]);
+    let key_k_prime = RoomKey::from_bytes([0xBB; 32]);
+    let dist_a = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_k,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("build distribution A");
+    let dist_b = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_k,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 2,
+    )
+    .expect("build distribution B (same key as A, different id)");
+    let dist_c = crate::event::distribution::build_member_key_distribution(
+        &admin_id,
+        &admin_dev,
+        &room,
+        2,
+        &key_k_prime,
+        &[admin_dev.device_key()],
+        &[genesis_id],
+        T0 + 3,
+    )
+    .expect("build distribution C (conflicting key)");
+    let id_a = frame_id(&dist_a.to_bytes(), room);
+    let id_b = frame_id(&dist_b.to_bytes(), room);
+    let id_c = frame_id(&dist_c.to_bytes(), room);
+    // The D5a winner is the candidate with the smallest event_id among those
+    // this device can unwrap. A and B both offer key K; C offers K'. The
+    // canonical source for key K is the smaller of its two offering ids.
+    let min_k_source = id_a.min(id_b);
+    // The winning key is K iff K's minimum source beats C, else K'.
+    let (expected_winner_key, expected_winner_source) = if min_k_source < id_c {
+        (key_k.clone(), min_k_source)
+    } else {
+        (key_k_prime.clone(), id_c)
+    };
+
+    // Publish in the adversarial order the review called out: the larger-id
+    // same-key copy (B) and the conflicting key (C) arrive around the
+    // originally-held A. Arrival order must not change the outcome.
+    engine.publish(&dist_a.to_bytes()).expect("publish A");
+    engine.publish(&dist_b.to_bytes()).expect("publish B");
+    engine.publish(&dist_c.to_bytes()).expect("publish C");
+
+    assert!(engine.has_room_key(2), "resolution leaves a usable key");
+    assert!(!engine.is_room_key_poisoned(2));
+    assert_eq!(
+        engine.room_key(2).expect("epoch 2 key").as_bytes(),
+        expected_winner_key.as_bytes(),
+        "the candidate with the smallest event_id must win (D5a)"
+    );
+
+    // The persisted source id must be the canonical (minimum) source of the
+    // winning key — never a same-key-but-larger id, and never mis-attributed
+    // to a distribution for a different key.
+    let persisted = engine
+        .store_mut()
+        .load_room_keys(&room)
+        .expect("load room keys")
+        .into_iter()
+        .find(|(epoch, _)| *epoch == 2)
+        .map(|(_, (_, source_event_id))| source_event_id)
+        .expect("epoch 2 key persisted");
+    assert_eq!(
+        persisted, expected_winner_source,
+        "the winner must be attributed to its minimum source id (arrival-order-independent)"
+    );
+    // Specifically: when K wins, its source is the minimum of A and B, not the
+    // larger same-key id and not the conflicting C.
+    if expected_winner_key.as_bytes() == key_k.as_bytes() {
+        assert_eq!(persisted, min_k_source);
+        assert_ne!(persisted, id_c, "the conflicting key's id must not win");
+    }
+}

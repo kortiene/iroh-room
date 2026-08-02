@@ -3897,13 +3897,15 @@ fn conflicting_distributions_converge_across_network_partition() {
 }
 
 /// Voluntary `member.left` rotation (spec D4/AC7): a member's voluntary
-/// departure folds immediately (access revoked at once), and the admin's next
-/// event carries the rotation excluding the departed member. From that fold
-/// point the departed member receives no new-epoch key, so post-rotation
-/// content is unreadable to it — the window between leave and the admin's
-/// rotation event is honestly bounded (T29).
+/// departure folds immediately (access revoked at once). The rotation that
+/// excludes the departed member is **not automatic in v1** — it lands only
+/// when the admin explicitly authors a rotation-bearing event (here, a
+/// standalone distribution). From that fold point the departed member receives
+/// no new-epoch key, so post-rotation content is unreadable to it. Until the
+/// operator rotates, the departed member keeps its old epoch key and can keep
+/// decrypting — an open-ended window (T29), not an automatic bounded one.
 #[test]
-fn voluntary_member_left_admin_next_event_rotates_and_excludes_departed() {
+fn voluntary_member_left_admin_rotation_excludes_departed() {
     let cfg = encrypted_cfg();
     let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
     let mut net = SimNet::new(room);

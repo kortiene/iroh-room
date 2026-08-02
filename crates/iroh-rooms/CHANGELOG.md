@@ -36,11 +36,22 @@ where feasible); the **experimental** tier may change on any release.
   losing) key, so a restart reloaded a stale key that diverged from every
   peer that had resolved to the winner. The resolution path now persists the
   winning key and its `source_event_id`, so the deterministically-chosen key
-  survives restart. Surfaced by the new poisoned-epoch restart-durability
-  test; the broader step-7 rotation test matrix (multi-epoch, multi-member,
-  adversarial file-share/pipe reads, backward-epoch replay, cross-partition
-  conflict convergence, paginated/partial key history, voluntary-leave
-  rotation) is landed alongside it.
+  survives restart. The winning key's attribution is also made
+  arrival-order-independent: a same-key re-offer retains the **minimum**
+  source `event_id`, so the persisted winner is attributed to its canonical
+  source regardless of the order same-key and conflicting distributions
+  arrived. Surfaced by the new poisoned-epoch restart-durability and
+  minimum-source-attribution tests; the broader step-7 rotation test matrix
+  (multi-epoch, multi-member, adversarial file-share/pipe reads,
+  backward-epoch replay, cross-partition conflict convergence,
+  paginated/partial key history, voluntary-leave rotation) is landed
+  alongside it.
+- Clarified two release-notes / spec overstatements (PR #204 review): the
+  epoch keys live in the `room_keys` table **inside `rooms.db`**, so any copy
+  of the database includes the keys to all covered history (it is not a
+  ciphertext-only artifact); and a voluntary `member.left` triggers **no
+  automatic rotation** in v1 — the departed member keeps decrypting until an
+  operator explicitly rotates, an open-ended window (T29), not a bounded one.
 - Fixed the three stacked defects behind the N=40 gossip-overlay load collapse
   (the reason rc.4 held #171/#173 out of shipped binaries), isolated by a
   seven-step single-variable experiment ladder on the corrected spike-N40
