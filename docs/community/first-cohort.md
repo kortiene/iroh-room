@@ -2,7 +2,7 @@
 
 Status: draft operating plan  
 Duration: 30 days  
-Release target: `v0.1.0-rc.4` controlled Production Beta
+Release target: `v0.1.0-rc.5` controlled Production Beta
 
 ## Purpose
 
