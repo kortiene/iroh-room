@@ -75,7 +75,17 @@ impl EpochKeyStore {
                 self.epochs.insert(epoch, EpochKeyState::Key(key, event_id));
                 Ok(())
             }
-            Some(EpochKeyState::Key(held, _)) if held.as_bytes() == key.as_bytes() => Ok(()),
+            Some(EpochKeyState::Key(held, held_id)) if held.as_bytes() == key.as_bytes() => {
+                // Same key re-offered: keep the *minimum* source event id so
+                // the attribution is deterministic (arrival-order-independent).
+                // The D5a resolution compares distribution event ids; the
+                // smallest id that ever offered this key is its canonical
+                // source, regardless of which copy arrived first.
+                let min_id = (*held_id).min(event_id);
+                self.epochs
+                    .insert(epoch, EpochKeyState::Key(held.clone(), min_id));
+                Ok(())
+            }
             Some(EpochKeyState::Key(held, held_id)) => {
                 // Conflicting offer: retain the previously-held key as a
                 // candidate, then poison the epoch.
@@ -146,6 +156,16 @@ impl EpochKeyStore {
     pub fn get(&self, epoch: u64) -> Option<&RoomKey> {
         match self.epochs.get(&epoch) {
             Some(EpochKeyState::Key(k, _)) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// The held key for `epoch` together with the event that offered it;
+    /// `None` when absent **or** poisoned. Used to persist the outcome of a
+    /// deterministic D5a resolution with its winning `source_event_id`.
+    pub fn get_with_source(&self, epoch: u64) -> Option<(&RoomKey, EventId)> {
+        match self.epochs.get(&epoch) {
+            Some(EpochKeyState::Key(k, id)) => Some((k, *id)),
             _ => None,
         }
     }
@@ -221,6 +241,30 @@ mod tests {
             .insert(3, key(0xAA), eid(0x01))
             .expect("same bytes are a no-op");
         assert!(store.has(3));
+    }
+
+    #[test]
+    fn same_key_reinsert_keeps_minimum_source_id() {
+        // The same key re-offered under a *smaller* event id must re-attribute
+        // the held key to that minimum, so a later D5a resolution compares the
+        // key's canonical source, not whichever copy arrived first.
+        let mut store = EpochKeyStore::default();
+        store.insert(3, key(0xAA), eid(0x09)).expect("fresh insert");
+        store
+            .insert(3, key(0xAA), eid(0x02))
+            .expect("same bytes, smaller id");
+        let (_, source) = store.get_with_source(3).expect("held with source");
+        assert_eq!(source, eid(0x02), "minimum source id is retained");
+        // A later re-offer under a larger id must not clobber the minimum.
+        store
+            .insert(3, key(0xAA), eid(0x07))
+            .expect("same bytes, larger id");
+        let (_, source) = store.get_with_source(3).expect("held with source");
+        assert_eq!(
+            source,
+            eid(0x02),
+            "minimum source id survives a later larger id"
+        );
     }
 
     #[test]

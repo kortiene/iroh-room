@@ -18,12 +18,12 @@
 
 use iroh_rooms_core::event::binding::DeviceBinding;
 use iroh_rooms_core::event::content::{
-    capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved, MessageText,
-    RoomCreated,
+    capability_hash, Content, EventType, FileShared, MemberInvited, MemberJoined, MemberRemoved,
+    MessageText, PipeOpened, RoomCreated,
 };
 use iroh_rooms_core::event::distribution::build_member_removed_with_rotation;
 use iroh_rooms_core::event::encrypted::{build_content_encrypted, UnreadableReason};
-use iroh_rooms_core::event::ids::{EventId, RoomId};
+use iroh_rooms_core::event::ids::{EventId, HashRef, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
@@ -2909,4 +2909,1436 @@ fn key_history_transfer_unlocks_backlog_for_new_member() {
         msg2_inner,
         "carol must read historical content after key-history transfer (G4)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Step-7 broader test matrix (issue #191, spec §7 step 7)
+// ---------------------------------------------------------------------------
+
+fn encrypted_cfg() -> SyncConfig {
+    SyncConfig {
+        encrypted_content_writes: true,
+        ..SyncConfig::default()
+    }
+}
+
+fn device_engine(p: &Principal, room: RoomId, cfg: SyncConfig) -> SyncEngine {
+    SyncEngine::open_with_local_device(
+        EventStore::open_in_memory().expect("store"),
+        room,
+        cfg,
+        Some(*p.dev.to_seed()),
+    )
+    .expect("open engine")
+}
+
+/// A built three-member room log: `genesis → invite/join bob → invite/join
+/// carol`, all published on the admin's engine. Returns the principals, room,
+/// and the head event id for parenting the next event.
+struct Room3 {
+    alice: Principal,
+    bob: Principal,
+    carol: Principal,
+    room: RoomId,
+    head: EventId,
+}
+
+/// Build genesis → invite bob → join bob → invite carol → join carol on
+/// `net.engine_mut(admin_node)`, then converge the mesh so every registered
+/// peer folds all three members Active.
+fn build_three_member_room(net: &mut SimNet, admin_node: PeerId, name: &str) -> Room3 {
+    let alice = Principal::new(0x01);
+    let bob = Principal::new(0x10);
+    let carol = Principal::new(0x20);
+    let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
+
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: name.to_owned(),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let gid = genesis.event_id();
+    net.engine_mut(admin_node)
+        .publish(&wire_bytes(&genesis, &alice.dev))
+        .expect("genesis");
+
+    let inv_bob_id = [0x01; 16];
+    let inv_bob_sec = [0x41; 16];
+    let inv_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: T0 + 1,
+        prev_events: vec![gid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_bob_id,
+            capability_hash: capability_hash(&room, &inv_bob_id, &inv_bob_sec),
+            role: "member".to_owned(),
+            invitee_key: bob.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_bob_eid = inv_bob.event_id();
+    net.engine_mut(admin_node)
+        .publish(&wire_bytes(&inv_bob, &alice.dev))
+        .expect("invite bob");
+
+    let join_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: bob.identity(),
+        device_id: bob.device(),
+        event_type: EventType::MemberJoined,
+        created_at: T0 + 2,
+        prev_events: vec![inv_bob_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_bob_id,
+            capability_secret: inv_bob_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &bob.id, bob.device()),
+            display_name: None,
+        }),
+    };
+    let join_bob_eid = join_bob.event_id();
+    net.engine_mut(admin_node)
+        .publish(&wire_bytes(&join_bob, &bob.dev))
+        .expect("join bob");
+
+    let inv_carol_id = [0x02; 16];
+    let inv_carol_sec = [0x42; 16];
+    let inv_carol = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: T0 + 3,
+        prev_events: vec![join_bob_eid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_carol_id,
+            capability_hash: capability_hash(&room, &inv_carol_id, &inv_carol_sec),
+            role: "member".to_owned(),
+            invitee_key: carol.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_carol_eid = inv_carol.event_id();
+    net.engine_mut(admin_node)
+        .publish(&wire_bytes(&inv_carol, &alice.dev))
+        .expect("invite carol");
+
+    let join_carol = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: carol.identity(),
+        device_id: carol.device(),
+        event_type: EventType::MemberJoined,
+        created_at: T0 + 4,
+        prev_events: vec![inv_carol_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_carol_id,
+            capability_secret: inv_carol_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &carol.id, carol.device()),
+            display_name: None,
+        }),
+    };
+    let head = join_carol.event_id();
+    net.engine_mut(admin_node)
+        .publish(&wire_bytes(&join_carol, &carol.dev))
+        .expect("join carol");
+
+    Room3 {
+        alice,
+        bob,
+        carol,
+        room,
+        head,
+    }
+}
+
+/// Publish an encrypted `MessageText` in `epoch` from `author`'s node, citing
+/// `prev`, and return its event id.
+#[allow(clippy::too_many_arguments)] // one argument per distinct encrypted-publish input
+fn publish_encrypted_text(
+    net: &mut SimNet,
+    node: PeerId,
+    author: &Principal,
+    room: RoomId,
+    body: &str,
+    epoch: u64,
+    key: &RoomKey,
+    nonce: [u8; 12],
+    prev: EventId,
+    t: u64,
+) -> EventId {
+    let inner = Content::MessageText(MessageText {
+        body: body.to_owned(),
+        format: None,
+        in_reply_to: None,
+        mentions: None,
+    });
+    let ev = build_content_encrypted(
+        &author.id,
+        &author.dev,
+        &room,
+        &inner,
+        epoch,
+        key,
+        &nonce,
+        &[prev],
+        t,
+    )
+    .expect("build encrypted");
+    let id = signed::event_id_from_bytes(&ev.signed);
+    net.engine_mut(node)
+        .publish(&ev.to_bytes())
+        .expect("publish encrypted");
+    id
+}
+
+/// Fetch the stored `SignedEvent` with `id` from `node`'s room tail.
+fn stored_event(net: &SimNet, node: PeerId, id: EventId) -> SignedEvent {
+    let tail = net.engine(node).room_tail(u32::MAX).expect("tail");
+    let se = tail
+        .iter()
+        .find(|se| se.event_id == id)
+        .expect("event in tail");
+    SignedEvent::decode(&se.wire.signed).expect("decodes")
+}
+
+/// Multi-epoch rotation (spec D7/G1): two sequential removals walk the room
+/// through epochs 2 and 3. Content authored in an older epoch stays readable
+/// to the members who hold that epoch's key; content in a newer epoch is
+/// unreadable to every member removed before it — forward secrecy is
+/// post-departure only, and old epochs remain decryptable to their holders.
+#[test]
+fn multi_epoch_rotation_old_epochs_readable_new_epochs_forward_secret() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+    net.add_peer(NODE_C, device_engine(&Principal::new(0x20), room, cfg));
+
+    let r = build_three_member_room(&mut net, NODE_A, "Multi Epoch");
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+
+    // Alice removes carol, rotating to epoch 2 (wrapped for alice + bob).
+    let epoch2_key = RoomKey::generate();
+    let removal_carol = build_member_removed_with_rotation(
+        &r.alice.id,
+        &r.alice.dev,
+        &r.room,
+        &r.carol.identity(),
+        Some(r.carol.device()),
+        None,
+        None,
+        Some(2),
+        Some(&epoch2_key),
+        &[r.alice.device(), r.bob.device()],
+        &[r.head],
+        T0 + 5,
+    )
+    .expect("build removal carol");
+    let removal_carol_id = signed::event_id_from_bytes(&removal_carol.signed);
+    net.engine_mut(NODE_A)
+        .publish(&removal_carol.to_bytes())
+        .expect("publish removal carol");
+
+    // Alice posts in epoch 2.
+    let msg_epoch2 = publish_encrypted_text(
+        &mut net,
+        NODE_A,
+        &r.alice,
+        r.room,
+        "epoch 2 secret",
+        2,
+        &epoch2_key,
+        [0x11; 12],
+        removal_carol_id,
+        T0 + 6,
+    );
+
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+    assert!(net.engine(NODE_A).has_room_key(2));
+    assert!(net.engine(NODE_B).has_room_key(2));
+    assert!(
+        !net.engine(NODE_C).has_room_key(2),
+        "carol is removed before epoch 2; she must not hold its key"
+    );
+
+    // Alice removes bob, rotating to epoch 3 (wrapped for alice only).
+    let epoch3_key = RoomKey::generate();
+    let removal_bob = build_member_removed_with_rotation(
+        &r.alice.id,
+        &r.alice.dev,
+        &r.room,
+        &r.bob.identity(),
+        Some(r.bob.device()),
+        None,
+        None,
+        Some(3),
+        Some(&epoch3_key),
+        &[r.alice.device()],
+        &[msg_epoch2],
+        T0 + 7,
+    )
+    .expect("build removal bob");
+    let removal_bob_id = signed::event_id_from_bytes(&removal_bob.signed);
+    net.engine_mut(NODE_A)
+        .publish(&removal_bob.to_bytes())
+        .expect("publish removal bob");
+
+    // Alice posts in epoch 3.
+    let msg_epoch3 = publish_encrypted_text(
+        &mut net,
+        NODE_A,
+        &r.alice,
+        r.room,
+        "epoch 3 secret",
+        3,
+        &epoch3_key,
+        [0x22; 12],
+        removal_bob_id,
+        T0 + 8,
+    );
+
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+
+    // --- Forward secrecy (G1): newer epochs are unreadable to those removed
+    //     before them. ---
+    let ev2_bob_view = stored_event(&net, NODE_B, msg_epoch2);
+    let ev2_carol_view = stored_event(&net, NODE_C, msg_epoch2);
+    let ev3_alice_view = stored_event(&net, NODE_A, msg_epoch3);
+    let ev3_bob_view = stored_event(&net, NODE_B, msg_epoch3);
+    let ev3_carol_view = stored_event(&net, NODE_C, msg_epoch3);
+
+    // Carol (removed before epoch 2) cannot read the epoch 2 message.
+    assert_eq!(
+        net.engine(NODE_C)
+            .read_content(&ev2_carol_view)
+            .expect_err("carol must not read epoch 2"),
+        UnreadableReason::NoEpochKey { epoch: 2 },
+    );
+    // Bob (removed before epoch 3) cannot read the epoch 3 message.
+    assert_eq!(
+        net.engine(NODE_B)
+            .read_content(&ev3_bob_view)
+            .expect_err("bob must not read epoch 3"),
+        UnreadableReason::NoEpochKey { epoch: 3 },
+    );
+    assert_eq!(
+        net.engine(NODE_C)
+            .read_content(&ev3_carol_view)
+            .expect_err("carol must not read epoch 3"),
+        UnreadableReason::NoEpochKey { epoch: 3 },
+    );
+
+    // --- Old epochs stay decryptable to their holders (D7): bob still reads
+    //     the epoch 2 message even though he was removed afterwards. ---
+    assert_eq!(
+        net.engine(NODE_B)
+            .readable_content(&ev2_bob_view)
+            .expect("bob reads epoch 2 backlog"),
+        Content::MessageText(MessageText {
+            body: "epoch 2 secret".to_owned(),
+            format: None,
+            in_reply_to: None,
+            mentions: None,
+        }),
+        "D7: old epochs remain decryptable to their holders"
+    );
+    // Alice reads everything (she holds every epoch).
+    assert!(net
+        .engine(NODE_A)
+        .readable_content(&ev3_alice_view)
+        .is_some());
+
+    // Convergence is key-independent (D2b): every node holds the same event
+    // set regardless of which keys it possesses.
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+}
+
+/// Multi-member room (3+ members): a removal wraps the new epoch for every
+/// remaining Active member and excludes the removed one. Each remaining member
+/// independently unwraps the same key; the removed member gets nothing.
+#[test]
+fn multi_member_room_remaining_members_each_unwrap_removed_member_gets_nothing() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+    net.add_peer(NODE_C, device_engine(&Principal::new(0x20), room, cfg));
+
+    let r = build_three_member_room(&mut net, NODE_A, "Multi Member");
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+    assert_eq!(
+        net.engine(NODE_C).snapshot().status(&r.carol.identity()),
+        Some(Status::Active)
+    );
+
+    // Alice removes bob, rotating to epoch 2 wrapped for alice + carol (the
+    // remaining Active members). Bob is excluded by the recipient filter.
+    let epoch2_key = RoomKey::generate();
+    let removal = build_member_removed_with_rotation(
+        &r.alice.id,
+        &r.alice.dev,
+        &r.room,
+        &r.bob.identity(),
+        Some(r.bob.device()),
+        None,
+        None,
+        Some(2),
+        Some(&epoch2_key),
+        &[r.alice.device(), r.bob.device(), r.carol.device()],
+        &[r.head],
+        T0 + 5,
+    )
+    .expect("build removal");
+    let removal_id = signed::event_id_from_bytes(&removal.signed);
+    net.engine_mut(NODE_A)
+        .publish(&removal.to_bytes())
+        .expect("publish removal");
+
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+
+    // Each remaining member unwraps the *same* epoch 2 key independently.
+    for node in [NODE_A, NODE_C] {
+        assert_eq!(
+            net.engine(node)
+                .room_key(2)
+                .unwrap_or_else(|| panic!("{node} must hold epoch 2 key"))
+                .as_bytes(),
+            epoch2_key.as_bytes(),
+            "{node} must recover the identical epoch 2 key"
+        );
+    }
+    assert!(
+        !net.engine(NODE_B).has_room_key(2),
+        "removed bob must not adopt epoch 2 key"
+    );
+
+    // Both remaining members read a post-removal epoch 2 message; bob cannot.
+    let msg = publish_encrypted_text(
+        &mut net,
+        NODE_A,
+        &r.alice,
+        r.room,
+        "for the remaining",
+        2,
+        &epoch2_key,
+        [0x33; 12],
+        removal_id,
+        T0 + 6,
+    );
+    net.run_to_quiescence();
+
+    for node in [NODE_A, NODE_C] {
+        let ev = stored_event(&net, node, msg);
+        assert!(
+            net.engine(node).readable_content(&ev).is_some(),
+            "{node} must read the epoch 2 message"
+        );
+    }
+    let ev_bob = stored_event(&net, NODE_B, msg);
+    assert_eq!(
+        net.engine(NODE_B)
+            .read_content(&ev_bob)
+            .expect_err("bob must not read epoch 2"),
+        UnreadableReason::NoEpochKey { epoch: 2 },
+    );
+}
+
+/// Adversarial (G1 extension): a removed device that keeps a patched gossip
+/// subscription receives *file share* and *pipe* ciphertexts too — not just
+/// messages — and they are unreadable to it. The D9 key-aware authorization
+/// projections stay fail-closed on the removed node: its blob gate serves no
+/// hash from an unreadable `file.shared`, and an unreadable close-typed
+/// envelope conservatively closes pipes.
+#[test]
+fn removed_device_reads_file_share_and_pipe_ciphertext_only() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+
+    // Two-member room: genesis → invite bob → join bob.
+    let alice = Principal::new(0x01);
+    let bob = Principal::new(0x10);
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Adversarial FS/Pipe".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let gid = genesis.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&genesis, &alice.dev))
+        .expect("genesis");
+
+    let inv_bob_id = [0x01; 16];
+    let inv_bob_sec = [0x41; 16];
+    let inv_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: T0 + 1,
+        prev_events: vec![gid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_bob_id,
+            capability_hash: capability_hash(&room, &inv_bob_id, &inv_bob_sec),
+            role: "member".to_owned(),
+            invitee_key: bob.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_bob_eid = inv_bob.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&inv_bob, &alice.dev))
+        .expect("invite bob");
+
+    let join_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: bob.identity(),
+        device_id: bob.device(),
+        event_type: EventType::MemberJoined,
+        created_at: T0 + 2,
+        prev_events: vec![inv_bob_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_bob_id,
+            capability_secret: inv_bob_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &bob.id, bob.device()),
+            display_name: None,
+        }),
+    };
+    let join_bob_eid = join_bob.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&join_bob, &bob.dev))
+        .expect("join bob");
+
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    // Remove bob with rotation to epoch 2.
+    let epoch2_key = RoomKey::generate();
+    let removal = build_member_removed_with_rotation(
+        &alice.id,
+        &alice.dev,
+        &room,
+        &bob.identity(),
+        Some(bob.device()),
+        None,
+        None,
+        Some(2),
+        Some(&epoch2_key),
+        &[alice.device()],
+        &[join_bob_eid],
+        T0 + 3,
+    )
+    .expect("build removal");
+    let removal_id = signed::event_id_from_bytes(&removal.signed);
+    net.engine_mut(NODE_A)
+        .publish(&removal.to_bytes())
+        .expect("publish removal");
+
+    // Alice shares a file and opens a pipe, both encrypted in epoch 2.
+    let blob_hash = [0xAB; 32];
+    let file_inner = Content::FileShared(FileShared {
+        file_id: [0xf1; 16],
+        name: "secret.bin".to_owned(),
+        mime_type: "application/octet-stream".to_owned(),
+        size_bytes: 10,
+        blob_hash: HashRef::from_bytes(blob_hash),
+        blob_format: None,
+        providers: None,
+    });
+    let file_ev = build_content_encrypted(
+        &alice.id,
+        &alice.dev,
+        &room,
+        &file_inner,
+        2,
+        &epoch2_key,
+        &[0x44; 12],
+        &[removal_id],
+        T0 + 4,
+    )
+    .expect("build file share");
+    let file_id = signed::event_id_from_bytes(&file_ev.signed);
+    net.engine_mut(NODE_A)
+        .publish(&file_ev.to_bytes())
+        .expect("publish file share");
+
+    let pipe_id = [0x9A; 16];
+    let pipe_inner = Content::PipeOpened(PipeOpened {
+        pipe_id,
+        owner_id: alice.identity(),
+        owner_endpoint: alice.device(),
+        kind: "tcp".to_owned(),
+        label: "secret pipe".to_owned(),
+        target_hint: "127.0.0.1:9".to_owned(),
+        alpn: "iroh-rooms/pipe/1".to_owned(),
+        allowed_members: vec![alice.identity()],
+        expires_at: None,
+    });
+    let pipe_ev = build_content_encrypted(
+        &alice.id,
+        &alice.dev,
+        &room,
+        &pipe_inner,
+        2,
+        &epoch2_key,
+        &[0x55; 12],
+        &[file_id],
+        T0 + 5,
+    )
+    .expect("build pipe opened");
+    let pipe_ev_id = signed::event_id_from_bytes(&pipe_ev.signed);
+    net.engine_mut(NODE_A)
+        .publish(&pipe_ev.to_bytes())
+        .expect("publish pipe opened");
+
+    // Bob keeps a patched subscription and receives both ciphertexts.
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    let file_bob = stored_event(&net, NODE_B, file_id);
+    let pipe_bob = stored_event(&net, NODE_B, pipe_ev_id);
+    assert_eq!(
+        net.engine(NODE_B)
+            .read_content(&file_bob)
+            .expect_err("bob must not read the file share"),
+        UnreadableReason::NoEpochKey { epoch: 2 },
+    );
+    assert_eq!(
+        net.engine(NODE_B)
+            .read_content(&pipe_bob)
+            .expect_err("bob must not read the pipe open"),
+        UnreadableReason::NoEpochKey { epoch: 2 },
+    );
+
+    // D9 fail-closed on bob: the unreadable file share contributes no blob
+    // hash to bob's serve gate, so bob would deny a fetch for that hash.
+    assert!(
+        !net.engine(NODE_B)
+            .file_shared_hashes()
+            .expect("hashes")
+            .contains(&blob_hash),
+        "bob's blob gate must not serve a hash from an unreadable file.shared (fail-closed)"
+    );
+    // Alice (key holder) authorizes the blob.
+    assert!(
+        net.engine(NODE_A)
+            .file_shared_hashes()
+            .expect("hashes")
+            .contains(&blob_hash),
+        "alice must surface the blob hash from the readable file.shared"
+    );
+    // Bob cannot see the pipe; alice can.
+    assert!(net
+        .engine(NODE_B)
+        .pipe_opened(&pipe_id)
+        .expect("pipe_opened")
+        .is_none());
+    assert!(net
+        .engine(NODE_A)
+        .pipe_opened(&pipe_id)
+        .expect("pipe_opened")
+        .is_some());
+}
+
+/// Adversarial (spec §5): a DAG `member.key_distribution` that names a
+/// **lower** epoch than the highest already seen is a backward-epoch replay
+/// and is rejected — the node's current epoch key is unchanged and the
+/// replayed key is never adopted.
+#[test]
+fn backward_epoch_distribution_is_rejected() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+
+    let alice = Principal::new(0x01);
+    let bob = Principal::new(0x10);
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Backward Epoch".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let gid = genesis.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&genesis, &alice.dev))
+        .expect("genesis");
+
+    let inv_bob_id = [0x01; 16];
+    let inv_bob_sec = [0x41; 16];
+    let inv_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: T0 + 1,
+        prev_events: vec![gid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_bob_id,
+            capability_hash: capability_hash(&room, &inv_bob_id, &inv_bob_sec),
+            role: "member".to_owned(),
+            invitee_key: bob.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_bob_eid = inv_bob.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&inv_bob, &alice.dev))
+        .expect("invite bob");
+
+    let join_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: bob.identity(),
+        device_id: bob.device(),
+        event_type: EventType::MemberJoined,
+        created_at: T0 + 2,
+        prev_events: vec![inv_bob_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_bob_id,
+            capability_secret: inv_bob_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &bob.id, bob.device()),
+            display_name: None,
+        }),
+    };
+    let join_bob_eid = join_bob.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&join_bob, &bob.dev))
+        .expect("join bob");
+
+    // Rotate forward to epoch 3 (wrapping for alice + bob), then attempt to
+    // replay an older epoch 2 distribution.
+    let epoch3_key = RoomKey::generate();
+    let dist3 = iroh_rooms_core::event::distribution::build_member_key_distribution(
+        &alice.id,
+        &alice.dev,
+        &room,
+        3,
+        &epoch3_key,
+        &[alice.device(), bob.device()],
+        &[join_bob_eid],
+        T0 + 3,
+    )
+    .expect("build epoch 3 distribution");
+    let dist3_id = signed::event_id_from_bytes(&dist3.signed);
+    net.engine_mut(NODE_A)
+        .publish(&dist3.to_bytes())
+        .expect("publish epoch 3 distribution");
+
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+    assert!(net.engine(NODE_A).has_room_key(3));
+    assert!(net.engine(NODE_B).has_room_key(3));
+
+    // A backward epoch-2 distribution (a replay attack, or a stale admin
+    // branch). It must be ignored, not adopted, on both nodes.
+    let stale_epoch2_key = RoomKey::generate();
+    let dist2_stale = iroh_rooms_core::event::distribution::build_member_key_distribution(
+        &alice.id,
+        &alice.dev,
+        &room,
+        2,
+        &stale_epoch2_key,
+        &[alice.device(), bob.device()],
+        &[dist3_id],
+        T0 + 4,
+    )
+    .expect("build stale epoch 2 distribution");
+    net.engine_mut(NODE_A)
+        .publish(&dist2_stale.to_bytes())
+        .expect("publish stale distribution");
+
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    for node in [NODE_A, NODE_B] {
+        assert!(
+            !net.engine(node).has_room_key(2),
+            "{node}: backward epoch 2 key must never be adopted (spec §5)"
+        );
+        assert_eq!(
+            net.engine(node)
+                .room_key(3)
+                .expect("{node} epoch 3 key")
+                .as_bytes(),
+            epoch3_key.as_bytes(),
+            "{node}: current epoch 3 key must be unchanged by the replay"
+        );
+        assert!(
+            !net.engine(node).is_room_key_poisoned(3),
+            "{node}: the replay must not poison the current epoch"
+        );
+    }
+}
+
+/// Adversarial (spec D5a): a malicious/equivocating admin authors two
+/// conflicting same-epoch distributions on opposite sides of a network
+/// partition. After the partition heals, every node holds the same event set
+/// and — because the deterministic smallest-`event_id` resolution is
+/// arrival-order-independent — adopts the **same** winning epoch key. Reads in
+/// that epoch succeed identically on every node; convergence is never
+/// key-dependent.
+#[test]
+fn conflicting_distributions_converge_across_network_partition() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+
+    let alice = Principal::new(0x01);
+    let bob = Principal::new(0x10);
+    let genesis = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::RoomCreated,
+        created_at: T0,
+        prev_events: vec![],
+        content: Content::RoomCreated(RoomCreated {
+            room_name: "Partition Conflict".to_owned(),
+            room_nonce: NONCE,
+            admins: vec![alice.identity()],
+            device_binding: DeviceBinding::create(&room, &alice.id, alice.device()),
+        }),
+    };
+    let gid = genesis.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&genesis, &alice.dev))
+        .expect("genesis");
+
+    let inv_bob_id = [0x01; 16];
+    let inv_bob_sec = [0x41; 16];
+    let inv_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: alice.identity(),
+        device_id: alice.device(),
+        event_type: EventType::MemberInvited,
+        created_at: T0 + 1,
+        prev_events: vec![gid],
+        content: Content::MemberInvited(MemberInvited {
+            invite_id: inv_bob_id,
+            capability_hash: capability_hash(&room, &inv_bob_id, &inv_bob_sec),
+            role: "member".to_owned(),
+            invitee_key: bob.identity(),
+            expires_at: None,
+            invitee_hint: None,
+        }),
+    };
+    let inv_bob_eid = inv_bob.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&inv_bob, &alice.dev))
+        .expect("invite bob");
+
+    let join_bob = SignedEvent {
+        schema_version: 1,
+        room_id: room,
+        sender_id: bob.identity(),
+        device_id: bob.device(),
+        event_type: EventType::MemberJoined,
+        created_at: T0 + 2,
+        prev_events: vec![inv_bob_eid],
+        content: Content::MemberJoined(MemberJoined {
+            via_invite_id: inv_bob_id,
+            capability_secret: inv_bob_sec,
+            role: "member".to_owned(),
+            device_binding: DeviceBinding::create(&room, &bob.id, bob.device()),
+            display_name: None,
+        }),
+    };
+    let join_bob_eid = join_bob.event_id();
+    net.engine_mut(NODE_A)
+        .publish(&wire_bytes(&join_bob, &bob.dev))
+        .expect("join bob");
+
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    // Partition alice from bob. On each side the admin (alice's keys, used to
+    // author on alice's node; injected on bob's side as a forked equivocation)
+    // authors a *different* epoch-2 distribution with a different random key.
+    net.partition(&[NODE_A], &[NODE_B]);
+
+    let key_a = RoomKey::generate();
+    let key_b = RoomKey::generate();
+    let dist_a = iroh_rooms_core::event::distribution::build_member_key_distribution(
+        &alice.id,
+        &alice.dev,
+        &room,
+        2,
+        &key_a,
+        &[alice.device(), bob.device()],
+        &[join_bob_eid],
+        T0 + 3,
+    )
+    .expect("build distribution A");
+    let dist_b = iroh_rooms_core::event::distribution::build_member_key_distribution(
+        &alice.id,
+        &alice.dev,
+        &room,
+        2,
+        &key_b,
+        &[alice.device(), bob.device()],
+        &[join_bob_eid],
+        T0 + 4, // different created_at ⇒ distinct event_id (an equivocation fork)
+    )
+    .expect("build distribution B");
+    let id_a = signed::event_id_from_bytes(&dist_a.signed);
+    let id_b = signed::event_id_from_bytes(&dist_b.signed);
+    assert_ne!(
+        id_a, id_b,
+        "the fork must produce two distinct distributions"
+    );
+
+    // Deliver dist_a to alice's side, dist_b to bob's side, while partitioned.
+    net.engine_mut(NODE_A)
+        .publish(&dist_a.to_bytes())
+        .expect("publish dist A");
+    net.engine_mut(NODE_B)
+        .publish(&dist_b.to_bytes())
+        .expect("publish dist B");
+
+    // Heal the partition; both distributions reach both nodes.
+    net.reconnect(NODE_A, NODE_B);
+    net.run_to_quiescence();
+
+    // Both nodes hold the same event set (the fork converges structurally)…
+    net.assert_converged(&[NODE_A, NODE_B]);
+
+    // …and both adopt the *same* epoch-2 key: the candidate with the
+    // lexicographically smallest distribution event_id wins (D5a), independent
+    // of which side of the partition a node was on.
+    let expected_winner = if id_a.as_bytes() < id_b.as_bytes() {
+        &key_a
+    } else {
+        &key_b
+    };
+    for node in [NODE_A, NODE_B] {
+        assert!(
+            net.engine(node).has_room_key(2),
+            "{node}: deterministic resolution must leave a usable epoch-2 key"
+        );
+        assert!(
+            !net.engine(node).is_room_key_poisoned(2),
+            "{node}: resolution must un-poison the epoch"
+        );
+        assert_eq!(
+            net.engine(node)
+                .room_key(2)
+                .expect("{node} epoch 2 key")
+                .as_bytes(),
+            expected_winner.as_bytes(),
+            "{node}: smallest-event-id candidate must win (D5a, arrival-order-independent)"
+        );
+    }
+}
+
+/// Voluntary `member.left` rotation (spec D4/AC7): a member's voluntary
+/// departure folds immediately (access revoked at once). The rotation that
+/// excludes the departed member is **not automatic in v1** — it lands only
+/// when the admin explicitly authors a rotation-bearing event (here, a
+/// standalone distribution). From that fold point the departed member receives
+/// no new-epoch key, so post-rotation content is unreadable to it. Until the
+/// operator rotates, the departed member keeps its old epoch key and can keep
+/// decrypting — an open-ended window (T29), not an automatic bounded one.
+#[test]
+fn voluntary_member_left_admin_rotation_excludes_departed() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+    net.add_peer(NODE_C, device_engine(&Principal::new(0x20), room, cfg));
+
+    let r = build_three_member_room(&mut net, NODE_A, "Voluntary Leave");
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+
+    // Carol voluntarily leaves. She authors the leave but cannot wrap keys
+    // (only the admin holds the wrap role), so the leave itself carries no
+    // rotation; the departure folds immediately on every node.
+    let leave = iroh_rooms_core::event::build_member_left(
+        &r.carol.id,
+        &r.carol.dev,
+        &r.room,
+        Some("moving on"),
+        &[r.head],
+        T0 + 5,
+    );
+    let leave_id = signed::event_id_from_bytes(&leave.signed);
+    net.engine_mut(NODE_C)
+        .publish(&leave.to_bytes())
+        .expect("publish leave");
+
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+    for node in [NODE_A, NODE_B, NODE_C] {
+        assert_eq!(
+            net.engine(node).snapshot().status(&r.carol.identity()),
+            Some(Status::Removed),
+            "{node}: carol's voluntary departure must fold immediately"
+        );
+    }
+
+    // The admin's next event carries the rotation that excludes carol: a
+    // standalone distribution of epoch 2 wrapped only for the remaining
+    // Active members (alice + bob).
+    let epoch2_key = RoomKey::generate();
+    let dist = iroh_rooms_core::event::distribution::build_member_key_distribution(
+        &r.alice.id,
+        &r.alice.dev,
+        &r.room,
+        2,
+        &epoch2_key,
+        &[r.alice.device(), r.bob.device()],
+        &[leave_id],
+        T0 + 6,
+    )
+    .expect("build post-leave distribution");
+    let dist_id = signed::event_id_from_bytes(&dist.signed);
+    net.engine_mut(NODE_A)
+        .publish(&dist.to_bytes())
+        .expect("publish post-leave distribution");
+
+    // Alice posts in epoch 2.
+    let msg = publish_encrypted_text(
+        &mut net,
+        NODE_A,
+        &r.alice,
+        r.room,
+        "after carol left",
+        2,
+        &epoch2_key,
+        [0x66; 12],
+        dist_id,
+        T0 + 7,
+    );
+
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+
+    // The remaining members adopt epoch 2; the departed carol does not (AC7).
+    assert!(net.engine(NODE_A).has_room_key(2));
+    assert!(net.engine(NODE_B).has_room_key(2));
+    assert!(
+        !net.engine(NODE_C).has_room_key(2),
+        "departed carol must receive no new-epoch key (AC7)"
+    );
+
+    // Post-rotation content is unreadable to carol, readable to the rest.
+    let msg_carol = stored_event(&net, NODE_C, msg);
+    assert_eq!(
+        net.engine(NODE_C)
+            .read_content(&msg_carol)
+            .expect_err("carol must not read post-rotation content"),
+        UnreadableReason::NoEpochKey { epoch: 2 },
+    );
+    for node in [NODE_A, NODE_B] {
+        let ev = stored_event(&net, node, msg);
+        assert!(
+            net.engine(node).readable_content(&ev).is_some(),
+            "{node} must read post-rotation content"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key-history edge cases (issue #191 step 7, spec D6)
+// ---------------------------------------------------------------------------
+
+/// Drive one `WantKeyHistory` round-trip directly (no `SimNet` queue): `from`
+/// asks `serving_node`'s engine, the response(s) are delivered to
+/// `requesting_node`'s engine. Returns the number of `KeyHistory` messages
+/// served. Mirrors the direct-drive in the step-6 key-history test: the
+/// requester is identified by her device key (`PeerId == DeviceKey`).
+fn drive_key_history_round_trip(
+    net: &mut SimNet,
+    serving_node: PeerId,
+    requesting_node: PeerId,
+    requester: &Principal,
+    room: RoomId,
+    have_epochs: std::collections::BTreeSet<u64>,
+) -> usize {
+    let requester_peer = PeerId::from_bytes(*requester.device().as_bytes());
+    let out = net.engine_mut(serving_node).on_message(
+        requester_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: room,
+            have_epochs,
+        },
+    );
+    let mut served = 0;
+    for outgoing in out {
+        assert_eq!(outgoing.peer, requester_peer);
+        let responses = net
+            .engine_mut(requesting_node)
+            .on_message(serving_node, outgoing.msg);
+        assert!(responses.is_empty(), "key adoption produces no outgoing");
+        served += 1;
+    }
+    served
+}
+
+/// Key history spanning multiple epochs (spec D6/G4): a room that has rotated
+/// several times serves every held epoch to a newly-joined member, who adopts
+/// them all and reads backlog from each prior epoch.
+#[test]
+fn key_history_spans_multiple_epochs_for_new_member() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_B, device_engine(&Principal::new(0x10), room, cfg));
+    net.add_peer(NODE_C, device_engine(&Principal::new(0x20), room, cfg));
+
+    let r = build_three_member_room(&mut net, NODE_A, "Multi-Epoch History");
+    net.connect_all();
+    net.run_to_quiescence();
+    net.assert_converged(&[NODE_A, NODE_B, NODE_C]);
+
+    // Alice rotates through epochs 2, 3, 4 (standalone distributions wrapped
+    // for alice + bob), posting a message in each. Carol (still Active) is
+    // *not* in the wrapped set, so she does not receive these epochs from the
+    // DAG — she must fetch them later via key history.
+    let mut head = r.head;
+    let mut epoch_keys = Vec::new();
+    let mut epoch_msgs = Vec::new();
+    for (i, epoch) in (2u64..=4).enumerate() {
+        let key = RoomKey::generate();
+        let dist = iroh_rooms_core::event::distribution::build_member_key_distribution(
+            &r.alice.id,
+            &r.alice.dev,
+            &r.room,
+            epoch,
+            &key,
+            &[r.alice.device(), r.bob.device()],
+            &[head],
+            T0 + 10 + (i as u64) * 2,
+        )
+        .expect("build distribution");
+        head = signed::event_id_from_bytes(&dist.signed);
+        net.engine_mut(NODE_A)
+            .publish(&dist.to_bytes())
+            .expect("publish distribution");
+
+        let msg = publish_encrypted_text(
+            &mut net,
+            NODE_A,
+            &r.alice,
+            r.room,
+            &format!("epoch {epoch} backlog"),
+            epoch,
+            &key,
+            [u8::try_from(0xA0 + epoch).expect("epoch fits in nonce byte"); 12],
+            head,
+            T0 + 11 + (i as u64) * 2,
+        );
+        head = msg;
+        epoch_keys.push((epoch, key));
+        epoch_msgs.push((epoch, msg));
+    }
+
+    // Converge alice + bob only (carol is isolated from the DAG fan-out so
+    // she stays keyless, modelling a member who was offline through the
+    // rotations and must catch up via key history). Bob holds every epoch.
+    net.run_to_quiescence();
+    for (epoch, _) in &epoch_keys {
+        assert!(net.engine(NODE_A).has_room_key(*epoch));
+        assert!(net.engine(NODE_B).has_room_key(*epoch));
+        assert!(
+            !net.engine(NODE_C).has_room_key(*epoch),
+            "carol must not hold epoch {epoch} from the DAG (not in wrapped set)"
+        );
+    }
+
+    // Carol requests her full key history (she has none) from alice, spanning
+    // every rotated epoch. She adopts them all.
+    let served = drive_key_history_round_trip(
+        &mut net,
+        NODE_A,
+        NODE_C,
+        &r.carol,
+        r.room,
+        std::collections::BTreeSet::new(),
+    );
+    assert!(served > 0, "alice must serve key history");
+    for (epoch, key) in &epoch_keys {
+        assert_eq!(
+            net.engine(NODE_C)
+                .room_key(*epoch)
+                .unwrap_or_else(|| panic!("carol must adopt epoch {epoch}"))
+                .as_bytes(),
+            key.as_bytes(),
+            "carol must recover the identical epoch {epoch} key"
+        );
+    }
+
+    // Carol now reads backlog from every prior epoch (G4).
+    for (epoch, msg) in &epoch_msgs {
+        let ev = stored_event(&net, NODE_C, *msg);
+        let body = net
+            .engine(NODE_C)
+            .readable_content(&ev)
+            .unwrap_or_else(|| panic!("carol must read epoch {epoch} backlog"));
+        let Content::MessageText(text) = body else {
+            panic!("expected message text");
+        };
+        assert_eq!(text.body, format!("epoch {epoch} backlog"));
+    }
+}
+
+/// Key-history pagination (spec D6): the per-response chunk cap
+/// (`MAX_KEY_HISTORY_CHUNKS_PER_RESPONSE == 32`) bounds a single `KeyHistory`
+/// message; a requester whose history exceeds the cap gets the first page and
+/// re-asks with an updated `have_epochs` to fetch the rest. Every page stays
+/// under the wire frame cap.
+#[test]
+fn key_history_paginates_at_chunk_cap_and_requester_reasks() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_C, device_engine(&Principal::new(0x20), room, cfg));
+
+    // Two-member room (alice + bob); alice rotates through 40 epochs so the
+    // history exceeds the 32-chunk page cap. Carol's engine is registered (as
+    // the requester) but never seeded with the distributions, so she stays
+    // keyless.
+    let r = build_three_member_room(&mut net, NODE_A, "Pagination");
+    net.connect_all();
+    net.run_to_quiescence();
+
+    let mut head = r.head;
+    let total_epochs = 40u64;
+    for epoch in 2..=(total_epochs + 1) {
+        let key = RoomKey::generate();
+        let dist = iroh_rooms_core::event::distribution::build_member_key_distribution(
+            &r.alice.id,
+            &r.alice.dev,
+            &r.room,
+            epoch,
+            &key,
+            &[r.alice.device(), r.bob.device()],
+            &[head],
+            T0 + 10 + epoch,
+        )
+        .expect("build distribution");
+        head = signed::event_id_from_bytes(&dist.signed);
+        net.engine_mut(NODE_A)
+            .publish(&dist.to_bytes())
+            .expect("publish distribution");
+    }
+    net.run_to_quiescence();
+
+    // Sanity: alice holds all 40 epochs (2..=41).
+    let held: Vec<u64> = (2..=(total_epochs + 1))
+        .filter(|e| net.engine(NODE_A).has_room_key(*e))
+        .collect();
+    assert_eq!(held.len() as u64, total_epochs, "alice holds every epoch");
+
+    // Carol has none. First page: capped at 32 chunks. The request/response
+    // goes over the direct drive; we count how many epochs carol adopts.
+    let carol_peer = PeerId::from_bytes(*r.carol.device().as_bytes());
+    let out = net.engine_mut(NODE_A).on_message(
+        carol_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: r.room,
+            have_epochs: std::collections::BTreeSet::new(),
+        },
+    );
+    assert!(!out.is_empty(), "alice must serve a first page");
+    // Every served KeyHistory message must respect the chunk cap and the wire
+    // frame cap.
+    let mut total_chunks_served = 0usize;
+    for outgoing in &out {
+        if let SyncMessage::KeyHistory { chunks, .. } = &outgoing.msg {
+            assert!(
+                chunks.len() <= 32,
+                "a single KeyHistory message must not exceed the 32-chunk cap"
+            );
+            total_chunks_served += chunks.len();
+            assert!(
+                outgoing.msg.encode().len() <= MAX_FRAME_BYTES,
+                "a KeyHistory page must fit the 1 MiB wire frame"
+            );
+        }
+    }
+    assert!(
+        total_chunks_served <= 32,
+        "the first page serves at most the 32-chunk cap across messages, got {total_chunks_served}"
+    );
+
+    // Deliver the first page to carol; count adopted epochs.
+    let mut have_epochs = std::collections::BTreeSet::new();
+    for outgoing in out {
+        let _ = net.engine_mut(NODE_C).on_message(NODE_A, outgoing.msg);
+    }
+    for epoch in 2..=(total_epochs + 1) {
+        if net.engine(NODE_C).has_room_key(epoch) {
+            have_epochs.insert(epoch);
+        }
+    }
+    assert!(
+        !have_epochs.is_empty(),
+        "carol must adopt at least one epoch from the first page"
+    );
+    assert!(
+        (have_epochs.len() as u64) < total_epochs,
+        "the first page must be partial (history exceeds the cap)"
+    );
+
+    // Carol re-asks with her updated have_epochs; pagination terminates with
+    // the full history.
+    let mut rounds = 0;
+    while (have_epochs.len() as u64) < total_epochs {
+        rounds += 1;
+        assert!(rounds < 8, "pagination must terminate in a few rounds");
+        let served = drive_key_history_round_trip(
+            &mut net,
+            NODE_A,
+            NODE_C,
+            &r.carol,
+            r.room,
+            have_epochs.iter().copied().collect(),
+        );
+        assert!(served > 0, "alice keeps serving while epochs are missing");
+        for epoch in 2..=(total_epochs + 1) {
+            if net.engine(NODE_C).has_room_key(epoch) {
+                have_epochs.insert(epoch);
+            }
+        }
+    }
+    assert_eq!(
+        have_epochs.len() as u64,
+        total_epochs,
+        "carol converges to the full 40-epoch history across pages (D6)"
+    );
+}
+
+/// Key history with a partial `have_epochs` set (spec D6): only the epochs the
+/// requester is missing are served — already-held epochs are skipped, so a
+/// catch-up transfer is incremental, not a full re-send.
+#[test]
+fn key_history_serves_only_missing_epochs() {
+    let cfg = encrypted_cfg();
+    let room = signed::derive_room_id(&Principal::new(0x01).identity(), &NONCE, T0);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, device_engine(&Principal::new(0x01), room, cfg));
+    net.add_peer(NODE_C, device_engine(&Principal::new(0x20), room, cfg));
+
+    let r = build_three_member_room(&mut net, NODE_A, "Partial have_epochs");
+    net.connect_all();
+    net.run_to_quiescence();
+
+    // Alice rotates through epochs 2, 3, 4.
+    let mut head = r.head;
+    for epoch in 2u64..=4 {
+        let key = RoomKey::generate();
+        let dist = iroh_rooms_core::event::distribution::build_member_key_distribution(
+            &r.alice.id,
+            &r.alice.dev,
+            &r.room,
+            epoch,
+            &key,
+            &[r.alice.device(), r.bob.device()],
+            &[head],
+            T0 + 10 + epoch,
+        )
+        .expect("build distribution");
+        head = signed::event_id_from_bytes(&dist.signed);
+        net.engine_mut(NODE_A)
+            .publish(&dist.to_bytes())
+            .expect("publish distribution");
+    }
+    net.run_to_quiescence();
+
+    // Carol claims she already holds epoch 2 (have_epochs = {2}); alice must
+    // serve only epochs 3 and 4 — never re-send epoch 2.
+    let carol_peer = PeerId::from_bytes(*r.carol.device().as_bytes());
+    let out = net.engine_mut(NODE_A).on_message(
+        carol_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: r.room,
+            have_epochs: [2u64].into_iter().collect(),
+        },
+    );
+    assert!(!out.is_empty(), "alice must serve the missing epochs");
+    let mut served_epochs = Vec::new();
+    for outgoing in &out {
+        if let SyncMessage::KeyHistory { chunks, .. } = &outgoing.msg {
+            for chunk in chunks {
+                served_epochs.push(chunk.epoch);
+            }
+        }
+    }
+    assert!(
+        !served_epochs.contains(&2),
+        "epoch 2 is already in have_epochs; it must not be re-served"
+    );
+    assert!(served_epochs.contains(&3), "epoch 3 must be served");
+    assert!(served_epochs.contains(&4), "epoch 4 must be served");
 }

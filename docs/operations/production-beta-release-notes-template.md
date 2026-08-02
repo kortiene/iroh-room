@@ -35,8 +35,26 @@ State these before install/run commands:
 - No central application server.
 - No guaranteed offline message delivery.
 - Local storage is plaintext unless this release explicitly says otherwise.
+  The per-epoch room content keys are stored in the `room_keys` table **inside
+  `rooms.db` itself** — there is no separate key store. Any copy, backup, or
+  read of `rooms.db` therefore includes both the ciphertext and the keys
+  needed to decrypt all covered history, so the database must be handled as a
+  secret (protected only as strongly as the identity keys, ADR-0001 scope;
+  threat-model T28).
 - Invite tickets are password-grade capabilities.
 - No native ticket-specific invite revocation if ADR-0002 remains in force.
+- **Content-key rotation (issue #191) constraints:** rotation is admin-driven
+  under a single immutable admin. An admin-offline removal/leave stalls
+  forward secrecy until the admin returns (T29). A voluntary `member.left`
+  revokes *access* immediately, but the departed member keeps its old epoch
+  key and can keep decrypting new content until the admin explicitly authors
+  and distributes a rotation that excludes it — **no automatic rotation fires
+  on the admin's next event in v1**, so this window is open-ended until an
+  operator rotates (T29). Metadata — event existence, type, timing, the
+  causal DAG, and an often-effectively-exact body length — stays cleartext
+  (T30); length-hiding padding is out of v1 scope. Rotation requires every
+  member past the step-6 compatibility floor (reader-first rollout, spec
+  `content-key-rotation.md` D8).
 - `audit.ndjson` is local best-effort audit, not remote, centrally retained,
   tamper-evident, or compliance-grade audit if ADR-0003 remains in force.
 - Binary artifacts are checksummed but not project-signed unless signing is
@@ -50,6 +68,9 @@ State these before install/run commands:
 - Storage posture: <ADR-0001 scoped plaintext beta / encrypted / blocked>.
 - Invite posture: <ADR-0002 bounded leaked-ticket model / native revocation>.
 - Audit posture: <ADR-0003 local audit / stronger audit>.
+- Content confidentiality posture: <content-key rotation enabled (T27
+  Controlled for the malicious-reader case; residuals T28/T29/T30) / rotation
+  not yet enabled — admission-based confidentiality only>.
 - Security reporting path: <PRIVATE_CONTACT_OR_PROCESS>.
 
 ## Compatibility And Migration
