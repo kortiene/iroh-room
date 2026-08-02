@@ -33,7 +33,7 @@ Six scope areas, each a self-contained reference section:
 3. [Canonical serialization rules](#3-canonical-serialization-rules) — the deterministic-CBOR profile.
 4. [Event ID & room ID derivation](#4-event-id--room-id-derivation) — the content-hash identifiers.
 5. [Signature payload & verification](#5-signature-payload--verification) — the 11-step algorithm.
-6. [MVP event-type registry](#6-mvp-event-type-registry) — the ten event types and their content schemas.
+6. [MVP event-type registry](#6-mvp-event-type-registry) — the twelve event types and their content schemas.
 
 Plus [membership & ordering](#7-membership-fold--ordering-summary),
 [connect-time authorization](#8-connect-time-authorization-blob--pipe),
@@ -304,7 +304,7 @@ completes them over `membership::AncestorView`).
 
 ## 6. MVP event-type registry
 
-*Spike: Event Protocol §7. Code: `event/{genesis,invite,join,left,removed,message,file,pipe,status,content}.rs`.*
+*Spike: Event Protocol §7. Code: `event/{genesis,invite,join,left,removed,message,file,pipe,status,content,encrypted,distribution}.rs`.*
 
 Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = unsigned int;
 `opt` = optional. `DeviceBinding = { identity_key: bstr[32], device_key: bstr[32], sig: bstr[64] }`
@@ -322,7 +322,8 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 | `pipe.opened` | Any current member (`owner_id == sender_id`). | room heads |
 | `pipe.closed` | The pipe owner or the admin. | room heads |
 | `agent.status` | Any current member (typically `role == "agent"`). | room heads |
-| `content.encrypted` | Any current member. Encrypted-content envelope (spec `content-key-rotation.md` D2); rollout phase R1: readers parse it as opaque-but-valid, **writers are disabled**. | room heads |
+| `content.encrypted` | Any current member. Encrypted-content envelope (spec `content-key-rotation.md` D2). Readers always parse it as opaque-but-valid; writers publish only behind the room's declared R2 floor (`SyncConfig::encrypted_content_writes`, rollout D8) — a floor no shipped CLI or `iroh-rooms-net` call site sets today. | room heads |
+| `member.key_distribution` | The **admin**'s device. Standalone distribution of a new content-key epoch to the remaining Active members (spec `content-key-rotation.md` D4/D6); the identical payload also rides inline on `member.removed.rotation`. | room heads |
 
 > **Removal is two distinct types**, not one type with a `reason` discriminator:
 > `member.left` (voluntary, signer == subject) and `member.removed` (admin kick, signer ==
@@ -374,7 +375,12 @@ role) · `device_binding: DeviceBinding` · `display_name: opt tstr`.
 **`member.removed`**
 `member_id: bstr[32]` (MUST `!= admin`) · `removed_by: bstr[32]` (MUST `== sender_id`) ·
 `reason: opt tstr` · `device_binding: opt DeviceBinding` (re-attestation of the admin's own
-device; verified when present, [§1](#1-identity--key-model)).
+device; verified when present, [§1](#1-identity--key-model)) ·
+`rotation: opt` [`member.key_distribution` content](#6-mvp-event-type-registry) (the D4 inline
+rotation payload — a fresh epoch key wrapped for the remaining Active members, excluding the
+removed member). Omitted entirely in plaintext rooms: strict validation rejects unknown content
+keys, so a parser older than `v0.1.0-rc.5` rejects a rotation-bearing `member.removed` as
+`invalid_content`. That is why the payload is gated on the room's encrypted-content opt-in.
 
 **`message.text`**
 `body: tstr` (≤ `MAX_MESSAGE_BODY_BYTES` = 16,384 bytes) · `format: opt tstr` (`plain` default \|
@@ -444,9 +450,29 @@ verified at key *adoption* per D5/D5a, where conflicting same-epoch keys fail cl
 inner body's canonical-CBOR map; after a successful open, the body MUST still pass the strict
 `Content::parse(inner_type)` **and** the sender field rules before anything surfaces (spec D2b
 — a failure is *unreadable*, logged with a stable `UnreadableReason` code, never a fold
-rejection). Writers publish only behind the room's declared floor; with the floor on,
+rejection). Writers publish only behind a declared compatibility floor. In v1 that floor is
+`SyncConfig::encrypted_content_writes`, a **per-engine** bool that defaults off and that no
+shipped code sets — there is no room-level declaration and no CLI or configuration path to turn
+it on, so shipped binaries never author `content.encrypted`. With the floor on,
 locally-authored **plaintext** content-class events are refused instead
 (`sync_plaintext_writes_disabled`) so the opt-in cannot leak cleartext by accident.
+
+**`member.key_distribution`** *(spec `content-key-rotation.md` D4/D5/D6; code:
+`event/distribution.rs`)*
+`new_epoch: uint` · `key_commitment: bstr[32]` (`DIGEST_LEN`; `BLAKE3(new_epoch_be8 ‖ room_id ‖
+room_key)`, verified at adoption — a second distribution claiming the same epoch under a
+different commitment **poisons** that epoch and fails reads closed until the D5a resolution rule
+picks the distribution with the smallest event id) ·
+`wrapped_keys: [(bstr[32] device_key, { ephemeral_public: bstr[32] (`PUBLIC_KEY_LEN`), nonce:
+bstr[12] (`WRAPPED_KEY_NONCE_LEN`), ciphertext: bstr[48] (`WRAPPED_KEY_CIPHERTEXT_LEN` — the
+32-byte room key plus a 16-byte GCM tag) })]` — one entry per recipient device, sorted by device
+id in canonical CBOR, and MUST be non-empty.
+
+Admin-authored only. Each entry wraps the same `new_epoch` room key to one recipient device
+under `SUITE_V1` (X25519 from the recipient's Ed25519 device key, HKDF-SHA-256, AES-256-GCM),
+using a fresh ephemeral admin key per recipient (D3a). The wrap KDF and its AAD pin `new_epoch`
+as **8-byte big-endian**, unlike the CBOR `uint` on the `content.encrypted` envelope — two
+independently frozen conventions; do not "harmonize" them.
 
 ### Structural sizes (from `event/constants.rs`)
 
@@ -514,7 +540,9 @@ linear extension of the causal DAG.
 ### Authorization gate & sticky departure
 
 - `member.invited(X)`, `member.removed(X)`: valid iff signer `== admin` (and for removal,
-  `X != admin`).
+  `X != admin`). `member.key_distribution` takes the **same admin-only gate** but names no
+  subject: it is authorization-gated and membership-inert — the fold judges it, then records no
+  status, role, or device change.
 - `member.left(X)`: valid iff signer `== X`.
 - `member.joined(X)`: valid iff signer is `X`'s device key **and** it causally descends from a
   **still-live** admin invite for `X` — one that has not been invalidated by a
@@ -763,12 +791,12 @@ document's §9 table cannot silently fall out of date without CI catching it fir
 |---|---|
 | **Single immutable admin** — the genesis signer, no co-admins, no transfer (spike §3.1, §7). | Multi-admin as a grow-only/quorum CRDT or a signed successor list (post-MVP). |
 | **One device per identity** — multi-device out of scope (spike §1). | A generalized device set per identity. |
-| **No key rotation.** Removal changes membership state but cannot cryptographically erase already-received data; enforcement is fail-closed-at-connect + tear-down-on-learn, **bounded by removal-event reachability**, not "briefly" (spike §3.6, §0). | Key rotation; member removal with rotation (PRD §13.5). |
+| **Content-key rotation exists on the wire, but no shipped binary can reach it.** `member.key_distribution`, `member.removed.rotation`, and the `content.encrypted` envelope implement per-epoch rotation (spec `content-key-rotation.md`), yet no CLI or `iroh-rooms-net` call site authors a rotation or raises the `encrypted_content_writes` floor — so a CLI-operated room stays plaintext, and removal still cannot cryptographically erase already-received data. Enforcement remains fail-closed-at-connect + tear-down-on-learn, **bounded by removal-event reachability**, not "briefly" (spike §3.6, §0). | The room-scoped opt-in surface and an admin rotation command (`content-key-rotation.md` §7 step 6); full group ratchet and PFS (PRD §13.5). |
 | **Key-bound invites only** — open/bearer tickets are excluded because they defeat sticky-kick (a banned party could mint a join under a fresh key). No native revocation beyond removing the subject; `max_uses` is not convergently enforceable, so an invite is treated as single-subject, reusable until expiry (spike §6). | Admin-signed `cap_id` revocation events; first-key-binding for open tickets; invite revocation (PRD §13.5). |
 | **Removed-member timeline pollution** — a removed member can keep authoring log-valid, zero-capability events by citing only pre-removal ancestors (spike §5). | UI hard-segregation of `from_removed_member` events from pickers/listings; an admin-signed tombstone (recommended, non-blocking). |
 | **Segregated admin fork** is detectable only via admin-tip advertisement; a removal held only by offline/withholding peers is irreducible without an availability assumption (spike §0). | A stronger availability assumption or an always-on relay/witness set. |
 | **Recent-history chat sync is count/time-bounded**, but the membership sub-DAG plus the full admin chain are **never windowed** — a hard invariant, not a limitation to fix (spike §0, §4). | N/A — this stays a hard invariant even as chat windowing policy evolves. |
-| No full group E2EE ratchet, no perfect forward secrecy, no secure multi-device recovery, no anonymous credentials (PRD §13.4). | Security roadmap: device verification, encrypted local database, recovery phrase, secure backup, trust levels for agents, room-level pipe policies, storage encryption, security review before public beta (PRD §13.5). |
+| No full group E2EE ratchet, no per-message forward secrecy (the #191 content-key rotation buys **post-departure** forward secrecy only, and only in a deployment that opts in), no secure multi-device recovery, no anonymous credentials (PRD §13.4). | Security roadmap: device verification, encrypted local database, recovery phrase, secure backup, trust levels for agents, room-level pipe policies, storage encryption, security review before public beta (PRD §13.5). |
 
 ---
 
@@ -781,7 +809,7 @@ document's §9 table cannot silently fall out of date without CI catching it fir
 | §3 Canonical serialization | Event Protocol §3 | `event/cbor.rs` | §1, §2 |
 | §4 Event ID & room ID | Event Protocol §4–§5 | `event/{ids,genesis}.rs` | §3, §4, §7 |
 | §5 Signature & verification | Event Protocol §6 | `event/{signed,validate}.rs` | §5, §6 |
-| §6 Event-type registry | Event Protocol §7 | `event/{genesis,invite,join,left,removed,message,file,pipe,status,content}.rs` | `serialization` (`invalid_content_*` / `valid_*` vectors) |
+| §6 Event-type registry | Event Protocol §7 | `event/{genesis,invite,join,left,removed,message,file,pipe,status,content,encrypted,distribution}.rs` | `serialization` (`invalid_content_*` / `valid_*` vectors) |
 | §7 Membership fold & ordering | Membership & Ordering §0–§4, §7 | `membership/{fold,model}.rs` | §10–§12, §18, §19 |
 | §8 Connect-time authorization | Membership & Ordering §5 | `membership/access.rs` | §16, §17 |
 | §9 Reason codes | Event Protocol §8 | `event/reject.rs` | `taxonomy.rs` |
@@ -793,6 +821,7 @@ document's §9 table cannot silently fall out of date without CI catching it fir
 - [`PHASE-0-SPIKE.md`](../PHASE-0-SPIKE.md) — the full normative source, ADRs, and residual-risk analysis.
 - [`PRD.v0.3.md`](../PRD.v0.3.md) §18.6 (Protocol Ambiguity Risk), §11 (product-level envelope view), §13/§14 (security & availability model).
 - [`specs/content-and-moderation-event-schemas.md`](../specs/content-and-moderation-event-schemas.md) — v2.0 design (not shipping) for the content-kind registry, stream-scoped moderation events, and `unknown_content_kind` rejection; gated on the D-9 schema-evolution ADR (P-26).
+- [`specs/content-key-rotation.md`](../specs/content-key-rotation.md) — the normative spec behind the `content.encrypted` envelope, the `member.key_distribution` payload, `SUITE_V1`, the D5a conflict rule, and the D8 write floor.
 - [`docs/getting-started.md`](getting-started.md) — the runnable end-to-end demo.
 - `crates/iroh-rooms-core/` — the reference implementation.
 - `crates/iroh-rooms-core/tests/conformance/` — the conformance suite.

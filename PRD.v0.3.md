@@ -842,7 +842,10 @@ MVP is successful if:
 12. Unauthorized pipe connection attempts are rejected.
 13. A room with 5 participants remains usable. This is the declared ceiling
     (ADR-1, `PHASE-0-SPIKE.md` §17.1.13): the full-mesh QUIC transport is sized
-    for ≤5 peers / ≤10 links, and nothing in code enforces or warns above it.
+    for ≤5 peers / ≤10 links, and since #137/#144 the code enforces it — the
+    membership fold hard-rejects the 6th active join with
+    `RejectReason::RoomFull` (`MAX_ACTIVE_MEMBERS = 5`), and a live observer
+    emits a one-shot near-cap warning one slot below it.
     Measured reality above the ceiling: at N=25 the system does not deliver
     messages at all (idle `frames_sent=0`, `accepted=0`, 661 MB inbound
     backlog; under load 22 published events produced `accepted=0` room-wide),

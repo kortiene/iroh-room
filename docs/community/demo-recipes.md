@@ -9,8 +9,9 @@ Supported binary artifacts for `v0.1.0-rc.5`: `x86_64-apple-darwin`,
 other platform builds from source.
 
 Source builders should use the exact release tag rather than `main`. The
-shipping dependency graph requires Rust 1.85 or newer in practice; RC1 was built
-with Rust 1.96.0.
+shipping dependency graph requires Rust 1.91 or newer in practice (the iroh 1.0
+stack declares `rust-version = "1.91"`); the `v0.1.0-rc.5` artifacts were built
+with Rust 1.97.1.
 
 ```bash
 git clone --branch v0.1.0-rc.5 --depth 1 \

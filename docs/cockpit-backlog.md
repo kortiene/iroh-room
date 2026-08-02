@@ -731,7 +731,8 @@ when a lock is held (mirror the CLI's bounded-wait honesty).
 **AC:**
 - parity test: `rooms.list`/`room.snapshot` agree with `room members --json` + `room tail --offline --json` on the same home
 - graceful `--version` handshake
-- builds with the workspace toolchain (`rust-version 1.80`)
+- builds with the workspace toolchain (Rust 1.91 or newer — this crate depends on
+  `iroh-rooms` with `experimental`, which pulls in the iroh 1.0 stack)
 
 **Tests:** Rust integration tests against a fixture home; TS-side decode tests.
 

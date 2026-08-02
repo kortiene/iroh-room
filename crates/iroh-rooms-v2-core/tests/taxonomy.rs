@@ -155,7 +155,7 @@ fn walk_and_find(dir: &std::path::Path, needle: &str) -> bool {
                 return true;
             }
         } else if path.extension().is_some_and(|e| e == "rs")
-            && !path.file_name().is_some_and(|n| n == "error.rs")
+            && path.file_name().is_none_or(|n| n != "error.rs")
         {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if text.contains(needle) {

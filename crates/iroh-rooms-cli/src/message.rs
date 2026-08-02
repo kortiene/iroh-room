@@ -1381,7 +1381,7 @@ mod tests {
     fn timeout_units_parse() {
         assert_eq!(parse_timeout("5s").unwrap(), Duration::from_secs(5));
         assert_eq!(parse_timeout("500ms").unwrap(), Duration::from_millis(500));
-        assert_eq!(parse_timeout("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_timeout("2m").unwrap(), Duration::from_mins(2));
         assert_eq!(parse_timeout("3").unwrap(), Duration::from_secs(3)); // bare = seconds
     }
 

@@ -10,9 +10,14 @@ license.workspace = true
 repository.workspace = true
 publish = false            # developer preview; crates.io release is a follow-up (spec OQ3)
 description = "Iroh Rooms Rust SDK: a curated, stability-tiered façade over iroh-rooms-core/-net"
-# Deliberately does NOT inherit the workspace `rust-version`: the `experimental`
-# feature pulls in `iroh-rooms-net` -> the iroh 1.0 stack (rustc >= 1.85),
-# mirroring `iroh-rooms-net/Cargo.toml`.
+# MSRV is feature-dependent, so this declares the floor of the DEFAULT (stable,
+# pure) tier and documents the rest. Default features resolve to rustc 1.85 (the
+# RustCrypto/dalek stack behind `iroh-rooms-core`). `experimental` / `full` /
+# `relay-only-test` pull in `iroh-rooms-net` -> the iroh 1.0 stack, which
+# declares `rust-version = "1.91"` and enforces that floor itself. Declaring
+# 1.91 here instead would lock a stable-tier consumer out of a build that works,
+# which is the opposite of what the stable tier is for.
+rust-version = "1.85"
 
 [lib]
 path = "src/lib.rs"
