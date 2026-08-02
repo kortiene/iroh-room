@@ -129,8 +129,28 @@ the durable audit trail. **Detection is unchanged; only the response changed.**
 
 **Scope `admin_seq` to membership/governance types.** Issue #191 offered this,
 and `PHASE-0-SPIKE.md:665` supports the underlying idea (fork severity should
-depend on whether the forked events "touch membership/authz"). Rejected for now
-as the primary fix because it is expensive and does not address the defect:
+depend on whether the forked events "touch membership/authz").
+
+The naive form — "membership types get a seq, everything else gets `NULL`" — is
+**actively dangerous and must not be implemented**. The derivation propagates
+only through parents that themselves carry a defined `admin_seq`
+(`store/mod.rs`: `for p in &parents { if let Some(a) = admin_seq_of(tx, p)? }`),
+so nulling admin chat *severs* the chain rather than thinning it. The shipped
+rc.3 fixture proves it: its chain is `E_CREATE(0) → E_MESSAGE_1(1) →
+E_MESSAGE_2(2) → E_MESSAGE_3(3) → E_INVITE_BOB(4)`
+(`tests/compatibility.rs` `RC3_DERIVED_CACHE`). Null the three chat rows and
+`E_INVITE_BOB`'s only parent has no value, so the invite itself becomes `None`.
+`admin_chain_tip` would pin at genesis for the life of the room, `AdminTip` would
+advertise `(genesis, 0)` forever, and the **T18 withheld-removal detector — the
+entire reason the chain exists — would be silently dead.** That is a far worse
+regression than the wedge it set out to fix.
+
+A sound variant exists: split *numbering eligibility* from *propagation*, so every
+admin event stays a carrier of the chain while only membership types consume a
+slot. If scoping is ever revisited, that is the shape to use.
+
+Either way it is rejected as the primary fix, because it is expensive and does
+not address the defect:
 
 - `admin_seq` is a **persisted column**. Existing databases keep values computed
   under the old rule; nothing recomputes them on open (`EventStore::rebuild()`
@@ -154,6 +174,15 @@ noise, as a coordinated change with a compatibility floor.
 **Bounded/timed recovery from the fork.** Deny for N ticks, then clear. Rejected:
 the fork verdict is already, by construction, the reconciled state, so a timer
 would delay recovery without ever preventing anything.
+
+**Adjudication with a "held-and-folded" clearing predicate.** The other option
+#191 offered: keep the denial, but clear it once every event at the colliding seq
+is in the fold's accepted set. Rejected as machinery that only *looks* like
+adjudication. `deliver` stores only fold-accepted events, so `stored ⟹ folded`
+holds on every path: the predicate is already true at the instant the fork is
+declared. It reaches the same outcome as this ADR while implying a safety check
+that never actually withholds anything — worse than the honest version, because a
+reader would trust it.
 
 ## Consequences
 
