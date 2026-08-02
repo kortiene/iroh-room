@@ -28,14 +28,18 @@ fi
 # release_readiness_docs.rs asserts the two sets match exactly so they cannot
 # drift apart. `facade_e2e.rs` is intentionally absent: its tests are not
 # `#[ignore]`-gated and already run inside the deterministic `--all-features`
-# tier below.
+# tier below. `diagnostics_cli.rs` is intentionally absent for the same reason:
+# its 4 tests are the ungated CI tier (same CI-safe join-then-dial shape as
+# `error_taxonomy_e2e.rs`'s CI tests, run inside `verify.sh` below) and it has
+# no `#[ignore]`-gated online tier — listing it here made the row a 0-test
+# no-op (audit feature-complete-audit-2026-07-02.md D-7).
 ONLINE_TIERS=(
   "cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1"
   "cargo test -p iroh-rooms-cli --test full_demo_e2e -- --ignored --test-threads=1"
   "cargo test -p iroh-rooms-cli --test pipe_cli -- --ignored --test-threads=1"
   "cargo test -p iroh-rooms-cli --test agent_e2e -- --ignored --test-threads=1"
   "cargo test -p iroh-rooms --features experimental --test example_agent_e2e -- --ignored --test-threads=1"
-  "cargo test -p iroh-rooms-cli --test error_taxonomy_e2e --test diagnostics_cli -- --ignored --test-threads=1"
+  "cargo test -p iroh-rooms-cli --test error_taxonomy_e2e -- --ignored --test-threads=1"
 )
 
 CHECK_NAMES=()

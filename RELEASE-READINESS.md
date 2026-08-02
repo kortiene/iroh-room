@@ -86,7 +86,7 @@ never produce a READY verdict).
 | Pipe security (authorized + unauthorized live) | `cargo test -p iroh-rooms-cli --test pipe_cli -- --ignored --test-threads=1` |
 | Agent flow (live status push) | `cargo test -p iroh-rooms-cli --test agent_e2e -- --ignored --test-threads=1` |
 | Agent flow (example agent, IR-0304) | `cargo test -p iroh-rooms --features experimental --test example_agent_e2e -- --ignored --test-threads=1` |
-| Error taxonomy / diagnostics (live) | `cargo test -p iroh-rooms-cli --test error_taxonomy_e2e --test diagnostics_cli -- --ignored --test-threads=1` |
+| Error taxonomy (live) | `cargo test -p iroh-rooms-cli --test error_taxonomy_e2e -- --ignored --test-threads=1` |
 
 ### P1 — tracked, requires explicit acknowledgement (not auto-blocking)
 
