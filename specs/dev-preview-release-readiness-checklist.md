@@ -141,7 +141,7 @@ gate, but they prove product-level ACs and are **release-blocking**. Run with
 | Pipe security (authorized + unauthorized live) | `cargo test -p iroh-rooms-cli --test pipe_cli -- --ignored --test-threads=1` |
 | Agent flow (live status push) | `cargo test -p iroh-rooms-cli --test agent_e2e -- --ignored --test-threads=1` |
 | Agent flow (example agent, IR-0304) | `cargo test -p iroh-rooms --test example_agent_e2e -- --ignored --test-threads=1` |
-| Error taxonomy / diagnostics (live) | `cargo test -p iroh-rooms-cli --test error_taxonomy_e2e --test diagnostics_cli -- --ignored --test-threads=1` |
+| Error taxonomy (live) | `cargo test -p iroh-rooms-cli --test error_taxonomy_e2e -- --ignored --test-threads=1` |
 | SDK façade over real QUIC | `cargo test -p iroh-rooms --test facade_e2e -- --ignored --test-threads=1` |
 
 > Implementation note for D2: discover the online-tier test binaries dynamically or keep
