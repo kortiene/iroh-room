@@ -128,8 +128,17 @@ impl From<StoreError> for SyncError {
     }
 }
 
-/// The room's admin-completeness verdict — the load-bearing fail-closed predicate
-/// the access planes consult (spec D6 / §10).
+/// The room's admin-completeness verdict (spec D6 / §10).
+///
+/// **This is not the authorization gate.** Since #211 exactly one variant denies
+/// anything — [`AdminViewSuspect`](Self::AdminViewSuspect). Consult
+/// [`SyncEngine::fail_closed_subjects`] for who is actually denied; do not infer
+/// a gate from "verdict != `Complete`", or you will re-create the room-wide
+/// outage ADR-0005 removed.
+///
+/// When a node is both behind *and* holds a fork, this reports
+/// `AdminViewSuspect`: the state with the gate outranks the advisory one. The
+/// fork is still recorded as a durable CRITICAL `equivocation` trust decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Completeness {
     /// The local admin view is as complete as anything advertised in the room.
@@ -137,10 +146,18 @@ pub enum Completeness {
     /// A higher admin tip is known but not yet backfilled: the node *might* be
     /// missing a removal and **fails closed** on removal-sensitive decisions for
     /// the affected subjects until it catches up.
+    ///
+    /// This is the only variant that denies anyone.
     AdminViewSuspect,
     /// Two distinct admin events were observed at the same `admin_seq` — the
-    /// detectable signature of an admin self-fork (spec §7); fail closed on
-    /// contested subjects and raise a CRITICAL `equivocation` alert.
+    /// detectable signature of an admin self-fork (spec §7). Raises a CRITICAL
+    /// `equivocation` alert.
+    ///
+    /// **Advisory: this denies nobody** (ADR-0005 / #211). A fork is only ever
+    /// declared over branches this node *holds*, so nothing is missing and the
+    /// fold has already merged them at least privilege. Treating it as a gate is
+    /// what wedged rooms permanently, because an honest admin publishing from a
+    /// stale head produces the identical signal.
     AdminForkDetected,
 }
 
@@ -149,8 +166,14 @@ pub enum Completeness {
 pub enum Severity {
     /// Advisory: catch-up will resolve it.
     Warning,
-    /// Non-recoverable safety event (admin equivocation, a degraded local
+    /// Safety event an operator must see (admin equivocation, a degraded local
     /// store).
+    ///
+    /// This is an **alert severity, not an authorization verdict**. Since #211
+    /// an `equivocation` decision no longer denies anyone: the fork state is by
+    /// construction one of complete information, so it is recorded and surfaced
+    /// but does not gate access. Only a *missing* admin event (`AdminViewSuspect`)
+    /// fails subjects closed, and that clears on catch-up.
     Critical,
 }
 
@@ -1418,14 +1441,24 @@ impl SyncEngine {
         })
     }
 
-    /// The admin-completeness verdict the access planes consult (spec D6).
+    /// The admin-completeness verdict (spec D6).
+    ///
+    /// Reporting only. The access planes must gate on
+    /// [`fail_closed_subjects`](Self::fail_closed_subjects), not on this — see
+    /// [`Completeness`] for why a non-`Complete` verdict does not imply a denial.
     #[must_use]
     pub fn completeness(&self) -> Completeness {
         self.completeness
     }
 
-    /// The subjects on which removal-sensitive access must fail closed while
-    /// [`completeness`](Self::completeness) is not [`Complete`](Completeness::Complete).
+    /// The subjects on which removal-sensitive access must fail closed — the
+    /// authoritative gate.
+    ///
+    /// Non-empty only while the node is **missing** an admin event it knows
+    /// exists ([`AdminViewSuspect`](Completeness::AdminViewSuspect)), and it
+    /// clears on catch-up. A detected fork contributes nothing here (ADR-0005 /
+    /// #211), so this can be empty while
+    /// [`completeness`](Self::completeness) is not `Complete`.
     #[must_use]
     pub fn fail_closed_subjects(&self) -> Vec<IdentityKey> {
         self.fail_closed.iter().copied().collect()
@@ -2806,14 +2839,25 @@ impl SyncEngine {
             false
         };
 
-        self.completeness = if fork.is_some() {
-            Completeness::AdminForkDetected
-        } else if behind {
+        // `behind` outranks `fork` in the reported verdict. Before #211 the order
+        // did not matter — both states denied — but now only `behind` closes
+        // admission. A node that holds a fork *and* is behind would otherwise
+        // report the advisory `AdminForkDetected` through the public
+        // `Node::completeness()` API while subjects are in fact failing closed,
+        // telling an embedder that nothing is denied at the exact moment the gate
+        // is active. The fork is not lost: it is recorded below as a durable
+        // CRITICAL trust decision.
+        self.completeness = if behind {
             Completeness::AdminViewSuspect
+        } else if fork.is_some() {
+            Completeness::AdminForkDetected
         } else {
             Completeness::Complete
         };
 
+        // Recorded independently, not as an either/or: the two conditions are
+        // orthogonal, so a concurrent fork must not swallow the suspicion record
+        // that explains why access is denied.
         if let Some((seq, ids)) = fork {
             self.record_trust(TrustDecision {
                 code: "equivocation",
@@ -2821,7 +2865,8 @@ impl SyncEngine {
                 admin_seq: seq,
                 event_ids: ids,
             });
-        } else if behind {
+        }
+        if behind {
             if let Some(susp) = self.suspect_tip {
                 self.record_trust(TrustDecision {
                     code: "admin_view_suspect",
@@ -2832,12 +2877,33 @@ impl SyncEngine {
             }
         }
 
-        // Fail closed on every removal-sensitive subject while incomplete: any
-        // not-yet-applied admin event could remove an active member, and we
-        // cannot know which, so we deny on all non-admin, non-removed subjects
-        // (the conservative, safe fail-closed set; spec D6 / §10).
+        // Fail closed on every removal-sensitive subject while an admin event is
+        // MISSING: a not-yet-applied admin event could remove an active member,
+        // and we cannot know which, so we deny on all non-admin, non-removed
+        // subjects (the conservative, safe fail-closed set; spec D6 / §10).
+        //
+        // Gated on `behind` — not on `completeness != Complete` — because the
+        // fork state is the opposite situation (#211). A fork is only ever
+        // declared over branches this node **holds** (`held.len() >= 2` above),
+        // so by construction nothing is missing and the rationale in the
+        // paragraph above does not apply: the fold has already merged both
+        // branches at least privilege (Test Vector §18), and `docs/protocol.md`
+        // §9 classifies `equivocation` as an advisory flag that "never affect[s]
+        // ... any authorization/expiry verdict" (Test Vector §12).
+        //
+        // Denying here turned ordinary concurrency — an admin publishing from a
+        // stale head — into a permanent, room-wide, reboot-surviving outage,
+        // while buying nothing against a malicious admin: the sole immutable
+        // admin can already remove anyone unilaterally, so equivocating gains it
+        // no capability it lacks. The signal is also undecidable (a benign
+        // stale-head publish and a deliberate fork are byte-identical) and, per
+        // the accept-time caching of `admin_ids_by_seq`, not even reliable.
+        //
+        // Detection is unchanged: the CRITICAL `equivocation` trust decision is
+        // still recorded above and persisted, and `completeness()` still reports
+        // `AdminForkDetected`. Only the authorization response changed.
         self.fail_closed.clear();
-        if self.completeness != Completeness::Complete {
+        if behind {
             let snap = &self.membership_projection.snapshot;
             let admin = snap.admin().copied();
             for member in snap.members() {

@@ -595,9 +595,20 @@ bound `device`, and the access predicates `blob_serve_allowed` / `pipe_connect_a
 
 Enforcement happens at QUIC connect-accept time, evaluated against the **current local
 membership snapshot** (the fold over the whole local validated log), default-deny. If the
-`admin_seq` incompleteness detector is tripped (a known-higher admin tip not yet backfilled, or
-a same-`admin_seq` fork), the node **fails closed** on affected subjects and raises a CRITICAL
-`equivocation` alert on the fork case.
+`admin_seq` incompleteness detector reports a **known-higher admin tip not yet backfilled**, the
+node **fails closed** on affected subjects until it catches up — an unapplied admin event could
+be a removal and the node cannot know which. That is the T18 (withheld-removal) defence, and it
+clears on catch-up or via the bounded attempt budget ([§13](#11-mvp-limitations-vs-roadmap)).
+
+A **same-`admin_seq` fork** is the other half of the detector and is treated differently
+(ADR-0005, issue #211): it raises a CRITICAL `equivocation` alert but **does not** deny anyone.
+The engine only ever declares a fork over branches it *holds*, so nothing is missing; the fold
+has already merged both at least privilege ([Test Vector §18](#10-test-vectors--linked-and-runnable)),
+and [§9](#9-rejection--flag-reason-codes) classifies `equivocation` as an advisory flag that
+never affects an authorization verdict. Two admin events at one `admin_seq` means they are
+causally **concurrent** — which an honest admin produces by publishing from a stale head — and
+denying on that undecidable signal wedged rooms permanently while buying nothing against a
+malicious admin, who can already remove anyone unilaterally.
 
 **Blob serve gate.** Accept a connect only from a QUIC/TLS-proven identity that is currently
 `Active`; serve a hash only if it is referenced by a valid, causally-visible `file.shared`

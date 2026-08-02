@@ -17,10 +17,15 @@
 //! 3. **Always reconcile the membership sub-DAG + full admin chain** —
 //!    `WantMembership`/`Events`, **never** windowed (the §0 hard invariant).
 //! 4. **Exchange admin tips + detect incompleteness** — `AdminTip` plus the
-//!    fail-closed [`Completeness`] detector (a known-higher tip ⇒
-//!    [`AdminViewSuspect`](Completeness::AdminViewSuspect); two tips at one
-//!    `admin_seq` ⇒ [`AdminForkDetected`](Completeness::AdminForkDetected) + a
-//!    CRITICAL `equivocation` [`TrustDecision`]).
+//!    [`Completeness`] detector. A known-higher tip we have not backfilled ⇒
+//!    [`AdminViewSuspect`](Completeness::AdminViewSuspect), which **fails
+//!    affected subjects closed** until catch-up: an unapplied admin event could
+//!    be a removal. Two held events at one `admin_seq` ⇒
+//!    [`AdminForkDetected`](Completeness::AdminForkDetected) + a CRITICAL
+//!    `equivocation` [`TrustDecision`], which is **advisory and denies nobody**
+//!    (ADR-0005 / #211): a fork is only declared over branches we hold, so
+//!    nothing is missing and the fold has already merged them at least
+//!    privilege.
 //! 5. **Assert set equality after sync** — the [`SyncDigest`] oracle (D8) and the
 //!    [`sim::SimNet`] convergence harness.
 //!
