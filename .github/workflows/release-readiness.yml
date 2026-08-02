@@ -1,0 +1,46 @@
+name: release-readiness
+
+# The full P0 release-readiness gate (`scripts/release-readiness.sh`) on a
+# schedule. The six loopback online tiers (`ONLINE_TIERS` in the script) — plus
+# the deterministic `verify.sh` tier — run here and at manual release time, NOT
+# on every PR: they are too slow / disk-heavy for per-PR CI (see `verify.yml`'s
+# disk notes + `Cargo.toml`'s `debug = "line-tables-only"`), but they are
+# loopback (no relay, no real network, no hosts) so they run cleanly on a
+# GitHub Actions runner. A green nightly run is pre-existing evidence at release
+# time and surfaces online-tier regressions between releases.
+#
+# Trigger manually from the Actions tab to run the gate on demand (e.g. before
+# cutting a release candidate). The script exits non-zero if any P0 check fails,
+# so a scheduled run's status IS the gate signal.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily; adjust as needed
+  workflow_dispatch:
+
+env:
+  # Mirror verify.yml: no `target/` cache between runs, so incremental
+  # compilation is pure overhead here, and its multi-GB footprint contributed to
+  # exhausting the runner's disk mid-link (lld SIGBUS writing one of the later
+  # `--all-targets --all-features` binaries in verify.sh).
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+# Don't cancel a running gate when the next schedule fires (rare for daily) — a
+# manual pre-release dispatch should not be killed by the scheduler.
+concurrency:
+  group: release-readiness
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Release-readiness gate (deterministic + online tiers)
+        run: scripts/release-readiness.sh

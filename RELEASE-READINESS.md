@@ -25,6 +25,8 @@ proved and what it did not. Run it from the repo root:
 scripts/release-readiness.sh
 ```
 
+The gate also runs nightly on `main` via the `release-readiness` GitHub Actions workflow (`.github/workflows/release-readiness.yml`) — a green nightly run is pre-existing evidence a maintainer can reference at release time, and it surfaces online-tier regressions between releases. It is loopback-only (no relay, no hosts), so it attests the same P0 gate a manual run does.
+
 Paste its final `release-readiness: …` verdict line into [Sign-off](#sign-off).
 
 ## Candidate build
