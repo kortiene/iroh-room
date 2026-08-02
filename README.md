@@ -32,6 +32,7 @@ Start with one of these paths:
 - **Implement or audit the protocol**: read [`docs/protocol.md`](docs/protocol.md)
 - **Understand release status**: read [`docs/releases/v0.1.0-rc.5-release-notes.md`](docs/releases/v0.1.0-rc.5-release-notes.md)
 - **Review security posture**: read [`docs/security/threat-model.md`](docs/security/threat-model.md)
+- **Report a vulnerability**: follow [`SECURITY.md`](SECURITY.md), not a public issue
 
 ## Install from source
 
@@ -283,9 +284,27 @@ The original Phase 0 and Phase 1 planning documents remain in the repository for
 
 For release-specific facts, prefer the versioned records in [`docs/releases/`](docs/releases/).
 
+## Security
+
+Report suspected vulnerabilities privately through
+[GitHub's advisory form](https://github.com/kortiene/iroh-room/security/advisories/new),
+not a public issue. [`SECURITY.md`](SECURITY.md) covers supported versions, what
+to include, what never to paste into a report, and the beta limitations that are
+already accepted rather than treated as vulnerabilities.
+
 ## License
 
 Licensed under either of:
 
-- Apache License, Version 2.0
-- MIT license
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

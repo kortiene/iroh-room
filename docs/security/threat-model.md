@@ -420,6 +420,13 @@ Production Beta needs at minimum:
 Until these exist, a production release can fail operationally even if the core
 protocol remains correct.
 
+The inbound half is now in place: [`SECURITY.md`](../../SECURITY.md) defines the
+private reporting channel (GitHub private vulnerability reporting), supported
+versions, redaction rules for reports, and the accepted limitations that are not
+treated as vulnerabilities. That answers Release Sign-Off question 10 and
+supplies items 1 and 2 above for security reports specifically. The internal
+response policies — items 3 through 7 — still do not exist.
+
 ## Release Sign-Off Questions
 
 The release owner must answer these for every Production Beta candidate:
