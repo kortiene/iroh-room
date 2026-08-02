@@ -91,6 +91,11 @@ struct Built {
     alice: Principal,
     bob: Principal,
     carol: Principal,
+    /// `invite_carol` — the last admin-authored event in the base log, carrying
+    /// `admin_seq = 2`. A test that wants to model an admin publishing from a
+    /// **stale head** parents two new admin events here: both derive
+    /// `admin_seq = 3` and collide.
+    admin_tip_eid: EventId,
 }
 
 /// Build `genesis → invite_bob → join_bob → invite_carol → join_carol →
@@ -267,6 +272,7 @@ fn build_log(n_chat: u32, with_removal: bool) -> Built {
         alice,
         bob,
         carol,
+        admin_tip_eid: inv_carol_eid,
     }
 }
 
@@ -394,6 +400,92 @@ fn child_before_parent_is_buffered_then_backfilled() {
         "carol active after backfill"
     );
     net.assert_membership_converged(&[NODE_A, NODE_B]);
+}
+
+// ---------------------------------------------------------------------------
+// Regression (#211) — an admin publishing from a stale head must not wedge the
+// room. Contrast with `stale_admin_tip_fails_closed_then_recovers` below: that
+// one fails closed because information is *missing* and recovers when it
+// arrives. Here the node holds **both** admin branches, so nothing is missing
+// and the fold has already merged them at least privilege (Test Vector §18).
+// ---------------------------------------------------------------------------
+
+/// An honest admin publishes two causally-concurrent events from a stale head.
+///
+/// Both cite `invite_carol` (`admin_seq = 2`) without either citing the other,
+/// so both derive `admin_seq = 3` (the `store/mod.rs` recompute). Before
+/// #211 that collision raised `Completeness::AdminForkDetected` and fail-closed
+/// **every** non-admin member permanently — a self-inflicted, reboot-surviving
+/// denial of service on ordinary concurrency.
+///
+/// Note what the log actually contains: two admin chat messages. Nothing about
+/// membership is ambiguous, and `docs/protocol.md` §9 classifies `equivocation`
+/// as an advisory flag that "never affect[s] the validated set, ordering, or any
+/// authorization/expiry verdict" (Test Vector §12).
+#[test]
+fn admin_stale_head_publish_does_not_wedge_the_room() {
+    let built = build_log(0, false);
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
+    seed(&mut net, NODE_A, &built.events);
+
+    // Healthy baseline: everyone active, nothing denied.
+    assert_eq!(net.engine(NODE_A).completeness(), Completeness::Complete);
+    assert!(net.engine(NODE_A).fail_closed_subjects().is_empty());
+
+    // The admin publishes twice from the same stale head. Neither cites the
+    // other, so they are causally concurrent and collide at admin_seq 3.
+    for (i, body) in ["branch one", "branch two"].iter().enumerate() {
+        let msg = SignedEvent {
+            schema_version: 1,
+            room_id: built.room,
+            sender_id: built.alice.identity(),
+            device_id: built.alice.device(),
+            event_type: iroh_rooms_core::event::content::EventType::MessageText,
+            created_at: T0 + 100 + i as u64,
+            prev_events: vec![built.admin_tip_eid],
+            content: Content::MessageText(MessageText {
+                body: (*body).to_owned(),
+                format: None,
+                in_reply_to: None,
+                mentions: None,
+            }),
+        };
+        net.engine_mut(NODE_A)
+            .publish(&wire(&msg, &built.alice.dev))
+            .expect("admin publishes from a stale head");
+    }
+
+    // Both branches are held and folded. No member loses capability: an admin
+    // that can already remove anyone unilaterally gains nothing by equivocating,
+    // and denying everyone on an undecidable signal is a guaranteed outage.
+    assert!(
+        net.engine(NODE_A).fail_closed_subjects().is_empty(),
+        "a stale-head publish must not fail-close members; denied: {:?}",
+        net.engine(NODE_A).fail_closed_subjects()
+    );
+    assert!(
+        net.engine(NODE_A)
+            .snapshot()
+            .is_active(&built.bob.identity()),
+        "bob stays active"
+    );
+    assert!(
+        net.engine(NODE_A)
+            .snapshot()
+            .is_active(&built.carol.identity()),
+        "carol stays active"
+    );
+
+    // Detection is retained: the collision is still recorded as a CRITICAL
+    // trust decision for the operator. Only the authorization response changed.
+    assert!(
+        net.engine(NODE_A)
+            .trust_decisions()
+            .iter()
+            .any(|d| d.code == "equivocation" && d.severity == Severity::Critical),
+        "the equivocation must still be recorded at CRITICAL for the audit trail"
+    );
 }
 
 // ---------------------------------------------------------------------------

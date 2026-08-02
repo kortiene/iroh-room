@@ -149,8 +149,14 @@ pub enum Completeness {
 pub enum Severity {
     /// Advisory: catch-up will resolve it.
     Warning,
-    /// Non-recoverable safety event (admin equivocation, a degraded local
+    /// Safety event an operator must see (admin equivocation, a degraded local
     /// store).
+    ///
+    /// This is an **alert severity, not an authorization verdict**. Since #211
+    /// an `equivocation` decision no longer denies anyone: the fork state is by
+    /// construction one of complete information, so it is recorded and surfaced
+    /// but does not gate access. Only a *missing* admin event (`AdminViewSuspect`)
+    /// fails subjects closed, and that clears on catch-up.
     Critical,
 }
 
@@ -2832,12 +2838,33 @@ impl SyncEngine {
             }
         }
 
-        // Fail closed on every removal-sensitive subject while incomplete: any
-        // not-yet-applied admin event could remove an active member, and we
-        // cannot know which, so we deny on all non-admin, non-removed subjects
-        // (the conservative, safe fail-closed set; spec D6 / §10).
+        // Fail closed on every removal-sensitive subject while an admin event is
+        // MISSING: a not-yet-applied admin event could remove an active member,
+        // and we cannot know which, so we deny on all non-admin, non-removed
+        // subjects (the conservative, safe fail-closed set; spec D6 / §10).
+        //
+        // Gated on `behind` — not on `completeness != Complete` — because the
+        // fork state is the opposite situation (#211). A fork is only ever
+        // declared over branches this node **holds** (`held.len() >= 2` above),
+        // so by construction nothing is missing and the rationale in the
+        // paragraph above does not apply: the fold has already merged both
+        // branches at least privilege (Test Vector §18), and `docs/protocol.md`
+        // §9 classifies `equivocation` as an advisory flag that "never affect[s]
+        // ... any authorization/expiry verdict" (Test Vector §12).
+        //
+        // Denying here turned ordinary concurrency — an admin publishing from a
+        // stale head — into a permanent, room-wide, reboot-surviving outage,
+        // while buying nothing against a malicious admin: the sole immutable
+        // admin can already remove anyone unilaterally, so equivocating gains it
+        // no capability it lacks. The signal is also undecidable (a benign
+        // stale-head publish and a deliberate fork are byte-identical) and, per
+        // the accept-time caching of `admin_ids_by_seq`, not even reliable.
+        //
+        // Detection is unchanged: the CRITICAL `equivocation` trust decision is
+        // still recorded above and persisted, and `completeness()` still reports
+        // `AdminForkDetected`. Only the authorization response changed.
         self.fail_closed.clear();
-        if self.completeness != Completeness::Complete {
+        if behind {
             let snap = &self.membership_projection.snapshot;
             let admin = snap.admin().copied();
             for member in snap.members() {
