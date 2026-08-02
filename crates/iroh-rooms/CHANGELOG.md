@@ -7,6 +7,8 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+## 0.1.0-rc.5 - 2026-08-01
+
 - Landed the **content-key rotation lifecycle** (issue #191 step 6, spec
   `content-key-rotation.md` D4/D5/D6), closing the malicious-reader forward
   secrecy gap for removed devices. An admin-authored `member.removed` now

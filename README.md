@@ -2,7 +2,7 @@
 
 Iroh Rooms is a local-first collaboration runtime for small trusted groups. It lets people and agents create a private room, exchange signed messages, share verified files, expose a loopback-only live TCP pipe, and keep the room state on their own machines instead of a central application server.
 
-The current release is `v0.1.0-rc.4`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
+The current release is `v0.1.0-rc.5`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
 
 ## What you can do with it
 
@@ -30,7 +30,7 @@ Start with one of these paths:
 - **Join the first builder cohort**: read [`COMMUNITY.md`](COMMUNITY.md) and [`docs/community/first-cohort.md`](docs/community/first-cohort.md)
 - **Share a local preview**: follow [`docs/live-pipe-preview.md`](docs/live-pipe-preview.md)
 - **Implement or audit the protocol**: read [`docs/protocol.md`](docs/protocol.md)
-- **Understand release status**: read [`docs/releases/v0.1.0-rc.4-release-notes.md`](docs/releases/v0.1.0-rc.4-release-notes.md)
+- **Understand release status**: read [`docs/releases/v0.1.0-rc.5-release-notes.md`](docs/releases/v0.1.0-rc.5-release-notes.md)
 - **Review security posture**: read [`docs/security/threat-model.md`](docs/security/threat-model.md)
 
 ## Install from source
@@ -80,7 +80,7 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 
 ## Current beta scope
 
-`v0.1.0-rc.4` supports:
+`v0.1.0-rc.5` supports:
 
 - local identity and device creation
 - room creation
@@ -249,7 +249,7 @@ Useful starting points:
 - [`crates/iroh-rooms/examples/example_agent/README.md`](crates/iroh-rooms/examples/example_agent/README.md)
 - [`docs/sdk-coverage.md`](docs/sdk-coverage.md)
 
-The SDK crate is not published for `v0.1.0-rc.4`. Use it from the workspace source until the release notes say otherwise.
+The SDK crate is not published for `v0.1.0-rc.5`. Use it from the workspace source until the release notes say otherwise.
 
 ## Contribute
 
