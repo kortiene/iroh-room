@@ -89,9 +89,11 @@ Confirmed against the pinned source; no blocking divergences:
 ## Key decisions / open questions resolved in this slice
 
 - **OQ-1 (MSRV)**: per-crate — `iroh-rooms-net` does **not** inherit the workspace
-  `rust-version = "1.80"` (the iroh 1.0 stack's MSRV is higher; the shipping crypto
-  deps already force ≥1.85, so this only corrects the *declared* floor). Reconciling
-  the workspace value is a follow-up.
+  `rust-version` and declares `rust-version = "1.91"` itself, matching the iroh 1.0
+  stack (`iroh`, `iroh-base`, `iroh-blobs`, `iroh-gossip`, `irpc`, `netwatch`, ... all
+  declare 1.91). That is a real floor, not just a declared one: the pure crates'
+  crypto stack only forces ≥1.85. The workspace value is reconciled to 1.85, the
+  pure crates' actual floor.
 - **OQ-3 (engine driver location)**: a thin `Node` runtime in this crate owns the
   `SyncEngine` and pumps it (one task; queries via a command channel). The CLI may
   later drive the engine manually against `NetTransport` directly — `NetTransport`
@@ -278,8 +280,10 @@ notes: `src/gossip.rs`.
 - `gossip_overlay` cargo feature on this crate, **default off** for direct net
   consumers. With it off the pure full-mesh path the v1 spike measured compiles
   back in verbatim and `iroh-rooms-core` stays at the no-gossip hard cap of 5;
-  rollback is flipping the flag. The CLI and the experimental SDK enable it so
-  the raised cap is paired with the bounded gossip topology.
+  rollback is flipping the flag. Neither the CLI nor the SDK facade's
+  `experimental` feature enables it, so shipped binaries keep the full mesh and
+  the hard cap of 5; a consumer that wants the overlay (and the paired raised
+  cap) opts in explicitly via `iroh-rooms-net/gossip_overlay`.
 - `iroh-gossip = "=0.101.0"` (optional), reconciled against `iroh = "=1.0.1"`
   with zero API drift (same recon as `spike-transport/NOTES.md` §1).
 - A second ALPN `GOSSIP_ALPN = b"/iroh-rooms/gossip/1"` (`alpn.rs`), distinct

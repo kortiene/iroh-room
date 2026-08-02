@@ -54,7 +54,14 @@ resolver = "2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kortiene/iroh-room"
-rust-version = "1.80"
+# The floor for the PURE crates that inherit this (`iroh-rooms-core`,
+# `iroh-rooms-v2-core`, `iroh-rooms-crypto`): the RustCrypto/dalek stack they
+# share (`ed25519-dalek 3.0.0-rc.0`, `curve25519-dalek 5.0.0-rc.0`, `sha2 0.11`,
+# `digest 0.11`, `signature 3.0`, `block-buffer 0.12`) declares
+# `rust-version = "1.85"`. Crates that link the iroh 1.0 stack do NOT inherit
+# this — they declare `1.91` per-crate, so this value stays honest for the pure
+# tier instead of over-declaring it.
+rust-version = "1.85"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

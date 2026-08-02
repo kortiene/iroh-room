@@ -38,7 +38,7 @@ use iroh_rooms_core::event::constants::{
     MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
     MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_PREV_EVENTS, MAX_SHARED_FILE_BYTES,
     MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, ROOMID_CONTEXT, SHORT_ID_LEN,
-    SIGNATURE_LEN,
+    SIGNATURE_LEN, WRAPPED_KEY_CIPHERTEXT_LEN, WRAPPED_KEY_NONCE_LEN,
 };
 use iroh_rooms_core::event::content::EventType;
 use iroh_rooms_core::event::reject::{Flag, RejectReason};
@@ -87,11 +87,17 @@ const ALL_FLAGS: &[Flag] = &[Flag::ClockSkew, Flag::Equivocation, Flag::FromRemo
 /// The `duplicate` ignored-outcome is neither a `RejectReason` nor a `Flag`.
 const DUPLICATE_CODE: &str = "duplicate";
 
-/// Every `EventType` (11) in the closed registry, hand-mirrored (the enum is
+/// Every `EventType` (12) in the closed registry, hand-mirrored (the enum is
 /// a plain closed enum, but an external test crate still cannot iterate it). The
-/// count is pinned below, so adding a 12th type forces an update here — which
+/// count is pinned below, so adding a 13th type forces an update here — which
 /// then trips the §6-registry doc-coverage assert unless the doc is updated too.
 /// Mirrors `event::content::EventType`.
+///
+/// That pin is only as good as the update: `MemberKeyDistribution` shipped in
+/// `v0.1.0-rc.5` (#191 step 6) without being added here, so the count stayed at
+/// 11 and §6 silently lost a row for a whole release. Adding a variant to
+/// `EventType` does not break this crate's compilation — re-check this list
+/// against `event::content::EventType` whenever the registry changes.
 const ALL_EVENT_TYPES: &[EventType] = &[
     EventType::RoomCreated,
     EventType::MemberInvited,
@@ -104,6 +110,7 @@ const ALL_EVENT_TYPES: &[EventType] = &[
     EventType::PipeClosed,
     EventType::AgentStatus,
     EventType::ContentEncrypted,
+    EventType::MemberKeyDistribution,
 ];
 
 /// Every taxonomy code the doc's reason/flag section must account for.
@@ -241,6 +248,12 @@ fn context_strings_and_structural_bounds_match_constants() {
             "MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT",
             MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT as u64,
         ),
+        // `member.key_distribution` wrapped-key bounds (#191 step 6, spec D3a/D5).
+        ("WRAPPED_KEY_NONCE_LEN", WRAPPED_KEY_NONCE_LEN as u64),
+        (
+            "WRAPPED_KEY_CIPHERTEXT_LEN",
+            WRAPPED_KEY_CIPHERTEXT_LEN as u64,
+        ),
     ];
     for (name, value) in bounds {
         assert!(
@@ -340,7 +353,7 @@ fn advertised_test_binaries_exist() {
 }
 
 // ---------------------------------------------------------------------------
-// §6 registry: the doc's event-type table must be exactly the 10 wire strings.
+// §6 registry: the doc's event-type table must be exactly the 12 wire strings.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -349,9 +362,9 @@ fn event_type_registry_table_matches_enum() {
     // this module and the doc's §6 table need review.
     assert_eq!(
         ALL_EVENT_TYPES.len(),
-        11,
-        "the closed event-type registry has exactly 11 types (10 MVP + \
-         content.encrypted, #191 step 3)"
+        12,
+        "the closed event-type registry has exactly 12 types (10 MVP + \
+         content.encrypted, #191 step 3 + member.key_distribution, #191 step 6)"
     );
 
     let want: BTreeSet<&str> = ALL_EVENT_TYPES.iter().map(EventType::as_str).collect();
@@ -654,11 +667,18 @@ fn leading_cells(md: &str) -> Vec<String> {
 }
 
 /// A token that could be a registry `event_type` wire string: non-empty, exactly
-/// one `.`, all lowercase ASCII around it (e.g. `room.created`). Rejects the
-/// header cell (`event_type`, no dot) and the separator (`---`).
+/// one `.`, all lowercase ASCII or `_` around it (e.g. `room.created`,
+/// `member.key_distribution`). Rejects the header cell (`event_type`, no dot)
+/// and the separator (`---`).
+///
+/// The `_` was missing until `v0.1.0-rc.5`, which made the only `snake_case`
+/// wire string — `member.key_distribution` — invisible to the §6 coverage assert
+/// even when the doc did list it.
 fn is_event_type_shaped(token: &str) -> bool {
     token.bytes().filter(|&b| b == b'.').count() == 1
-        && token.bytes().all(|b| b.is_ascii_lowercase() || b == b'.')
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'_')
 }
 
 /// The `Test fn` column (third cell) of every vector-map row, restricted to the

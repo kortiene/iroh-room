@@ -36,7 +36,7 @@ Start with one of these paths:
 
 ## Install from source
 
-You need Rust 1.80 or newer and `git`.
+You need Rust 1.91 or newer and `git`. The CLI links the iroh 1.0 stack, whose crates declare `rust-version = "1.91"`.
 
 ```bash
 git clone https://github.com/kortiene/iroh-room.git
@@ -93,17 +93,18 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 - local best-effort audit at `<IROH_ROOMS_HOME>/audit.ndjson`
 - a Rust SDK facade in `crates/iroh-rooms`, source/workspace use only
 
-The supported binary artifact for this candidate is `x86_64-apple-darwin`. Builders on other platforms should build from source unless a matching release artifact exists.
+Prebuilt binaries for this candidate ship for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner and published with a SHA-256 checksum on the [`v0.1.0-rc.5` release](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.5); see [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md) for the verify-and-install steps. Builders on any other platform should build from source.
 
 ## Limits you should understand
 
 Read these before trusting Iroh Rooms with real work:
 
 - **No central application server**: peers sync directly through the iroh transport
-- **Room-size cap is topology-gated**: no-gossip/full-mesh builds keep the original `MAX_ACTIVE_MEMBERS = 5` hard cap and reject the 6th active join with `RejectReason::RoomFull`. The supported CLI and experimental SDK enable the bounded gossip overlay, which raises the cap to 40; `room members --status` shows `active: <n>/<cap> (<k> slots remaining)`, and `room.active_members.near_cap` fires at one slot below the active cap. Do not raise the cap on a no-gossip full mesh: before the reject existed, N=25 was measured to stop delivering messages entirely (idle `frames_sent=0`, `accepted=0`, a 661 MB inbound backlog) while every connectivity signal still read healthy.
+- **Five active members per room**: the supported CLI and the SDK facade both ship the full-mesh topology and the hard `MAX_ACTIVE_MEMBERS = 5` cap, rejecting the 6th active join with `RejectReason::RoomFull`. `room members --status` shows `active: <n>/5 (<k> slots remaining)`, and `room.active_members.near_cap` fires at one slot below the cap. The bounded gossip overlay and the paired 40-member cap (`iroh-rooms-net/gossip_overlay` + `iroh-rooms-core/large_rooms`) are compiled and tested but **not enabled in any shipped artifact**; re-enabling them still gates on real-network overlay evidence. Do not raise the cap on a no-gossip full mesh: before the reject existed, N=25 was measured to stop delivering messages entirely (idle `frames_sent=0`, `accepted=0`, a 661 MB inbound backlog) while every connectivity signal still read healthy.
 - **No guaranteed offline delivery**: a peer may need to be online and serving for another peer to fetch data
 - **Files up to 100 MiB, and the cap is not free**: the enforced share cap is `MAX_SHARED_FILE_BYTES` = 100 MiB. A 100 MiB fetch was measured at ~134.6 MB consumer RSS (the collector allocates the next power of two) and ~2.004x disk use (the payload is written to the out path and re-imported into the blob store), and there is no GC or delete path in non-test code
 - **Plaintext local storage**: beta storage is scoped to trusted local machines
+- **Room content is plaintext too**: the content-key rotation lifecycle is implemented in the protocol and the sync engine (encrypted content envelopes, per-epoch room keys, `member.key_distribution`), but the shipped CLI has no command that triggers it and no way to turn on encrypted writes — so rooms you operate with this binary carry plaintext content and gain no forward secrecy after a member departs
 - **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
 - **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
 - **Local audit only**: `audit.ndjson` is useful for incident reconstruction, not compliance-grade audit

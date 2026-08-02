@@ -23,7 +23,9 @@ adds and verifies a Windows artifact.
 
 Prerequisites:
 
-- Rust toolchain compatible with the workspace and locked dependencies.
+- Rust toolchain 1.91 or newer — the iroh 1.0 stack in the CLI's dependency
+  graph declares `rust-version = "1.91"`. Must also be compatible with the
+  locked dependencies.
 - `git`.
 
 Install:

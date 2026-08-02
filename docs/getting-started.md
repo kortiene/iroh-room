@@ -118,8 +118,10 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 ## Prerequisites
 
 - **OS:** macOS or Linux (the current dev target).
-- **Rust:** the workspace pins `rust-version = "1.80"`; install a toolchain ≥ 1.80 via
-  [rustup](https://rustup.rs/).
+- **Rust:** 1.91 or newer — the CLI links the iroh 1.0 stack, whose crates declare
+  `rust-version = "1.91"`. Install a toolchain ≥ 1.91 via [rustup](https://rustup.rs/).
+  (The pure protocol crates — `iroh-rooms-core`, `iroh-rooms-v2-core`,
+  `iroh-rooms-crypto` — build on 1.85 or newer.)
 - **git**, plus `python3` and `curl` for the live-pipe step (a `nc` alternative is noted there).
 
 Clone and build a release binary:
@@ -1093,7 +1095,7 @@ never renders as reachable):
 $ iroh-rooms room members <ROOM_ID> --status --verbose
 room: blake3:…
 admin: …
-active: 2/40 (38 slots remaining)
+active: 2/5 (3 slots remaining)
 member: … role=admin status=active conn=self
 member: … role=member status=active conn=connected
 peers: 1 connected, 0 offline, 0 unauthorized
@@ -1103,9 +1105,10 @@ diag: transport connected=1 (direct=1 relay=0 mixed=0) offline=0 unauthorized=0
 ```
 
 The `active: <n>/<cap> (<k> slots remaining)` line (issue #144) surfaces the
-current active-member count against the compiled hard cap. No-gossip/full-mesh
-builds keep `MAX_ACTIVE_MEMBERS = 5`; the supported CLI enables the bounded
-gossip overlay and raises the cap to 40. A live `room tail` / managed session
+current active-member count against the compiled hard cap. The supported CLI
+ships the full-mesh topology and `MAX_ACTIVE_MEMBERS = 5`, so `<cap>` always
+reads `5`; the bounded gossip overlay that would raise it to 40 is compiled but
+not enabled in any shipped artifact. A live `room tail` / managed session
 that observes the count cross from below one slot remaining to at/above it also
 emits a one-shot `warning[room_near_capacity]:` stderr line and a
 `room.active_members.near_cap` audit record (see

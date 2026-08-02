@@ -56,8 +56,8 @@ Each participant should have:
 
 Owner tasks:
 
-- Confirm the GitHub release has the macOS artifact and checksum.
-- Keep source-build instructions discoverable for non-macOS builders.
+- Confirm the GitHub release has all four supported artifacts (`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and their checksums.
+- Keep source-build instructions discoverable for builders outside those four triples.
 - Verify [`docs/community/demo-recipes.md`](demo-recipes.md) against the current
   CLI.
 - Open GitHub Discussions or use issues only until there are repeated

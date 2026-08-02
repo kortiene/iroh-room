@@ -4,16 +4,22 @@ version = "0.1.0-rc.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
+# Not inherited: this crate links the iroh 1.0 stack, which sets a higher real
+# floor than the workspace (pure-crate) value. See the MSRV note below.
+rust-version = "1.91"
 
 [[bin]]
 name = "iroh-rooms"
 path = "src/main.rs"
 
-# MSRV note (spec IR-0105 D2 / OQ-1): adding `iroh-rooms-net` (and transitively the
-# iroh 1.0 stack) raises this crate's *effective* MSRV above the workspace-declared
-# `rust-version = 1.80`. The shipping crypto deps already forced rustc >= 1.85, so
-# this only raises the declared floor, mirroring `iroh-rooms-net/Cargo.toml`.
+# MSRV note (spec IR-0105 D2 / OQ-1): this crate links `iroh-rooms-net` and,
+# transitively, the iroh 1.0 stack — `iroh`, `iroh-base`, `iroh-blobs`,
+# `iroh-dns`, `iroh-relay`, `iroh-tickets`, `iroh-util`, `irpc`, `n0-watcher`,
+# `netwatch`, `portmapper` all declare `rust-version = "1.91"`. That is the real
+# floor, so this crate declares 1.91 explicitly instead of inheriting the
+# workspace value (1.85, the pure crates' floor). Mirrors
+# `iroh-rooms-net/Cargo.toml`. CI must build this crate on a pinned 1.91
+# toolchain, or the number drifts again at the next iroh bump.
 
 [lints]
 workspace = true
@@ -30,12 +36,16 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # `gossip_overlay` is deliberately NOT enabled here. It pulls in
 # `iroh-rooms-core/large_rooms` (the 5 -> 40 active-member cap), and the
 # spec's Phase C gate — `specs/gossip-overlay-events-fan-out.md` Step 8, "only
-# after Step 7 passes" — is not met: the Phase B acceptance criterion is "no
-# cascade at 1 event/s, connectedness >95%, delivery >95% at every N", and the
-# committed spike-N40 harness measures a cascade at 1 event/s with both figures
-# under 95% (`crates/spike-N40/results/results-gossip.md`). Until that AC
-# genuinely passes, the shipped CLI keeps the full-mesh topology and the cap of
-# 5. The overlay stays compiled and tested under `--all-features`.
+# after Step 7 passes" — is not fully met. The Step 7 acceptance criterion
+# itself now DOES pass on loopback: #193 (shipped in rc.5) fixed the three
+# stacked hub-overload defects, and the committed matrix is clean at every
+# required cell — N=5/10/20/40 x {1, 5 events/s}, 100% delivery, zero queue
+# saturations, zero reconnect churn
+# (`crates/spike-N40/results/results-gossip.md`). What is still owed is
+# real-network (non-loopback) overlay evidence, plus the admin same-seq
+# fail-closed wedge, which permanently wedges a room with no recovery path.
+# Until both are closed, the shipped CLI keeps the full-mesh topology and the
+# cap of 5. The overlay stays compiled and tested under `--all-features`.
 iroh-rooms-net = { path = "../iroh-rooms-net" }
 # The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
 # (spec AC2). The offline authoring path imports stable items through here
@@ -54,8 +64,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 # same type as `iroh-rooms-net`'s (same `=1.0.1` pin, kept in sync by hand).
 # Argument parsing for the subcommand tree (PRD §16 CLI surface). `derive` gives
 # the declarative `Cli`/subcommand structs. Caret 4.x; the exact patch is pinned
-# in Cargo.lock. (CI builds on the latest stable toolchain — the landed crypto
-# deps, e.g. `ed25519-dalek 3.0.0-rc.0`, already require rustc >= 1.85.)
+# in Cargo.lock. (CI builds on the latest stable toolchain. This crate's real
+# floor is rustc 1.91, set by the iroh 1.0 stack — see the MSRV note above;
+# `clap 4.6.1` itself declares only 1.85.)
 clap = { version = "4", features = ["derive"] }
 # Serialize the on-disk identity profile and the `identity show --json` output.
 serde = { version = "1", features = ["derive"] }

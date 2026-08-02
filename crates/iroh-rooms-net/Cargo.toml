@@ -9,10 +9,14 @@ version = "0.1.0-rc.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack has a higher
-# MSRV than the workspace-declared `1.80`. The shipping crypto deps already force
-# >= 1.85, so this raises only the *declared* floor, not the real one (spec OQ-1 /
-# A5). Reconciling the workspace `rust-version` is tracked as a follow-up.
+# Deliberately does NOT inherit `rust-version`: the iroh 1.0 stack declares
+# `rust-version = "1.91"` (`iroh`, `iroh-base`, `iroh-blobs`, `iroh-gossip`,
+# `iroh-dns`, `iroh-relay`, `iroh-tickets`, `iroh-util`, `irpc`, `n0-watcher`,
+# `netwatch`, `portmapper`), far above the workspace value that covers the pure
+# crates (1.85). Declaring it here makes the real floor machine-checkable
+# instead of only described (spec OQ-1 / A5). Enabling `gossip_overlay` adds no
+# new floor — `iroh-gossip 0.101.0` also declares 1.91.
+rust-version = "1.91"
 # Keep `publish` gated until the CLI (N1) wires the adapter into a runtime.
 publish = false
 

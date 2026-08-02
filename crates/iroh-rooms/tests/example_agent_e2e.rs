@@ -579,7 +579,7 @@ mod online {
     /// expensive first build is already paid for by
     /// [`ensure_example_agent_built`]. Never runs in CI, so this being
     /// generous is not a CI-latency concern (spec OQ4).
-    const CHILD_TIMEOUT: Duration = Duration::from_mins(2);
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
     /// Timeout safety bound for the negative case. The proof that the
     /// identity-binding guard fires pre-IO is the *error message* assertion
     /// below (the example's `ensure!` text, not a `JOIN_TIMEOUT` connect-

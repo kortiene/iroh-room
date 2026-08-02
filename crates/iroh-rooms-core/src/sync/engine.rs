@@ -1859,7 +1859,7 @@ impl SyncEngine {
                 Err(e) => {
                     self.counters.store_insert_failed += 1;
                     self.log(&format!("store insert retry failed: {e}"));
-                    let exhausted = self.store_retry.get_mut(&id).map_or(true, |entry| {
+                    let exhausted = self.store_retry.get_mut(&id).is_none_or(|entry| {
                         entry.attempts += 1;
                         entry.attempts >= self.config.store_retry_attempts
                     });
@@ -2145,7 +2145,7 @@ impl SyncEngine {
     fn oldest_parked(&self, author: Option<IdentityKey>) -> Option<EventId> {
         self.park
             .iter()
-            .filter(|(_, p)| author.map_or(true, |a| p.author == a))
+            .filter(|(_, p)| author.is_none_or(|a| p.author == a))
             .min_by(|(id_a, a), (id_b, b)| a.seq.cmp(&b.seq).then(id_a.cmp(id_b)))
             .map(|(id, _)| *id)
     }
@@ -2639,7 +2639,7 @@ impl SyncEngine {
             // can never be backfilled. Treat it only as a *suspect* tip that drives
             // a bounded catch-up pull (spec D6 / §13).
             let local = self.store.admin_chain_tip(&self.room_id).ok().flatten();
-            let behind = local.map_or(true, |(_, loc)| seq > loc)
+            let behind = local.is_none_or(|(_, loc)| seq > loc)
                 && !self
                     .store
                     .contains_in_room(&self.room_id, &id)
@@ -2795,7 +2795,7 @@ impl SyncEngine {
         let local = self.store.admin_chain_tip(&self.room_id)?;
         let mut suspicion_cleared = false;
         let behind = if let Some(susp) = self.suspect_tip {
-            let still_behind = local.map_or(true, |(_, loc)| susp.seq > loc)
+            let still_behind = local.is_none_or(|(_, loc)| susp.seq > loc)
                 && !self.store.contains_in_room(&self.room_id, &susp.id)?;
             if !still_behind {
                 self.suspect_tip = None;

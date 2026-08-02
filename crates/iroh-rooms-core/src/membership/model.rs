@@ -16,7 +16,9 @@ use crate::event::keys::{DeviceKey, IdentityKey};
 /// Default builds stay at 5, the full-mesh-safe bound measured before the gossip
 /// overlay. The `large_rooms` feature raises the cap to 40 for binaries that also
 /// compile the bounded gossip topology (`iroh-rooms-net/gossip_overlay`), whose
-/// spike-N40 run survived N=40 with 100% event delivery and no cascade.
+/// spike-N40 run survived N=40 with 100% event delivery and no cascade **on
+/// loopback**. No shipped artifact enables either feature: the CLI and the SDK
+/// facade both build at 5, pending real-network overlay evidence.
 #[cfg(not(feature = "large_rooms"))]
 pub const MAX_ACTIVE_MEMBERS: usize = 5;
 
@@ -25,7 +27,9 @@ pub const MAX_ACTIVE_MEMBERS: usize = 5;
 /// Default builds stay at 5, the full-mesh-safe bound measured before the gossip
 /// overlay. The `large_rooms` feature raises the cap to 40 for binaries that also
 /// compile the bounded gossip topology (`iroh-rooms-net/gossip_overlay`), whose
-/// spike-N40 run survived N=40 with 100% event delivery and no cascade.
+/// spike-N40 run survived N=40 with 100% event delivery and no cascade **on
+/// loopback**. No shipped artifact enables either feature: the CLI and the SDK
+/// facade both build at 5, pending real-network overlay evidence.
 #[cfg(feature = "large_rooms")]
 pub const MAX_ACTIVE_MEMBERS: usize = 40;
 
