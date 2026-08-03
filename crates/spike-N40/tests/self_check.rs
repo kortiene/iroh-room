@@ -306,7 +306,11 @@ async fn n5_mini_rebound_node_catches_missed_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n5_metrics_render_markdown_and_json_without_panic() {
-    let baseline_rss = process_rss_bytes().expect("capture pre-spawn RSS baseline");
+    // RSS baseline is Linux-only (`crates/spike-N40/src/rss.rs` reads
+    // `/proc/self/status`); on macOS/other platforms it degrades to 0 — these
+    // tests assert metrics rendering / disconnect recovery, not RSS values, so
+    // they run cross-platform (macOS x86_64-apple-darwin qualification).
+    let baseline_rss = process_rss_bytes().unwrap_or(0);
     let cluster = spawn().await.expect("spawn N=5 cluster");
     let audit_baseline = cluster.audit.snapshot();
     let counters = counter_baseline(&cluster).await.expect("counter baseline");
@@ -370,7 +374,11 @@ async fn n5_disconnect_peer_drops_then_redials_and_delivery_recovers() {
     // RecordingAudit, the mesh returns to full connectedness within a bounded
     // window, the reconnect churn flows through `cluster_metrics`, and a
     // subsequent publish still fans out to the dropped-then-redialed peer.
-    let baseline_rss = process_rss_bytes().expect("capture pre-spawn RSS baseline");
+    // RSS baseline is Linux-only (`crates/spike-N40/src/rss.rs` reads
+    // `/proc/self/status`); on macOS/other platforms it degrades to 0 — these
+    // tests assert metrics rendering / disconnect recovery, not RSS values, so
+    // they run cross-platform (macOS x86_64-apple-darwin qualification).
+    let baseline_rss = process_rss_bytes().unwrap_or(0);
     let cluster = spawn().await.expect("spawn N=5 cluster");
     let target = cluster.nodes[N - 1].endpoint_id;
     let target_identity = cluster.nodes[N - 1].identity;
