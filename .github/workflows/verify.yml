@@ -15,11 +15,30 @@ env:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    # Keep the Linux cell named exactly `verify`: branch protection requires
+    # that context. The Intel macOS cell turns the manual x86_64 qualification
+    # into an ongoing native-platform signal without claiming arm64 coverage.
+    name: ${{ matrix.check_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            check_name: verify
+          - runner: macos-15-intel
+            check_name: verify (macos-15-intel)
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - name: Verify
-        run: scripts/verify.sh
+        run: |
+          # macOS defaults to 256 file descriptors; the loopback integration
+          # tests need 1024. `ulimit` is shell-local, so it must stay in this
+          # step rather than a separate setup step.
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            ulimit -S -n 1024
+          fi
+          scripts/verify.sh
