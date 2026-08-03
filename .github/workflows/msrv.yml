@@ -8,9 +8,10 @@ name: msrv
 # until #209 corrected it to 1.91. This workflow is the machine check that
 # prevents a repeat (`iroh-rooms-cli/Cargo.toml` explicitly requires it).
 #
-# Four jobs cover the {default, all-features} × {shipping, pure-core} matrix the
-# declared MSRVs imply (`--all-targets` checks targets, NOT features, so the two
-# must be crossed explicitly):
+# Four configurations, each run on Linux and Intel macOS, cover the {default,
+# all-features} × {shipping, pure-core} matrix the declared MSRVs imply
+# (`--all-targets` checks targets, NOT features, so the two must be crossed
+# explicitly):
 #   - msrv-1-91: the whole workspace, `--all-features`, on rustc 1.91 (the iroh
 #     stack's floor = max declared MSRV). Catches any drift above 1.91.
 #   - msrv-1-91-default: the SHIPPING configuration (default features — gossip
@@ -58,8 +59,12 @@ concurrency:
 
 jobs:
   msrv-1-91:
-    name: "MSRV 1.91 (iroh tier: whole workspace, --all-features)"
-    runs-on: ubuntu-latest
+    name: "MSRV 1.91 (iroh tier: whole workspace, --all-features) (${{ matrix.runner }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.91
@@ -67,8 +72,12 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --locked
 
   msrv-1-85:
-    name: "MSRV 1.85 (pure tier: core/crypto/v2-core + iroh-rooms facade, default features)"
-    runs-on: ubuntu-latest
+    name: "MSRV 1.85 (pure tier: core/crypto/v2-core + iroh-rooms facade, default features) (${{ matrix.runner }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85
@@ -81,8 +90,12 @@ jobs:
           -p iroh-rooms
 
   msrv-1-91-default:
-    name: "MSRV 1.91 (shipping config: whole workspace, default features — gossip OFF)"
-    runs-on: ubuntu-latest
+    name: "MSRV 1.91 (shipping config: whole workspace, default features — gossip OFF) (${{ matrix.runner }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.91
@@ -90,8 +103,12 @@ jobs:
         run: cargo check --workspace --all-targets --locked
 
   msrv-1-85-core-features:
-    name: "MSRV 1.85 (iroh-rooms-core --all-features: store/sync = vendored rusqlite)"
-    runs-on: ubuntu-latest
+    name: "MSRV 1.85 (iroh-rooms-core --all-features: store/sync = vendored rusqlite) (${{ matrix.runner }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85
