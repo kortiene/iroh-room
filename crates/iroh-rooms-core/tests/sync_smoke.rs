@@ -410,18 +410,16 @@ fn child_before_parent_is_buffered_then_backfilled() {
 // and the fold has already merged them at least privilege (Test Vector §18).
 // ---------------------------------------------------------------------------
 
-/// An honest admin publishes two causally-concurrent events from a stale head.
+/// An honest admin publishes two causally-concurrent chat messages from a stale
+/// head.
 ///
-/// Both cite `invite_carol` (`admin_seq = 2`) without either citing the other,
-/// so both derive `admin_seq = 3` (the `store/mod.rs` recompute). Before
-/// #211 that collision raised `Completeness::AdminForkDetected` and fail-closed
-/// **every** non-admin member permanently — a self-inflicted, reboot-surviving
-/// denial of service on ordinary concurrency.
-///
-/// Note what the log actually contains: two admin chat messages. Nothing about
-/// membership is ambiguous, and `docs/protocol.md` §9 classifies `equivocation`
-/// as an advisory flag that "never affect[s] the validated set, ordering, or any
-/// authorization/expiry verdict" (Test Vector §12).
+/// Both cite `invite_carol` without either citing the other. Before #211 that
+/// same-`admin_seq` collision raised `Completeness::AdminForkDetected` and
+/// fail-closed **every** non-admin member permanently. After #213 the detector
+/// is a fold-level **divergence**: two chat messages have no membership effect,
+/// so there is nothing to diverge on — no fork verdict and no CRITICAL
+/// `equivocation` row, exactly as `docs/protocol.md` §9 classifies the flag as
+/// advisory (Test Vector §12).
 #[test]
 fn admin_stale_head_publish_does_not_wedge_the_room() {
     let built = build_log(0, false);
@@ -477,20 +475,28 @@ fn admin_stale_head_publish_does_not_wedge_the_room() {
         "carol stays active"
     );
 
-    // Detection is retained: the collision is still recorded as a CRITICAL
-    // trust decision for the operator. Only the authorization response changed.
+    // Two chat messages are not a membership divergence (issue #213 / ADR-0006):
+    // no fork verdict, and no CRITICAL `equivocation` is recorded. The old
+    // same-`admin_seq` oracle fired here on ordinary concurrency; the divergence
+    // detector does not.
+    assert_eq!(
+        net.engine(NODE_A).completeness(),
+        Completeness::Complete,
+        "two admin chat messages are not a divergence"
+    );
     assert!(
         net.engine(NODE_A)
             .trust_decisions()
             .iter()
-            .any(|d| d.code == "equivocation" && d.severity == Severity::Critical),
-        "the equivocation must still be recorded at CRITICAL for the audit trail"
+            .all(|d| d.code != "equivocation"),
+        "no equivocation is recorded for two admin chat messages; got {:?}",
+        net.engine(NODE_A).trust_decisions()
     );
 }
 
 /// A fork must not mask an active missing-removal gate.
 ///
-/// When a node both holds a same-`admin_seq` fork **and** learns of a higher
+/// When a node both holds a divergence **and** learns of a higher
 /// admin tip it does not have, the two conditions are orthogonal: the fork is
 /// advisory, the missing tip denies. The verdict must report the one with the
 /// gate, and both trust decisions must be recorded — otherwise a consumer of the
@@ -503,27 +509,36 @@ fn a_fork_does_not_mask_an_active_missing_tip_gate() {
     net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
     seed(&mut net, NODE_A, &built.events);
 
-    // Manufacture the fork: two admin events from the same stale head.
-    for (i, body) in ["branch one", "branch two"].iter().enumerate() {
-        let msg = SignedEvent {
+    // Manufacture a genuine divergence: two concurrent admin invites of dave
+    // with conflicting roles (member vs agent), both from the stale admin head.
+    // Same-effect concurrency would not fire (ADR-0006); conflicting effects do.
+    let dave = Principal::new(0x30);
+    let mk_invite = |role: &str, invite_id: [u8; 16], sec: [u8; 16]| {
+        let ev = SignedEvent {
             schema_version: 1,
             room_id: built.room,
             sender_id: built.alice.identity(),
             device_id: built.alice.device(),
-            event_type: iroh_rooms_core::event::content::EventType::MessageText,
-            created_at: T0 + 200 + i as u64,
+            event_type: iroh_rooms_core::event::content::EventType::MemberInvited,
+            created_at: T0 + 200,
             prev_events: vec![built.admin_tip_eid],
-            content: Content::MessageText(MessageText {
-                body: (*body).to_owned(),
-                format: None,
-                in_reply_to: None,
-                mentions: None,
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: capability_hash(&built.room, &invite_id, &sec),
+                role: role.to_owned(),
+                invitee_key: dave.identity(),
+                expires_at: None,
+                invitee_hint: None,
             }),
         };
-        net.engine_mut(NODE_A)
-            .publish(&wire(&msg, &built.alice.dev))
-            .expect("stale-head publish");
-    }
+        wire(&ev, &built.alice.dev)
+    };
+    net.engine_mut(NODE_A)
+        .publish(&mk_invite("member", [0xD1; 16], [0x51; 16]))
+        .expect("invite dave as member");
+    net.engine_mut(NODE_A)
+        .publish(&mk_invite("agent", [0xD2; 16], [0x52; 16]))
+        .expect("invite dave as agent");
     assert_eq!(
         net.engine(NODE_A).completeness(),
         Completeness::AdminForkDetected,
@@ -760,14 +775,70 @@ fn shuffled_delivery_converges_across_seeds() {
 
 #[test]
 fn admin_fork_raises_critical_equivocation() {
-    // Two distinct removals at the same admin_seq: a self-fork by the admin.
+    // A genuine divergence: two concurrent admin invites of dave with
+    // conflicting roles (member vs agent), both parented on the admin tip.
+    // Same-effect concurrency is not a divergence (ADR-0006) — covered by
+    // `same_effect_concurrent_admin_events_are_not_a_divergence` below.
     let built = build_log(0, false);
     let mut net = SimNet::new(built.room);
     net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
     seed(&mut net, NODE_A, &built.events);
 
-    // Re-derive the two parents the removal cited and forge two distinct removals
-    // (different `reason`) at the same admin_seq.
+    let dave = Principal::new(0x30);
+    let mk_invite = |role: &str, invite_id: [u8; 16], sec: [u8; 16]| {
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: built.room,
+            sender_id: built.alice.identity(),
+            device_id: built.alice.device(),
+            event_type: iroh_rooms_core::event::content::EventType::MemberInvited,
+            created_at: T0 + 100,
+            prev_events: vec![built.admin_tip_eid],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: capability_hash(&built.room, &invite_id, &sec),
+                role: role.to_owned(),
+                invitee_key: dave.identity(),
+                expires_at: None,
+                invitee_hint: None,
+            }),
+        };
+        wire(&ev, &built.alice.dev)
+    };
+
+    // A ingests both branches; the conflicting roles trip the divergence detector.
+    net.deliver_raw(NODE_A, NODE_A, &mk_invite("member", [0xD1; 16], [0x51; 16]));
+    net.deliver_raw(NODE_A, NODE_A, &mk_invite("agent", [0xD2; 16], [0x52; 16]));
+
+    assert_eq!(
+        net.engine(NODE_A).completeness(),
+        Completeness::AdminForkDetected
+    );
+    let decisions = net.engine(NODE_A).trust_decisions();
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.code == "equivocation" && d.severity == Severity::Critical),
+        "a CRITICAL equivocation trust decision is recorded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Boundary (issue #213 / ADR-0006) — same-effect concurrency is NOT a divergence
+// ---------------------------------------------------------------------------
+
+/// Two concurrent admin removals of the same member have the **same**
+/// authorization effect, so the fold resolves identically either way: there is
+/// no conflict to arbitrate, and the divergence detector must NOT fire. This is
+/// the boundary the old same-`admin_seq` oracle got wrong (it fired on any
+/// collision), and the precise line #213 draws (different-effect only).
+#[test]
+fn same_effect_concurrent_admin_events_are_not_a_divergence() {
+    let built = build_log(0, false);
+    let mut net = SimNet::new(built.room);
+    net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
+    seed(&mut net, NODE_A, &built.events);
+
     let inv_carol_eid = SignedEvent::decode(&WireEvent::decode(&built.events[3]).unwrap().signed)
         .unwrap()
         .event_id();
@@ -795,23 +866,23 @@ fn admin_fork_raises_critical_equivocation() {
         wire(&ev, &built.alice.dev)
     };
 
-    let fork_a = mk_removal("a");
-    let fork_b = mk_removal("b");
-
-    // A ingests both branches; the second at the same admin_seq trips the detector.
-    net.deliver_raw(NODE_A, NODE_A, &fork_a);
-    net.deliver_raw(NODE_A, NODE_A, &fork_b);
+    // Two concurrent removals of carol (distinct reasons, same effect): a benign
+    // stale-head publish, not a divergence.
+    net.deliver_raw(NODE_A, NODE_A, &mk_removal("a"));
+    net.deliver_raw(NODE_A, NODE_A, &mk_removal("b"));
 
     assert_eq!(
         net.engine(NODE_A).completeness(),
-        Completeness::AdminForkDetected
+        Completeness::Complete,
+        "two same-effect concurrent admin events are not a divergence"
     );
-    let decisions = net.engine(NODE_A).trust_decisions();
     assert!(
-        decisions
+        net.engine(NODE_A)
+            .trust_decisions()
             .iter()
-            .any(|d| d.code == "equivocation" && d.severity == Severity::Critical),
-        "a CRITICAL equivocation trust decision is recorded"
+            .all(|d| d.code != "equivocation"),
+        "no equivocation for same-effect concurrency; got {:?}",
+        net.engine(NODE_A).trust_decisions()
     );
 }
 
