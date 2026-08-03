@@ -10,6 +10,13 @@
 
 > This document is the implementation plan for the pure v2 cryptographic core. It landed as **unused, isolated infrastructure**: a pure crate with no network, store, or async dependencies, never published and not re-exported from the SDK in this phase. The plan still chooses no deployment model and performs no git or GitHub actions; runtime/store/network crates may wire to it through separate, later issues (§12).
 
+> **Additive scope correction (#161, 2026-08-03):** references below to #150
+> describe the frozen Phase-B checkpoint candidate that was implemented. They
+> do not define the final #134 §7.6 snapshot/bootstrap wire format. That format
+> is specified by
+> [`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md),
+> without changing the candidate code or vectors.
+
 ---
 
 ## 1. Summary
@@ -498,6 +505,12 @@ Also expose machine-readable `.code()` strings so downstream CLI/runtime layers 
 4. Validate checkpoint roots by recomputing from supplied state.
 5. Add tests for snapshot hash stability, changed member leaf changes root/hash, wrong root rejected, and old checkpoint replay behavior.
 
+The five steps above record #150's candidate scope. #161 later established that
+the final §7.6 boundary additionally needs a canonical full-state snapshot,
+current-administrator quorum certificate, checkpoint-bound authority-transition
+proof, transfer encoding, and atomic installation rules. The final format must
+not reinterpret #150's eight-field body or legacy `SnapshotHash`.
+
 ### Step 10 — Implement member projection and Merkle map (#151)
 
 1. Define member statuses, role/capability representation, device bindings, and any governance cursor fields from #134 §8.1.
@@ -613,6 +626,11 @@ The `cargo tree` result must be inspected or machine-checked for banned dependen
 - [x] #148 authorization rules implemented with exhaustive allow/deny tests (the five-rule `validate_governance_entry`/`validate_and_apply_governance_entry` predicate over the opaque `ValidatedGovernanceState`/`GovernanceTip` in `governance/log/authz.rs`, including old-admin threshold counting, device-grant/revoke ownership rules, and the corrected 14-operation e2e registry; see `specs/v2-governance-authorization-rules.md` §16).
 - [x] #149 fork detection and `fork.resolve` implemented with fail-closed unresolved-fork behavior (the pure `detect_governance_fork` predicate in `governance/log/fork.rs`, the fork-aware `GovernanceMachine` with `Linear`/`GovernanceForked` states + recovery-threshold `fork.resolve` in `governance/log/machine.rs`, authenticated-evidence retention for audit, the typed `ForkResolve` payload + `ResolvedForkMarker`, and the wire-bytes lifecycle in `tests/v2_governance_fork_e2e.rs`; see `specs/v2-governance-fork-detection-resolution.md` §19).
 - [x] #150 checkpoints and snapshot hashes implemented and pinned by vectors (the signed eight-field `CheckpointBody` — schema_version/room_id/state_root/member_root/governance_tip/unresolved_forks/epoch/seq — with `snapshot_hash = BLAKE3(SNAPSHOT_HASH || csb)`, `decode_verified`, and root-recompute `validate_against_state` in `governance/checkpoint.rs`; frozen positive vector `governance-checkpoint-clean-state-v1` plus active `state-root-mismatch`/`snapshot-hash-mismatch` negatives in `tests/golden/v2-signed-records.json`, pinned by `tests/signed_records_golden.rs` + `governance/checkpoint.rs` unit tests; see `specs/v2-governance-checkpoints-snapshot-hash.md` §7).
+
+  This checked item remains evidence for the candidate implementation only.
+  Final §7.6 format implementation and vectors are separately gated by #161's
+  normative spec; the candidate vector is not interoperability evidence for
+  that format.
 - [x] #151 member projection and Merkle map/proofs implemented and pinned by vectors (the §8.1 `ProjectedMemberRecord` + §8.2 `SortedMerkleMap` — identity-sorted leaves, `BLAKE3(member-leaf||record)` / `BLAKE3(merkle-node||left||right)`, odd-trailing-node promotion, empty root `BLAKE3(merkle-node||0x40)`, incremental insert/replace/remove byte-identical to a full rebuild — in `member/{projected,sorted}.rs`, compact inclusion proofs with a bounded streaming verifier, sequence-aware governance apply, and frozen independently-reproduced golden vectors for 0/1/2/3/10 000 leaves in `tests/golden/v2-member-merkle.json` driven by `tests/member_sorted_merkle.rs`; landed in #183).
 - [x] #152 content event body validation implemented with strict unknown-kind/key rejection (the normative #134 §9.2 `ContentEventBody` in `content/body.rs` — one canonical-CBOR map of exactly twelve keys with strict §6.4 validation, the concrete exact-byte envelope + device-key verifier + pure per-device chain validator in `content/event.rs` (`ContentEvent`/`VerifiedContentEvent`/`verify_content_event`/`seal_content_event`/`validate_device_chain_link`), the shared canonical-CBOR `null` extension, the closed eight-kind registry, the `EventId::from_content_event_csb` recompute, and the focused `tests/content_body_validation.rs` acceptance suite; the pre-#152 provisional schema is retained test-only as `content::provisional` to keep the frozen #153 vector byte-stable; see `specs/v2-content-event-body-validation.md` §17).
 - [x] #153 golden vectors exist for every signed record and every hash/root boundary (every signed-record family pinned in `tests/golden/v2-signed-records.json` + `tests/signed_records_golden.rs` — governance entry/approval/checkpoint, member leaf, content event, fork resolution — with CSB/id/signature/state-root/snapshot-hash/member-root boundaries and one negative per `Reject` code; 0/1/2/3/10 000-leaf Merkle roots in `tests/golden/v2-member-merkle.json`; the inclusion-proof fixture gap from §4 D7 / §8 Step 12 closed by three hand-derived, independently-reproducible canonical-CBOR inclusion proofs over the frozen 2-/3-leaf trees in `tests/golden/v2-member-merkle.json`, driven by `tests/member_sorted_merkle.rs::frozen_inclusion_proofs_match_independently_derived_structure`; exclusion is expressed as absence-of-proof + rebound-proof rejection).
@@ -632,6 +650,12 @@ The `cargo tree` result must be inspected or machine-checked for banned dependen
 - Unknown kinds/keys must reject, not ignore.
 - Authorization must fail closed under unresolved forks and unknown governance state.
 - Snapshot hashes and state roots must commit to all state that affects authorization.
+- **#161 correction:** the normative `governance::log` six-component state root
+  uses #151's active-device member projection and does not distinguish retained
+  revoked-device tombstones. The final checkpoint-approved full-snapshot hash
+  supplies that commitment; no non-checkpoint state import may rely on the six
+  roots alone until that debt is resolved. This is separate from #150's legacy
+  candidate model.
 
 ### Privacy
 
@@ -701,9 +725,9 @@ Because no production runtime consumes the crate at initial landing, rollback is
 - **OQ-1:** ~~What are the exact domain-separation strings from #134/#146? The table in D3 is a candidate and must be reconciled before code lands.~~ **Resolved by #146.** #134 §6.2 freezes eleven `iroh-room-v2/<kind>` strings (see D3 update above and `specs/v2-identifiers-domain-separation.md`); the D3 candidate strings remain only as legacy compatibility aliases.
 - **OQ-2:** ~~What is the exact v2 key model: v1-style identity key plus device key, or a changed principal/device model?~~ **Resolved by #146/#152.** A `PrincipalId`/`MemberId` (Ed25519 identity) plus a separate `DeviceId` (device key) is the v2 model; content events sign under the in-body `device_id` via `verify_device`. See `specs/v2-identifiers-domain-separation.md` §15 and `specs/v2-content-event-body-validation.md` §17.
 - **OQ-3:** ~~What exact governance actions and approval thresholds does #134 §7 define?~~ **Resolved by #147/#148.** A closed 14-operation §7.3 registry with pure `apply(old, op) -> new_state`, administrator threshold `W` counted over the *old* admin set (rule 4), and a separate recovery threshold for `fork.resolve`. See `specs/v2-governance-log-entry-approval-state-root.md` §17 and `specs/v2-governance-authorization-rules.md` §16.
-- **OQ-4:** ~~Does `state_root` commit to unresolved fork evidence directly, or only to accepted/resolved governance state plus a separate fork set?~~ **Resolved by #149/#150.** It commits directly: checkpoints carry a hashed `unresolved_forks` commitment validated against the folded state, and the fork-aware machine retains all competing branch evidence in its audit record. See `specs/v2-governance-fork-detection-resolution.md` §19 and `specs/v2-governance-checkpoints-snapshot-hash.md` §7.
+- **OQ-4:** ~~Does `state_root` commit to unresolved fork evidence directly, or only to accepted/resolved governance state plus a separate fork set?~~ **Historical #150 resolution, corrected by #161.** The six-component normative `governance::log` state root commits its six defined projections of accepted state, including resolved-fork markers in community policy; it does not directly contain complete unresolved branch evidence or revoked-device tombstones omitted by #151's active-device projection. The #150 candidate separately hashes an `unresolved_forks` field. The final #161 format forbids checkpoint production/installation while unresolved and requires full-DAG proof material for resolved histories. See `specs/v2-governance-fork-detection-resolution.md` §19, `specs/v2-governance-checkpoints-snapshot-hash.md` §8, and `specs/v2-governance-snapshot-transition-proof.md` §8.
 - **OQ-5:** ~~What are the exact `fork.resolve` action enum values and authorization requirements?~~ **Resolved by #149.** `ForkResolve { branch_heads, selected_head, selected_state_root, created_at_ms }`, authorized by a `W`-of-`R` recovery threshold sourced from the last common uncontested ancestor, with no administrator fallback. See `specs/v2-governance-fork-detection-resolution.md` §19.
-- **OQ-6:** ~~What fields are mandatory in governance checkpoints, and is checkpoint sequence global, per-branch, or per-author?~~ **Resolved by #150.** Eight mandatory fields (`schema_version`, `room_id`, `state_root`, `member_root`, `governance_tip`, `unresolved_forks`, `epoch`, `seq`); `seq` is per-room monotonic and `epoch` advisory. See `specs/v2-governance-checkpoints-snapshot-hash.md` §7.
+- **OQ-6:** ~~What fields are mandatory in governance checkpoints, and is checkpoint sequence global, per-branch, or per-author?~~ **Candidate resolved by #150; final §7.6 resolved by #161.** #150's eight fields and advisory `epoch` remain frozen only for its legacy candidate. The final checkpoint map, quorum certificate, and per-community `checkpoint_seq` are defined in `specs/v2-governance-snapshot-transition-proof.md` §5; it has no `epoch` and is not an extension of the candidate body.
 - **OQ-7:** ~~Does #134 require a specific Merkle map construction, or may the implementation use the sparse BLAKE3 map described here?~~ **Resolved by #151.** The normative member commitment is an identity-sorted Merkle tree (leaves sorted by raw 32-byte `PrincipalId`, `BLAKE3(member-leaf || record)` / `BLAKE3(merkle-node || left || right)`, trailing odd node promoted unchanged), not the legacy sparse 256-level map. See `member/{projected,sorted}.rs` + `tests/golden/v2-member-merkle.json` (commit #183).
 - **OQ-8:** ~~What is the authoritative #134 §9.2 content-kind/body registry if it differs from `specs/content-and-moderation-event-schemas.md`?~~ **Resolved by #152.** A closed eight-kind registry: `message.{text,reaction,edited}`, `file.shared`, `agent.status`, `moderation.{block,report,remove}`; unknown kinds/keys reject. See `specs/v2-content-event-body-validation.md` §17.
 - **OQ-9:** ~~What artifact should record the independent audit: a doc under `docs/audits/`, a spec appendix, or an orchestrator-managed issue attachment?~~ **Resolved.** A doc under `docs/audits/` (the established convention — see `docs/audits/feature-complete-audit-2026-07-02.md`). Draft: `docs/audits/v2-governance-fork-audit-2026-07-30.md`, pending independent sign-off.

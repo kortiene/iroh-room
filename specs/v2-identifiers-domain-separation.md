@@ -10,6 +10,14 @@
 
 ---
 
+> **Additive domain amendment (#161, 2026-08-03):** #134 §6.2 calls the
+> original eleven domains a minimum. The final governance snapshot format adds
+> four distinct hash purposes in §16. The eleven implemented constants and
+> vectors remain byte-stable; Phase C must add and pin the four new constants
+> before advertising that format.
+
+---
+
 ## 1. Summary
 
 Implement the #134 §6 v2 cryptographic identifier foundation in `crates/iroh-rooms-v2-core/`: frozen domain-separation constants, typed v2 identifiers, BLAKE3-256 derivation helpers over declared preimages, and strict canonical-CBOR record validation rules used before governance/content/replica layers build on top.
@@ -549,3 +557,30 @@ Because this crate is unused by the shipped runtime, rollback is source-level on
 
 The `StreamId` and `EventId` derivations intentionally share the single `content-event` domain today (documented OQ-1 assumption in `src/ids.rs`); `tests/identifiers.rs::stream_and_event_ids_share_content_event_domain_by_design` pins this so a future dedicated stream-domain change can never land silently.
 
+---
+
+## 16. Additive governance-snapshot domains (#161)
+
+#161 freezes four additional #134 §6.2 purposes:
+
+```text
+GOVERNANCE_SNAPSHOT            = "iroh-room-v2/governance-snapshot"
+GOVERNANCE_TRANSITION_MANIFEST = "iroh-room-v2/governance-transition-manifest"
+GOVERNANCE_SPAN_ANCHOR         = "iroh-room-v2/governance-span-anchor"
+GOVERNANCE_SPAN_STEP           = "iroh-room-v2/governance-span-step"
+```
+
+They separate the uncompressed full-state snapshot hash, authority-transition
+manifest hash, span-anchor hash, and span-step hash. Governance checkpoint ID
+derivation/signing continues to use the existing
+`iroh-room-v2/governance-checkpoint` record boundary under D2. Closed `kind`
+discriminants remain an additional structural check, not a substitute for
+purpose separation.
+
+Adding these constants is backward compatible because no existing preimage,
+identifier, signature, or golden byte changes. Before format version 1 is
+advertised, Phase C must expose the constants, include them in the frozen
+domain inventory, byte-pin exact ASCII/uniqueness, and add independent hash
+vectors for all four preimages. The exact formats and formulas are normative in
+[`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md)
+§2.2 and §7.4.

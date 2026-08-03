@@ -10,6 +10,17 @@
 
 ---
 
+> **Additive status amendment (#161, 2026-08-03):** this document records the
+> frozen Phase-B checkpoint candidate implemented by #150. It is not the final
+> #134 §7.6 bootstrap checkpoint or snapshot encoding. The normative format is
+> now [`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md),
+> with rationale in
+> [`ADR-0008`](../docs/decisions/ADR-0008-governance-snapshot-transition-proof.md).
+> Existing candidate code and vectors remain byte-stable and must not be
+> reinterpreted as the new format.
+
+---
+
 ## 1. Summary
 
 A governance checkpoint is a signed commitment to a folded governance state at a
@@ -212,3 +223,39 @@ future canonicalization drift.
 chains, or transport binding live here; a receiver must supply the folded state
 to `validate_against_state`. Wiring checkpoints into a store/network crate is a
 separate, later issue (epic spec §12).
+
+---
+
+## 8. Additive normative supersession (#161)
+
+#161 found that the candidate boundary above cannot satisfy #134 §7.6 without a
+new record family. In particular, its `SnapshotHash` hashes the eight-field
+checkpoint body rather than a snapshot blob; its envelope has one signer rather
+than a current-administrator quorum; and it carries no canonical full-state
+snapshot, blob length, stream/replica commitment, or authority-transition
+proof. Its `validate_against_state` implementation recomputes a projected
+member root only as an input to legacy state-root verification; it does not
+compare that value with `body.member_root`, nor compare `body.governance_tip` or
+`body.room_id` with the supplied state. Those are candidate validation gaps,
+not properties to inherit into the final format.
+
+#161 separately found a gap in the normative `governance::log` path: its #151
+member component projects active devices, while the fold retains revoked-device
+tombstones and consults them when validating a future device grant. That issue
+does not arise from the candidate model above; the final full snapshot closes
+it with a separate checkpoint-approved blob hash.
+
+Consequently:
+
+- `CheckpointBody`, `Envelope<SnapshotHash>`, the two legacy domains, and
+  `governance-checkpoint-clean-state-v1` remain historical candidate artifacts;
+- none is an alias, downgrade, or alternate encoding of the final §7.6 format;
+- implementations must not advertise §7.6 snapshot bootstrap based on these
+  artifacts; and
+- the exact final snapshot, checkpoint certificate, transition proof,
+  compression profile, and installation rules are specified only by
+  [`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md).
+
+This is an additive status correction. It does not rewrite or invalidate the
+evidence for what #150 actually implemented, and its frozen bytes remain under
+the original compatibility gate.
