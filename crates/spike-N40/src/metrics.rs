@@ -164,7 +164,12 @@ pub async fn cluster_metrics(
         node_metrics_vec.push(node_metrics(cluster, i, baseline).await?);
     }
 
-    let process_rss = process_rss_bytes().context("sample process RSS")?;
+    // RSS is Linux-only (`crates/spike-N40/src/rss.rs` reads `/proc/self/status`);
+    // on macOS/other platforms this sample degrades to 0 — `rss_per_node_est`
+    // becomes meaningless but no consumer asserts on it, so `cluster_metrics`
+    // runs cross-platform (the shipping measurement binary `main.rs` still
+    // fails-closed on non-Linux, preserving the no-fabricated-number stance).
+    let process_rss = process_rss_bytes().unwrap_or(0);
     let per_node_est = if n == 0 {
         0
     } else {
