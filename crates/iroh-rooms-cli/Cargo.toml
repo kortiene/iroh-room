@@ -18,8 +18,9 @@ path = "src/main.rs"
 # `netwatch`, `portmapper` all declare `rust-version = "1.91"`. That is the real
 # floor, so this crate declares 1.91 explicitly instead of inheriting the
 # workspace value (1.85, the pure crates' floor). Mirrors
-# `iroh-rooms-net/Cargo.toml`. CI must build this crate on a pinned 1.91
-# toolchain, or the number drifts again at the next iroh bump.
+# `iroh-rooms-net/Cargo.toml`. CI builds this crate on a pinned 1.91 toolchain
+# (`.github/workflows/msrv.yml`), or the number drifts again at the next iroh
+# bump.
 
 [lints]
 workspace = true

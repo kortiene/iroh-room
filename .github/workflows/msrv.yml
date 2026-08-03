@@ -1,0 +1,99 @@
+name: msrv
+
+# Enforce the declared MSRVs on pinned toolchains so MSRV drift fails the PR
+# instead of silently merging. The workspace declares a per-tier MSRV
+# (`Cargo.toml`: `rust-version = "1.85"` for the pure tier; `iroh-rooms-cli` and
+# `iroh-rooms-net` declare `"1.91"` for the iroh stack). `verify.yml`'s floating
+# `@stable` masked the real floor for two iroh majors — a false `"1.80"` survived
+# until #209 corrected it to 1.91. This workflow is the machine check that
+# prevents a repeat (`iroh-rooms-cli/Cargo.toml` explicitly requires it).
+#
+# Four jobs cover the {default, all-features} × {shipping, pure-core} matrix the
+# declared MSRVs imply (`--all-targets` checks targets, NOT features, so the two
+# must be crossed explicitly):
+#   - msrv-1-91: the whole workspace, `--all-features`, on rustc 1.91 (the iroh
+#     stack's floor = max declared MSRV). Catches any drift above 1.91.
+#   - msrv-1-91-default: the SHIPPING configuration (default features — gossip
+#     overlay OFF, per `iroh-rooms-cli/Cargo.toml`) on rustc 1.91. `--all-features`
+#     compiles the `#[cfg(feature = "gossip_overlay")]` branches and skips the
+#     shipping `#[cfg(not(...))]` code, so this default-features job is what
+#     actually covers the binary we ship.
+#   - msrv-1-85: the pure tier (default features) on rustc 1.85, selecting the
+#     pure crates explicitly (`-p`). `--workspace --exclude` does NOT work here:
+#     cargo still resolves the excluded members' deps (the iroh stack) and fails
+#     their >1.85 `rust-version` (portmapper 1.91, redb 1.89, …).
+#   - msrv-1-85-core-features: `iroh-rooms-core`'s non-default `store`/`sync`
+#     features (the vendored `rusqlite`) on rustc 1.85 — the pure default-features
+#     job does not exercise them, so a rusqlite MSRV bump above 1.85 would
+#     otherwise be masked by the 1.91 `--all-features` job.
+#
+# Maintenance: a NEW pure crate (inheriting the workspace `rust-version =
+# "1.85"`) MUST be added to the `-p` list in `msrv-1-85` (and to
+# `msrv-1-85-core-features` if it has 1.85-pure non-default features) to be
+# verified. A new iroh-tier crate (declaring `rust-version = "1.91"`) is
+# auto-covered by `msrv-1-91` / `msrv-1-91-default` and needs no change here.
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  # Mirror verify.yml: no `target/` cache between runs, so incremental
+  # compilation is pure overhead here, and its multi-GB footprint contributed to
+  # exhausting the runner's disk mid-link (lld SIGBUS writing one of the later
+  # `--all-targets` binaries).
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+# Cancel a superseded run when a new push lands on the same ref (standard for
+# PR CI; the release-readiness gate uses `false` to protect manual dispatches,
+# but this workflow has no long-running manual role).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msrv-1-91:
+    name: "MSRV 1.91 (iroh tier: whole workspace, --all-features)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.91
+      - name: cargo check --workspace --all-targets --all-features (rustc 1.91)
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  msrv-1-85:
+    name: "MSRV 1.85 (pure tier: core/crypto/v2-core + iroh-rooms facade, default features)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: cargo check --all-targets (rustc 1.85, pure tier)
+        run: >
+          cargo check --all-targets --locked
+          -p iroh-rooms-core
+          -p iroh-rooms-crypto
+          -p iroh-rooms-v2-core
+          -p iroh-rooms
+
+  msrv-1-91-default:
+    name: "MSRV 1.91 (shipping config: whole workspace, default features — gossip OFF)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.91
+      - name: cargo check --workspace --all-targets (rustc 1.91, default features)
+        run: cargo check --workspace --all-targets --locked
+
+  msrv-1-85-core-features:
+    name: "MSRV 1.85 (iroh-rooms-core --all-features: store/sync = vendored rusqlite)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: cargo check -p iroh-rooms-core --all-features (rustc 1.85)
+        run: cargo check -p iroh-rooms-core --all-features --all-targets --locked
