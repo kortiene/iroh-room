@@ -793,9 +793,12 @@ impl RoomMembership {
     #[must_use]
     pub fn admin_divergence(&self, admin: IdentityKey) -> Option<Vec<EventId>> {
         // Group admin-authored authorization writes by the subject they touch.
+        // Only accepted (held-and-validated) nodes: a Pending or Rejected admin
+        // event must never fire a divergence (it may still be dropped from the
+        // validated set), matching the detector's held-and-accepted contract.
         let mut by_subject: BTreeMap<IdentityKey, Vec<EventId>> = BTreeMap::new();
         for (id, node) in &self.nodes {
-            if node.event.event.sender_id != admin {
+            if !node.is_accepted() || node.event.event.sender_id != admin {
                 continue;
             }
             let subject = match &node.event.event.content {

@@ -20,7 +20,9 @@
 //!    [`Completeness`] detector. A known-higher tip we have not backfilled ⇒
 //!    [`AdminViewSuspect`](Completeness::AdminViewSuspect), which **fails
 //!    affected subjects closed** until catch-up: an unapplied admin event could
-//!    be a removal. Two held events at one `admin_seq` ⇒
+//!    be a removal. A fold-level admin **divergence** — two causally concurrent
+//!    admin membership writes with a conflicting authorization effect on one
+//!    subject (issue #213 / ADR-0006) ⇒
 //!    [`AdminForkDetected`](Completeness::AdminForkDetected) + a CRITICAL
 //!    `equivocation` [`TrustDecision`], which is **advisory and denies nobody**
 //!    (ADR-0005 / #211): a fork is only declared over branches we hold, so
