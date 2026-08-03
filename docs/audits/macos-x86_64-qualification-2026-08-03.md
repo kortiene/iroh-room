@@ -3,7 +3,7 @@
 ## Scope
 
 - **Platform under test:** native `x86_64-apple-darwin` (Intel Mac). This attests **only** `x86_64-apple-darwin`. **`aarch64-apple-darwin` remains untested** (no Apple Silicon in the fleet) — do not read this as covering both Apple triples.
-- **Why:** `.github/workflows/verify.yml` runs `ubuntu-latest` only; both Apple triples shipped having never executed a test. This is the first native macOS qualification evidence in the repo.
+- **Why:** `.github/workflows/verify.yml` runs `ubuntu-latest` only — there is no macOS CI gate, so a macOS regression is not auto-caught. rc.1's sign-off (`docs/releases/v0.1.0-rc.1-production-beta-signoff.md`, 2026-07-07) recorded an earlier one-time macOS `x86_64-apple-darwin` `verify.sh` + `release-readiness.sh` pass; this run re-establishes the qualification on the substantially-grown current test corpus and is the first record with full per-binary evidence.
 - **Repository:** `kortiene/iroh-room`, branch `main`, SHA `edeae8d267f4d53d15bc69ea8cf1f6bb4e3eb8cc` (the merge of #220, which was required — see below).
 - **Date:** 2026-08-03 07:59 EDT.
 - **Method:** fresh qualification clone, `git pull --ff-only`, `ulimit -n 1024` (macOS defaults to 256 fds; the loopback integration tests hit `EMFILE` otherwise), `scripts/verify.sh`. No source edits / commits / pushes were performed during qualification; source worktree clean afterward.
@@ -33,13 +33,13 @@ All phases green:
 
 ## Totals
 
-**2505 passed; 0 failed; 20 ignored** across all `verify.sh` phases (2498 in the workspace `--all-targets --all-features` run across 102 test binaries + 7 doctests). The 20 ignored are the loopback `#[ignore]`-gated online tiers (run separately by `release-readiness.sh`), unchanged from ubuntu.
+**2505 passed; 0 failed; 20 ignored** across all `verify.sh` phases (2498 in the workspace `--all-targets --all-features` run across 102 test binaries + 7 doctests). Of the 20 ignored: 18 are the loopback `#[ignore]`-gated online tiers (run separately by `release-readiness.sh`); the other 2 are fixture-regeneration utilities in `tests/compatibility` and `tests/protocol_conformance` that are **not** part of the release-readiness tier.
 
 No `rusqlite`/`libsqlite3-sys`, `EMFILE`, kqueue, tokio, `getrandom`, or firewall-related failure.
 
 ## One defect found during qualification — fixed in #220
 
-The first run (2026-08-02, SHA `3acf956`) was NOT QUALIFIED: two `spike-N40` `self_check` tests (`n5_metrics_render_markdown_and_json_without_panic`, `n5_disconnect_peer_drops_then_redials_and_delivery_recovers`) panicked because they `.expect()`-ed `process_rss_bytes()`, which reads Linux-only `/proc/self/status` (`crates/spike-N40/src/rss.rs` is Linux-only by design). All 2370 **shipping-crate** tests passed even on that first run — the platform hole was, in practice, a single spike-crate harness bug.
+The first run (2026-08-02, SHA `3acf956`) was NOT QUALIFIED: two `spike-N40` `self_check` tests (`n5_metrics_render_markdown_and_json_without_panic`, `n5_disconnect_peer_drops_then_redials_and_delivery_recovers`) panicked because they `.expect()`-ed `process_rss_bytes()`, which reads Linux-only `/proc/self/status` (`crates/spike-N40/src/rss.rs` is Linux-only by design). All **shipping-crate** tests passed even on that first run (the only failures were the two `spike-N40` tests) — the platform hole was, in practice, a single spike-crate harness bug, not a portability defect.
 
 **Fix (#220, merged `edeae8d`):** tolerate non-Linux at the two RSS call sites (`self_check.rs` baseline + `cluster_metrics` per-sample) via `.unwrap_or(0)`; the shipping measurement binary (`main.rs`) is deliberately left fail-closed on non-Linux to preserve the no-fabricated-number stance for release measurement. Linux unchanged. The 2026-08-03 re-run at `edeae8d` is green.
 
@@ -47,9 +47,9 @@ The first run (2026-08-02, SHA `3acf956`) was NOT QUALIFIED: two `spike-N40` `se
 
 Every emitted `test result:` line was `ok`. Format: `binary — N passed; 0 failed; M ignored`.
 
-**iroh-rooms (façade):** `src/lib.rs` 0/0 · `tests/example_agent_e2e` 9/3 · `tests/experimental_surface` 11/0 · `tests/facade_e2e` 4/0 · `tests/iroh_pin_consistency` 2/0 · `tests/stable_surface` 11/0 · `tests/store_concurrency_e2e` 2/0 · `src/main.rs` (CLI) 286/0 · 8 examples 0/0
+**iroh-rooms (façade):** `src/lib.rs` 0/0 · `tests/example_agent_e2e` 9/3 · `tests/experimental_surface` 11/0 · `tests/facade_e2e` 4/0 · `tests/iroh_pin_consistency` 2/0 · `tests/stable_surface` 11/0 · `tests/store_concurrency_e2e` 2/0 · 8 examples 0/0
 
-**iroh-rooms-cli:** `tests/agent_cli` 24/0 · `tests/agent_e2e` 0/2 · `tests/agent_invite_flow` 8/0 · `tests/diagnostics_cli` 4/0 · `tests/docs_conformance` 74/0 · `tests/error_taxonomy` 26/0 · `tests/error_taxonomy_e2e` 2/1 · `tests/file_cli` 42/0 · `tests/full_demo_e2e` 12/6 · `tests/identity_cli` 37/0 · `tests/invite_cli` 25/0 · `tests/join_cli` 12/0 · `tests/live_pipe_preview_docs` 23/0 · `tests/message_cli` 14/0 · `tests/no_direct_iroh_dep` 3/0 · `tests/phase0_memo_conformance` 20/0 · `tests/pipe_cli` 19/1 · `tests/release_readiness_docs` 19/0 · `tests/release_readiness_e2e` 6/0 · `tests/room_cli` 40/0 · `tests/tail_cli` 45/0 · `tests/two_peer_e2e` 18/5
+**iroh-rooms-cli:** `src/main.rs` (the `iroh-rooms` CLI binary) 286/0 · `tests/agent_cli` 24/0 · `tests/agent_e2e` 0/2 · `tests/agent_invite_flow` 8/0 · `tests/diagnostics_cli` 4/0 · `tests/docs_conformance` 74/0 · `tests/error_taxonomy` 26/0 · `tests/error_taxonomy_e2e` 2/1 · `tests/file_cli` 42/0 · `tests/full_demo_e2e` 12/6 · `tests/identity_cli` 37/0 · `tests/invite_cli` 25/0 · `tests/join_cli` 12/0 · `tests/live_pipe_preview_docs` 23/0 · `tests/message_cli` 14/0 · `tests/no_direct_iroh_dep` 3/0 · `tests/phase0_memo_conformance` 20/0 · `tests/pipe_cli` 19/1 · `tests/release_readiness_docs` 19/0 · `tests/release_readiness_e2e` 6/0 · `tests/room_cli` 40/0 · `tests/tail_cli` 45/0 · `tests/two_peer_e2e` 18/5
 
 **iroh-rooms-core:** `src/lib.rs` 300/0 · `tests/cbor_property` 6/0 · `tests/compatibility` 7/1 · `tests/e2e_lifecycle` 12/0 · `tests/encrypted_authz_reads` 11/0 · `tests/encrypted_envelope` 15/0 · `tests/encrypted_write_path` 19/0 · `tests/file_shared_hashes` 5/0 · `tests/golden_vectors` 58/0 · `tests/membership_fold` 32/0 · `tests/membership_store_e2e` 6/0 · `tests/protocol_conformance` 81/1 · `tests/store_e2e` 5/0 · `tests/sync_batch_dedup_e2e` 5/0 · `tests/sync_convergence` 46/0 (67s) · `tests/sync_restart` 16/0 · `tests/sync_smoke` 43/0
 
@@ -68,7 +68,7 @@ Every emitted `test result:` line was `ok`. Format: `binary — N passed; 0 fail
 ## Caveats
 
 - **`aarch64-apple-darwin` is NOT covered** — no Apple Silicon in the fleet. That triple continues to ship untested.
-- **Point-in-time:** this attests SHA `edeae8d` only. It is a manual qualification, **not** a CI gate — `verify.yml` still runs `ubuntu-latest` only, so a future macOS regression would not be caught until a re-run. Follow-up: add `macos-13` (x86_64) to the `verify.yml` / `msrv.yml` matrix so the qualification self-renews.
+- **Point-in-time:** this attests SHA `edeae8d` only. It is a manual qualification, **not** a CI gate — `verify.yml` still runs `ubuntu-latest` only, so a future macOS regression would not be caught until a re-run. Follow-up: add `macos-15-intel` (the available `x86_64-apple-darwin` runner — `release.yml` documents that `macos-13` is retired and `macos-14` is deprecated) to the `verify.yml` / `msrv.yml` matrix so the qualification self-renews.
 - The optional heavier gates (`release-readiness.sh` loopback online tiers; the 1.91/1.85 MSRV checks) were **not** run on macOS — they are loopback and very likely fine, but unmeasured. Worth adding to a future macOS matrix run.
 
 ## What this attests
