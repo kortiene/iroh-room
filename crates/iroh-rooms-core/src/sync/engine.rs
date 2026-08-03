@@ -149,15 +149,16 @@ pub enum Completeness {
     ///
     /// This is the only variant that denies anyone.
     AdminViewSuspect,
-    /// Two distinct admin events were observed at the same `admin_seq` — the
-    /// detectable signature of an admin self-fork (spec §7). Raises a CRITICAL
-    /// `equivocation` alert.
+    /// Two causally concurrent admin membership writes with a conflicting
+    /// authorization effect on one subject — a fold-level **divergence** (issue
+    /// #213 / ADR-0006). Raises a CRITICAL `equivocation` alert.
     ///
     /// **Advisory: this denies nobody** (ADR-0005 / #211). A fork is only ever
     /// declared over branches this node *holds*, so nothing is missing and the
     /// fold has already merged them at least privilege. Treating it as a gate is
     /// what wedged rooms permanently, because an honest admin publishing from a
-    /// stale head produces the identical signal.
+    /// stale head produces concurrent admin events — which the divergence
+    /// detector ignores unless their authorization effects actually conflict.
     AdminForkDetected,
 }
 
@@ -342,8 +343,8 @@ struct Parked {
 /// an **unverified hint** — not proof the event exists — so it is bounded by an
 /// attempt budget: a fabricated tip is expired after `attempts` ticks rather than
 /// pinning the node fail-closed forever (spec D6 / §13). It is held only here and
-/// is **never** folded into the held admin state (`admin_ids_by_seq`), so it can
-/// neither forge a fork nor advance the local tip.
+/// is **never** folded into the held fold state, so it can neither forge a
+/// divergence nor advance the local tip.
 #[derive(Clone, Copy, Debug)]
 struct SuspectTip {
     /// The advertised tip id (we may never hold it — it may not exist).
@@ -533,13 +534,6 @@ pub struct SyncEngine {
     /// and bounded by an attempt budget so a fabricated higher tip cannot pin the
     /// node fail-closed forever (spec §13).
     suspect_tip: Option<SuspectTip>,
-    /// Admin event ids seen at each `admin_seq`, recorded **only** from
-    /// held-and-validated admin events (local accepts + the persisted chain),
-    /// **never** from raw advertisements. Two distinct *held* ids at one seq is a
-    /// genuine admin self-fork (spec §7); sourcing this from held events alone
-    /// means a peer cannot forge a fork against the honest admin by advertising a
-    /// fabricated tip.
-    admin_ids_by_seq: BTreeMap<u64, BTreeSet<EventId>>,
     completeness: Completeness,
     fail_closed: BTreeSet<IdentityKey>,
     trust_decisions: Vec<TrustDecision>,
@@ -732,7 +726,6 @@ impl SyncEngine {
             backfill_depth: BTreeMap::new(),
             tokens: BTreeMap::new(),
             suspect_tip: None,
-            admin_ids_by_seq: BTreeMap::new(),
             completeness: Completeness::Complete,
             fail_closed: BTreeSet::new(),
             trust_decisions: Vec::new(),
@@ -752,7 +745,6 @@ impl SyncEngine {
             epoch_commitments: BTreeMap::new(),
             highest_epoch_seen: 0,
         };
-        engine.seed_admin_state()?;
         // Restore the genuinely non-rebuildable transient state (the orphan park,
         // the unconfirmed admin-tip suspicion, the backfill token buckets, the
         // trust-decision audit, and adopted room keys) from the v2 sync-cache
@@ -1793,7 +1785,6 @@ impl SyncEngine {
                 // peer re-serving duplicates every tick, so both caches reset.
                 self.closure_cache = None;
                 self.covered_cache.clear();
-                self.note_admin_event(id);
                 // Fold-driven key adoption (#191 step 6): if this event carries a
                 // distribution payload, attempt to unwrap and adopt the epoch key.
                 self.adopt_key_from_event(id, &ev.event.content);
@@ -2665,9 +2656,9 @@ impl SyncEngine {
     fn handle_admin_tip(&mut self, tip: Option<(EventId, u64)>, out: &mut Vec<Outgoing>) {
         if let Some((id, seq)) = tip {
             // An `AdminTip` is an **unverified** peer claim, not proof the event
-            // exists. Do NOT feed it into the held admin state (`admin_ids_by_seq`
-            // / the local tip): doing so would let a single peer forge a fork
-            // against the honest admin (a fabricated id colliding at a seq we hold)
+            // exists. Do NOT feed it into the held fold (the divergence detector
+            // / the local tip): doing so would let a single peer forge a divergence
+            // against the honest admin (a fabricated id the fold never accepted)
             // or, via a bogus huge seq, pin us fail-closed forever on a tip that
             // can never be backfilled. Treat it only as a *suspect* tip that drives
             // a bounded catch-up pull (spec D6 / §13).
@@ -2797,29 +2788,17 @@ impl SyncEngine {
     /// Re-derive the completeness verdict, fail-closed subject set, and trust
     /// decisions from current admin state (spec D6).
     fn recompute_completeness(&mut self) -> Result<(), StoreError> {
-        // Fork: an `admin_seq` at which we hold **two distinct, validated** admin
-        // events (spec §7). Every id in `admin_ids_by_seq` came from an
-        // accepted-and-stored admin event (never from an advertisement), so a peer
-        // cannot forge a fork by advertising a fake tip; we re-confirm the
-        // conflicting ids are still held so the alarm always names branches this
-        // node truly holds. A real cross-partition fork is still detected once the
-        // never-windowed membership pull backfills the other branch.
-        let mut fork = None;
-        for (seq, ids) in &self.admin_ids_by_seq {
-            if ids.len() < 2 {
-                continue;
-            }
-            let mut held = Vec::new();
-            for id in ids {
-                if self.store.contains_in_room(&self.room_id, id)? {
-                    held.push(*id);
-                }
-            }
-            if held.len() >= 2 {
-                fork = Some((*seq, held));
-                break;
-            }
-        }
+        // Fork: a fold-level admin **divergence** — two causally concurrent admin
+        // membership writes with a conflicting authorization effect on one subject
+        // (issue #213 / ADR-0006). Sourced from the held fold only, so a peer
+        // cannot forge one by advertising a fabricated tip; a real cross-partition
+        // fork is still detected once the never-windowed membership pull backfills
+        // the other branch onto the held fold.
+        let fork: Option<Vec<EventId>> = self
+            .membership_projection
+            .snapshot
+            .admin()
+            .and_then(|admin| self.fold.admin_divergence(*admin));
 
         // Behind: an advertised (unverified) tip ahead of our local held chain that
         // we have not yet backfilled. Cleared here the moment we hold it / our local
@@ -2858,11 +2837,11 @@ impl SyncEngine {
         // Recorded independently, not as an either/or: the two conditions are
         // orthogonal, so a concurrent fork must not swallow the suspicion record
         // that explains why access is denied.
-        if let Some((seq, ids)) = fork {
+        if let Some(ids) = fork {
             self.record_trust(TrustDecision {
                 code: "equivocation",
                 severity: Severity::Critical,
-                admin_seq: seq,
+                admin_seq: 0, // a divergence concerns a subject, not one admin_seq
                 event_ids: ids,
             });
         }
@@ -2895,13 +2874,15 @@ impl SyncEngine {
         // stale head — into a permanent, room-wide, reboot-surviving outage,
         // while buying nothing against a malicious admin: the sole immutable
         // admin can already remove anyone unilaterally, so equivocating gains it
-        // no capability it lacks. The signal is also undecidable (a benign
-        // stale-head publish and a deliberate fork are byte-identical) and, per
-        // the accept-time caching of `admin_ids_by_seq`, not even reliable.
+        // no capability it lacks. The verdict therefore stays advisory even after
+        // #213 made the *signal* sound: the fold-level divergence detector (issue
+        // #213 / ADR-0006) distinguishes a real equivocation (concurrent admin
+        // writes with a conflicting effect on one subject) from benign same-effect
+        // concurrency, replacing the unsound same-`admin_seq` oracle.
         //
-        // Detection is unchanged: the CRITICAL `equivocation` trust decision is
-        // still recorded above and persisted, and `completeness()` still reports
-        // `AdminForkDetected`. Only the authorization response changed.
+        // Detection: the CRITICAL `equivocation` trust decision is recorded above
+        // and persisted, and `completeness()` reports `AdminForkDetected` — but
+        // only on a genuine divergence, never on ordinary concurrency.
         self.fail_closed.clear();
         if behind {
             let snap = &self.membership_projection.snapshot;
@@ -3108,21 +3089,6 @@ impl SyncEngine {
         if let Err(e) = self.store.append_trust_decision(&self.room_id, &row) {
             self.log(&format!("checkpoint failed: trust_decision: {e}"));
         }
-    }
-
-    /// Record a locally-accepted, **stored** admin event's `(admin_seq, id)` for
-    /// fork detection. Only held-and-validated events feed this state (spec §7), so
-    /// a peer cannot forge a fork by advertising a fabricated tip.
-    fn note_admin_event(&mut self, id: EventId) {
-        if let Ok(Some(se)) = self.store.get_in_room(&self.room_id, &id) {
-            if let Some(seq) = se.admin_seq {
-                self.note_admin_id(seq, id);
-            }
-        }
-    }
-
-    fn note_admin_id(&mut self, seq: u64, id: EventId) {
-        self.admin_ids_by_seq.entry(seq).or_default().insert(id);
     }
 
     /// Fold-driven key adoption (#191 step 6). If `content` carries a
@@ -3357,20 +3323,6 @@ impl SyncEngine {
             return;
         };
         self.persist_room_key(epoch, &key, &source_event_id);
-    }
-
-    /// On open, seed the per-seq fork-detection state from the persisted, validated
-    /// admin chain only (spec §9 restart determinism). Advertised tips are not yet
-    /// known here and are never persisted, so nothing unverified is seeded.
-    fn seed_admin_state(&mut self) -> Result<(), StoreError> {
-        if let Some(admin) = self.membership_projection.snapshot.admin() {
-            for se in self.store.by_sender(&self.room_id, admin)? {
-                if let Some(seq) = se.admin_seq {
-                    self.note_admin_id(seq, se.event_id);
-                }
-            }
-        }
-        Ok(())
     }
 
     // ------------------------------------------------------------------

@@ -767,6 +767,71 @@ impl RoomMembership {
             .is_some_and(|node| node.membership_ancestors.contains(&ancestor))
     }
 
+    /// Fold-level admin-divergence detector (issue #213 / ADR-0006).
+    ///
+    /// Replaces the unsound same-`admin_seq` engine oracle, which over-fired on
+    /// ordinary concurrency (an honest admin publishing from a stale head) and
+    /// missed the case it was named for (conformance Vector 12: both admin
+    /// branches parented on a member-authored event, so both derive
+    /// `admin_seq = None`). The sound signature is a **divergence**: two causally
+    /// concurrent `admin`-authored membership writes with a **different**
+    /// authorization effect on the **same** subject. Same-effect concurrency
+    /// (e.g. two removes of one member) does NOT fire — the fold resolves
+    /// identically either way, so there is no conflict to arbitrate and no harm.
+    ///
+    /// Covers admin authorization writes (`MemberInvited`, `MemberRemoved`;
+    /// joins/leaves are self-authored, not admin writes). Anything outside the
+    /// membership types — chat, `MemberKeyDistribution`, … — is provably
+    /// undetectable here; see ADR-0006 for the coverage boundary. In particular,
+    /// conflicting `member.key_distribution` for one epoch is caught by the
+    /// independent D5a epoch-poisoning path, which adopts neither key.
+    ///
+    /// Sourced from held-and-validated accepted events only (this fold's `nodes`),
+    /// so a peer cannot forge a divergence by advertising a fabricated tip.
+    /// Advisory only — never changes a verdict or the snapshot (§9). Returns the
+    /// conflicting event ids (the concurrent causal heads with differing effects).
+    #[must_use]
+    pub fn admin_divergence(&self, admin: IdentityKey) -> Option<Vec<EventId>> {
+        // Group admin-authored authorization writes by the subject they touch.
+        let mut by_subject: BTreeMap<IdentityKey, Vec<EventId>> = BTreeMap::new();
+        for (id, node) in &self.nodes {
+            if node.event.event.sender_id != admin {
+                continue;
+            }
+            let subject = match &node.event.event.content {
+                Content::MemberInvited(c) => c.invitee_key,
+                Content::MemberRemoved(c) => c.member_id,
+                _ => continue,
+            };
+            by_subject.entry(subject).or_default().push(*id);
+        }
+        // A divergence is >=2 causally concurrent admin writes on one subject with
+        // >=2 distinct effects. Causally ordered writes (one cites the other) are
+        // not a fork; same-effect concurrency is benign.
+        for (_subject, ids) in by_subject {
+            let heads = self.causal_heads(&ids);
+            if heads.len() < 2 {
+                continue;
+            }
+            let mut effects: BTreeSet<String> = BTreeSet::new();
+            for id in &heads {
+                let Some(node) = self.nodes.get(id) else {
+                    continue;
+                };
+                let key = match &node.event.event.content {
+                    Content::MemberInvited(c) => format!("invite:{}", c.role),
+                    Content::MemberRemoved(_) => "remove".to_owned(),
+                    _ => continue,
+                };
+                effects.insert(key);
+            }
+            if effects.len() >= 2 {
+                return Some(heads);
+            }
+        }
+        None
+    }
+
     /// Removed-dominates status over the heads (spec D5 step 3): the `max` over
     /// each head's status contribution.
     fn status_from_heads(&self, heads: &[EventId]) -> Status {

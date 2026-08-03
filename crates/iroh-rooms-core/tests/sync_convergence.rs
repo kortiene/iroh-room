@@ -1278,44 +1278,49 @@ fn bogus_higher_admin_tip_expires_and_does_not_pin_fail_closed() {
 // never-windowed membership backfill (held-branch detection, no advertisement)
 // ---------------------------------------------------------------------------
 
-/// Confirms the held-only fork detector still catches a *real* admin self-fork
-/// across a partition: two distinct removals at the same `admin_seq`, one held by
-/// each peer. Neither peer holds both branches initially, but the never-windowed
-/// `WantMembership` exchange reconciles both admin-authored branches onto each
-/// peer (both are auth-class), so each detects `AdminForkDetected` + a CRITICAL
-/// `equivocation` — proving the security fix tightens, not removes, fork detection.
+/// Confirms the held-only divergence detector still catches a *real* admin
+/// equivocation across a partition: two concurrent admin invites of one subject
+/// with conflicting roles, one branch held by each peer. Neither peer holds both
+/// branches initially, but the never-windowed `WantMembership` exchange
+/// reconciles both admin-authored branches onto each peer (both are auth-class),
+/// so each detects `AdminForkDetected` + a CRITICAL `equivocation` — proving the
+/// #213 detector tightens, not removes, fork detection.
 #[test]
 fn cross_partition_admin_fork_detected_after_membership_backfill() {
     let built = build_log(0, false);
     // genesis(0) inv_bob(1) join_bob(2) inv_carol(3) join_carol(4)
-    let inv_carol_eid = SignedEvent::decode(&WireEvent::decode(&built.events[3]).unwrap().signed)
-        .unwrap()
-        .event_id();
     let join_carol_eid = SignedEvent::decode(&WireEvent::decode(&built.events[4]).unwrap().signed)
         .unwrap()
         .event_id();
 
-    let mk_removal = |reason: &str| {
+    // A genuine divergence split across a partition: two concurrent admin
+    // invites of dave with conflicting roles (member vs agent). Each peer holds
+    // one branch; after the never-windowed membership backfill each holds both,
+    // and the fold-level divergence detector fires. Same-effect concurrency
+    // would not fire (ADR-0006); conflicting effects do.
+    let dave = Principal::new(0x30);
+    let mk_invite = |role: &str, invite_id: [u8; 16], sec: [u8; 16]| {
         let ev = SignedEvent {
             schema_version: 1,
             room_id: built.room,
             sender_id: built.alice.identity(),
             device_id: built.alice.device(),
-            event_type: EventType::MemberRemoved,
+            event_type: EventType::MemberInvited,
             created_at: T0 + 100,
-            prev_events: vec![join_carol_eid, inv_carol_eid],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: built.carol.identity(),
-                removed_by: built.alice.identity(),
-                reason: Some(reason.to_owned()),
-                device_binding: None,
-                rotation: None,
+            prev_events: vec![join_carol_eid],
+            content: Content::MemberInvited(MemberInvited {
+                invite_id,
+                capability_hash: capability_hash(&built.room, &invite_id, &sec),
+                role: role.to_owned(),
+                invitee_key: dave.identity(),
+                expires_at: None,
+                invitee_hint: None,
             }),
         };
         wire_bytes(&ev, &built.alice.dev)
     };
-    let fork_a = mk_removal("a");
-    let fork_b = mk_removal("b");
+    let fork_a = mk_invite("member", [0xD1; 16], [0x51; 16]);
+    let fork_b = mk_invite("agent", [0xD2; 16], [0x52; 16]);
 
     let mut net = SimNet::new(built.room);
     net.add_peer(NODE_A, fresh_engine(built.room, SyncConfig::default()));
