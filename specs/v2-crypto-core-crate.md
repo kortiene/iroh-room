@@ -17,6 +17,17 @@
 > [`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md),
 > without changing the candidate code or vectors.
 
+> **Additive scope correction (#157, 2026-08-03):** the implemented #146
+> descriptor-hash `ReplicaId` and its golden vector are Phase-B candidate
+> behavior, not the final #134 §6.3 signing-key identity. Stable v2.0 uses a raw
+> Ed25519 replica signing public key bound by governance to a separate Iroh
+> endpoint. The normative lifecycle profile is
+> [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md); this
+> pure-spec correction leaves code and candidate vectors unchanged until the
+> explicit Phase C reconciliation, which must add any required successor
+> schema/profile versions and vectors rather than rewrite frozen candidate
+> evidence.
+
 ---
 
 ## 1. Summary

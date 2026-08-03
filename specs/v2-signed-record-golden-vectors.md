@@ -236,6 +236,13 @@ If #146 later introduces a dedicated `CommunityId`, update the vector names and 
 > frozen bytes are unchanged. The dedicated `CommunityId` derivation is covered by its own
 > frozen fixture in `tests/golden/v2-identifiers.json` (issue #146).
 
+> **Additive correction (#157, 2026-08-03):** that identifier fixture's
+> descriptor-hash `ReplicaId` is Phase-B candidate evidence, not the stable
+> #134 §6.3 signing identity. The stable profile uses a raw validated Ed25519
+> replica public key governed separately from the Iroh endpoint and requires a
+> bumped successor fixture/schema; the frozen candidate is not rewritten. See
+> [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md).
+
 ### D6 — MemberRecord is a projection/leaf vector, not a signed envelope, in current code
 
 Issue #153 lists `MemberRecord` alongside signed record types. Current code has:

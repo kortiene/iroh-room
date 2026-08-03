@@ -188,6 +188,14 @@ wraps that digest; the display string round-trips through strict parse; and reco
 under a different frozen domain yields a distinct digest. A completeness test pins all
 eleven domains and proves their digests are mutually distinct.
 
+> **Additive correction (#157, 2026-08-03):** the `ReplicaId` row in this frozen
+> file records the Phase-B descriptor-hash candidate; that row is not final #134
+> §6.3 signing-key evidence. Stable v2 uses the raw validated Ed25519 replica
+> public key and a separate governed Iroh endpoint. The implementation pass must
+> add a bumped successor fixture/schema and vectors rather than rewriting this
+> file in place. See
+> [`v2-replica-endpoint-identity.md`](../../../../specs/v2-replica-endpoint-identity.md).
+
 The negative vector `non-canonical-duplicate-key-v1` feeds a duplicate-key CBOR map to the
 strict decoder and asserts it rejects before any identifier/schema work, surfacing as
 `Reject::NonCanonicalEncoding` (`non_canonical_encoding`). `identifiers.rs` extends this

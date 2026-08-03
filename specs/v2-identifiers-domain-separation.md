@@ -16,6 +16,15 @@
 > vectors remain byte-stable; Phase C must add and pin the four new constants
 > before advertising that format.
 
+> **Additive identity correction (#157, 2026-08-03):** #134 §6.3 defines
+> `ReplicaId` as the configured replica signing public key. The §15 OQ-6
+> descriptor-hash resolution, `from_replica_descriptor_csb`, and its identifier
+> vector are pre-wire-freeze Phase-B candidate behavior, superseded by
+> [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md).
+> `ReplicaId` is a raw validated Ed25519 public key; `REPLICA_RECEIPT` remains a
+> receipt authentication domain and does not derive that key. This pure-spec
+> correction does not rewrite the candidate code/vector.
+
 ---
 
 ## 1. Summary
@@ -584,3 +593,36 @@ domain inventory, byte-pin exact ASCII/uniqueness, and add independent hash
 vectors for all four preimages. The exact formats and formulas are normative in
 [`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md)
 §2.2 and §7.4.
+
+---
+
+## 17. Additive replica identity correction (#157)
+
+The post-landing answer in §15 OQ-6 is superseded for stable v2.0. The normative
+identity equation is:
+
+```text
+ReplicaId = replica_signing_public_key   // raw Ed25519 bstr[32]
+```
+
+There is no descriptor preimage and no BLAKE3 derivation. The eventual pure core
+type must apply #157's canonical, non-identity, prime-subgroup admission
+predicate and verify replica receipts and replica-certified stream-checkpoint
+votes strictly under that key. Existing raw-byte equality/order semantics
+remain useful, but the named-hash constructor and descriptor-hash golden value
+are candidate evidence only.
+
+#157 also requires separate signature and TLS-exporter purposes for the sketched
+live binding. These are provisional examples, not frozen constants:
+
+```text
+REPLICA_ENDPOINT_BINDING = "iroh-room-v2/replica-endpoint-binding"
+REPLICA_ENDPOINT_EXPORTER = "iroh-room-v2/replica-endpoint-channel/v1"
+```
+
+They separate the fresh live-session signature and channel binding that join the
+governance-named replica signer to the TLS-proven Iroh endpoint. Phase C must
+choose and byte-pin the final labels plus the exact proof transcript before
+advertising stable v2. The full semantics, rotation rules, compatibility
+boundary, and negative-vector gate are normative in
+[`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md).

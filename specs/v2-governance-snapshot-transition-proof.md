@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | #161 — `[SPEC] §25 #3: Governance snapshot encoding + admin-transition proof` |
-| **Refs** | #134 §§6.2, 7.1–7.6, 14, 15, 22.1, 25 #3; #147–#151; #160; ADR-0004; ADR-0008 |
+| **Refs** | #134 §§6.2, 7.1–7.6, 14, 15, 22.1, 25 #3; #147–#151; #157; #160; ADR-0004; ADR-0008; ADR-0009 |
 | **Status** | Proposed normative format. Accepted on merge; implementation, independent vectors, and Phase-C store/network wiring remain required before advertisement. |
 | **Scope** | Pure specification: exact snapshot/checkpoint/proof/transfer formats, verification rules, limits, and fixtures. No runtime, store, or codec implementation. |
 
@@ -286,6 +286,21 @@ ReplicaRecord = {
 The top-level `replicas` array is strictly ascending and duplicate-free by
 `descriptor.replica_id`. The descriptor id is the record's map key; endpoint
 bytes are opaque and may be empty.
+
+> **Additive #157 identity correction (2026-08-03):** format version 1 keeps this
+> exact `bstr` field, permissive candidate semantics, byte-preserving decoder,
+> and vectors. #157 adds a versioned operational resolver but does not decide
+> whether layering it inside this intentionally opaque field preserves format-1
+> semantics or requires a successor under §14. Stable advertising is blocked
+> until the format owner records that ruling and pins the applicable additive
+> profile/format vectors. Regardless of the ruling, low-level decoding cannot
+> grant authority: activation fails for the entire active replica profile if any
+> descriptor fails #157's exact key-eligibility, canonical endpoint resolution,
+> active role-set disjointness, or retained-history cross-role rule.
+> Implementations must never filter failed entries or derive/recompute a
+> configured receipt quorum over a subset; format 1 contains no receipt-quorum
+> field. See
+> [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md).
 
 #### 4.2.3 Member/device component
 
@@ -1235,7 +1250,11 @@ Format version 1 MUST NOT be advertised until all are true:
 9. historical-authorization dependencies have an accepted owner/schema before
    compaction claims they are disposable; and
 10. the legacy candidate fixture/decoder remains byte-identical and cannot be
-   confused with this family.
+   confused with this family; and
+11. the #157 compatibility ruling and applicable additive endpoint-profile/
+    snapshot-format vectors exist before stable replica state is advertised;
+    format 1 remains byte-identical, and no descriptor-hash value is relabeled
+    as a signing public key.
 
 No public v2 interoperability claim may treat the closed #150 candidate issue
 or its legacy vector as satisfying this gate.
@@ -1250,3 +1269,5 @@ or its legacy vector as satisfying this gate.
   the `application/zstd` Media Type*.
 - ADR-0008, *Full-State Governance Snapshots with Checkpoint-Bound Authority
   Proofs*.
+- ADR-0009, *Separate Replica Signing Keys from Iroh Endpoint Keys*.
+- [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md).
