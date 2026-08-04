@@ -8,6 +8,19 @@
 | **Owning crate** | `crates/iroh-rooms-v2-core/` |
 | **Status** | Implemented in `crates/iroh-rooms-v2-core/src/governance/log/` (`genesis.rs`, `model.rs`, `operation.rs`, `records.rs`, `state.rs`) with unit, byte-pinned, and end-to-end coverage (`tests/v2_governance_log_e2e.rs`) plus the updated golden-vector suite (`tests/golden/`). How the §16 open questions were resolved is recorded in §17. |
 
+> **Additive replica-lifecycle correction (#157, 2026-08-03):** the landed
+> descriptor's hash-derived `ReplicaId`, opaque/empty `endpoint`, missing receipt
+> quorum, and single-record `replica.set` upsert are Phase-B candidate
+> scaffolding. Stable v2.0 uses a raw replica signing public key governed
+> separately from one Iroh endpoint. Signing-key rotation requires #159 to
+> define one atomic full-set-plus-quorum replacement; two sequential upserts
+> must not count predecessor and successor as two replica seats. See
+> [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md). No code or
+> golden bytes change in this pure-spec correction; later implementation must
+> add a successor genesis schema (and resulting `CommunityId` vectors), version
+> every other affected governance/snapshot schema, and add vectors rather than
+> rewrite the frozen candidate.
+
 ---
 
 ## 1. Summary
