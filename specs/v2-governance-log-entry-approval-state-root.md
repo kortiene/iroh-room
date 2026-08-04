@@ -21,6 +21,16 @@
 > every other affected governance/snapshot schema, and add vectors rather than
 > rewrite the frozen candidate.
 
+> **Additive replica-durability correction (#156, 2026-08-03):** the candidate
+> descriptor has no governed durability-class or receipt-quorum field. Its
+> opaque `capability: uint(0..255)` MUST NOT be reinterpreted as #156's
+> `local_sync_group_v1` class. #159 and the governance/snapshot schema owner
+> must place the full descriptor, exact class, `W`, and atomic full-set
+> transition in explicitly versioned successor genesis/`replica.set` schemas.
+> #156/ADR-0010 define semantics and the stable-commit predicate, not those wire
+> fields. Existing code and frozen candidate bytes remain unchanged. See
+> [`v2-replica-durability-class.md`](v2-replica-durability-class.md).
+
 ---
 
 ## 1. Summary
@@ -417,7 +427,7 @@ Use `BTreeMap`/sorted `Vec` everywhere roots depend on order. Store revoked invi
 | `device.revoke` | `member_id`, `device_id` | Mark/remove device from member's active device set with tombstone if needed for deterministic replay. Root component: members/devices/roles. |
 | `admin.set` | sorted admin principals, threshold | Replace administrator set and threshold; validate non-empty unique admins and `1 <= threshold <= admins.len()`. Root component: administrators. |
 | `recovery.set` | recovery policy/config | Replace recovery component with canonical config. Root component: recovery. |
-| `replica.set` | `replica_id`, endpoint/capability/status | Upsert or disable a replica record, sorted by `ReplicaId`. Root component: replicas. |
+| `replica.set` | `replica_id`, endpoint/capability/status | Upsert or disable a Phase-B candidate replica record, sorted by `ReplicaId`. `capability` is not a durability class. Stable v2 uses #159's successor atomic full-set/class/`W` operation. Root component: replicas. |
 | `stream.create` | `stream_id`, stream metadata, initial policy | Insert a new active stream; reject duplicate `stream_id` as invalid content unless #134 defines idempotency. Root component: stream manifest. |
 | `stream.policy_set` | `stream_id`, stream policy | Replace the policy for an existing stream; reject missing stream unless #134 defines create-on-set. Root component: stream manifest. |
 | `stream.archive` | `stream_id`, archived flag/time/reason | Mark an existing stream archived; keep in manifest. Root component: stream manifest. |

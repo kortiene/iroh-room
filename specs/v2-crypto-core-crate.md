@@ -28,6 +28,16 @@
 > schema/profile versions and vectors rather than rewrite frozen candidate
 > evidence.
 
+> **Additive scope correction (#156, 2026-08-03):** ADR-0010 now chooses
+> `local_sync_group_v1` as the v2.0 receipt durability class, realized by a
+> bounded synchronized local group commit. This pure Phase-B crate still has no
+> receipt, publication-certificate, descriptor-class, SQLite, or writer type,
+> and its receipt-domain constant is not implementation evidence. The Phase C
+> profile is
+> [`v2-replica-durability-class.md`](v2-replica-durability-class.md); successor
+> receipt/class/descriptor vectors must be additive and do not reopen #153's
+> frozen Track-2 fixtures.
+
 ---
 
 ## 1. Summary

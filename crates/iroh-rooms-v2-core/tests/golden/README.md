@@ -210,3 +210,11 @@ id field, unknown schema version).
 - Replica-receipt vectors: no receipt type exists in Track 2 scope.
 
 These are intentionally absent; do not treat the omission as a coverage gap.
+
+> **Additive correction (#156, 2026-08-03):** ADR-0010 specifies
+> `local_sync_group_v1` as the stable-v2 receipt durability semantics. That
+> pure-spec decision does not add a receipt/class codec, publication
+> certificate, store, or crash vector to this Phase-B fixture family. The Phase
+> C implementation must add explicitly versioned successor receipt/class/
+> descriptor vectors without rewriting these files. See
+> [`specs/v2-replica-durability-class.md`](../../../../specs/v2-replica-durability-class.md).

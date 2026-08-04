@@ -3,9 +3,9 @@
 | | |
 |---|---|
 | **Issue** | #157 — `[SPEC] §25 #2: Replica key vs Iroh Endpoint ID rotation` |
-| **Refs** | #134 §§6.2–6.4, 7.2–7.3, 10.2–10.3, 11.2, 13.4, 19, 25 #2; #146; #147; #159; #161; ADR-0004; ADR-0008; ADR-0009 |
+| **Refs** | #134 §§6.2–6.4, 7.2–7.3, 10.2–10.3, 11.2, 13.4, 19, 25 #2; #146; #147; #156; #159; #161; ADR-0004; ADR-0008–ADR-0010 |
 | **Status** | Proposed decision/lifecycle profile — normative when ADR-0009 and this profile merge; §5 is a non-wire Phase C handshake sketch |
-| **Scope** | Pure specification. Phase C implementation, exact handshake envelope, replica replacement/operator UX (#159), and durability-class policy (#156) remain separate work. |
+| **Scope** | Pure specification. Phase C implementation, exact handshake envelope, and replica replacement/operator UX (#159) remain separate work. #156/ADR-0010 now define receipt durability semantics; their codec/store implementation remains Phase C work. |
 
 ---
 
@@ -61,7 +61,8 @@ normative.
   identity rules needed here.
 - Replica catch-up, replacement ordering, equivocation penalties, and operator
   UX, which #159 owns.
-- The default durability class, which #156 owns.
+- The receipt durability-class encoding and implementation. #156/ADR-0010 now
+  specify the `local_sync_group_v1` semantic default.
 - Replica fault-domain placement or proof that two configured replicas run on
   independent hardware.
 - v1 identity semantics. v1 continues to use `device_id == EndpointId`.
@@ -129,8 +130,10 @@ operational eligibility.
 Hints, supported features, operator labels, and durability/retention metadata
 are not endpoint identity and MUST NOT substitute for `EndpointId`. Their exact
 governed fields remain to be frozen by Phase C/#159 in a versioned full
-descriptor, with #156 supplying durability-class semantics rather than wire
-encoding. #161 requires a new snapshot format version for a field-schema or
+descriptor. #156/ADR-0010 supply `local_sync_group_v1` durability-class
+semantics rather than wire encoding; the candidate `capability` integer is not
+that class and MUST NOT be overloaded as one. #161 requires a new snapshot
+format version for a field-schema or
 field-semantic change. #157 does not decide whether a versioned resolver inside
 the intentionally opaque `bstr` is an external operational profile or such a
 semantic change. Before stable advertising, the governance/snapshot format
@@ -436,6 +439,16 @@ sequence received after a higher one is not invalid solely because transport or
 history delivery was out of order; live freshness/high-water policy is a
 separate check.
 
+For the v2.0 default, the receipt's class MUST equal the
+`local_sync_group_v1` class governed for that `ReplicaId` at the exact
+head/component root. Before any receipt bytes escape, one bounded synchronized
+group transaction atomically persists the exact event/reference metadata,
+exact signed receipt, sequence high-water, and idempotency state behind a
+qualified local barrier. The exact rules and crash boundary are in
+[`v2-replica-durability-class.md`](v2-replica-durability-class.md). Queue
+admission, an in-memory retry, SQLite `synchronous=NORMAL`, remote fanout, or an
+RBSR match does not satisfy them.
+
 The endpoint that delivered a detached receipt is irrelevant to signature
 validity. A TLS-authenticated endpoint cannot sign or validate a receipt merely
 because governance binds it to the replica.
@@ -448,6 +461,13 @@ governance heads or replica component roots do not combine. Reusing one
 endpoint for multiple connections cannot increase quorum weight. #157 does not
 choose the still-missing authenticated representation of `W`; #159 and the
 governance/snapshot schema owner own it.
+
+Class equality is also exact. Unknown classes fail closed; v2.0 defines no
+ordering or "stronger counts as weaker" substitution. Hidden remote WAL copies,
+shared storage, and internal mirroring add no quorum weight. Fewer than `W`
+matching active signers remains `Pending`/`QuorumUnavailable` and never lowers
+the class or `W`. A certificate is `W` authenticated durability assertions, not
+cryptographic proof of independent disks or honest barrier execution.
 
 ### 6.3 Replica-certified stream checkpoints
 
@@ -527,7 +547,8 @@ replica identity. It MUST be represented as replica replacement:
 
 1. generate an independent signing key and a distinct endpoint key as needed;
 2. catch the replacement replica up and prove it ready without granting it
-   receipt quorum weight;
+   receipt quorum weight, including `local_sync_group_v1` stable-store and
+   monotonic-sequence readiness under #156/ADR-0010;
 3. use the #159 governance procedure to atomically replace the old active set
    entry with the new `ReplicaId` without dropping below the required
    durability/quorum policy;
@@ -709,12 +730,15 @@ format until all of these pass:
    namespace, never counts predecessor and successor as two seats, and cannot
    mix certificates/votes across replica component roots.
 7. Crash/restore tests prove endpoint rollout cannot roll back or fork the
-   per-replica receipt counter.
+   per-replica receipt counter, and atomically bind each exact signed receipt to
+   its event/reference/idempotency state behind #156's stable barrier.
 8. Receipt tests distinguish producer sequence reuse/equivocation from benign
    out-of-order delivery and do not overclaim compromise containment.
 9. #159 and the governance/snapshot schema owner freeze the versioned full
    descriptor, authenticated `W`, atomic replacement, catch-up/equivocation,
-   and operator path; #156 supplies durability-class semantics. The format owner
+   and operator path; #156/ADR-0010 supply the exact
+   `local_sync_group_v1` semantics and bounded group-commit/crash predicate.
+   The format owner
    records §3.2's compatibility ruling, versions every affected container, and
    keeps changed vectors additive.
 10. Historical replica-set/quorum and role-key evidence has a frozen proof and
@@ -753,8 +777,9 @@ retain opaque historical bytes.
 Changing only the endpoint rotates transport identity without changing replica
 identity; changing `ReplicaId` is one atomic full-set replacement and follows
 #159. #159 and the governance/snapshot schema owner also own the authenticated
-receipt quorum and full #134 §11.2 descriptor, with #156 supplying durability
-semantics. This issue leaves #161's format-1 decoder byte-identical and requires
+receipt quorum and full #134 §11.2 descriptor. #156/ADR-0010 supply
+`local_sync_group_v1` durability semantics, not those fields' encoding. This
+issue leaves #161's format-1 decoder byte-identical and requires
 the explicit §3.2 compatibility ruling plus any resulting successor format
 before stable-v2 use. The successor genesis schema derives a new `CommunityId`;
 it cannot reinterpret an existing candidate id in place.
@@ -768,6 +793,12 @@ never replaces application verification. #157 assigns replica keys to the
 votes used for stream-checkpoint certification but leaves the vote/certificate
 wire to its owner. Before normal application data, a live replica claimant must
 pass a nonce- and TLS-channel-bound proof with §5's bounded-bootstrap exception.
+
+For persistence receipts, policy verification also requires exact agreement on
+the governed durability class. The v2.0 class is `local_sync_group_v1`; its
+stable local barrier and failure semantics are defined by #156/ADR-0010. It does
+not turn transport identity, another replica's copy, or a checkpoint signature
+into a receipt.
 
 ### 11.4 Phase C binding-purpose requirement (§6.2)
 
