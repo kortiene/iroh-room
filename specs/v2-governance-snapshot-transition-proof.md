@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | #161 — `[SPEC] §25 #3: Governance snapshot encoding + admin-transition proof` |
-| **Refs** | #134 §§6.2, 7.1–7.6, 14, 15, 22.1, 25 #3; #147–#151; #156; #157; #160; ADR-0004; ADR-0008–ADR-0010 |
+| **Refs** | #134 §§6.2, 7.1–7.6, 14, 15, 22.1, 25 #3; #147–#151; #156; #157; #159; #160; ADR-0004; ADR-0008–ADR-0011 |
 | **Status** | Proposed normative format. Accepted on merge; implementation, independent vectors, and Phase-C store/network wiring remain required before advertisement. |
 | **Scope** | Pure specification: exact snapshot/checkpoint/proof/transfer formats, verification rules, limits, and fixtures. No runtime, store, or codec implementation. |
 
@@ -47,6 +47,42 @@ linear mode is forbidden. The proof uses full-DAG mode and carries all
 authenticated branch material needed to reproduce the existing recovery-
 authorized resolution. A currently unresolved fork cannot produce an
 authorization or compaction checkpoint.
+
+> **Additive #159 lifecycle correction (2026-08-03):** snapshot format 1
+> remains byte-identical and cannot express stable replacement: it has no
+> `staged` status, full #134 §11.2 descriptor, authenticated `W`/class,
+> readiness/incident commitment, or permanent tombstone accumulator. #159/
+> ADR-0011 require a successor snapshot/governance/genesis family in which a
+> zero-weight staged candidate catches up before an old-admin-approved committed
+> prepare reserves one complete-policy active-set-transition/cancellation intent. A
+> predecessor-`W` prepare-bound checkpoint-frontier bundle derives the child;
+> activation atomically disables the old seat and activates the new. Unrelated
+> **ordinary** governance cannot extend the open prepare. Recovery-authorized
+> `fork.resolve` remains the exception; full-DAG proof/state must retain the
+> selected and losing suffixes, original prepare/latest base, and the mandatory
+> current-`W`, selected-admin-approved fork-frontier reconciliation control for
+> every accepted stable-v2 resolution, even when no detached replica artifact
+> was observed. Pending state includes the governance-carried control-signer-
+> exclusion commitment and fixed-size structural count/root for the governance-
+> derived unresolved reservations, closures, and governance-retained statement/
+> control commitments.
+> A nested resolution rolls that set into the newest reservation. Exact-replay
+> signer statements carry separate held-set roots; collection adds them and
+> verified supplemental leaves to the final frontier/child count/root.
+> Snapshot/replay may clear pending state only after retaining and verifying the
+> one latest child and its final bounded-chunk full-DAG dependency proof.
+> Truncation or an unavailable suffix fails closed. Fold validity depends only
+> on authenticated governance inputs: a detached readiness withdrawal gates
+> local service and drives cancellation/disablement but does not reinterpret
+> exposed child bytes. Abandonment is the prepare's governance-head-advancing
+> cancellation child, not a detached replay.
+> Successor state/snapshots must retain applicable handoff/cancellation,
+> fork-reconciliation, signer-cutover, and historical-policy commitments.
+> Changed genesis bytes derive a new `CommunityId`; candidate vectors
+> are preserved. This compact proof can omit ordinary replica operations, so it
+> is not the historical replica-policy witness required to verify retained
+> receipts/checkpoints. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---
 
@@ -306,9 +342,10 @@ bytes are opaque and may be empty.
 > neither an authenticated receipt quorum nor a durability-class field, and its
 > `capability` integer is not `local_sync_group_v1`. Low-level decoding and root
 > reproduction remain byte-identical, but format 1 cannot by itself activate a
-> receipt-producing stable-v2 replica. #159 and the governance/snapshot schema
-> owner must freeze the successor full descriptor/class/`W` profile and any
-> resulting format version. #156/ADR-0010 define the class semantics and local
+> receipt-producing stable-v2 replica. #159/ADR-0011 define the successor
+> lifecycle/class/`W` semantics; the Phase C governance/snapshot schema owner
+> must freeze the exact full descriptor profile and any resulting format
+> version. #156/ADR-0010 define the class semantics and local
 > stable-commit predicate only. Administrator signatures on a governance
 > checkpoint prove authority; they are not replica persistence receipts. See
 > [`v2-replica-durability-class.md`](v2-replica-durability-class.md).

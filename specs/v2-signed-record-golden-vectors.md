@@ -102,6 +102,29 @@ Relevant local context:
 > do not rewrite these frozen records. See
 > [`v2-replica-durability-class.md`](v2-replica-durability-class.md).
 
+> **Additive scope correction (#159, 2026-08-03):** no successor full replica
+> policy, staged readiness, atomic replacement, receipt/checkpoint conflict,
+> incident evidence, tombstone/history proof, or recovery-checkpoint byte exists
+> in this Track-2 family. #159/ADR-0011 define their semantics but leave every
+> candidate fixture unchanged. Phase C must add explicitly versioned successor
+> positive/negative vectors, including intersecting-`W` boundaries, committed
+> prepare-bound handoff and governed-cancellation children, outcome-neutral
+> `ForkResolvedFenceStatement`, target-tagged `ForkResolvedFrontier`,
+> governance-carried control-signer exclusions, and
+> `replica.handoff.fork_reconcile`. Nested-resolution vectors must pin the
+> fixed-size structural count/root, exact-replayed statement-held roots, and
+> collected final-union count/root plus complete canonical bounded-chunk proof.
+> Include F1 rolled into F2, late supplemental leaves without statement
+> mutation, exact boundary-size leaves/chunks, structural-only propose/commit
+> rejection, and rejection
+> of omission, duplication, noncanonical order, root/count mismatch, oversized
+> leaf/chunk, unavailable suffix, truncation, and `uint64` count overflow. Add
+> exact-generation vote journals,
+> vote/frontier evidence, incident-bound conflict controls, signer cutovers,
+> late artifacts, same-slot/same-sequence conflict, and benign out-of-order
+> negatives. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
+
 ---
 
 ## 4. Key decisions

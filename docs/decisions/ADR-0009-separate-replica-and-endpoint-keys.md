@@ -7,6 +7,21 @@
 - **Related:** #134 §§6.3, 7.2–7.3, 10.3, 11.2, 13.4, 25 #2; #146; #159; #161; ADR-0004; ADR-0008
 - **Normative profile:** [`specs/v2-replica-endpoint-identity.md`](../../specs/v2-replica-endpoint-identity.md)
 
+> **Additive resolution note (ADR-0011, 2026-08-03):** the future-tense #159
+> clauses below are now resolved semantically by ADR-0011: zero-weight staging,
+> predecessor-admin-approved atomic full-policy replacement, permanent disabled
+> signing identities, and a committed prepare plus predecessor-`W` checkpoint
+> handoff. Every stable-v2 governance-fork closure additionally requires #159's
+> outcome-neutral current-`W`, selected-admin-approved fork-frontier control; it
+> grants recovery keys no replica or
+> administrator weight and does not alter `admin_seq`. Nested controls retain
+> governance-carried exclusions and distinct fixed-size structural, signer-held,
+> and collected-final dependency commitments whose corresponding bounded-chunk
+> full-DAG proofs survive replay. Named Phase C owners still must freeze and
+> implement the exact successor descriptor,
+> governance, handoff, evidence, and history bytes. This note preserves the
+> original decision text while superseding its open #159 references.
+
 ## Context
 
 #134 gives a community replica two cryptographic roles:

@@ -38,6 +38,31 @@
 > receipt/class/descriptor vectors must be additive and do not reopen #153's
 > frozen Track-2 fixtures.
 
+> **Additive scope correction (#159, 2026-08-03):** ADR-0011 now defines the
+> stable replica lifecycle as zero-weight governed staging followed by one
+> predecessor-admin-authorized atomic full-policy activation/replacement.
+> Verified receipt/checkpoint equivocation causes local new-quorum quarantine
+> and mandatory permanent governed retirement; sequence rollback requires a
+> fresh identity unless exact continuous in-place state recovers. This crate
+> implements none of that. Its `active|disabled`, single-record `replica.set`,
+> candidate checkpoint, and vectors remain unchanged. Successor lifecycle,
+> intersecting `W`, readiness, evidence, history, receipt, checkpoint-vote
+> journal, committed prepare-bound handoff and governed cancellation,
+> outcome-neutral `ForkResolvedFenceStatement`, target-tagged
+> `ForkResolvedFrontier`, selected-admin-approved
+> `replica.handoff.fork_reconcile`, governance-carried control-signer
+> exclusions, fixed-size structural/signer-held/collected-final nested-resolution
+> dependency roots plus corresponding bounded-chunk full-DAG proofs, fold-time
+> readiness purity, vote/frontier evidence, incident-bound conflict controls,
+> retired-signer cutovers, and bounded incident-evidence/recovery-control public
+> formats are additive Phase C work. Local evidence-intake, quarantine/barrier
+> generations, trigger-subject caps/saturation, direct-trigger records/
+> cumulative subject aggregates/revisions, materialization cursor/per-row
+> projections/stale-pair index, and transaction accounting are
+> separate non-wire Phase C store/crash conformance, not crypto-core codecs or
+> golden vectors. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
+
 ---
 
 ## 1. Summary

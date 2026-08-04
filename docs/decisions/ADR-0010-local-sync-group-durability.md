@@ -7,6 +7,27 @@
 - **Related:** #134 §§3, 5.2, 10.2–10.4, 13.4, 15.2, 19, 21–22, 25 #7; #157; #159; ADR-0004; ADR-0009
 - **Normative profile:** [`specs/v2-replica-durability-class.md`](../../specs/v2-replica-durability-class.md)
 
+> **Additive resolution note (ADR-0011, 2026-08-03):** ADR-0011 resolves the
+> future-tense #159 clauses below. Same-identity recovery is permitted only when
+> the exact continuous receipt high-water, checkpoint vote/generation journals,
+> signer/store, and single-writer state recover in place; uncertain rollback
+> permanently requires a fresh identity. The continuous journal includes every
+> prepare, cancellation, fork-resolved fence/frontier, conflict, and cutover
+> signer action that can advance or fence a checkpoint lineage, including every
+> pending structural, signer-held, and collected-final nested-resolution
+> dependency count/root and corresponding proof needed to recover it. ADR-0011
+> also defines zero-weight staging, governed replacement, equivocation
+> quarantine, and operator semantics. Receipt status is logically downgraded at
+> the bounded durable community-incident-barrier commit, before resumable per-
+> certificate materialization. Authoritative evidence/barrier/quarantine high-
+> water, keyed signer-incident index including trigger-subject saturation, and
+> direct-trigger records/cumulative subject aggregates/source revisions are
+> exact recovery state; derived cursor/per-certificate progress and stale-pair
+> index are validated or conservatively reset and rebuilt.
+> Named Phase C owners still freeze/
+> implement their exact bytes. This note
+> preserves the original decision text rather than rewriting it.
+
 ## Context
 
 #134 requires a replica to persist an event and required blob references

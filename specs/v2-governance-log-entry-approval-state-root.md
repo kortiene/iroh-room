@@ -12,8 +12,8 @@
 > descriptor's hash-derived `ReplicaId`, opaque/empty `endpoint`, missing receipt
 > quorum, and single-record `replica.set` upsert are Phase-B candidate
 > scaffolding. Stable v2.0 uses a raw replica signing public key governed
-> separately from one Iroh endpoint. Signing-key rotation requires #159 to
-> define one atomic full-set-plus-quorum replacement; two sequential upserts
+> separately from one Iroh endpoint. Signing-key rotation uses #159's one
+> atomic full-set-plus-quorum replacement; two sequential upserts
 > must not count predecessor and successor as two replica seats. See
 > [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md). No code or
 > golden bytes change in this pure-spec correction; later implementation must
@@ -24,12 +24,54 @@
 > **Additive replica-durability correction (#156, 2026-08-03):** the candidate
 > descriptor has no governed durability-class or receipt-quorum field. Its
 > opaque `capability: uint(0..255)` MUST NOT be reinterpreted as #156's
-> `local_sync_group_v1` class. #159 and the governance/snapshot schema owner
-> must place the full descriptor, exact class, `W`, and atomic full-set
-> transition in explicitly versioned successor genesis/`replica.set` schemas.
+> `local_sync_group_v1` class. #159 supplies the lifecycle semantics and the
+> governance/snapshot schema owner must place the full descriptor, exact class,
+> `W`, and atomic full-set transition in explicitly versioned successor
+> genesis/`replica.set` schemas.
 > #156/ADR-0010 define semantics and the stable-commit predicate, not those wire
 > fields. Existing code and frozen candidate bytes remain unchanged. See
 > [`v2-replica-durability-class.md`](v2-replica-durability-class.md).
+
+> **Additive replica-replacement correction (#159, 2026-08-03):** #159/
+> ADR-0011 resolve the successor semantics: ordinary old-state administrators
+> first add a zero-weight `staged` full descriptor, then one complete-policy
+> operation atomically changes old `active -> disabled` and new
+> `staged -> active`. Disabled signing identities are permanent tombstones;
+> verified equivocation requires governed retirement, and rollback uncertainty
+> requires a new identity. The successor operation carries intersecting-majority
+> `W`, class, readiness/evidence commitments, canonical checkpoint-handoff terms
+> for active-set changes, and complete state. A predecessor-admin-approved
+> `replica.handoff.prepare` commits first, leaves replica policy unchanged, and
+> permits only its prepared active-set `replica.set` or cancellation child
+> derived from the exact intent.
+> Eligible replicas produce one prepare-bound predecessor-`W` frontier bundle;
+> a derived child then obtains predecessor-admin threshold approval, and neither
+> input alone can fold the child. Abandonment is a separately approved/committed
+> cancellation child derived from the same reservation. Unrelated **ordinary**
+> governance cannot extend the reservation; recovery-authorized `fork.resolve`
+> remains the exception and every accepted stable-v2 resolution structurally
+> creates a current-`W`, selected-admin-approved
+> `replica.handoff.fork_reconcile` requirement without consulting detached
+> artifact observations. Its state carries a governance-derived control-signer-
+> exclusion commitment and fixed-size **structural** count/root for the
+> governance-derived unresolved set; verifier-local quarantine/readiness/
+> evidence arrival is never a fold input. If another resolution commits first,
+> it rolls every prior unresolved reservation, closure, governance-retained
+> statement/control commitment, and applicable exclusion into the newest
+> structural commitment. Each exact-replay signer statement adds only its own
+> held-set count/root; collection unions those sets and verified supplemental
+> leaves into the separate **final** count/root. One latest reconciliation child
+> verifies that final bounded-chunk full-DAG proof and consumes all dependencies
+> atomically; it either closes the selected reservation or becomes its
+> latest base. A local readiness withdrawal stops service and drives governed
+> cancellation/disablement but never arrival-order-reinterprets an exposed
+> child. Recovery keys count toward neither administrator nor replica quorum,
+> and `admin_seq` is unchanged. This
+> prevents ordinary churn from staling the cancellation while avoiding an
+> unapproved fence and handoff hash cycle. It is a new schema, not the landed
+> one-record map upsert. Existing code, operation strings, roots,
+> genesis/`CommunityId`, and golden bytes remain candidate evidence. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---
 
