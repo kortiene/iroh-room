@@ -54,8 +54,13 @@
 > exclusions, fixed-size structural/signer-held/collected-final nested-resolution
 > dependency roots plus corresponding bounded-chunk full-DAG proofs, fold-time
 > readiness purity, vote/frontier evidence, incident-bound conflict controls,
-> retired-signer cutovers, and bounded evidence/fail-stop
-> formats are additive Phase C work. See
+> retired-signer cutovers, and bounded incident-evidence/recovery-control public
+> formats are additive Phase C work. Local evidence-intake, quarantine/barrier
+> generations, trigger-subject caps/saturation, direct-trigger records/
+> cumulative subject aggregates/revisions, materialization cursor/per-row
+> projections/stale-pair index, and transaction accounting are
+> separate non-wire Phase C store/crash conformance, not crypto-core codecs or
+> golden vectors. See
 > [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---

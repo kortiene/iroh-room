@@ -223,13 +223,19 @@ These are intentionally absent; do not treat the omission as a coverage gap.
 > zero-weight staging, atomic full-policy activation/replacement, permanent
 > disabled signing identities, evidence-driven equivocation quarantine, and
 > no same-key recovery after receipt or checkpoint-vote-journal rollback
-> uncertainty. This frozen Phase-B family contains none of those wire objects.
-> Add successor genesis/policy/readiness/receipt/checkpoint/committed-prepare-
+> uncertainty. This frozen Phase-B family contains none of those public wire
+> objects or local operational store state. Add successor genesis/policy/
+> readiness/receipt/checkpoint/committed-prepare-
 > handoff/cancellation/outcome-neutral-fork-fence/target-tagged-fork-frontier/
-> reconciliation/control-signer-exclusion/frontier-evidence/cutover/bounded-
-> incident/recovery vectors under a bumped schema; do not rewrite current
-> identifiers, records, or
-> negatives. Fork-reconciliation fixtures include fixed-size structural,
+> reconciliation/control-signer-exclusion/frontier-evidence/cutover/incident-
+> evidence/recovery-control vectors under a bumped schema; do not rewrite
+> current identifiers, records, or negatives. Evidence-intake, quarantine/
+> barrier generations, trigger-subject caps/saturation, direct-trigger records/
+> cumulative subject aggregates/revisions, materialization cursor/per-row
+> projections/stale-pair index, and transaction
+> accounting belong to explicitly non-wire Phase C store/crash conformance
+> rather than this public golden family. Fork-
+> reconciliation fixtures include fixed-size structural,
 > exact-replayed statement-held, and collected final-union dependency count/
 > roots; the complete canonical bounded-chunk proof; F1-to-F2 roll-up; late
 > supplemental leaves without statement mutation; boundary-size positives;

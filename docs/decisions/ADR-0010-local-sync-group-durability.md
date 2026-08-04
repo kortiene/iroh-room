@@ -17,7 +17,14 @@
 > pending structural, signer-held, and collected-final nested-resolution
 > dependency count/root and corresponding proof needed to recover it. ADR-0011
 > also defines zero-weight staging, governed replacement, equivocation
-> quarantine, and operator semantics. Named Phase C owners still freeze/
+> quarantine, and operator semantics. Receipt status is logically downgraded at
+> the bounded durable community-incident-barrier commit, before resumable per-
+> certificate materialization. Authoritative evidence/barrier/quarantine high-
+> water, keyed signer-incident index including trigger-subject saturation, and
+> direct-trigger records/cumulative subject aggregates/source revisions are
+> exact recovery state; derived cursor/per-certificate progress and stale-pair
+> index are validated or conservatively reset and rebuilt.
+> Named Phase C owners still freeze/
 > implement their exact bytes. This note
 > preserves the original decision text rather than rewriting it.
 

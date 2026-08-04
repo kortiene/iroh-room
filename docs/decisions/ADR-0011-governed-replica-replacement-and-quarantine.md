@@ -64,11 +64,21 @@ versions and additive vectors; changed genesis bytes derive a new
 
 Same-identity crash recovery is fail-closed: every receipt, checkpoint,
 prepare/cancel/handoff, fork-resolution dependency/control, evidence-intake,
-incident/quarantine, and single-writer journal must recover as one exact
-continuous state. The current lineage must have no unresolved fork-frontier
-requirement, and only a governed active, locally non-quarantined identity may
-resume issuance. Any uncertainty uses a fresh identity; a recovered quarantined
-identity serves evidence/history only.
+authoritative incident evidence/barrier/quarantine/high-water/index, direct-
+trigger records, cumulative subject aggregates, per-incident trigger-subject
+saturation, source-revision high-waters, and the single-writer journal must
+recover as one exact continuous state. Derived materialization cursors, phases,
+catalog generations, per-row markers, and stale-pair index may instead be
+validated against that state or conservatively reset and rebuilt; they are
+never trusted ahead. The
+current lineage must have no unresolved fork-frontier requirement, and only a
+governed active, locally non-quarantined identity may resume issuance.
+Uncertainty in signer issuance-continuity state uses a fresh identity.
+Uncertainty in authoritative community incident state instead blocks the
+community until exact repair or verified recovery; rotating a signer does not
+repair a missing barrier/index/trigger obligation. Loss of rebuildable
+projection progress alone does neither and forces a conservative rescan. A
+recovered quarantined identity serves evidence/history only.
 
 ### Replacement procedure
 
@@ -228,6 +238,33 @@ never local evidence arrival order. An incident-bound prepare excludes the
 faulted signer deterministically; if configured `W` then cannot be met, the
 transition remains unavailable rather than bypassing or lowering the handoff.
 
+Durable containment does not enumerate every retained stream in that write.
+One size-bounded incident-activation transaction stores the capped evidence,
+signer incident, quarantine, a fixed-size community incident barrier/generation,
+and the canonical trigger set: exactly one checkpoint stream subject or the
+sorted/deduplicated one-or-two receipt/publication subjects derived from the two
+signed bodies. Each retained keyed record, cumulative subject aggregate, and
+source revision in that set commits atomically. The barrier is an O(1) local
+operational read gate backed by the checked high-water and keyed signer-incident
+index: it excludes the signer immediately, puts every subject that signer could
+have authorized into conservative signer-incident mode, and makes older per-
+stream/certificate projections conservative/pending. A coalesced
+materializer then scans existing indexes in idempotent local transactions capped
+at 256 incident-by-subject projection units and 1 MiB of Phase-C-accounted
+marker mutations, committing its fixed two-dimensional generation/subject
+cursor with each batch. Each unit applies one incident to one subject; a far-
+behind row advances through intermediate generations across capped transactions
+and is not consumable until its cumulative projection reaches the target. Each
+batch compare-and-commits the captured incident/catalog generations and
+unchanged subject revision; older completion cannot overwrite a newer pending
+incident. Completion uses a bounded emptiness query over the stale-pair index,
+whose membership is maintained with row/catalog changes; it never rescans the
+retained population in one transaction. Materialization never changes
+governance or fold-time validity,
+lowers `W`, certifies a cutover, or clears quarantine. These barrier, cursor,
+trigger/cap/saturation, projection, and accounting schemas are local conformance
+state, not public wire objects.
+
 Previously retained receipts and certificates remain historical artifacts
 under their exact governing context; exclusion is prospective. A checkpoint in
 the conflicting slot cannot support a current `CompleteThroughCheckpoint`
@@ -263,16 +300,23 @@ committed receipt high-water; every per-stream checkpoint vote/generation and
 issuance-fence journal; every prepare, handoff, cancellation, fork-resolved
 statement/frontier, nested-resolution dependency reservation, conflict, and
 cutover record, including each structural/final count/root and complete proof;
-and the evidence-intake/incident/quarantine fail-stop state. The
-exact current governance context must be non-forked with no pending
+and the authoritative evidence-intake/incident-barrier/quarantine high-water,
+keyed incident index, direct-trigger records, cumulative subject aggregates, and
+source-revision high-waters, including each incident's trigger-subject
+saturation bit. Derived materialization progress, including the stale-pair
+index, is accepted only when consistent with its atomic commits; otherwise it
+is conservatively reset and rebuilt behind the barrier. The exact current
+governance context must be non-forked with no pending
 `fork_frontier_reconciliation_required` or unresolved closure, and the governed
 active identity must be locally non-quarantined, free of mandatory-retirement
 causes, and otherwise operationally eligible. A quarantined or mandatory-
 retirement identity may recover only the bounded evidence/history lane.
-Restoring a possibly old backup, discovering a lower or uncertain high-water,
-or losing any atomic receipt/checkpoint/control/idempotency state requires
-replacement. Querying peers and choosing a larger-looking counter or generation
-cannot prove that no unseen higher artifact was signed.
+Restoring a possibly old backup, discovering a lower or uncertain issuance
+high-water, or losing any atomic receipt/checkpoint/control/idempotency state
+requires replacement. Losing only rebuildable materialization cursor/per-row
+progress does not: it forces a conservative rescan. Querying peers and choosing
+a larger-looking counter or generation cannot prove that no unseen higher
+artifact was signed.
 
 Compromise, checkpoint or receipt equivocation, sequence rollback, and an
 unrepairable durability breach permanently retire the signing identity. A
@@ -313,17 +357,81 @@ artifact bodies and one witness per body are retained, while excess verified
 artifacts update only a constant-size digest/count. The primary pair proves the
 community-wide signer fault and is sufficient for current `W` to cut that
 signer over conservatively on every retained stream; no unbounded per-stream
-proof archive is implied. Verification
-closes the local issuance fence before persistence. If the authoritative
-evidence/quarantine commit fails, the community fails closed for new receipt and
-checkpoint decisions until incident state is durably restored. A preallocated,
-independently reserved, maximum-size evidence-intake slot stores each bounded
-candidate package before verification. Invalid candidates clear it; verified
-packages clear only after one authoritative transaction commits the incident,
-quarantine, every affected per-stream recovery/cutover marker, and current
-receipt/checkpoint reconfirmation state. A non-empty/unreadable slot
-blocks restart issuance and enables exact replay, while an ordinary crash with
-an empty healthy slot does not invent a suspect signer. The local
+proof archive is implied. Verification closes the local issuance fence before
+persistence. A preallocated, independently reserved, maximum-size evidence-
+intake slot stores each bounded candidate package before verification. Invalid
+candidates clear it. A verified new-incident candidate clears only after one
+bounded transaction commits its evidence/incident state, quarantine, fixed
+community barrier/generation, and direct-trigger record/cumulative subject
+aggregate for exactly one checkpoint subject or the canonical one-or-two
+receipt/publication subjects. Every subject in that candidate set commits
+atomically; the transaction never scans the retained stream/certificate
+population. An existing-incident candidate clears only after its bounded
+idempotent trigger-set change/saturation/no-op determination commits against
+authoritative state.
+
+The barrier immediately makes older dependent rows logically stale and excludes
+the signer. A coalesced canonical-index materializer commits fixed derived rows
+and its two-dimensional generation/subject cursor in local batches capped by
+both 256 incident-by-subject projection units and 1 MiB of deterministically
+accounted marker mutations. Each unit applies one incident to one subject, so a
+far-behind row advances through intermediate generations without unbounded work
+in one transaction and remains pending until its cumulative projection covers
+every quarantine through the target. A separate direct-refresh unit applies one
+subject's complete fixed trigger aggregate at its captured source revision, so
+multiple trigger-record updates safely collapse without an ordered revision
+log. A batch compare-and-commits that target, the catalog generation, and
+unchanged subject-aggregate revisions; finalization has the same generation
+guards plus a bounded stale-index emptiness query, never a retained-row scan. A
+genuinely new row created solely from post-barrier Q-free work may
+stamp the current generation in its creation transaction only when bounded
+index checks prove that its exact context excludes every quarantined signer and
+the applicable current-`W` cutover/recovery or receipt recertification absorbs
+all prior contexts; mere absence of a Q signature is insufficient. Imports and
+restores remain stale. Duplicate or overflow evidence for the same signer does
+not restart the scan: it derives its canonical one-or-two-subject set, locks all
+named subjects in canonical order, and atomically applies a fixed commutative/
+idempotent conservative join to each authoritative
+`(subject, signer_incident)` record. It then joins each changed record into the
+subject's fixed cumulative trigger aggregate. The stream join keeps
+the earliest affected generation/frontier, uses a fixed conservative-unknown
+sentinel for distinct frontiers at that generation, and never weakens the
+recovery/cutover disposition; it compares no unbounded ancestry. Receipt/
+publication joins likewise never make status greener. Only a changed aggregate
+increments the checked source revision/catalog generation and invalidates that
+subject's cache. If that makes the stale-pair predicate non-empty, the same
+commit marks materialization pending even at an unchanged incident generation.
+A changed pair record persists authoritatively even when an already-more-
+conservative aggregate needs no refresh. An unchanged saturated replay is a
+bounded no-op.
+
+Precise trigger cardinality is lifetime-bounded per signer incident. Exactly
+one stream subject is derived for checkpoint evidence and at most two canonical
+subjects for receipt evidence; the incident retains at most eight distinct
+`(subject, signer_incident)` records across create/delete/reimport cycles.
+Existing subjects may still join stronger terms. A new subject consumes a slot
+in canonical order. Cap-plus-one sets only the incident's fixed
+`direct_trigger_subjects_saturated` bit and allocates no record or aggregate for
+the omitted subject. The already-active broad barrier/index keeps it
+conservative, so saturation allocates no incident generation, cache
+invalidation, or materialization scan. Before allocating a slot, evidence
+already covered by a certified retired-signer cutover or superseded context
+updates only capped audit metadata and cannot reopen recovery. Separate signer
+incidents have independent caps.
+
+The authoritative records, aggregates, and saturation bit are preserved before
+discard. Failure of that update is incident-persistence failure, not
+materialization blocking. A later per-row-applied batch failure leaves the
+barrier intact, Q excluded, and stale rows pending while already evaluated work
+may continue only at unchanged `W`. Failure or corruption of the intake slot,
+evidence, quarantine, barrier/high-water, keyed signer-incident index, or direct-
+trigger record/cumulative aggregate/source revision or trigger-subject
+saturation bit instead fail-stops the community. A readable
+non-empty slot enables exact replay; an unreadable slot remains fail-stopped
+until repaired or explicitly recovered. An empty healthy slot may coexist with
+resumable materialization and does not by itself prove that no incident work
+remains. Missing or uncertain derived cursor/per-row progress resets to a
+conservative scan and is never completion proof. The local
 `audit.ndjson` file records only minimized incident metadata. It is best-effort,
 local, and non-tamper-evident and is never the equivocation proof.
 
@@ -343,7 +451,8 @@ nor the unused Phase-B candidate. In particular, it does not change v1
 `admin_seq`, the fold-level advisory divergence detector, or any approved
 release claim.
 
-Phase C must add, with independent review and additive vectors:
+Phase C must add, with independent review and additive public vectors plus
+explicitly non-wire local-store conformance where identified:
 
 - a successor full descriptor and replica-policy schema carrying lifecycle
   status, authenticated class, explicit `W`, and permanent tombstone history;
@@ -357,10 +466,21 @@ Phase C must add, with independent review and additive vectors:
   their exact conflict slots, durable vote journal, cross-policy handoff/fence,
   checkpoint vote/frontier fault evidence, checked generation succession,
   conflict-slot controls, retired-signer cutovers, and recovery semantics;
-- hard-bounded signer incident evidence, retired-signer cutovers, bounded
-  evidence-intake slot, and historical replica-policy proofs;
-- store, issuance-fence, crash/rollback, and convergence behavior; and
-- the operator CLI/API, stable error codes, JSON output, and audit hooks.
+- hard-bounded public signer incident evidence, retired-signer cutovers, and
+  historical replica-policy proofs;
+- non-wire local store schemas for bounded evidence intake, the fixed community
+  incident barrier/direct-trigger records/cumulative subject aggregates, checked
+  incident/subject/catalog generations, authoritative source-revision high-
+  water, canonical one-or-two-subject derivation, lifetime eight-subject cap and
+  saturation bit, bounded overflow audit metadata, per-row applied generation/
+  revision and stale-pair index,
+  projection-unit+accounted-byte caps, coalesced two-dimensional cursor/
+  completion, plus issuance-fence,
+  conservative progress rebuild, crash/rollback, race, and convergence behavior;
+  and
+- the operator CLI/API, distinct barrier-persistence/materialization errors,
+  progress JSON/status including precise trigger-subject count/cap/saturation,
+  aggregate audit events, and bounded metrics.
 
 Candidate `active|disabled`, descriptor-hash `ReplicaId`, opaque capability,
 single-record `replica.set`, snapshot format 1, and golden bytes remain labeled
@@ -415,6 +535,10 @@ continuity is actually required.
   may stop publication when fewer than `W` eligible replicas remain.
 - Every replica-policy transition changes the component root, so pending work
   must finish or recertify under one exact context.
+- A verified incident may expose a bounded resumable materialization backlog;
+  stale rows remain conservative and a blocked batch is visible, but it cannot
+  re-include the signer or force a community-wide persistence failure while the
+  authoritative barrier remains healthy.
 - Operators receive a deterministic recovery path and a concrete penalty, but
   signatures still do not prove honest storage, physical independence,
   malicious intent, or compromise time.

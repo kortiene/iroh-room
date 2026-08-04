@@ -28,7 +28,16 @@
 > Verified receipt/checkpoint equivocation
 > likewise quarantines new weight and requires governed replacement without
 > lowering `W`; current receipt status drops to reconfirmation-required when the
-> old certificate has fewer than `W` eligible signers. See
+> old certificate has fewer than `W` eligible signers. That logical downgrade
+> occurs when #159's bounded community incident barrier commits, not after its
+> resumable per-certificate materialization. Exact same-identity recovery
+> restores the authoritative evidence/barrier/quarantine high-water and keyed
+> signer-incident index, including trigger-subject saturation, plus direct-
+> trigger records/cumulative subject aggregates/source revisions; derived
+> cursors/per-certificate markers and stale-pair index are
+> validated or conservatively reset and rebuilt, so stale receipt status cannot
+> return.
+> See
 > [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---
