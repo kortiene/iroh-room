@@ -94,6 +94,14 @@ Relevant local context:
 - Store, network, CLI, SDK, deployment, migration, GitHub, or release work.
 - Closing or commenting on GitHub issues.
 
+> **Additive scope correction (#156, 2026-08-03):** #156/ADR-0010 now define
+> the `local_sync_group_v1` receipt durability semantics, but no receipt,
+> publication-certificate, governed-class, or store-crash bytes exist in this
+> Track-2 fixture family. Their absence remains intentional for #153 and remains
+> a separate #134 §20.3/§25 Phase C wire-freeze blocker. Add successor vectors;
+> do not rewrite these frozen records. See
+> [`v2-replica-durability-class.md`](v2-replica-durability-class.md).
+
 ---
 
 ## 4. Key decisions

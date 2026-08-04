@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | #161 — `[SPEC] §25 #3: Governance snapshot encoding + admin-transition proof` |
-| **Refs** | #134 §§6.2, 7.1–7.6, 14, 15, 22.1, 25 #3; #147–#151; #157; #160; ADR-0004; ADR-0008; ADR-0009 |
+| **Refs** | #134 §§6.2, 7.1–7.6, 14, 15, 22.1, 25 #3; #147–#151; #156; #157; #160; ADR-0004; ADR-0008–ADR-0010 |
 | **Status** | Proposed normative format. Accepted on merge; implementation, independent vectors, and Phase-C store/network wiring remain required before advertisement. |
 | **Scope** | Pure specification: exact snapshot/checkpoint/proof/transfer formats, verification rules, limits, and fixtures. No runtime, store, or codec implementation. |
 
@@ -301,6 +301,17 @@ bytes are opaque and may be empty.
 > configured receipt quorum over a subset; format 1 contains no receipt-quorum
 > field. See
 > [`v2-replica-endpoint-identity.md`](v2-replica-endpoint-identity.md).
+
+> **Additive #156 durability correction (2026-08-03):** format version 1 has
+> neither an authenticated receipt quorum nor a durability-class field, and its
+> `capability` integer is not `local_sync_group_v1`. Low-level decoding and root
+> reproduction remain byte-identical, but format 1 cannot by itself activate a
+> receipt-producing stable-v2 replica. #159 and the governance/snapshot schema
+> owner must freeze the successor full descriptor/class/`W` profile and any
+> resulting format version. #156/ADR-0010 define the class semantics and local
+> stable-commit predicate only. Administrator signatures on a governance
+> checkpoint prove authority; they are not replica persistence receipts. See
+> [`v2-replica-durability-class.md`](v2-replica-durability-class.md).
 
 #### 4.2.3 Member/device component
 
@@ -1250,11 +1261,14 @@ Format version 1 MUST NOT be advertised until all are true:
 9. historical-authorization dependencies have an accepted owner/schema before
    compaction claims they are disposable; and
 10. the legacy candidate fixture/decoder remains byte-identical and cannot be
-   confused with this family; and
+    confused with this family;
 11. the #157 compatibility ruling and applicable additive endpoint-profile/
     snapshot-format vectors exist before stable replica state is advertised;
     format 1 remains byte-identical, and no descriptor-hash value is relabeled
-    as a signing public key.
+    as a signing public key; and
+12. the successor governed replica profile authenticates #156's exact
+    `local_sync_group_v1` class and `W`; format-1 `capability` is never
+    overloaded, and receipt/class vectors remain a separate Phase C gate.
 
 No public v2 interoperability claim may treat the closed #150 candidate issue
 or its legacy vector as satisfying this gate.

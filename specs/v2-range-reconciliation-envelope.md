@@ -3,9 +3,9 @@
 | | |
 |---|---|
 | **Issue** | #155 — `[SPEC] §25 #1: Range-reconciliation algorithm + spec-owned envelope` |
-| **Refs** | #134 §§12.2–13.4 / §20.3 / §25 #1; ADR-0004; ADR-0007; Meyer 2022/2023 |
+| **Refs** | #134 §§12.2–13.4 / §20.3 / §25 #1; #156; ADR-0004; ADR-0007; ADR-0010; Meyer 2022/2023 |
 | **Status** | Proposed normative algorithm profile; provisional wire sketch. No implementation and no stable-wire claim until §10 is complete. |
-| **Scope** | Pure specification. Phase C implementation, stream-checkpoint encoding, and the other #134 §25 decisions remain separate work. |
+| **Scope** | Pure specification. Phase C implementation and stream-checkpoint encoding remain separate work; later §25 decisions are consumed additively where relevant. |
 
 ---
 
@@ -1045,6 +1045,14 @@ body acceptable. A valid body returned for a different requested id is
 `invalid_response`, gives no branch progress, and is never stored under the
 requested id. `EventBatch` retains #134's separate 1 MiB / 256-event bounds.
 
+Here and below, "stored" means admitted to the receiver's validated retained-
+set path; it is not a persistence receipt. RBSR completion, body validation,
+page-cache/database visibility, or remote possession cannot create
+`local_sync_group_v1`. A receipt-producing replica must separately pass
+#156/ADR-0010's bounded synchronized commit before exposing its own receipt, and
+a #159 replacement cannot use volatile reconciled bytes as stable-catch-up
+readiness evidence.
+
 Device sequence is scoped to `(community_id, device_id)`, not to a stream. A
 valid first retained event can therefore reference either an event in another
 stream or an event legitimately pruned below this retention generation. Full
@@ -1075,6 +1083,12 @@ substitute for resolution and grants no completion credit.
 The RBSR fingerprint is intentionally a different commitment from the
 checkpoint Merkle root. A replica MUST NOT sign a checkpoint merely because an
 RBSR view digest matched.
+
+`local_sync_group_v1` is a §10.2 receipt assertion, not an RBSR completion state
+or a stream-checkpoint signature. A storage-unready replica refuses checkpoint
+votes as a safety predicate, but the still-unfrozen stream-checkpoint owner must
+define the signer-side retained-storage and vote-atomicity contract. This spec
+does not infer that contract from `CompleteThroughCheckpoint`.
 
 If range work finishes but count/root comparison fails, report
 `checkpoint_root_mismatch` and record the serving peer/view as non-proving. A
@@ -1183,10 +1197,11 @@ Replace #134 §13.4 client-claim item 4:
 > is not resolution and MUST NOT support a synchronization claim through X.
 
 These amendments resolve §25 #1's algorithm and ownership choice and remove an
-unsafe ambiguity at the body-validation boundary. They do not
-resolve stream-checkpoint body encoding, concurrent checkpoint proposal policy,
-the governance snapshot/admin-transition proof (#161), durability class, or
-replica replacement/equivocation policy.
+unsafe ambiguity at the body-validation boundary. They do not resolve
+stream-checkpoint body encoding, concurrent checkpoint proposal policy, the
+governance snapshot/admin-transition proof (#161), or replica
+replacement/equivocation policy. #156/ADR-0010 separately resolve the receipt
+durability-class semantics; RBSR supplies no shortcut around them.
 
 ---
 
@@ -1376,8 +1391,9 @@ Wire version 1 becomes stable only when all are true:
    accepted; the checkpoint count/root and §7.2 boundary-proof gates are then
    exercised end to end with no backend completion-boolean bypass. #161 owns the
    governance snapshot/admin-transition proof and #159 owns replica replacement/
-   equivocation policy; the remaining schema work MUST have an explicit owner
-   before Phase C claims this item.
+   equivocation policy; #156/ADR-0010 define receipt durability but the final
+   receipt/class codec and stream-checkpoint storage predicate still need their
+   explicit owners before Phase C claims this item.
 6. The §10.5 performance gate passes with all budgets enabled.
 7. The reviewed `degraded`/horizon/device-cut amendment fields are accepted into
    or explicitly excluded from version 1; the boundary proof itself cannot be
