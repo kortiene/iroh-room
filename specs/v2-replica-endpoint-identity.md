@@ -3,9 +3,27 @@
 | | |
 |---|---|
 | **Issue** | #157 — `[SPEC] §25 #2: Replica key vs Iroh Endpoint ID rotation` |
-| **Refs** | #134 §§6.2–6.4, 7.2–7.3, 10.2–10.3, 11.2, 13.4, 19, 25 #2; #146; #147; #156; #159; #161; ADR-0004; ADR-0008–ADR-0010 |
+| **Refs** | #134 §§6.2–6.4, 7.2–7.3, 10.2–10.3, 11.2, 13.4, 19, 25 #2; #146; #147; #156; #159; #161; ADR-0004; ADR-0008–ADR-0011 |
 | **Status** | Proposed decision/lifecycle profile — normative when ADR-0009 and this profile merge; §5 is a non-wire Phase C handshake sketch |
-| **Scope** | Pure specification. Phase C implementation, exact handshake envelope, and replica replacement/operator UX (#159) remain separate work. #156/ADR-0010 now define receipt durability semantics; their codec/store implementation remains Phase C work. |
+| **Scope** | Pure specification. #159/ADR-0011 now define replacement, equivocation, and operator semantics; Phase C implementation and exact handshake/receipt/checkpoint/evidence codecs remain separate work. #156/ADR-0010 define receipt durability semantics; their codec/store implementation remains Phase C work. |
+
+> **Additive #159 lifecycle resolution (2026-08-03):** authenticated genesis may
+> admit its initial valid active set directly; every post-genesis signing
+> identity follows governed `staged -> active -> disabled` or terminal
+> `staged -> disabled`, where staged has a bounded catch-up lane and zero quorum
+> weight and disabled is a permanent same-role tombstone. Replacement stages a
+> new independent key, proves stable checkpoint-relative readiness, then
+> atomically changes old
+> `active -> disabled` and new `staged -> active` in one complete successor
+> policy carrying exact class and `W`. Verified same-slot checkpoint or
+> same-sequence receipt equivocation quarantines the signer from new quorum
+> decisions and requires permanent governed replacement. Rollback uncertainty
+> never guesses a counter. Fork resolution retains governance-carried control
+> exclusions plus structural, signer-held, and collected-final fixed-size
+> dependency roots whose corresponding bounded-chunk full-DAG proofs survive
+> snapshot/replay; local readiness or quarantine arrival never rewrites exposed
+> governance bytes. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---
 
@@ -60,7 +78,7 @@ normative.
 - Receipt, publication-certificate, or stream-checkpoint formats beyond the
   identity rules needed here.
 - Replica catch-up, replacement ordering, equivocation penalties, and operator
-  UX, which #159 owns.
+  UX, specified separately by #159/ADR-0011.
 - The receipt durability-class encoding and implementation. #156/ADR-0010 now
   specify the `local_sync_group_v1` semantic default.
 - Replica fault-domain placement or proof that two configured replicas run on
@@ -128,9 +146,10 @@ operational eligibility.
 
 #134 §11.2 also assigns discovery/relay hints to the full replica descriptor.
 Hints, supported features, operator labels, and durability/retention metadata
-are not endpoint identity and MUST NOT substitute for `EndpointId`. Their exact
-governed fields remain to be frozen by Phase C/#159 in a versioned full
-descriptor. #156/ADR-0010 supply `local_sync_group_v1` durability-class
+are not endpoint identity and MUST NOT substitute for `EndpointId`. #159/
+ADR-0011 supply their successor lifecycle semantics; the Phase C governance/
+snapshot format owner must freeze the exact versioned full-descriptor fields.
+#156/ADR-0010 supply `local_sync_group_v1` durability-class
 semantics rather than wire encoding; the candidate `capability` integer is not
 that class and MUST NOT be overloaded as one. #161 requires a new snapshot
 format version for a field-schema or
@@ -168,7 +187,8 @@ codec never acquire networking or quorum authority from successful decoding.
 A disable/replacement transition MUST be able to retire an opaque, malformed,
 equal-key, or otherwise ineligible historical descriptor without first making
 it valid. Disabled records preserve evidence but carry no live networking or
-quorum authority. #159 owns the exact retirement/tombstone operation.
+quorum authority. #159/ADR-0011 define permanent retirement/tombstone semantics;
+the Phase C governance/snapshot owner freezes the exact operation and proof.
 
 Within a community, active `ReplicaId`s are unique, resolved active
 `EndpointId`s are unique, and the two complete active key sets are disjoint:
@@ -189,10 +209,12 @@ key once admitted as a `ReplicaId` MUST NOT later be admitted as an `EndpointId`
 for that community, or conversely, even after retirement. Otherwise a retained
 or stolen old-role secret would gain authority in the other role. Admission
 therefore consults authenticated, non-compacted per-community role-key history,
-including every resolvable active and disabled descriptor. #159 and the
-governance/snapshot schema owner must preserve or commit that history before a
-stable implementation can admit replacements. This cross-role tombstone rule
-does not decide #159's same-role planned-restoration policy.
+including every resolvable active and disabled descriptor. #159/ADR-0011
+require that retained history; the Phase C governance/snapshot schema owner
+must freeze and implement its commitment before stable replacement admission.
+This cross-role tombstone rule
+composes with #159/ADR-0011's same-role rule: every disabled `ReplicaId` is a
+permanent tombstone, including after planned rotation.
 
 ### 3.4 Key custody
 
@@ -229,9 +251,9 @@ The protocol field named `replica_set_hash` is #161's exact **replica component
 root**, over full active and disabled `ReplicaRecord`s. It is not an active-only
 set hash. Stable use must derive active eligibility, status, uniqueness, and the
 configured receipt quorum `W` from authenticated decoded governance state. The
-candidate model does not encode `W`; #157 does not choose its location. #159
-together with the governance/snapshot schema owner must freeze that
-representation and version every changed container.
+candidate model does not encode `W`; #157 does not choose its location. #159/
+ADR-0011 require explicit `W`, while the Phase C governance/snapshot schema
+owner must freeze its representation and version every changed container.
 
 A verifier consuming a descriptor MUST know all of:
 
@@ -459,8 +481,9 @@ Receipt quorum counting is by distinct active `ReplicaId`, never by endpoint,
 connection, address, process, or signature count. Receipts from different
 governance heads or replica component roots do not combine. Reusing one
 endpoint for multiple connections cannot increase quorum weight. #157 does not
-choose the still-missing authenticated representation of `W`; #159 and the
-governance/snapshot schema owner own it.
+choose the still-missing authenticated representation of `W`; #159/ADR-0011
+define its policy semantics and the Phase C governance/snapshot owner freezes
+the bytes.
 
 Class equality is also exact. Unknown classes fail closed; v2.0 defines no
 ordering or "stronger counts as weaker" substitution. Hidden remote WAL copies,
@@ -489,8 +512,14 @@ evidence: a checkpoint/snapshot/log segment or future inclusion proof that
 establishes the exact governance head, full replica component, and `W`.
 
 #161's sparse authority proof omits ordinary `replica.set` operations and does
-not by itself supply this historical policy proof. #159 and the receipt/
-stream-checkpoint owner must freeze its proof and retention/compaction rules.
+not by itself supply this historical policy proof. #159/ADR-0011 define the
+retention semantics; the Phase C evidence/history and receipt/stream-checkpoint
+owners must freeze the proof and compaction rules, including handoff/
+cancellation controls, `ForkResolvedFenceStatement`/
+`ForkResolvedFrontier`/`replica.handoff.fork_reconcile` history, governance-
+carried control exclusions, every pending structural/signer-held/final nested-
+resolution count/root and its corresponding dependency proof, and retired-
+signer cutovers that affect current use.
 Until then, a cryptographically correct old-key signature may be reported as
 signature-valid, but not as policy-authorized. Implementations must retain or
 fetch the governing evidence and must not compact it merely because the key is
@@ -509,7 +538,8 @@ A planned endpoint rotation is:
    proposed channel-bound challenge behind the new endpoint;
 3. run an operator-local, non-authorizing proposed-descriptor proof of
    possession; the new endpoint cannot pass normal §5 while it is not active,
-   and #159/Phase C own its exact staging mechanism;
+   and #159/ADR-0011 define the staging boundary while the Phase C identity/
+   handshake owner freezes its exact mechanism;
 4. accept an administrator-quorum-approved `replica.set` that changes only the
    endpoint for the existing `ReplicaId`;
 5. at the new head, accept only the new endpoint and a new binding proof; and
@@ -519,7 +549,7 @@ A planned endpoint rotation is:
 The `ReplicaId`, historical signatures, and receipt-sequence namespace remain
 unchanged. The signer/counter store MUST remain single-writer or otherwise
 atomically monotonic across the move; copying an old database or signer state
-must not roll back receipt sequence.
+must not roll back receipt sequence or any checkpoint vote/generation journal.
 
 Changing endpoint material changes the full replica component root even though
 `ReplicaId` and its sequence namespace remain stable. Receipts or
@@ -534,11 +564,13 @@ normal work under the stale root. Old-root certification must finish before the
 transition or be recertified under the new root. The client closes the old
 connection and re-proves binding at the new endpoint after learning the state.
 
-For an endpoint-key compromise, skip any convenience grace period: publish the
-governance change through the emergency path defined by #159, stop trusting the
-old mapping at the new head, rotate address/discovery material, and audit the
-exposure. The attacker still cannot pass §5 at the new endpoint or sign replica
-artifacts without the separate replica key.
+For an endpoint-key compromise, skip any convenience grace period: use #159/
+ADR-0011's ordinary predecessor-admin-authorized endpoint-update or replacement
+procedure with typed `endpoint_key_compromise` cause, stop trusting the old
+mapping at the new head, rotate address/discovery material, and audit the
+exposure. There is no separate emergency authority. The attacker still cannot
+pass §5 at the new endpoint or sign replica artifacts without the separate
+replica key.
 
 ### 7.2 Replica-signing-key rotation
 
@@ -549,9 +581,10 @@ replica identity. It MUST be represented as replica replacement:
 2. catch the replacement replica up and prove it ready without granting it
    receipt quorum weight, including `local_sync_group_v1` stable-store and
    monotonic-sequence readiness under #156/ADR-0010;
-3. use the #159 governance procedure to atomically replace the old active set
-   entry with the new `ReplicaId` without dropping below the required
-   durability/quorum policy;
+3. commit #159's predecessor-admin-approved prepare reservation, obtain its
+   predecessor-`W` checkpoint-frontier bundle, approve the derived activation
+   child, and atomically replace the old active set entry with the new `ReplicaId`
+   without dropping below the required durability/quorum policy;
 4. start a fresh receipt-sequence namespace for the new
    `(CommunityId, ReplicaId)`; and
 5. retain the old public descriptor, authenticated governing-set evidence, and
@@ -561,16 +594,17 @@ The predecessor and successor MUST NOT both count as independent active quorum
 seats in a governed one-for-one replacement. This is a state-transition rule,
 not proof that the services occupy one physical machine. Two sequential
 single-record upserts are unsafe: add-first temporarily inflates quorum weight,
-while disable-first may drop the active set below policy. #159 must define one
-atomic full-set/replacement transition, including the receipt quorum, before
-signing rotation is implementable.
+while disable-first may drop the active set below policy. #159/ADR-0011 define
+the required full-set/quorum transition as zero-weight staging followed by one
+complete-policy old-admin-authorized old-disable/new-activate operation; its
+exact codec remains Phase C work.
 
 No mutable alias maps the old `ReplicaId` to a new signing key. The old signer,
 an old-to-new cross-signature, endpoint possession, or operator metadata cannot
 authorize the successor; only governance can. A compromised signing key MUST
-never be reactivated. Whether a safely planned retirement is permanently
-tombstoned or may be restored with continuous counter state and no overlap is a
-#159 lifecycle decision; #157 does not invent an unenforceable alias chain.
+never be reactivated. #159/ADR-0011 choose permanent tombstones for every
+disabled signing identity, including safely planned retirement; exact
+continuous in-place crash recovery is not retirement or reactivation.
 
 A publication certificate cannot straddle the replica-component transition:
 every counted receipt agrees on the exact governance head and component root.
@@ -666,9 +700,9 @@ mechanism is a separate explicitly versioned protocol decision.
 
 The candidate `replica.set` payload/apply path upserts one record and its
 genesis model does not carry #134's receipt quorum. It therefore cannot express
-the atomic signing-key replacement required by §7.2. #159 must replace or
-version that transition as one full-set-plus-quorum operation; the current
-single-record upsert is not rotation support.
+the atomic signing-key replacement required by §7.2. #159/ADR-0011 require a
+versioned successor full-policy-plus-quorum operation; the current single-record
+upsert is not rotation support.
 
 ADR-0004 accepted Phase B while explicitly keeping §25 decisions open and
 names a §25 conflict as a review trigger. This profile invokes that trigger and
@@ -734,16 +768,16 @@ format until all of these pass:
    its event/reference/idempotency state behind #156's stable barrier.
 8. Receipt tests distinguish producer sequence reuse/equivocation from benign
    out-of-order delivery and do not overclaim compromise containment.
-9. #159 and the governance/snapshot schema owner freeze the versioned full
-   descriptor, authenticated `W`, atomic replacement, catch-up/equivocation,
-   and operator path; #156/ADR-0010 supply the exact
-   `local_sync_group_v1` semantics and bounded group-commit/crash predicate.
-   The format owner
-   records §3.2's compatibility ruling, versions every affected container, and
-   keeps changed vectors additive.
+9. #159/ADR-0011 supply the full-policy lifecycle, atomic replacement,
+   catch-up/equivocation, and operator semantics; the governance/snapshot schema
+   owner freezes their exact descriptor, `W`, readiness/evidence, and history
+   bytes. #156/ADR-0010 supply the exact `local_sync_group_v1` semantics and
+   bounded group-commit/crash predicate. The format owner records §3.2's
+   compatibility ruling, versions every affected container, and keeps changed
+   vectors additive.
 10. Historical replica-set/quorum and role-key evidence has a frozen proof and
     retention owner before compaction discards anything needed by retained
-    artifacts or cross-role admission checks.
+    artifacts, prepare/fork-frontier controls, or cross-role admission checks.
 11. Candidate descriptor-hash fixtures are explicitly versioned/labeled and
     cannot be selected by stable-v2 negotiation; successor genesis vectors show
     the resulting `CommunityId` change rather than preserving it by fiat.
@@ -776,8 +810,9 @@ retain opaque historical bytes.
 
 Changing only the endpoint rotates transport identity without changing replica
 identity; changing `ReplicaId` is one atomic full-set replacement and follows
-#159. #159 and the governance/snapshot schema owner also own the authenticated
-receipt quorum and full #134 §11.2 descriptor. #156/ADR-0010 supply
+#159/ADR-0011. That profile supplies authenticated receipt-quorum and full-
+descriptor semantics; the Phase C governance/snapshot schema owner freezes the
+exact fields and operation. #156/ADR-0010 supply
 `local_sync_group_v1` durability semantics, not those fields' encoding. This
 issue leaves #161's format-1 decoder byte-identical and requires
 the explicit §3.2 compatibility ruling plus any resulting successor format

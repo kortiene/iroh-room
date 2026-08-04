@@ -3,9 +3,33 @@
 | | |
 |---|---|
 | **Issue** | #156 — `[SPEC] §25 #7: Durability class (fsync vs group commit vs replicated WAL)` |
-| **Refs** | #134 §§3, 5.2, 10.2–10.4, 13.4, 15.2, 16.2, 19, 21–22, 25 #7; #155; #157; #159; #161; ADR-0004; ADR-0007–ADR-0010 |
+| **Refs** | #134 §§3, 5.2, 10.2–10.4, 13.4, 15.2, 16.2, 19, 21–22, 25 #7; #155; #157; #159; #161; ADR-0004; ADR-0007–ADR-0011 |
 | **Status** | Proposed normative durability profile. Accepted on merge; Phase C implementation, receipt/full-descriptor encoding, and independent vectors remain required before advertisement. |
 | **Scope** | Pure specification. No runtime, store, receipt codec, schema, CLI, or operator-recovery implementation. |
+
+> **Additive #159 lifecycle resolution (2026-08-03):** a replacement candidate receives
+> zero durability/quorum weight while governed `staged`; after stable
+> checkpoint-relative catch-up, one old-admin-authorized complete-policy
+> transition atomically disables the predecessor and activates the successor.
+> Exact continuous in-place crash recovery may retain `ReplicaId`; uncertain or
+> rolled-back receipt state or per-stream checkpoint vote/generation journals
+> require permanent retirement and a fresh identity, never a guessed counter or
+> generation. Active-signer-set changes also require a committed predecessor-
+> admin prepare reservation, a predecessor-`W` durable checkpoint-frontier
+> bundle/fence, and its derived admin-approved prepared `replica.set` child. After a
+> stable-v2 governance-fork closure, one outcome-neutral
+> `ForkResolvedFenceStatement` and every derived
+> `ForkResolvedFrontier`/reconciliation decision are part of the same continuous
+> signer journal. Nested resolutions carry governance-derived control exclusions
+> and distinct fixed-size structural, signer-held, and collected-final dependency
+> commitments whose corresponding bounded-chunk full-DAG proofs survive
+> snapshot/replay; losing, unavailable, or uncertain
+> reservation/statement state prevents same-key issuance.
+> Verified receipt/checkpoint equivocation
+> likewise quarantines new weight and requires governed replacement without
+> lowering `W`; current receipt status drops to reconfirmation-required when the
+> old certificate has fewer than `W` eligible signers. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---
 
@@ -68,7 +92,7 @@ This profile does not define:
 - #134's still-open publication-certificate head-agreement behavior during
   ordinary governance churn;
 - replica catch-up, activation, replacement, equivocation penalty, recovery
-  commands, or operator UX, which #159 owns;
+  commands, or operator UX, specified separately by #159/ADR-0011;
 - physical replica placement or cryptographic proof of independent disks,
   hosts, sites, operators, or power supplies;
 - durability of referenced blob payload bytes unless a later explicit policy
@@ -225,8 +249,9 @@ The class does not survive or prove:
 
 The class used for quorum is authorized by authenticated governance, not chosen
 by a `ServerHello`, command-line flag, local database, or receipt signer. The
-full descriptor/genesis/`replica.set` schema owner and #159 must encode it in an
-explicitly versioned profile. The current candidate descriptor's opaque
+full descriptor/genesis/`replica.set` schema owner must encode it in the
+explicitly versioned profile whose lifecycle semantics #159 supplies. The
+current candidate descriptor's opaque
 `capability: uint(0..255)` MUST NOT be reinterpreted as a durability class.
 
 The live replica also advertises whether it is presently ready to produce that
@@ -389,8 +414,9 @@ to delivery order. Two different signed bodies from the same
 `(CommunityId, ReplicaId)` at one sequence are equivocation evidence. Sequence
 rollback or an unverifiable restored high-water makes the signer not ready. It
 must not guess a larger counter, scan only locally available receipts, or reset
-to zero; #159 restores authenticated state or activates a new `ReplicaId` and
-namespace.
+to zero. #159 permits the old identity only when exact continuous in-place
+state recovers; otherwise governance permanently retires it and activates a new
+`ReplicaId` and namespace.
 
 ### 4.6 Shutdown and maintenance
 
@@ -466,7 +492,8 @@ replica:
 - stops signing stream checkpoints whose claimed set depends on the affected
   storage;
 - preserves available fault/audit evidence; and
-- requires the Phase C/#159 recovery rule before resuming.
+- applies #159/ADR-0011's recovery rule through the Phase C implementation
+  before resuming.
 
 A transient checkpoint failure does not retroactively erase a `FULL` WAL commit
 that is known intact, but it is an operational storage fault that must be
@@ -566,6 +593,17 @@ certificate, cadence, proposer, and cut-proof bytes. This profile does not infer
 that contract from RBSR state or silently require one per-event receipt for
 every reconciled historical body.
 
+#159/ADR-0011 additionally require each observable checkpoint vote and every
+prepare, handoff/cancellation, fork-resolved fence/frontier, abandon, conflict,
+or cutover control, with its exact generation or frontier, idempotency record,
+and fence, to stable-commit before release.
+Uncertain recovery of that journal withdraws same-key readiness even when the
+receipt high-water alone appears intact.
+Detached readiness/quarantine observations gate local authoring and service;
+they do not arrival-order-change the fold validity of already exposed signed
+governance inputs, which uses only authenticated policy and governance-carried
+control exclusions.
+
 ### 6.5 Retention and compaction
 
 The class means stable retention under the policy that authorized the receipt,
@@ -591,7 +629,8 @@ Signing-key rotation creates a new `ReplicaId` and sequence namespace. A
 replacement replica completes stable catch-up and passes class readiness before
 #159 grants active quorum weight. If old sequence state is lost or rolled back,
 the same `ReplicaId` cannot resume merely by choosing a higher-looking counter;
-#159 restores authenticated state or performs replacement.
+#159 permits only exact continuous in-place recovery or performs permanent
+replacement.
 
 Receipts across the old/new component roots never combine. #156 does not define
 the atomic `replica.set`, readiness proof wire, operator command, or recovery
@@ -656,8 +695,8 @@ receipt construction, signature generation, or socket write as a stable
 receipt. The primary release counter is signed receipts released after stable
 commit; its denominator and failure outcomes are explicit.
 
-The exact CLI/operator presentation belongs to #159. That issue must consume
-the typed readiness/storage/rollback states here and must not reduce them to an
+The exact CLI/operator presentation is defined by #159/ADR-0011. It consumes
+the typed readiness/storage/rollback states here and does not reduce them to an
 unqualified "replica online" boolean.
 
 ---
@@ -738,9 +777,12 @@ The distributed matrix includes:
 - endpoint rotation with intact store/high-water and no dual writer;
 - restored old backup/high-water rollback that prevents same-key activation;
 - signing-key replacement with a fresh namespace and no mixed-root
-  certificate; and
+  certificate;
+- governance-fork closure after open and closed replica-frontier activity,
+  proving the outcome-neutral current-`W` fork-resolved statement/frontier
+  survives crash and never accepts recovery-key weight; and
 - a receipt/event mismatch on recovery that becomes a visible durability breach
-  and #159 recovery condition.
+  and applies #159/ADR-0011's recovery path.
 
 ### 9.5 Remaining stable-wire blockers
 
@@ -754,7 +796,8 @@ the publication wire ready. Stable advertising still waits for:
 - the #157 endpoint resolver/binding implementation and successor genesis
   reconciliation;
 - stream-checkpoint/cut/vote formats and their stable-local signing boundary;
-- #159 replacement, rollback, equivocation, evidence, and operator recovery; and
+- Phase C codecs/implementations for #159/ADR-0011's replacement, rollback,
+  equivocation, evidence, handoff, and operator semantics; and
 - independent receipt/class/crash vectors and review.
 
 ---
@@ -805,7 +848,8 @@ outcome.
 
 RBSR discovers candidate inventory differences. Receiving, validating, or
 matching an event through RBSR does not stable-commit it and cannot create a
-receipt or make a replica #159-ready. A fetched body's transition from
+receipt or satisfy #159's staged-replica readiness. A fetched body's transition
+from
 validated or quarantined data to retained storage follows the separately
 specified store policy; RBSR itself supplies none.
 
@@ -883,7 +927,7 @@ Add or refine:
 | Failure | Required behavior |
 |---|---|
 | Stable commit/barrier fails or is ambiguous | Issue no receipt; recover exact idempotency state before retry; withdraw readiness while storage health is uncertain. |
-| Receipt sequence state rolls back | Do not resume the same `ReplicaId`; restore authenticated monotonic state or replace it through #159. |
+| Receipt sequence state rolls back | Resume only if exact continuous in-place state is recovered; otherwise permanently replace the `ReplicaId` through #159. |
 | One of three replicas offline | Two matching `local_sync_group_v1` receipts may certify; report degraded redundancy and never infer physical independence from keys. |
 | Fewer than `W` eligible/ready replicas | Keep publication `Pending`/`QuorumUnavailable`; never lower class or quorum. |
 | Referenced blob payload unavailable | Preserve the durable event/reference and report blob availability separately; the baseline receipt does not cover payload bytes. |

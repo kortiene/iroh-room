@@ -218,3 +218,21 @@ These are intentionally absent; do not treat the omission as a coverage gap.
 > C implementation must add explicitly versioned successor receipt/class/
 > descriptor vectors without rewriting these files. See
 > [`specs/v2-replica-durability-class.md`](../../../../specs/v2-replica-durability-class.md).
+
+> **Additive correction (#159, 2026-08-03):** ADR-0011 specifies governed
+> zero-weight staging, atomic full-policy activation/replacement, permanent
+> disabled signing identities, evidence-driven equivocation quarantine, and
+> no same-key recovery after receipt or checkpoint-vote-journal rollback
+> uncertainty. This frozen Phase-B family contains none of those wire objects.
+> Add successor genesis/policy/readiness/receipt/checkpoint/committed-prepare-
+> handoff/cancellation/outcome-neutral-fork-fence/target-tagged-fork-frontier/
+> reconciliation/control-signer-exclusion/frontier-evidence/cutover/bounded-
+> incident/recovery vectors under a bumped schema; do not rewrite current
+> identifiers, records, or
+> negatives. Fork-reconciliation fixtures include fixed-size structural,
+> exact-replayed statement-held, and collected final-union dependency count/
+> roots; the complete canonical bounded-chunk proof; F1-to-F2 roll-up; late
+> supplemental leaves without statement mutation; boundary-size positives;
+> structural-only propose/commit rejection; and omission/duplicate/order/root/
+> count/oversized/truncated/unavailable/overflow negatives. See
+> [`specs/v2-replica-replacement-recovery.md`](../../../../specs/v2-replica-replacement-recovery.md).

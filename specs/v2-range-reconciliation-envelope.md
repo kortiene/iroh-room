@@ -3,9 +3,22 @@
 | | |
 |---|---|
 | **Issue** | #155 — `[SPEC] §25 #1: Range-reconciliation algorithm + spec-owned envelope` |
-| **Refs** | #134 §§12.2–13.4 / §20.3 / §25 #1; #156; ADR-0004; ADR-0007; ADR-0010; Meyer 2022/2023 |
+| **Refs** | #134 §§12.2–13.4 / §20.3 / §25 #1; #156; #159; ADR-0004; ADR-0007; ADR-0010–ADR-0011; Meyer 2022/2023 |
 | **Status** | Proposed normative algorithm profile; provisional wire sketch. No implementation and no stable-wire claim until §10 is complete. |
 | **Scope** | Pure specification. Phase C implementation and stream-checkpoint encoding remain separate work; later §25 decisions are consumed additively where relevant. |
+
+> **Additive #159 lifecycle correction (2026-08-03):** RBSR equality is one
+> input to a staged replica's checkpoint-relative catch-up; it grants no
+> receipt/checkpoint weight until verified state is committed under the
+> governed class and an old-admin-quorum complete-policy transition activates
+> the candidate. RBSR `view_equivocation`, invalidity, withholding, and
+> transport disagreement remain operator/session evidence, not checkpoint
+> equivocation. Permanent quarantine/exclusion requires an objective eligible-
+> signer same-slot checkpoint pair, same-sequence receipt pair, or mutually
+> exclusive checkpoint-vote/frontier statement. RBSR equality or session
+> evidence cannot clear a prepare fence or replace #159's current-`W`, selected-
+> admin-approved fork-frontier reconciliation after `fork.resolve`. See
+> [`v2-replica-replacement-recovery.md`](v2-replica-replacement-recovery.md).
 
 ---
 
@@ -1104,9 +1117,10 @@ A malicious responder can lie about counts, digests, splits, or ids, and can
 withhold data without finding a fingerprint collision. Structural validation
 and budgets bound the work; the checkpoint gate prevents false completeness.
 Malformed responses provide no progress credit. Repeated invalidity/withholding
-is operator evidence. Whether and how it removes a peer from completeness
-dependencies is owned by the still-open replica replacement/equivocation policy
-in #159; #155 authorizes no removal behavior.
+is operator evidence. #159/ADR-0011 permit bounded local peer selection and
+operator-governed reconfiguration for that behavior but do not call it
+checkpoint equivocation or automatically retire a `ReplicaId`; #155 itself
+authorizes no removal behavior.
 
 ---
 
@@ -1389,9 +1403,10 @@ Wire version 1 becomes stable only when all are true:
 5. Final stream-checkpoint/device-cut, stream-event-root domain, publication-
    certificate, replica-certificate, and historical-authorization schemas are
    accepted; the checkpoint count/root and §7.2 boundary-proof gates are then
-   exercised end to end with no backend completion-boolean bypass. #161 owns the
-   governance snapshot/admin-transition proof and #159 owns replica replacement/
-   equivocation policy; #156/ADR-0010 define receipt durability but the final
+   exercised end to end with no backend completion-boolean bypass. #161 defines
+   the governance snapshot/admin-transition proof, and #159/ADR-0011 define
+   replica replacement/equivocation semantics; #156/ADR-0010 define receipt
+   durability, but the final
    receipt/class codec and stream-checkpoint storage predicate still need their
    explicit owners before Phase C claims this item.
 6. The §10.5 performance gate passes with all budgets enabled.
