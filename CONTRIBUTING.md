@@ -1,8 +1,11 @@
 # Contributing to Iroh Rooms
 
-Iroh Rooms uses GitHub Issues as the traceable source of work. Each meaningful
-change should start from an issue with acceptance criteria and traceability back
-to `PRD.v0.3.md` or `PHASE-0-SPIKE.md`.
+Iroh Rooms uses [`ROADMAP.md`](ROADMAP.md) RB-1 as the authoritative source of
+future scope and GitHub Issues as the traceable source of execution. Each
+meaningful roadmap change should start from an issue with acceptance criteria
+and traceability to an RB-1 row and its cited product, protocol, security, or
+operations source. `PRD.v0.3.md` is current; `PRD.md` is historical v0.2 and
+does not independently add scope.
 
 ## Local Setup
 
@@ -14,7 +17,7 @@ scripts/verify.sh
 
 ## Standard Workflow
 
-1. Pick an issue from the current milestone.
+1. Pick an issue from the current milestone and confirm its RB-1 row.
 2. Create a branch using the issue number and a short slug.
 3. Make the smallest coherent change that satisfies the issue.
 4. Run `scripts/verify.sh`.
@@ -113,10 +116,12 @@ verdict line into its Sign-off section.
 ## Production Readiness
 
 Do not treat a green Developer Preview gate as a production-grade release.
-Production-grade post-MVP work is governed by
-[`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md), which defines the Phase 2.5
-bar for security, local data handling, networking evidence, compatibility,
-release operations, and beta validation.
+[`ROADMAP.md`](ROADMAP.md) governs roadmap scope and the rule that every
+non-cohort deliverable completes before the external cohort.
+[`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md) remains the detailed source
+for security, local data handling, networking evidence, compatibility, release
+operations, and candidate sign-off. A historical release waiver does not
+complete an RB-1 row.
 
 For production-candidate preparation, run:
 
@@ -134,3 +139,19 @@ scripts/production-readiness.sh --offline-only
 fail while production P0 artifacts are still missing. Manual P0 sign-offs in
 `PRODUCTION-READINESS.md` remain required before any Production Beta or GA
 label.
+
+## Roadmap Baseline Changes
+
+Do not add, remove, waive, or reclassify roadmap scope only through an issue
+disposition, milestone edit, specification status, or release sign-off. A scope
+change requires a reviewed RB-1.x amendment that:
+
+1. names every affected stable row ID;
+2. explains the reason and approval;
+3. updates dependencies, completion evidence, hardware/external roles, status,
+   and cohort-blocking flags; and
+4. adds an entry to the amendment log in `ROADMAP.md`.
+
+Closed-as-not-planned work and permanent waivers do not count as completion.
+Frozen evidence and approved release records receive additive successors or
+errata, never rewrites.

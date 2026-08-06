@@ -4,6 +4,11 @@ Iroh Rooms is a local-first collaboration runtime for small trusted groups. It l
 
 The current release is `v0.1.0-rc.5`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
 
+The external builder cohort is deferred until every non-cohort item in the
+approved [`RB-1 roadmap baseline`](ROADMAP.md) is complete and the exact
+roadmap-complete candidate passes its final gates. The existing rc.5 release is
+not that candidate, and historical cohort preparation is not cohort evidence.
+
 ## What you can do with it
 
 Use Iroh Rooms when you want a private local workspace with peers you already trust:
@@ -27,7 +32,7 @@ Start with one of these paths:
 
 - **Try the CLI demo**: follow [`docs/getting-started.md`](docs/getting-started.md)
 - **Install or remove a beta binary**: use [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md)
-- **Join the first builder cohort**: read [`COMMUNITY.md`](COMMUNITY.md) and [`docs/community/first-cohort.md`](docs/community/first-cohort.md)
+- **Review roadmap and cohort status**: start with [`ROADMAP.md`](ROADMAP.md), then read [`docs/community/first-cohort.md`](docs/community/first-cohort.md)
 - **Share a local preview**: follow [`docs/live-pipe-preview.md`](docs/live-pipe-preview.md)
 - **Implement or audit the protocol**: read [`docs/protocol.md`](docs/protocol.md)
 - **Understand release status**: read [`docs/releases/v0.1.0-rc.5-release-notes.md`](docs/releases/v0.1.0-rc.5-release-notes.md)
@@ -268,15 +273,25 @@ Open issues on GitHub with enough detail to reproduce the behavior. Do not attac
 
 ## Community
 
-The first community loop is intentionally small: technical builders who can tolerate beta friction and give precise feedback. The goal is to learn whether private local-first rooms are useful for sharing local previews, artifacts, and agent status without deploying anything.
+The final external cohort will be intentionally small: technical builders who
+can tolerate candidate friction and give precise feedback. It is not recruiting
+or running yet. [`ROADMAP.md`](ROADMAP.md) defines the implementation and
+verification work that must finish first; independent security reviewers and
+hardware/network test operators are verification roles, not cohort
+participants.
 
-Read [`COMMUNITY.md`](COMMUNITY.md), then use [`docs/community/demo-recipes.md`](docs/community/demo-recipes.md) to run one workflow. File what worked, what failed, and what felt unclear.
+Current developers can still read [`COMMUNITY.md`](COMMUNITY.md) and use
+[`docs/community/demo-recipes.md`](docs/community/demo-recipes.md) for local
+testing. Those rehearsals do not count as the final cohort.
 
 ## Project history
 
-The original Phase 0 and Phase 1 planning documents remain in the repository for traceability:
+The authoritative roadmap and the original planning documents remain in the
+repository for traceability:
 
+- [`ROADMAP.md`](ROADMAP.md): RB-1, the authoritative roadmap-completion contract before the external cohort
 - [`PRD.v0.3.md`](PRD.v0.3.md): current product requirements and MVP scope
+- [`PRD.md`](PRD.md): historical v0.2 requirements record; it does not compete with v0.3 or RB-1
 - [`PHASE-0-SPIKE.md`](PHASE-0-SPIKE.md): protocol design, architecture decisions, spike plan, and residual risks
 - [`PHASE-0-GO-NO-GO.md`](PHASE-0-GO-NO-GO.md): Phase 0 decision record
 - [`RELEASE-READINESS.md`](RELEASE-READINESS.md): developer preview release gate
