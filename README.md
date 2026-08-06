@@ -4,10 +4,12 @@ Iroh Rooms is a local-first collaboration runtime for small trusted groups. It l
 
 The current release is `v0.1.0-rc.5`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
 
-The external builder cohort is deferred until every non-cohort item in the
-approved [`RB-1 roadmap baseline`](ROADMAP.md) is complete and the exact
-roadmap-complete candidate passes its final gates. The existing rc.5 release is
-not that candidate, and historical cohort preparation is not cohort evidence.
+The external builder cohort is deferred until every cohort-blocking `PRE` row
+in the approved [`RB-1 roadmap baseline`](ROADMAP.md) is complete, every
+cohort-blocking `COND` row is explicitly resolved, and every cohort-blocking
+`FC` gate passes on the exact roadmap-complete candidate. The existing rc.5
+release is not that candidate, and historical cohort preparation is not cohort
+evidence.
 
 ## What you can do with it
 

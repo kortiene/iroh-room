@@ -5,11 +5,12 @@ RB-1. This document defines production-readiness work and acceptance evidence;
 RB-1 defines roadmap scope, ordering, and the cohort boundary.
 
 The earlier Phase 2.5 sequence treated this as a narrow pre-Phase-3 plan. The
-maintainer decision recorded by ADR-0012 supersedes that ordering: desktop,
-calls, task/agent work, availability, v2, Cockpit, and every other included
-non-cohort RB-1 row complete before the final external cohort. Historical
-release sign-offs and waivers remain evidence for their releases, but do not
-complete an RB-1 row.
+maintainer decision recorded by ADR-0012 supersedes that ordering. The cohort
+waits until every cohort-blocking `PRE` row—including desktop, calls,
+task/agent work, availability, v2, and Cockpit—is complete, every
+cohort-blocking `COND` row is explicitly resolved, and every cohort-blocking
+`FC` gate passes on the exact candidate. Historical release sign-offs and
+waivers remain evidence for their releases, but do not complete an RB-1 row.
 
 ## Executive Summary
 
@@ -419,9 +420,10 @@ Use these as issue seeds. Keep each issue small enough to review independently.
 
 Follow [`ROADMAP.md`](ROADMAP.md): freeze the baseline, record #162 Trigger 3,
 materialize dependency-ordered issues, make D-9 the first technical decision,
-and complete every non-cohort row before cutting the roadmap-complete cohort
-candidate. Then pass every recurring candidate gate, confirm three named
-participants, and start the 30-day final cohort.
+complete every cohort-blocking `PRE` row, and explicitly resolve every
+cohort-blocking `COND` row before cutting the roadmap-complete cohort candidate.
+Then pass every cohort-blocking `FC` gate on that exact candidate, confirm three
+named participants, and start the 30-day final cohort.
 
 The production claim remains evidence-bound. Cohort-discovered fixes may require
 a replacement candidate, affected gate reruns, and a restarted or extended
