@@ -282,9 +282,11 @@ verification work that must finish first; independent security reviewers and
 hardware/network test operators are verification roles, not cohort
 participants.
 
-Current developers can still read [`COMMUNITY.md`](COMMUNITY.md) and use
+[`COMMUNITY.md`](COMMUNITY.md) records the rc.5-era cohort model and is
+historical guidance, not an instruction source for current testing or the final
+cohort. Current developers can use
 [`docs/community/demo-recipes.md`](docs/community/demo-recipes.md) for local
-testing. Those rehearsals do not count as the final cohort.
+rehearsals; those rehearsals do not count as the final cohort.
 
 ## Project history
 

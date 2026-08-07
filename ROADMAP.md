@@ -116,7 +116,7 @@ All implementation and verification work must preserve these constraints:
 | RB-GOV-003 | Post the explicit Trigger 3 `FIRED` record on #162 without closing it. | PRE | #162; ADR-0004 | `iroh-room` / #162 | RB-GOV-001 | Dated comment with qualified audit scope and current test evidence | Maintainer | not-started | Yes |
 | RB-GOV-004 | Create dependency-ordered GitHub issues and milestones for every required RB-1 row, including the Cockpit repository boundary. | PRE | ADR-0012 | `iroh-room` / pending | RB-GOV-003 | Every required row links an owning issue; dependency audit complete | Maintainer/project operator | not-started | Yes |
 | RB-DEC-001 | Decide D-9 schema evolution: lock-step rejection or forward-compatible handling, including registry and fixture rules. | PRE | `specs/content-and-moderation-event-schemas.md`; PR #186 | `iroh-room` / pending RB-GOV-004 | RB-GOV-004 | Accepted ADR, conformance matrix, implementation issue dependencies updated | Protocol reviewer | not-started | Yes |
-| RB-COND-001 | Re-evaluate proof-carrying light-client mode if the 10k roster snapshot exceeds 5 MiB. | COND | #160; ADR-0004 | `iroh-room` / #160 | RB-GOV-001 | Current benchmark remains below 5 MiB; any regression creates an amendment/implementation issue | Performance operator | complete | Yes |
+| RB-COND-001 | Measure the complete 10,000-member bootstrap and re-evaluate proof-carrying light-client mode if it exceeds 5 MiB. | COND | #160; ADR-0004; ADR-0008 | `iroh-room` / successor pending RB-GOV-004 | RB-V2C-011..012 | Full-state fixture includes governance, proof, checkpoint, and member data; measured encoded/decoded sizes are recorded; an over-target result has an accepted implementation disposition | Performance operator | partial | Yes |
 | RB-COND-002 | Define the supported desktop OS/architecture matrix before Phase 4; explicitly decide Windows rather than inferring support from Tauri. | COND | PRD v0.3 Phase 4; release matrix | `iroh-room` / pending RB-GOV-004 | RB-GOV-004 | Accepted platform decision and mapped qualification rows | Release/platform owners | not-started | Yes |
 
 ## Phase C entry corrections and admin-fork hardening
@@ -178,7 +178,7 @@ All implementation and verification work must preserve these constraints:
 | RB-UP-105 | Emit structured diagnostics through a stable JSON block. | PRE | Cockpit UP-105 | `iroh-room` / pending RB-GOV-004 | RB-DEC-001 | Direct/relay/offline/auth/config schemas and tests | Network reviewer | not-started | Yes |
 | RB-UP-106 | Add runtime counters for pipe bytes, fetch progress, and sync/backfill state. | PRE | Cockpit UP-106 | `iroh-room` / pending RB-GOV-004 | RB-UP-105 | Monotonicity/reset/privacy and integration tests | Performance reviewer | not-started | Yes |
 | RB-CLI-001 | Ship a guided local smoke-check command for new users that validates identity, local data access, diagnostics, and a minimal room workflow without exposing secrets. | PRE | production readiness P2 | `iroh-room` / pending RB-GOV-004 | RB-UP-105 | CLI unit/integration tests plus a fresh-host documented success, failure, and redaction rehearsal | Independent fresh-host documentation operator | not-started | Yes |
-| RB-SDK-001 | Reconcile SDK façade coverage with all intended stable core/network/CLI capabilities. | PRE | `docs/sdk-coverage.md`; production readiness | `iroh-room` / pending RB-GOV-004 | Relevant implementation rows | Updated coverage table, stable-surface tests, no accidental direct imports | SDK reviewer | partial | Yes |
+| RB-SDK-001 | Reconcile SDK façade coverage for the complete pre-desktop v1/core/network/CLI capability set named by this row. | PRE | `docs/sdk-coverage.md`; production readiness | `iroh-room` / pending RB-GOV-004 | RB-ENTRY-001..007; RB-ADM-001..005; RB-SEC-001..009; RB-SEC-011..018; RB-NET-001..008; RB-UP-101..106; RB-CLI-001; RB-PIPE-001..003; RB-PRD3-001..007; RB-PRD3-010 | Updated coverage table maps every dependency's SDK-visible surface, stable-surface tests pass, and no accidental direct imports remain; later rows own their explicitly named SDK evidence | SDK reviewer | partial | Yes |
 | RB-SDK-002 | Publish the supported Rust SDK crates with versioning, ownership, and release procedure. | PRE | PRD v0.3 Phase 2; production readiness | `iroh-room` / pending RB-GOV-004 | RB-SDK-001; RB-REL-001..003 | Registry publication dry run + published candidate packages | Crate/release owners | not-started | Yes |
 | RB-REL-001 | Sign every supported release artifact and publish verification instructions. | PRE | production readiness; threat model | `iroh-room` / pending RB-GOV-004 | RB-GOV-004 | Signature assets and independent verification on each artifact | Signing-key custodian | not-started | Yes |
 | RB-REL-002 | Publish verifiable build provenance for every supported artifact. | PRE | production readiness; release operations | `iroh-room` / pending RB-GOV-004 | RB-REL-001 | Provenance attestations bind source commit, workflow, target, and digest | Provenance reviewer | not-started | Yes |
@@ -285,7 +285,7 @@ All implementation and verification work must preserve these constraints:
 | RB-V2D-006 | Implement abuse controls, moderation, quotas, alerts, and operator dashboards. | PRE | #134 Phase D | `iroh-room` / pending RB-GOV-004 | RB-SEC-015; RB-UP-105..106; RB-V2C-014 | Adversarial load, quota, privacy, and operator-response tests | Abuse/performance/operations reviewers | not-started | Yes |
 | RB-V2D-007 | Pass direct, relay, lossy, mobile, slow-link, and constrained-device phase gates. | PRE | #134 Phase D | `iroh-room` / pending RB-GOV-004 | RB-V2C-014; RB-NET-007..008 | Structured multi-environment result corpus | Cellular, home, CGNAT, VPS, constrained-device operators | blocked | Yes |
 | RB-V2D-008 | Implement and dry-run v1→v2 migration with rollback and immutable v1 verification. | PRE | #134 §20/Phase D; #162 | `iroh-room` / pending RB-GOV-004 | RB-V2C-014; RB-REL-005 | Published prior-candidate fixtures, dry runs, rollback, and byte-preservation tests | Migration/data operator | not-started | Yes |
-| RB-V2D-009 | Complete an independent review of v2 core, runtime, store, network, migration, and operator trust surfaces. | PRE | #134 hardening; production readiness | `iroh-room` / pending RB-GOV-004 | RB-V2D-001..008 | Human/firm audit, finding dispositions, and candidate delta review | Independent human reviewer/firm | not-started | Yes |
+| RB-V2D-009 | Complete an independent pre-Phase-E review of v2 core, runtime, store, network, migration, and operator trust surfaces. | PRE | #134 hardening; production readiness | `iroh-room` / pending RB-GOV-004 | RB-V2D-001..008 | Human/firm audit, finding dispositions, and remediation verification; RB-FC-009 owns the final-candidate delta | Independent human reviewer/firm | not-started | Yes |
 
 ## V2 Phase E — future architecture included before cohort
 
@@ -296,14 +296,19 @@ All implementation and verification work must preserve these constraints:
 | RB-V2E-003 | Specify and implement regional placement policy. | PRE | #134 Phase E | `iroh-room` / pending RB-GOV-004 | RB-V2E-002 | Region-loss, policy, privacy, and operations evidence | Multi-region infrastructure/operator | not-started | Yes |
 | RB-V2E-004 | Specify and implement mandatory group encryption for the Phase E profile. | PRE | #134 Phase E; #162 | `iroh-room` / pending RB-GOV-004 | RB-V2D-005; RB-V2E-001..003 | Independent vectors, membership/rotation/recovery tests, security audit | Independent cryptography reviewer | not-started | Yes |
 
-## Cockpit and upstream ergonomics — all 36 enumerated backlog items
+## Cockpit and upstream ergonomics — enumerated backlog and explicit futures
 
 The Cockpit backlog's optional labels do not remove items from RB-1. CPT work
 requires creation of `kortiene/pi-rooms-cockpit`; its six UP items are the
 `RB-UP-101` through `RB-UP-106` rows above and remain in this repository. Those
-six rows plus the 30 CPT rows below are the complete enumerated backlog. The
+six rows plus the 30 CPT rows below are the complete enumerated table. The
 source's "34 issues" footer is arithmetically stale; no listed item is dropped
 to make the count match.
+
+The source separately names four optional future deliverables. They remain
+included through stable rows: invite-revocation surfacing is `RB-SEC-001`,
+multi-room simultaneous sessions are `RB-CPT-013`, pipe traffic sparklines are
+`RB-CPT-018` with `RB-UP-106`, and live Pi-theme matching is `RB-CPT-012`.
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -315,13 +320,13 @@ to make the count match.
 | RB-CPT-006 | Cockpit secret-redaction and trust posture. | PRE | CPT-006 | `pi-rooms-cockpit` / pending | RB-GOV-004 | Redaction/threat tests and security guidance | Security reviewer | blocked | Yes |
 | RB-CPT-010 | UX specification and ASCII mockups for all panels. | PRE | CPT-010 | `pi-rooms-cockpit` / pending | RB-GOV-004 | Approved panel specification | Product/design reviewer | blocked | Yes |
 | RB-CPT-011 | Dashboard shell, layout engine, and keyboard navigation. | PRE | CPT-011 | `pi-rooms-cockpit` / pending | RB-CPT-010 | Interaction and accessibility tests | Terminal UX reviewer | blocked | Yes |
-| RB-CPT-012 | Cockpit visual language and theme mapping. | PRE | CPT-012 | `pi-rooms-cockpit` / pending | RB-CPT-010..011 | Theme/contrast/golden evidence | Design reviewer | blocked | Yes |
-| RB-CPT-013 | State model and room registry. | PRE | CPT-013 | `pi-rooms-cockpit` / pending | RB-CPT-002 | Multi-room/restart tests | — | blocked | Yes |
+| RB-CPT-012 | Cockpit visual language, theme mapping, and live Pi-theme matching. | PRE | CPT-012; Cockpit optional-future list | `pi-rooms-cockpit` / pending | RB-CPT-010..011 | Theme switching, role mapping, contrast, and golden evidence | Design reviewer | blocked | Yes |
+| RB-CPT-013 | State model, room registry, and simultaneous sessions across multiple rooms. | PRE | CPT-013; Cockpit optional-future list | `pi-rooms-cockpit` / pending | RB-CPT-002 | Concurrent multi-room session, isolation, resource-bound, and restart tests | — | blocked | Yes |
 | RB-CPT-014 | Members and Agents panel. | PRE | CPT-014 | `pi-rooms-cockpit` / pending | RB-CPT-004; RB-CPT-011; RB-CPT-013 | Panel/golden/live-room tests | — | blocked | Yes |
 | RB-CPT-015 | Live Activity offline-JSON diff feed. | PRE | CPT-015 | `pi-rooms-cockpit` / pending | RB-CPT-004; RB-CPT-011; RB-CPT-013 | Diff/order/dedup/golden tests | — | blocked | Yes |
 | RB-CPT-016 | Managed live-tail session presence. | PRE | CPT-016 | `pi-rooms-cockpit` / pending | RB-CPT-003..004 | Reconnect/cleanup/presence tests | — | blocked | Yes |
 | RB-CPT-017 | Files panel for list, share, and fetch. | PRE | CPT-017 | `pi-rooms-cockpit` / pending | RB-CPT-004; RB-CPT-011 | Integrity/availability/golden tests | — | blocked | Yes |
-| RB-CPT-018 | Pipes panel and audit feed. | PRE | CPT-018 | `pi-rooms-cockpit` / pending | RB-CPT-003; RB-CPT-011 | Pipe/audit/security/golden tests | Security reviewer | blocked | Yes |
+| RB-CPT-018 | Pipes panel, audit feed, and pipe traffic sparklines. | PRE | CPT-018; Cockpit optional-future list | `pi-rooms-cockpit` / pending | RB-CPT-003; RB-CPT-011; RB-UP-106 | Pipe/audit/security/golden tests plus counter-derived sparkline accuracy and reset handling | Security/performance reviewers | blocked | Yes |
 | RB-CPT-019 | Network and Availability panel. | PRE | CPT-019 | `pi-rooms-cockpit` / pending | RB-CPT-004; RB-CPT-016 | Path/availability/limitation tests | Network reviewer | blocked | Yes |
 | RB-CPT-020 | Alerts panel for coded errors, warnings, and next actions. | PRE | CPT-020 | `pi-rooms-cockpit` / pending | RB-CPT-004; RB-CPT-011 | Taxonomy/golden/action tests | — | blocked | Yes |
 | RB-CPT-021 | Command bar and invite-ticket dialog. | PRE | CPT-021 | `pi-rooms-cockpit` / pending | RB-CPT-011; RB-CPT-013 | Command/authz/secret-handling tests | Security reviewer | blocked | Yes |
