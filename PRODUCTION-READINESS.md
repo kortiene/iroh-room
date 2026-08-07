@@ -1,12 +1,16 @@
 # Production Readiness Plan
 
-Status: Phase 2.5 proposal / execution plan. This document defines the work
-required to move Iroh Rooms from Developer Preview to a production-grade
-post-MVP release under the existing small-room scope.
+Status: live evidence and gate plan, governed by [`ROADMAP.md`](ROADMAP.md)
+RB-1. This document defines production-readiness work and acceptance evidence;
+RB-1 defines roadmap scope, ordering, and the cohort boundary.
 
-This is not a feature-expansion plan. Desktop UX, calls, task events, advanced
-agent workflows, multi-device identity, and the Phase 5 availability layer stay
-out of scope until the current CLI/runtime can be trusted in real use.
+The earlier Phase 2.5 sequence treated this as a narrow pre-Phase-3 plan. The
+maintainer decision recorded by ADR-0012 supersedes that ordering. The cohort
+waits until every cohort-blocking `PRE` row—including desktop, calls,
+task/agent work, availability, v2, and Cockpit—is complete, every
+cohort-blocking `COND` row is explicitly resolved, and every cohort-blocking
+`FC` gate passes on the exact candidate. Historical release sign-offs and
+waivers remain evidence for their releases, but do not complete an RB-1 row.
 
 ## Executive Summary
 
@@ -22,12 +26,13 @@ requires a different bar:
    schema migration, and upgrade/rollback behavior are defined.
 5. Networking limitations are measured, user-visible, and diagnosable.
 6. SDK/protocol compatibility is governed by versioned contracts.
-7. A real beta cohort has validated the workflow on real machines and networks.
+7. A final external cohort validates the roadmap-complete candidate on real
+   machines and networks after all pre-cohort work and candidate gates finish.
 
-The recommended next phase is:
+The next production-readiness stage is:
 
 ```text
-Phase 2.5 - Production Release Candidate
+RB-1 - Roadmap Completion and Candidate Evidence
 ```
 
 The goal is a scoped production claim:
@@ -48,7 +53,8 @@ Use these labels consistently in docs, release notes, and issue milestones.
 | Label | Meaning | Required evidence |
 | --- | --- | --- |
 | Developer Preview | MVP workflow works, known limitations disclosed, P0 preview gate green | `scripts/release-readiness.sh` exits `0` |
-| Production Beta | Production P0 gates green, security/ops docs complete, limited beta cohort running | Production sign-off plus beta plan |
+| Roadmap-complete cohort candidate | Every cohort-blocking RB-1 PRE/COND row complete and every FC gate green | Exact tagged candidate plus RB-1 evidence map |
+| Production Beta | Historical controlled-beta label, or the roadmap-complete candidate while milestone #8 is active | Versioned sign-off plus exact cohort plan |
 | Production GA | Beta exit criteria met, release artifacts signed, support/rollback/security process active | Production sign-off plus beta results |
 
 Do not use "production" for a build that has only passed the Developer Preview
@@ -57,7 +63,9 @@ project can be relied on within its stated constraints.
 
 ## Production P0 Gates
 
-Every item in this section blocks a Production Beta label.
+Every item in this section blocks the roadmap-complete cohort candidate and
+Production GA. Earlier versioned Production Beta sign-offs remain historical
+records; their waivers do not satisfy RB-1.
 
 ### P0.1 Preview Gate Is Green
 
@@ -71,20 +79,21 @@ Required evidence:
 
 ### P0.2 Real-Network Evidence Is Current
 
-Gate A evidence must be refreshed or explicitly accepted if still recent.
+Gate A evidence must be refreshed for the roadmap-complete candidate whenever
+transport behavior or the evidence environment has changed.
 
 Required evidence:
 
 - `crates/spike-nat/results/results.md` contains measured two-host runs, not a
   placeholder.
-- The production sign-off states whether the July 2026 Gate A evidence,
-  including the 2026-07-07 local↔`demo1` refresh, is being accepted as current
-  or replaced by a new run.
-- The remaining cellular forced-relay throughput caveat is either re-measured
-  with a larger transfer or explicitly accepted as non-blocking for the scoped
-  release.
-- The missing home-NAT to CGNAT reverse leg is either run or explicitly accepted
-  as non-blocking with rationale.
+- The production sign-off identifies which historical Gate A evidence remains
+  applicable and links the required final-candidate refresh.
+- The cellular forced-relay throughput caveat is re-measured with a
+  representative larger transfer.
+- The missing home-NAT to CGNAT reverse leg is run.
+- Any unavailable hardware is acquired or rented. Changing the required
+  evidence needs a versioned RB-1 amendment; a permanent waiver is not
+  completion.
 
 ### P0.3 Threat Model And Security Review
 
@@ -97,8 +106,9 @@ Required evidence:
   pipes, local storage, relay metadata, malicious peers, compromised devices,
   stolen tickets, and removed members.
 - All production-blocking threats have owner, mitigation, and test evidence.
-- An external or independent security review is completed or the release label
-  remains Production Beta with that caveat clearly stated.
+- An independent human reviewer or firm covers every shipped trust surface and
+  completes a final-candidate delta review. The existing non-author-agent v2
+  audit covers governance/fork handling only.
 
 ### P0.4 Invite And Access Revocation Story
 
@@ -107,10 +117,11 @@ Production cannot rely only on "do not leak tickets" language.
 Required evidence:
 
 - Ticket expiry behavior is tested and documented.
-- The release has either native invite revocation or a documented bounded-risk
-  model that limits leaked-ticket blast radius.
+- Native invite revocation is implemented and reachable through the shipped
+  product surfaces.
 - For Phase 2.5 Production Beta, the bounded-risk model is accepted in
   `docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md`.
+  That remains historical beta evidence, not RB-1 completion.
 - Removed members lose blob and pipe access consistently.
 - Active pipe sessions are torn down or fail closed after removal is learned.
 - Tests cover wrong identity, expired ticket, removed member, non-member, and
@@ -118,16 +129,16 @@ Required evidence:
 
 ### P0.5 Local Data Handling
 
-Plaintext local data may be acceptable only if the production claim says so
-clearly. It is not acceptable for users to discover this by reading source.
-For Phase 2.5, the accepted beta posture is captured in
+Plaintext local data was accepted only for the historical scoped beta posture.
+It is not sufficient for the roadmap-complete cohort candidate. The earlier
+posture is captured in
 `docs/decisions/ADR-0001-local-storage-posture.md`: trusted local machines,
 plaintext room data disclosed, no local-compromise-resistance claim.
 
 Required evidence:
 
-- Storage encryption is implemented or deliberately deferred in
-  `docs/decisions/ADR-0001-local-storage-posture.md`.
+- Database, key, blob, audit, and recovery storage encryption is implemented as
+  assigned by RB-1.
 - Backup and restore instructions exist.
 - Export instructions exist, even if the initial export is low-level.
 - SQLite schema migration policy exists.
@@ -209,29 +220,32 @@ Current Beta evidence:
 
 ## Production P1 Gates
 
-These do not block Production Beta if explicitly accepted, but they should block
-Production GA unless waived with rationale.
+RB-1 classifies these outcomes individually. Included implementation and
+release rows block the cohort candidate; human/product evidence remains a
+cohort-dependent GA requirement. A waiver does not complete an included row.
 
 | Gate | Required outcome |
 | --- | --- |
 | Multi-platform CI | Linux and macOS run the deterministic gate; platform-specific caveats documented |
-| Packaging | At least one supported binary install path is documented and verified |
+| Packaging | Every supported artifact is documented and verified on native hardware |
 | Human DX timings | Identity, two-peer room, and first pipe timing targets are measured on a release candidate |
-| Beta cohort | 5-10 technical users complete the demo on real machines |
+| Final cohort | Three named participants run the 30-day milestone #8 loop after the roadmap-complete candidate is ready |
 | Product validation | Users can explain the availability model and identify Live Pipe value |
 | Dependency review | Runtime dependency churn is reviewed before release |
 | Support loop | Issues template and triage labels exist for security, networking, data loss, and UX failures |
 
 ## Production P2 Gates
 
-These improve GA quality but should not distract from P0/P1.
+These were previously described as optional GA quality work. RB-1 now includes
+the explicitly named deliverables before the cohort unless a versioned
+amendment changes them.
 
 - `room list` and consistent JSON output across read commands.
 - Live `room tail` renders `agent.status` and `file.shared`, not only
   `message.text`.
 - A guided local smoke-check command for new users.
-- Optional signed release artifacts.
-- Optional cargo/crates.io publication of the stable SDK tier.
+- Signed release artifacts and verifiable provenance.
+- Cargo/crates.io publication of the supported stable SDK tier.
 - More user-friendly network diagnostics.
 
 ## Workstreams
@@ -243,15 +257,15 @@ Owner profile: protocol/security-minded maintainer.
 Deliverables:
 
 1. Threat model.
-2. Invite revocation or bounded leaked-ticket decision.
-3. Persistent audit implementation and retention/privacy decision.
-4. Storage encryption decision.
-5. Independent review checklist.
+2. Native invite revocation.
+3. Persistent, retained, rotated, tamper-evident audit.
+4. Local database, key, blob, audit, and recovery-storage encryption.
+5. Independent full-surface review and final-candidate delta.
 
 Acceptance criteria:
 
-- Every security limitation in `RELEASE-READINESS.md` is either fixed, scoped,
-  or explicitly carried into the production label.
+- Every security limitation assigned to an RB-1 implementation row is fixed and
+  evidenced before cohort activation.
 - Secret-leakage tests remain green.
 - Removed-member access loss is proven for events, blobs, and pipes.
 
@@ -263,7 +277,7 @@ Deliverables:
 
 1. Gate A refresh plan.
 2. Relay throughput re-measure.
-3. Missing reverse-leg run or waiver.
+3. Missing reverse-leg run.
 4. Diagnostics improvements.
 5. Failure-mode runbook.
 
@@ -308,21 +322,23 @@ Acceptance criteria:
 - The release notes truthfully separate supported capabilities from known
   limitations.
 
-### Product Beta
+### Final External Cohort
 
 Owner profile: product/field maintainer.
 
 Deliverables:
 
-1. Beta cohort plan.
+1. Cohort activation plan bound to the exact roadmap-complete candidate.
 2. Demo script and observation worksheet.
 3. DX metric collection.
 4. Product validation memo.
 
 Acceptance criteria:
 
-- At least 5 external or semi-external technical users complete the core demo.
-- At least 80% can explain the online-peer availability model.
+- Three named external participants complete the recorded attempts during the
+  30-day window.
+- Comprehension of the online-peer availability model is recorded for every
+  participant.
 - At least one real workflow validates Live Pipe over a public tunnel.
 
 ## Phase 2.5 Milestones
@@ -352,16 +368,21 @@ Exit criteria:
 
 Exit criteria:
 
+- Every cohort-blocking RB-1 `PRE`/`COND` row is complete.
 - `scripts/release-readiness.sh` exits `0`.
 - `scripts/production-readiness.sh` automated preflight passes.
 - Manual P0 sign-offs are complete.
 - Release notes and install docs are complete.
+- Every recurring RB-1 `FC` gate is bound to the exact tagged candidate.
 
 ### Milestone D - Production Beta
 
 Exit criteria:
 
-- Beta cohort starts with scoped expectations.
+- Three named participants are confirmed and milestone #8 is assigned its
+  30-day due date against the exact roadmap-complete candidate.
+- The final external cohort starts with scoped expectations only after
+  Milestone C and every RB-1 candidate gate are complete.
 - Issues are triaged daily during the beta window.
 - No P0 security/data-loss/networking blockers remain open.
 
@@ -381,25 +402,29 @@ Use these as issue seeds. Keep each issue small enough to review independently.
 | --- | --- | --- | --- | --- |
 | PR-0001 | Add production readiness plan and preflight script | P0 | release | This document and script |
 | PR-0002 | Draft security threat model | P0 | security | Required before Production Beta |
-| PR-0003 | Accept scoped plaintext beta via ADR-0001 | P0 | security/data | Trusted-local-machine beta; GA still needs encryption or narrower scope |
-| PR-0004 | Define invite revocation or bounded leaked-ticket model | P0 | security/protocol | ADR-0002 accepts bounded-risk model for Production Beta; GA still needs native revocation or explicit re-acceptance |
+| PR-0003 | Accept scoped plaintext beta via ADR-0001 | P0 | security/data | Historical beta evidence; RB-1 requires the included encryption rows before cohort activation |
+| PR-0004 | Define invite revocation or bounded leaked-ticket model | P0 | security/protocol | ADR-0002 is historical beta evidence; RB-1 requires native invite revocation before cohort activation |
 | PR-0005 | Sign off persistent audit retention/privacy posture | P0 | observability | ADR-0003 accepts local `audit.ndjson` posture for Production Beta; GA should revisit retention/rotation/tamper evidence |
 | PR-0006 | Add schema migration and compatibility policy | P0 | data/protocol | Core v1 fixture gate implemented; next candidate must preserve previous-candidate data evidence |
 | PR-0007 | Add backup, restore, and export docs | P0 | operations | Avoid data-loss ambiguity |
-| PR-0008 | Refresh Gate A relay-throughput evidence | P0 | networking | 2026-07-07 local↔`demo1` refresh added; cellular relay larger-transfer caveat and home-NAT→CGNAT reverse-leg waiver/run still need sign-off; 2026-07-14 `relay-only-test` compile-time build seam landed (PR #107) as controlled tooling for the owed relay-only run — tooling only, no measurement performed, does not satisfy P0.2 |
+| PR-0008 | Refresh Gate A relay-throughput evidence | P0 | networking | 2026-07-07 local↔`demo1` refresh added; cellular relay larger-transfer and home-NAT→CGNAT reverse-leg runs remain owed by RB-NET-007/008; the 2026-07-14 `relay-only-test` seam is tooling only, not completion |
 | PR-0009 | Add production release sign-off template | P0 | release | Implemented in `docs/operations/release-operations.md` |
 | PR-0010 | Add privacy-preserving bug report template | P1 | support | Needed for beta |
 | PR-0011 | Add macOS/Linux release artifact checklist | P1 | release | Implemented via release artifact script and install/rollback runbook |
 | PR-0012 | Measure human DX timings on a release candidate | P1 | product | PRD section 17.2 |
-| PR-0013 | Run 5-10 user production beta | P1 | product | Real machines, real networks |
-| PR-0014 | Add `room list` | P2 | CLI | High UX value, not a production blocker |
-| PR-0015 | Render all MVP event types in live `room tail` | P2 | CLI | Current gap is disclosed |
+| PR-0013 | Run the final external cohort | P1 | product | Three named participants, 30 days, exact roadmap-complete candidate; cohort-dependent |
+| PR-0014 | Add `room list` | P2 | CLI | Now included as cohort-blocking RB-UP-101 |
+| PR-0015 | Render all MVP event types in live `room tail` | P2 | CLI | Now included as cohort-blocking RB-UP-102/103 |
 
 ## Final Recommendation
 
-Proceed with Phase 2.5 before starting Phase 3. The project has enough runtime
-surface to create real user value. The highest-leverage work is now reducing
-security, data, release, and operational ambiguity around that surface.
+Follow [`ROADMAP.md`](ROADMAP.md): freeze the baseline, record #162 Trigger 3,
+materialize dependency-ordered issues, make D-9 the first technical decision,
+complete every cohort-blocking `PRE` row, and explicitly resolve every
+cohort-blocking `COND` row before cutting the roadmap-complete cohort candidate.
+Then pass every cohort-blocking `FC` gate on that exact candidate, confirm three
+named participants, and start the 30-day final cohort.
 
-The production claim should remain deliberately narrow until beta evidence says
-otherwise.
+The production claim remains evidence-bound. Cohort-discovered fixes may require
+a replacement candidate, affected gate reruns, and a restarted or extended
+cohort window before GA.

@@ -1,8 +1,25 @@
 # First Builder Cohort
 
-Status: draft operating plan  
-Duration: 30 days  
-Release target: `v0.1.0-rc.5` controlled Production Beta
+Status: deferred; do not recruit or start until the RB-1 activation gate passes
+
+Duration: 30 days from milestone #8 activation
+
+Release target: the exact tagged roadmap-complete cohort candidate, not
+`v0.1.0-rc.5`
+
+## Activation Gate
+
+[`ROADMAP.md`](../../ROADMAP.md) is authoritative. Before this plan starts:
+
+1. every cohort-blocking `PRE` and `COND` row is complete;
+2. every recurring final-candidate gate passes on one exact tagged candidate;
+3. no cohort-blocking issue or advertised-but-unreachable capability remains;
+4. three named external participants are confirmed; and
+5. milestone #8 records the candidate and receives its 30-day due date.
+
+Independent security reviewers and hardware, network, replica, call, release,
+or recovery test operators are verification roles, not cohort participants.
+Rehearsals performed before activation do not count as cohort evidence.
 
 ## Purpose
 
@@ -11,8 +28,9 @@ The first cohort exists to answer one question:
 > Can technical builders use Iroh Rooms to collaborate privately around local
 > work without a central application server?
 
-This is not a broad launch. It is a controlled usage loop with a small number
-of builders who can tolerate beta friction and give precise feedback.
+This is not a broad launch. It is the final controlled validation loop after the
+roadmap-complete candidate exists, with a small number of builders who can give
+precise feedback.
 
 ## Positioning
 
@@ -26,7 +44,7 @@ without deploys or public tunnel URLs.
 
 ## Cohort Profile
 
-Invite 10 builders manually.
+Confirm three named builders manually after the activation gate passes.
 
 Prioritize:
 
@@ -56,12 +74,14 @@ Each participant should have:
 
 Owner tasks:
 
-- Confirm the GitHub release has all four supported artifacts (`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and their checksums.
-- Keep source-build instructions discoverable for builders outside those four triples.
+- Confirm the exact candidate has every artifact required by the approved
+  platform matrix, plus signatures and provenance, and that each was qualified
+  on its native platform.
+- Keep source-build instructions discoverable for builders outside the approved
+  platform matrix.
 - Verify [`docs/community/demo-recipes.md`](demo-recipes.md) against the current
   CLI.
-- Open GitHub Discussions or use issues only until there are repeated
-  participant threads.
+- Use issues until #103 records the Discussions decision.
 - Prepare a short terminal recording for the Live Pipe recipe.
 
 Participant ask:
@@ -69,16 +89,17 @@ Participant ask:
 - Run the two-human room recipe.
 - File one cohort feedback issue, even if the workflow succeeds.
 
-## Week 2: Recruit Manually
+## Week 2: Run Named Attempts
 
-Invite 10 named builders. Do not announce broadly.
+Run the three named participant attempts. Do not announce broadly.
 
-Use the outreach scripts in [`docs/community/outreach.md`](outreach.md).
+Use only the three participant confirmations bound to the milestone #8
+activation record. `docs/community/outreach.md` is an rc.5-era ten-builder
+script and is not an instruction source for this final cohort.
 
 Expected output:
 
-- 10 invites sent.
-- 5 scheduled attempts.
+- 3 participants confirmed.
 - 3 completed attempts.
 - 1 observed session where the maintainer does not guide every step.
 
@@ -112,13 +133,17 @@ Decision options:
 
 ## Success Metrics
 
-The first cohort succeeds if:
+The first cohort produces the required decision evidence if:
 
-- 10 people outside maintainers launch the tool.
-- 5 complete a room workflow with another participant.
-- 3 complete Live Pipe or verified file sharing.
+- all 3 named participants launch the tool and complete a room workflow;
+- all 3 attempt Live Pipe or verified file sharing;
 - 3 useful issues are filed.
 - 1 person uses it on a real project without maintainer hand-holding.
+
+Success metrics do not override safety or correctness. A material security,
+protocol, migration, platform, networking, or product fix creates a replacement
+candidate, reruns the affected gates, and requires an explicit decision to
+restart or extend the 30-day window.
 
 ## Stop Conditions
 
