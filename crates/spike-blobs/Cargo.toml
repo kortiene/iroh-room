@@ -28,7 +28,7 @@ workspace = true
 # `iroh-blobs 0.103.0` is the only published line carrying the per-node /
 # per-hash `provider::events` ACL; it pins `iroh ^1.0`. See NOTES.md §1.
 iroh = "=1.0.1"
-iroh-blobs = "=0.103.0"
+iroh-blobs = "=0.103.1"
 blake3 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 anyhow = "1"

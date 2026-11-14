@@ -13,7 +13,7 @@ repository.workspace = true
 # `rust-version = "1.91"` (`iroh`, `iroh-base`, `iroh-blobs`, `iroh-gossip`,
 # `iroh-dns`, `iroh-relay`, `iroh-tickets`, `iroh-util`, `irpc`, `n0-watcher`,
 # `netwatch`, `portmapper`), far above the workspace value that covers the pure
-# crates (1.85). Declaring it here makes the real floor machine-checkable
+# crates (1.87). Declaring it here makes the real floor machine-checkable
 # instead of only described (spec OQ-1 / A5). Enabling `gossip_overlay` adds no
 # new floor — `iroh-gossip 0.101.0` also declares 1.91.
 rust-version = "1.91"
@@ -67,7 +67,8 @@ iroh = "=1.0.1"
 # `fs-store` feature provides the persistent `store::fs::FsStore` used by
 # `crate::blob::BlobStore`. Only the local producer/import half is wired here; the
 # serve ALPN + two-gate ACL (spike `src/net.rs`) is the follow-up serve/fetch issue.
-iroh-blobs = "=0.103.0"
+# 0.103.1 since 2026-11-14: upstream yanked 0.103.0; same API, same `iroh ^1.0`.
+iroh-blobs = "=0.103.1"
 # Independent BLAKE3-256 recompute cross-checked against the store's own import
 # hash (spike NOTES.md §4 belt-and-suspenders — an internal-bug guard). Same 1.x
 # line `iroh-rooms-core` already resolves.
