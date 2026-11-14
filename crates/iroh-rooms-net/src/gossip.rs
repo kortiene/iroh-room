@@ -556,7 +556,11 @@ async fn receiver_task(
             }
             Some(Ok(Event::NeighborDown(device))) => {
                 // Duplicate/down-after-restart notifications must not wrap the
-                // observable count to usize::MAX.
+                // observable count to usize::MAX. `fetch_update` was renamed to
+                // `try_update` and deprecated in Rust 1.100, but `try_update`
+                // is still unstable on this crate's MSRV 1.91 — keep the old
+                // name until the floor rises.
+                #[allow(deprecated)]
                 let _ = neighbors.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     Some(n.saturating_sub(1))
                 });

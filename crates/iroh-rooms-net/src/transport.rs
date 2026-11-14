@@ -2245,7 +2245,7 @@ mod tests {
         // The successor queue is unaffected and still delivers routed frames.
         shared.route(&dummy_outgoing(peer));
         let delivered = rx2.recv().await.expect("successor queue delivers");
-        assert!(!delivered.is_empty());
+        assert_ne!(delivered, [] as [_; 0]);
     }
 
     // --- Issue #126: connection-generation guard on teardown -----------------
@@ -2653,7 +2653,7 @@ mod tests {
     #[test]
     fn connected_peers_is_empty_on_fresh_shared() {
         let (shared, _rx) = make_shared();
-        assert!(shared.connected_peers().is_empty());
+        assert_eq!(shared.connected_peers(), [] as [_; 0]);
     }
 
     #[test]

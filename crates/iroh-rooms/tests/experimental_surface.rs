@@ -15,6 +15,12 @@
 //! belongs in the e2e tier, not here.
 
 #![cfg(feature = "experimental")]
+// `assert!(!name_of::<T>().is_empty())` is this suite's deliberate tripwire
+// idiom: it pins that a type-name/wire-bytes value exists at all. These values
+// are never empty by construction, so the assert_is_empty failure-output
+// rationale does not apply — a failing tripwire is debugged from the source
+// line, not from printing the value.
+#![allow(clippy::assert_is_empty)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

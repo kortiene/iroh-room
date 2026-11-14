@@ -255,8 +255,8 @@ mod tests {
         let (room, genesis) = build_genesis_for_admin(&id, &dev, "n40", &nonce, BASE_T);
         let gid = event_id_from_bytes(&genesis.signed);
         let w = Workload::build(room, &id, &dev, gid, 0, BASE_T, "n40");
-        assert!(w.wires.is_empty());
-        assert!(w.event_ids().is_empty());
+        assert_eq!(w.wires, [] as [_; 0]);
+        assert_eq!(w.event_ids(), [] as [_; 0]);
     }
 
     #[test]

@@ -1,0 +1,32 @@
+# Automated dependency updates (RB-REL-003 / #238).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Patch/minor bumps for the bulk of the graph land as one PR.
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # The iroh stack is pinned exactly (`=`) across shipping crates, the SDK
+      # facade, and the spikes so re-exported types stay identical; bump it by
+      # hand in one coordinated PR.
+      - dependency-name: "iroh"
+      - dependency-name: "iroh-blobs"
+      - dependency-name: "iroh-gossip"
+      - dependency-name: "bao-tree"
+      - dependency-name: "n0-future"
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    ignore:
+      # The Rust toolchain is pinned on purpose (see verify.yml); bump it in a
+      # dedicated PR that also clears any new clippy lints.
+      - dependency-name: "dtolnay/rust-toolchain"

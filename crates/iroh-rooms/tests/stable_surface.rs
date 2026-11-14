@@ -14,7 +14,12 @@
 //! membership) using the façade alone, proving it is a sufficient superset of
 //! that path (AC2 / spec §5.4).
 
-#![allow(clippy::similar_names)] // admin_identity/admin_device etc. are intentionally parallel
+#![allow(clippy::similar_names)]
+// admin_identity/admin_device etc. are intentionally parallel
+// The type-name / wire-bytes emptiness asserts below are tripwires (values are
+// never empty by construction); printing the value on failure adds nothing,
+// so the assert_is_empty suggestion is declined for this suite.
+#![allow(clippy::assert_is_empty)]
 
 use iroh_rooms::events::{
     build_agent_status, capability_hash, validate_wire_bytes, Content, EventId, EventType,

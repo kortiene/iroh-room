@@ -127,7 +127,7 @@ mod tests {
         match event.content {
             Content::RoomCreated(c) => {
                 assert_eq!(c.admins, vec![id.identity_key()]);
-                assert!(event.prev_events.is_empty());
+                assert_eq!(event.prev_events, [] as [_; 0]);
             }
             other => panic!("expected room.created, got {other:?}"),
         }

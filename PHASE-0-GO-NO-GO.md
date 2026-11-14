@@ -241,9 +241,9 @@ Confirmed versions actually used (re-verified against each crate's
 | Crate | Confirmed pin | Note |
 |---|---|---|
 | `iroh` | `=1.0.1` | stable 1.x core; recon originally said `1.0.0`, crates.io sparse index confirmed `1.0.1` |
-| `iroh-base` | `=1.0.1` | stable 1.x |
+| `iroh-base` | `=1.0.1` | stable 1.x; transitive, not pinned directly — `Cargo.lock` resolves `1.4.1` since the 2026-11-14 dependency refresh |
 | `iroh-gossip` | `=0.101.0` | builds against iroh 1.0.1 with zero API drift; spike table was correct here |
-| `iroh-blobs` | `=0.103.0` | carries `provider::events` ACL; recon's earlier `0.97` was **stale** — corrected to `0.103.0` |
+| `iroh-blobs` | `=0.103.1` | carries `provider::events` ACL; recon's earlier `0.97` was **stale** — corrected to `0.103.0`; moved to `0.103.1` on 2026-11-14 after upstream yanked `0.103.0` (same API) |
 | `ed25519-dalek` | `=3.0.0-rc.0` | release *candidate*; must stay in lockstep with the version iroh 1.0 pins |
 | `ciborium` | `^0.2` | verified deterministic-CBOR path in `event-core` (Gate B green) |
 | `blake3` | `^1` | stable |

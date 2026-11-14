@@ -214,9 +214,9 @@ mod tests {
     #[test]
     fn empty_providers_list_is_valid() {
         let fs = FileShared::new_raw("f", "n", "m", 0, [0u8; HASH_LEN], &[]);
-        assert!(fs.providers.is_empty());
+        assert_eq!(fs.providers, [] as [serde_bytes::ByteBuf; 0]);
         let decoded = FileShared::decode(&fs.encode().expect("encode")).expect("decode");
-        assert!(decoded.providers.is_empty());
+        assert_eq!(decoded.providers, [] as [serde_bytes::ByteBuf; 0]);
     }
 
     #[test]
