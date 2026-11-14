@@ -1,0 +1,35 @@
+name: deny
+
+# Supply-chain gate (RB-REL-003 / #238): RustSec advisories, yanked crates,
+# license allow-list, bans, and source registries per `deny.toml`. Runs on every
+# PR and push to main, and daily so a newly published advisory against an
+# unchanged lockfile still surfaces.
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "30 6 * * *" # 06:30 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A new advisory should not block unrelated PRs' other checks, but it does
+    # fail this job so it is visible and can be made required.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
