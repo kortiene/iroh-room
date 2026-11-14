@@ -1183,6 +1183,6 @@ mod tests {
         assert_eq!(record.grant_seq, 1);
         assert_eq!(record.revoke_seq, Some(3));
         assert_eq!(record.status, ProjectedStatus::Revoked);
-        assert!(record.active_devices.is_empty());
+        assert_eq!(record.active_devices, [] as [_; 0]);
     }
 }

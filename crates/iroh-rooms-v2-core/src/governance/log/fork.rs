@@ -457,12 +457,12 @@ mod tests {
         // entry signature, and every verified approval's CSB + signature.
         assert_eq!(evidence.branches.len(), 2);
         for branch in &evidence.branches {
-            assert!(!branch.entry.csb().is_empty());
+            assert_ne!(branch.entry.csb(), []);
             // The entry signature bytes are retained.
             assert_eq!(branch.entry.signature().as_bytes().len(), 64);
             // Each branch carries its approval evidence with exact CSB + sig.
             for approval in branch.entry.approvals() {
-                assert!(!approval.csb().is_empty());
+                assert_ne!(approval.csb(), []);
                 assert_eq!(approval.signature().as_bytes().len(), 64);
             }
         }

@@ -434,14 +434,13 @@ async fn settle_path(endpoint: &Endpoint, remote: EndpointId, settle: Duration) 
 async fn full_sample(endpoint: &Endpoint, remote: EndpointId) -> SettledPath {
     let info = endpoint.remote_info(remote).await;
     let (path_type, relay_url) = classify_remote_info(info.as_ref());
-    let remote_addrs = info
-        .as_ref()
-        .map(|i| {
-            i.addrs()
-                .map(|a| format!("{} ({:?})", a.addr(), a.usage()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let remote_addrs = match info.as_ref() {
+        Some(i) => i
+            .addrs()
+            .map(|a| format!("{} ({:?})", a.addr(), a.usage()))
+            .collect(),
+        None => Vec::new(),
+    };
     SettledPath {
         path_type,
         relay_url,

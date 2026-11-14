@@ -852,7 +852,7 @@ fn exhausted_retry_budget_records_critical_store_degraded() {
 
     let _ = engine.on_tick(T0 + 2);
     assert_eq!(engine.store_retry_len(), 1, "attempt 1 of 2: still queued");
-    assert!(engine.trust_decisions().is_empty());
+    assert_eq!(engine.trust_decisions(), [] as [_; 0]);
 
     let _ = engine.on_tick(T0 + 3);
     assert_eq!(engine.store_retry_len(), 0, "budget exhausted: abandoned");
@@ -960,7 +960,7 @@ fn peer_reserve_clears_pending_retry_exactly_once() {
     // And the tick after has nothing left to retry.
     let _ = engine.on_tick(T0 + 2);
     assert_eq!(engine.counters().store_retry_dropped, 0);
-    assert!(engine.trust_decisions().is_empty());
+    assert_eq!(engine.trust_decisions(), [] as [_; 0]);
 }
 
 // ---------------------------------------------------------------------------

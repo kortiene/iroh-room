@@ -200,7 +200,7 @@ fn parent_lookup_tolerates_out_of_order() {
 
     // Parent arrives: dangling edge resolves, lamport propagates.
     assert_eq!(store.insert(&g).unwrap(), InsertOutcome::Inserted);
-    assert!(store.missing_parents(&m.event_id).unwrap().is_empty());
+    assert_eq!(store.missing_parents(&m.event_id).unwrap(), [] as [_; 0]);
     assert_eq!(store.get(&g.event_id).unwrap().unwrap().lamport, Some(0));
     assert_eq!(store.get(&m.event_id).unwrap().unwrap().lamport, Some(1));
 }
@@ -464,20 +464,24 @@ fn empty_store_queries_return_empty() {
     assert!(!store.contains(&unknown_id).unwrap());
     assert!(store.get(&unknown_id).unwrap().is_none());
     assert_eq!(store.count(&unknown_room).unwrap(), 0);
-    assert!(store.heads(&unknown_room).unwrap().is_empty());
+    assert_eq!(store.heads(&unknown_room).unwrap(), [] as [_; 0]);
     assert!(store.admin_chain_tip(&unknown_room).unwrap().is_none());
-    assert!(store.parents_of(&unknown_id).unwrap().is_empty());
-    assert!(store.children_of(&unknown_id).unwrap().is_empty());
-    assert!(store.missing_parents(&unknown_id).unwrap().is_empty());
-    assert!(store.room_tail(&unknown_room, 10).unwrap().is_empty());
-    assert!(store
-        .by_type(&unknown_room, EventType::MessageText)
-        .unwrap()
-        .is_empty());
-    assert!(store
-        .by_sender(&unknown_room, &any_sender.identity_key())
-        .unwrap()
-        .is_empty());
+    assert_eq!(store.parents_of(&unknown_id).unwrap(), [] as [_; 0]);
+    assert_eq!(store.children_of(&unknown_id).unwrap(), [] as [_; 0]);
+    assert_eq!(store.missing_parents(&unknown_id).unwrap(), [] as [_; 0]);
+    assert_eq!(store.room_tail(&unknown_room, 10).unwrap(), [] as [_; 0]);
+    assert_eq!(
+        store
+            .by_type(&unknown_room, EventType::MessageText)
+            .unwrap(),
+        [] as [_; 0]
+    );
+    assert_eq!(
+        store
+            .by_sender(&unknown_room, &any_sender.identity_key())
+            .unwrap(),
+        [] as [_; 0]
+    );
 }
 
 // Diamond merge: lamport = max(parent lamports) + 1.
@@ -552,7 +556,7 @@ fn room_tail_limit_is_respected() {
         .unwrap();
 
     // limit=0 returns nothing.
-    assert!(store.room_tail(&room, 0).unwrap().is_empty());
+    assert_eq!(store.room_tail(&room, 0).unwrap(), [] as [_; 0]);
 
     // limit=2 returns the two most-recent events in ascending canonical order.
     let tail: Vec<_> = store
@@ -783,10 +787,10 @@ fn by_type_excludes_other_event_types() {
     );
 
     // A type with no events in the room returns empty.
-    assert!(store
-        .by_type(&room, EventType::MemberLeft)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        store.by_type(&room, EventType::MemberLeft).unwrap(),
+        [] as [_; 0]
+    );
 }
 
 // ── room_ids() (spec IR-0108 §4.2 / §5.1) ────────────────────────────────────
@@ -949,7 +953,7 @@ fn parked_round_trip_upsert_load_delete_cascades() {
 
     // Delete removes the frame and cascades its missing edges.
     store.delete_parked(&room, &child).unwrap();
-    assert!(store.load_parked(&room).unwrap().is_empty());
+    assert_eq!(store.load_parked(&room).unwrap(), [] as [_; 0]);
     let orphan_edges: i64 = store
         .conn
         .query_row(
@@ -970,7 +974,7 @@ fn trust_decisions_append_only_monotone_seq() {
     let b = EventId::from_bytes([0x72; 32]);
     let mut store = EventStore::open_in_memory().unwrap();
 
-    assert!(store.load_trust_decisions(&room).unwrap().is_empty());
+    assert_eq!(store.load_trust_decisions(&room).unwrap(), [] as [_; 0]);
 
     let first = TrustRow {
         seq: 0,

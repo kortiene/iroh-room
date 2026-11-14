@@ -1448,7 +1448,7 @@ fn advisory_flags_from_removed_member() {
 
     // Unknown event id returns an empty flag list.
     let unknown = EventId::from_bytes([0xff; 32]);
-    assert!(m.advisory_flags(&unknown).is_empty());
+    assert_eq!(m.advisory_flags(&unknown), [] as [_; 0]);
 }
 
 // --------------------------------------------------------------------------

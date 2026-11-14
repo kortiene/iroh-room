@@ -429,7 +429,7 @@ fn admin_stale_head_publish_does_not_wedge_the_room() {
 
     // Healthy baseline: everyone active, nothing denied.
     assert_eq!(net.engine(NODE_A).completeness(), Completeness::Complete);
-    assert!(net.engine(NODE_A).fail_closed_subjects().is_empty());
+    assert_eq!(net.engine(NODE_A).fail_closed_subjects(), [] as [_; 0]);
 
     // The admin publishes twice from the same stale head. Neither cites the
     // other, so they are causally concurrent and collide at admin_seq 3.
@@ -544,7 +544,7 @@ fn a_fork_does_not_mask_an_active_missing_tip_gate() {
         Completeness::AdminForkDetected,
         "the fork alone is still detected and reported"
     );
-    assert!(net.engine(NODE_A).fail_closed_subjects().is_empty());
+    assert_eq!(net.engine(NODE_A).fail_closed_subjects(), [] as [_; 0]);
 
     // Now learn of a higher admin tip we do not hold: information IS missing.
     let _ = net.engine_mut(NODE_A).on_message(
