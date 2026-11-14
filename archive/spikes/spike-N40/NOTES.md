@@ -1,7 +1,7 @@
 # `spike-N40` — N=40 v1-with-guardrails measurement & GO/NO-GO decision memo (#145)
 
 This is the decision-memo deliverable required by issue #145 and spec
-`specs/measure-n40-v1-guardrails.md`. It records what was measured, the
+`docs/post-ga/specs/measure-n40-v1-guardrails.md`. It records what was measured, the
 caveats, the cascade-threshold statement, the N=40 rebind result, and the
 GO/NO-GO rubric evaluation for #154 (gossip-overlay decision).
 

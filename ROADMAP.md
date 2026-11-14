@@ -110,9 +110,9 @@ All implementation and verification work must preserve these constraints:
 | Historical product record | [`PRD.md`](PRD.md), treated as v0.2 evidence only |
 | Production and security | [`PRODUCTION-READINESS.md`](PRODUCTION-READINESS.md), [`RELEASE-READINESS.md`](RELEASE-READINESS.md), [`SECURITY.md`](SECURITY.md), [`docs/security/threat-model.md`](docs/security/threat-model.md), ADR-0001 through ADR-0003 |
 | Operations and compatibility | [`docs/operations/`](docs/operations/), [`docs/compatibility.md`](docs/compatibility.md), [`docs/sdk-coverage.md`](docs/sdk-coverage.md), release workflows and scripts |
-| V2 architecture | GitHub #134, #162, [`ADR-0004`](docs/decisions/ADR-0004-accept-v2-large-community-architecture.md), ADR-0007 through ADR-0011, `specs/v2-*`, and the frozen v2 vectors |
+| V2 architecture | GitHub #134, #162, [`ADR-0004`](docs/post-ga/decisions/ADR-0004-accept-v2-large-community-architecture.md), ADR-0007 through ADR-0011, `docs/post-ga/specs/v2-*`, and the frozen v2 vectors |
 | Admin-fork safety | ADR-0005, [`ADR-0006`](docs/decisions/ADR-0006-fold-level-divergence-detector.md), T18 and Vector 18 conformance evidence |
-| Network and scale | Gate A specifications/results, gossip/N=40 specifications/results, GitHub #192/#214, [`specs/measure-real-network-gossip-overlay.md`](specs/measure-real-network-gossip-overlay.md) |
+| Network and scale | Gate A specifications/results, gossip/N=40 specifications/results, GitHub #192/#214, [`docs/post-ga/specs/measure-real-network-gossip-overlay.md`](docs/post-ga/specs/measure-real-network-gossip-overlay.md) |
 | Product extensions | [`docs/cockpit-backlog.md`](docs/cockpit-backlog.md), [`specs/room-list-read-cli.md`](specs/room-list-read-cli.md), [`specs/live-tail-ndjson-stream.md`](specs/live-tail-ndjson-stream.md) |
 | Community and cohort | [`COMMUNITY.md`](COMMUNITY.md), [`docs/community/first-cohort.md`](docs/community/first-cohort.md), GitHub #99 through #103, milestones #5 and #8 |
 | Evidence only | Historical audits, release notes/sign-offs, closed milestones, GitHub review threads, workflow runs, and platform/network result corpora |

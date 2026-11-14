@@ -36,7 +36,7 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # `room tail` bring up a `Node` over it to push/receive `message.text` frames.
 # `gossip_overlay` is deliberately NOT enabled here. It pulls in
 # `iroh-rooms-core/large_rooms` (the 5 -> 40 active-member cap), and the
-# spec's Phase C gate — `specs/gossip-overlay-events-fan-out.md` Step 8, "only
+# spec's Phase C gate — `docs/post-ga/specs/gossip-overlay-events-fan-out.md` Step 8, "only
 # after Step 7 passes" — is not fully met. The Step 7 acceptance criterion
 # itself now DOES pass on loopback: #193 (shipped in rc.5) fixed the three
 # stacked hub-overload defects, and the committed matrix is clean at every

@@ -1,7 +1,7 @@
 # `spike-N40` results — committed run artifacts
 
 This directory holds the durable, machine-readable outputs of the #145
-N=40 measurement harness (spec `specs/measure-n40-v1-guardrails.md`).
+N=40 measurement harness (spec `docs/post-ga/specs/measure-n40-v1-guardrails.md`).
 Unlike `spike-nat`'s Gate A (a manual two-host run CI cannot prove), every
 scenario here runs on deterministic loopback — CI proves the harness builds and
 both full-mesh and gossip connect modes work at N=5 (`tests/self_check.rs`); the

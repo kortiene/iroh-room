@@ -2,7 +2,7 @@
 # that measures where the v1 full-mesh event transport with the post-`b0622ec`
 # guardrails in place breaks at N=5/10/20/40: process RSS, per-node task
 # estimates, the queue-close-on-full cascade start, and rebind/NAT-drop
-# convergence (spec `specs/measure-n40-v1-guardrails.md`). It MUST NOT be
+# convergence (spec `docs/post-ga/specs/measure-n40-v1-guardrails.md`). It MUST NOT be
 # depended on by the shipping crates (`iroh-rooms-core` /
 # `iroh-rooms-cli` / `iroh-rooms-net` / `iroh-rooms`) and it MUST NOT modify
 # them. See `NOTES.md` for the GO/NO-GO decision memo for #154.
