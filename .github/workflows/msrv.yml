@@ -69,7 +69,7 @@ jobs:
         runner: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.91
       - name: cargo check --workspace --all-targets --all-features (rustc 1.91)
         run: cargo check --workspace --all-targets --all-features --locked
@@ -82,7 +82,7 @@ jobs:
         runner: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.87
       - name: cargo check --all-targets (rustc 1.87, pure tier)
         run: >
@@ -100,7 +100,7 @@ jobs:
         runner: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.91
       - name: cargo check --workspace --all-targets (rustc 1.91, default features)
         run: cargo check --workspace --all-targets --locked
@@ -113,7 +113,7 @@ jobs:
         runner: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.89
       - name: cargo check -p iroh-rooms-core --all-features (rustc 1.89)
         run: cargo check -p iroh-rooms-core --all-features --all-targets --locked
