@@ -298,7 +298,10 @@ fn full_session_validate_then_store() {
         store.children_of(&genesis.event_id).unwrap(),
         vec![invite.event_id],
     );
-    assert!(store.missing_parents(&msg_b.event_id).unwrap().is_empty());
+    assert_eq!(
+        store.missing_parents(&msg_b.event_id).unwrap(),
+        [] as [_; 0]
+    );
 
     // Verbatim wire bytes round-trip through the store.
     assert_eq!(

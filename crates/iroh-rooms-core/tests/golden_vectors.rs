@@ -263,7 +263,7 @@ fn valid_genesis_is_accepted_and_preserves_signed_bytes() {
         signed::event_id_from_bytes(validated.signed_bytes())
     );
     assert_eq!(validated.event.event_type, EventType::RoomCreated);
-    assert!(validated.flags.is_empty());
+    assert_eq!(validated.flags, [] as [_; 0]);
 }
 
 #[test]
@@ -530,7 +530,7 @@ fn no_clock_skew_flag_within_threshold() {
         now_ms: Some(ROOM_CREATED_AT + 1_000),
     };
     let validated = validate_wire_bytes(&bytes, &ctx).expect("must accept");
-    assert!(validated.flags.is_empty());
+    assert_eq!(validated.flags, [] as [_; 0]);
 }
 
 // --- Signature checks. --------------------------------------------------------

@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn connected_devices_empty_on_fresh_table() {
         let table = PeerTable::new(8);
-        assert!(table.connected_devices().is_empty());
+        assert_eq!(table.connected_devices(), [] as [_; 0]);
     }
 
     #[test]

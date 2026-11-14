@@ -195,7 +195,7 @@ fn full_room_lifecycle_converges_across_shuffled_arrival_order() {
     );
     // Sanity: 4 sealed, 4 accepted, no unresolved forks in a clean chain.
     assert_eq!(sealed_a.len(), 4);
-    assert!(outcome_a.unresolved_forks.is_empty());
+    assert_eq!(outcome_a.unresolved_forks, [] as [_; 0]);
 
     // Membership projection reflects the accepted state, not insertion order.
     assert!(outcome_a.state.is_active(&admin.member_id()));
@@ -213,7 +213,7 @@ fn full_room_lifecycle_converges_across_shuffled_arrival_order() {
     let decoded = validate_against_state(&cp, &outcome_b.state).expect("checkpoint validates");
     assert_eq!(decoded.state_root, outcome_b.state_root);
     assert_eq!(decoded.member_root, outcome_b.member_root);
-    assert!(decoded.unresolved_forks.is_empty());
+    assert_eq!(decoded.unresolved_forks, [] as [[GovernanceEntryId; 2]; 0]);
 
     // --- Member Merkle projection: inclusion/exclusion proofs verify without
     // access to the full state (spec §6.5 / D7). ---

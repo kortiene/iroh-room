@@ -339,7 +339,7 @@ fn fail_closed_posture_survives_restart() {
         SyncEngine::open(EventStore::open_in_memory().unwrap(), built.room, cfg).unwrap();
     seed_engine(&mut engine_b, &built.events);
     assert_eq!(engine_b.completeness(), Completeness::Complete);
-    assert!(engine_b.fail_closed_subjects().is_empty());
+    assert_eq!(engine_b.fail_closed_subjects(), [] as [_; 0]);
 
     // A peer advertises a fake admin tip at seq = 999 > 2.  This arms
     // suspect_tip (persisted) and drives completeness → AdminViewSuspect.

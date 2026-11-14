@@ -2892,7 +2892,7 @@ fn key_history_transfer_unlocks_backlog_for_new_member() {
         let responses = net.engine_mut(NODE_C).on_message(NODE_A, msg);
         // Carol's adoption produces no outgoing messages; the fold/key store
         // updates are local.
-        assert!(responses.is_empty());
+        assert_eq!(responses, [] as [_; 0]);
     }
 
     assert!(

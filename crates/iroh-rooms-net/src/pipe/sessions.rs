@@ -212,7 +212,7 @@ mod tests {
         let s = PipeSessions::new();
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
-        assert!(s.live().is_empty());
+        assert_eq!(s.live(), [] as [_; 0]);
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn info_on_empty_table_is_empty() {
         let s = PipeSessions::new();
-        assert!(s.info().is_empty());
+        assert_eq!(s.info(), [] as [_; 0]);
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
             "no live session for the pipe ⇒ nothing torn down"
         );
         assert_eq!(s.count_for(&[0xcd; 16]), 0);
-        assert!(s.info().is_empty());
+        assert_eq!(s.info(), [] as [_; 0]);
         assert_eq!(s.len(), 0);
         assert!(s.is_empty());
     }
@@ -332,6 +332,6 @@ mod tests {
         );
 
         // `Debug` is used in panel/log lines — it must render something.
-        assert!(!format!("{base:?}").is_empty());
+        assert_ne!(format!("{base:?}"), "");
     }
 }

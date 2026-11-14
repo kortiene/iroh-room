@@ -1126,8 +1126,7 @@ async fn p9_clean_close_emits_pipe_closed_on_log() {
     let tail = alice_node.room_tail(50).await.expect("room_tail");
     let has_closed = tail.iter().any(|se| {
         SignedEvent::decode(&se.wire.signed)
-            .ok()
-            .is_some_and(|ev| matches!(ev.content, Content::PipeClosed(_)))
+            .is_ok_and(|ev| matches!(ev.content, Content::PipeClosed(_)))
     });
     assert!(
         has_closed,
@@ -1296,7 +1295,7 @@ async fn p11_per_pipe_session_attribution() {
     // Before any connector attaches, every accessor reads zero for both pipes.
     assert_eq!(alice_node.live_pipe_sessions_for(pipe_a), 0);
     assert_eq!(alice_node.live_pipe_sessions_for(pipe_b), 0);
-    assert!(alice_node.pipe_session_info().is_empty());
+    assert_eq!(alice_node.pipe_session_info(), [] as [_; 0]);
 
     // Bob connects through pipe A only and round-trips a byte to force
     // the accept handler to register the session. The local client is kept

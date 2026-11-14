@@ -109,7 +109,7 @@ fn causal_chain_genesis_then_message() {
 
     assert_eq!(v_msg.event.prev_events[0], v_genesis.event_id);
     assert_eq!(v_msg.event.event_type, EventType::MessageText);
-    assert!(v_msg.flags.is_empty());
+    assert_eq!(v_msg.flags, [] as [_; 0]);
 }
 
 /// Three-event chain: genesis → `msg_a` → `msg_b`.  Each event's `event_id`
@@ -337,7 +337,7 @@ fn two_identity_room_session() {
         panic!("expected MessageText");
     };
     assert_eq!(m.in_reply_to, Some(v3.event_id));
-    assert!(v4.flags.is_empty());
+    assert_eq!(v4.flags, [] as [_; 0]);
     // All five event IDs are distinct.
     let ids: Vec<EventId> = [
         v0.event_id,
@@ -806,7 +806,7 @@ fn member_removed_with_optional_device_binding_accepted() {
         .expect("member.removed with device_binding must be accepted");
 
     assert_eq!(validated.event.event_type, EventType::MemberRemoved);
-    assert!(validated.flags.is_empty());
+    assert_eq!(validated.flags, [] as [_; 0]);
     // Confirm the optional binding is preserved in the decoded event.
     let Content::MemberRemoved(c) = &validated.event.content else {
         panic!("expected MemberRemoved content");
