@@ -48,7 +48,10 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not `@stable`): a floating toolchain let clippy 1.100's new
+      # lints turn `verify` red with no code change (PR #360). Bump this pin
+      # deliberately, in its own PR, across verify/release-readiness/release.
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       # The build script derives the archive name from the rustc host triple, so
       # a runner image whose arch drifts would publish an archive labelled for a
