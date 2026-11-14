@@ -42,7 +42,7 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # stacked hub-overload defects, and the committed matrix is clean at every
 # required cell — N=5/10/20/40 x {1, 5 events/s}, 100% delivery, zero queue
 # saturations, zero reconnect churn
-# (`crates/spike-N40/results/results-gossip.md`). What is still owed is
+# (`archive/spikes/spike-N40/results/results-gossip.md`). What is still owed is
 # real-network (non-loopback) overlay evidence, plus the admin same-seq
 # fail-closed wedge, which permanently wedges a room with no recovery path.
 # Until both are closed, the shipped CLI keeps the full-mesh topology and the

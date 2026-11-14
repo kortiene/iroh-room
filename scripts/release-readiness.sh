@@ -85,7 +85,7 @@ done
 echo
 
 echo "== P1 — tracked, non-blocking =="
-RESULTS_MD="crates/spike-nat/results/results.md"
+RESULTS_MD="archive/spikes/spike-nat/results/results.md"
 if [[ -f "$RESULTS_MD" ]] && ! grep -q "pending manual two-host run" "$RESULTS_MD"; then
   echo "gate-a: measured results present in $RESULTS_MD"
 else

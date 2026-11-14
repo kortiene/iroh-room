@@ -84,7 +84,7 @@ transport behavior or the evidence environment has changed.
 
 Required evidence:
 
-- `crates/spike-nat/results/results.md` contains measured two-host runs, not a
+- `archive/spikes/spike-nat/results/results.md` contains measured two-host runs, not a
   placeholder.
 - The production sign-off identifies which historical Gate A evidence remains
   applicable and links the required final-candidate refresh.
