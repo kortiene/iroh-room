@@ -93,7 +93,8 @@ Confirmed against the pinned source; no blocking divergences:
   stack (`iroh`, `iroh-base`, `iroh-blobs`, `iroh-gossip`, `irpc`, `netwatch`, ... all
   declare 1.91). That is a real floor, not just a declared one: the pure crates'
   crypto stack only forces ≥1.85. The workspace value is reconciled to 1.85, the
-  pure crates' actual floor.
+  pure crates' actual floor. (Raised to 1.87 on 2026-11-14: the patched `ctutils`
+  for RUSTSEC-2026-0385 declares 1.87.)
 - **OQ-3 (engine driver location)**: a thin `Node` runtime in this crate owns the
   `SyncEngine` and pumps it (one task; queries via a command channel). The CLI may
   later drive the engine manually against `NetTransport` directly — `NetTransport`
