@@ -289,6 +289,17 @@ from the shipped binary.
 - `RB-SEC-002` (#250) and `RB-ADM-005` (#297) stay `POST-GA` (RB-1.2); this
   amendment does not bring rotation or admin transfer into GA.
 
+## RB-1.5 — release signing role
+
+On 2026-11-15 the maintainer approved Sigstore keyless signing for release
+artifacts (design for #237 / #248). There is no long-lived signing key to
+custody. `RB-REL-001`'s hardware / external role is therefore
+**release-workflow owner + release-environment reviewer** (the `release`
+environment's required reviewer). The row's deliverable, dependencies,
+completion evidence, status, and cohort-blocking flag are unchanged. Status
+stays `not-started`: the signing workflow is on `main`, and no signed release
+has been published, so the signature-asset evidence does not exist yet.
+
 ## Governance and entry decisions
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
@@ -362,7 +373,7 @@ from the shipped binary.
 | RB-CLI-001 | Ship a guided local smoke-check command for new users that validates identity, local data access, diagnostics, and a minimal room workflow without exposing secrets. | PRE | production readiness P2 | `iroh-room` / #261 | RB-UP-105 | CLI unit/integration tests plus a fresh-host documented success, failure, and redaction rehearsal | Independent fresh-host documentation operator | not-started | Yes |
 | RB-SDK-001 | Reconcile SDK façade coverage for the complete pre-desktop v1/core/network/CLI capability set named by this row. | PRE | `docs/sdk-coverage.md`; production readiness | `iroh-room` / #306 | RB-ENTRY-001..007; RB-ADM-001..005; RB-SEC-001..009; RB-SEC-011..018; RB-NET-001..008; RB-UP-101..106; RB-CLI-001; RB-PIPE-001..003; RB-PRD3-001..007; RB-PRD3-010 | Updated coverage table maps every dependency's SDK-visible surface, stable-surface tests pass, and no accidental direct imports remain; later rows own their explicitly named SDK evidence | SDK reviewer | partial | Yes |
 | RB-SDK-002 | Publish the supported Rust SDK crates with versioning, ownership, and release procedure. | PRE | PRD v0.3 Phase 2; production readiness | `iroh-room` / #313 | RB-SDK-001; RB-REL-001..003 | Registry publication dry run + published candidate packages | Crate/release owners | not-started | Yes |
-| RB-REL-001 | Sign every supported release artifact and publish verification instructions. | PRE | production readiness; threat model | `iroh-room` / #237 | RB-GOV-004 | Signature assets and independent verification on each artifact | Signing-key custodian | not-started | Yes |
+| RB-REL-001 | Sign every supported release artifact and publish verification instructions. | PRE | production readiness; threat model | `iroh-room` / #237 | RB-GOV-004 | Signature assets and independent verification on each artifact | release-workflow owner + release-environment reviewer | not-started | Yes |
 | RB-REL-002 | Publish verifiable build provenance for every supported artifact. | PRE | production readiness; release operations | `iroh-room` / #248 | RB-REL-001 | Provenance attestations bind source commit, workflow, target, and digest | Provenance reviewer | not-started | Yes |
 | RB-REL-003 | Enforce dependency vulnerability, license, and release-supply-chain gates. | PRE | production readiness; threat model | `iroh-room` / #238 | RB-GOV-004 | CI policy and clean final reports with dispositions | Security/release reviewer | partial | Yes |
 | RB-REL-004 | Qualify every supported OS/architecture natively, including downloaded artifact execution. | PRE | release matrix; platform audits | `iroh-room` / #265 | RB-COND-002; RB-REL-001..002 | Native verify plus checksum/signature/install smoke per target | Linux, Intel Mac, Apple Silicon operators | partial | Yes |
@@ -615,3 +626,4 @@ afterwards.
 | RB-1.2 | 2026-11-15 | Decide OD-1 as option (b): v0.1 GA ships plaintext room content, encrypted in transit only, disclosed; reclassify `RB-SEC-002`, `RB-SEC-011..014`, and `RB-ADM-005` `POST-GA`; keep `RB-REL-007` `GA-P0` with an encryption-claims entry; move the rotation builder to the SDK `experimental` tier; narrow OD-2 to unreachability of the encryption path. | Maintainer decision 2026-11-15 (OD-1, option b); recorded in ADR-0014; active on merge |
 | RB-1.3 | 2026-11-15 | Decide OD-2: v0.1 GA ships with WAIVER-PBETA-0003 re-accepted and disclosed, backed by an internal structured self-review (`docs/security/v0.1-self-review.md`); reclassify `RB-SEC-010` and `RB-FC-009` `POST-GA`; let the accepted waiver plus the self-review record satisfy the security-review gate item for the v0.1 GA candidate only; align `RB-FC-003`; move the waiver's expiry to before v0.2 or public beta expansion. | Maintainer decision 2026-11-15 (OD-2, waiver option); recorded in ADR-0014; active on merge |
 | RB-1.4 | 2026-11-15 | Add `GA-P0` row `RB-GA-002` (#379): CLI `room remove` (admin only) and `room leave`, with honest removal wording (peers enforce removal once they see it; removed members keep what they already had); reword threat-model T07/T09/T18; record T09's v0.1 GA disposition as admin removal plus sticky departure. | Maintainer decision 2026-11-15 (member removal, option B, GA-P0); active on merge |
+| RB-1.5 | 2026-11-15 | `RB-REL-001`: hardware / external role becomes "release-workflow owner + release-environment reviewer". Keyless Sigstore signing has no signing key to custody. Deliverable, dependencies, evidence, status (`not-started`), and cohort-blocking flag unchanged. | Maintainer decision 2026-11-15 (signed-release design D8); active on merge |

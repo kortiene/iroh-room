@@ -44,10 +44,103 @@ user-writable install directory.
 
 ## Install From Binary Artifact
 
-Before installing:
+`v0.1.0-rc.1` through `v0.1.0-rc.5` publish a per-archive `.sha256` and nothing
+else. Those candidates are checksum-only
+([`WAIVER-PBETA-0004`](../releases/v0.1.0-rc.5-production-beta-signoff.md) is
+still in force). No signed release has been published yet.
 
-1. Download the archive and adjacent `.sha256` file from the release.
-2. Verify the checksum.
+Releases built by the signing workflow, starting with the first release after
+rc.5, publish the following assets for each of the four triples, plus the two
+aggregate files:
+
+| Asset | What it is |
+| --- | --- |
+| `iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz` | The archive. `<COMMIT>` is the first 12 hex digits of the tagged commit. |
+| `<archive>.sha256` | One SHA-256 line, two spaces, the bare archive name. |
+| `<archive>.sigstore.json` | GitHub build-provenance attestation bundle (SLSA). Verify with `gh attestation verify`. |
+| `SHA256SUMS` | The four `.sha256` lines, sorted by filename. |
+| `SHA256SUMS.sigstore.json` | Cosign keyless signature bundle over `SHA256SUMS`. Verify with `cosign verify-blob`. |
+
+`<archive>.sigstore.json` and `SHA256SUMS.sigstore.json` are different kinds of
+bundle. Pass the archive bundle to `gh attestation verify --bundle`. Pass
+`SHA256SUMS.sigstore.json` to `cosign verify-blob --bundle`. The workflow also
+attests `SHA256SUMS` itself, and that attestation bundle is not uploaded.
+`gh attestation verify SHA256SUMS` reads it from GitHub.
+
+The signer identity for both checks is the workflow on the tag:
+
+```text
+https://github.com/kortiene/iroh-room/.github/workflows/release.yml@refs/tags/v<VERSION>
+```
+
+The OIDC issuer is `https://token.actions.githubusercontent.com`. There is no
+project-held signing key. macOS code signing and notarization are not part of
+these artifacts; a browser download may still be quarantined by Gatekeeper.
+
+Verify a signed release with the repository script (it downloads the assets,
+or reads a directory you already have). `v0.1.0-rc.1` through `v0.1.0-rc.5`
+fail at the attestation step by design:
+
+```bash
+scripts/verify-release-artifacts.sh v<VERSION> <TRIPLE>
+# assets already on disk, and you know the tagged commit:
+scripts/verify-release-artifacts.sh --dir ./assets --commit <FULL_SHA> v<VERSION> <TRIPLE>
+```
+
+`<TRIPLE>` is `x86_64-apple-darwin`, `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`. `--commit` must be
+the full 40-hex source digest. The script then passes `--source-digest` to
+`gh attestation verify` and `--certificate-github-workflow-sha` to
+`cosign verify-blob`, which is what the workflow's own self-verify does with
+`GITHUB_SHA`. The online `gh` path needs `gh auth login`.
+
+`gh` is required, and it must provide `gh attestation verify`. If `cosign` is
+missing after the checksums and the `gh attestation verify` checks have
+passed, the script exits 3 and says the signature was not checked. Exit 0
+means the checksum, both archive attestation checks, the online `SHA256SUMS`
+attestation, and `cosign verify-blob` all passed.
+
+The same checks by hand, from a directory that contains the assets:
+
+```bash
+TAG=v<VERSION>
+ARCHIVE=iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz
+IDENTITY="https://github.com/kortiene/iroh-room/.github/workflows/release.yml@refs/tags/${TAG}"
+
+# Linux. On macOS use: shasum -a 256 -c "${ARCHIVE}.sha256"
+sha256sum -c "${ARCHIVE}.sha256"
+sha256sum -c --ignore-missing SHA256SUMS
+
+gh attestation verify "$ARCHIVE" \
+  --repo kortiene/iroh-room \
+  --cert-identity "$IDENTITY" \
+  --source-ref "refs/tags/${TAG}" \
+  --deny-self-hosted-runners
+gh attestation verify "$ARCHIVE" \
+  --bundle "${ARCHIVE}.sigstore.json" \
+  --repo kortiene/iroh-room \
+  --cert-identity "$IDENTITY" \
+  --source-ref "refs/tags/${TAG}" \
+  --deny-self-hosted-runners
+gh attestation verify SHA256SUMS \
+  --repo kortiene/iroh-room \
+  --cert-identity "$IDENTITY" \
+  --source-ref "refs/tags/${TAG}" \
+  --deny-self-hosted-runners
+
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Add `--source-digest <FULL_SHA>` to each `gh attestation verify` and
+`--certificate-github-workflow-sha <FULL_SHA>` to `cosign verify-blob` when you
+know the tagged commit. `shasum` has no `--ignore-missing`; on macOS check the
+per-archive `.sha256`, or pass that one line to `shasum -a 256 -c`. The script
+does that fallback itself.
+
+Install after the checks succeed.
 
 macOS:
 
@@ -68,9 +161,6 @@ install -m 0755 iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>/iroh-rooms \
   "$HOME/.local/bin/iroh-rooms"
 iroh-rooms --version
 ```
-
-Production Beta artifacts are checksummed. They are not project-signed unless
-the release notes explicitly say signing has shipped.
 
 ## Configure Local Data
 

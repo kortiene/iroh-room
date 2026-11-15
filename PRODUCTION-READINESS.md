@@ -217,13 +217,26 @@ Current Beta evidence:
 
 - `scripts/build-release-artifacts.sh` builds a versioned
   `iroh-rooms` archive from a recorded commit and emits a `.sha256` file.
+  The script does not sign.
+- The published `v0.1.0-rc.5` artifacts, and rc.1 through rc.4, are
+  checksum-only. `WAIVER-PBETA-0004` is still in force. No signed release
+  has been published, so this gate's signing evidence is not met yet.
+- `.github/workflows/release.yml` on `main` is the signing workflow for
+  releases built after rc.5. Its `sign-and-publish` job (the `release`
+  environment) attests each archive and `SHA256SUMS` with `actions/attest`
+  and keyless-signs `SHA256SUMS` with `cosign sign-blob`. That path has not
+  yet produced a published release.
+- `scripts/verify-release-artifacts.sh` checks a downloaded archive's
+  checksum, GitHub build-provenance attestation, and `SHA256SUMS` cosign
+  signature. It fails on rc.1 through rc.5 at the attestation step by design.
 - `docs/operations/install-uninstall.md` defines source install, binary
-  install, checksum verification, local data configuration, uninstall, data
-  removal, backup, and rollback.
+  install, checksum verification, signed-artifact verification, local data
+  configuration, uninstall, data removal, backup, and rollback.
 - `docs/operations/production-beta-release-notes-template.md` provides the
   release notes template with limitations before install/run instructions.
 - `docs/operations/release-operations.md` contains the production sign-off
-  template and stop-ship rules.
+  template, the tag-ref dispatch, the `release` environment approval, and
+  the draft-publish rules.
 - `.github/ISSUE_TEMPLATE/bug_report.md` provides privacy-preserving bug report
   guidance.
 

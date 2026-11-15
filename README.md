@@ -100,7 +100,7 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 - local best-effort audit at `<IROH_ROOMS_HOME>/audit.ndjson`
 - a Rust SDK facade in `crates/iroh-rooms`, source/workspace use only
 
-Prebuilt binaries for this candidate ship for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner and published with a SHA-256 checksum on the [`v0.1.0-rc.5` release](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.5); see [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md) for the verify-and-install steps. Builders on any other platform should build from source.
+Prebuilt binaries for this candidate ship for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner and published with a SHA-256 checksum on the [`v0.1.0-rc.5` release](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.5). This candidate is checksum-only, as are rc.1 through rc.4. Releases built by the signing workflow, starting with the first release after rc.5, also publish a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. Verify those with `scripts/verify-release-artifacts.sh`, described in [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md). No signed release has been published yet. Builders on any other platform should build from source.
 
 ## Limits you should understand
 
@@ -115,7 +115,7 @@ Read these before trusting Iroh Rooms with real work:
 - **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
 - **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
 - **Local audit only**: `audit.ndjson` is useful for incident reconstruction, not compliance-grade audit
-- **Unsigned release artifacts**: archives have SHA-256 checksums but no project signature in this candidate
+- **Release artifacts**: this candidate's archives have SHA-256 checksums and no project signature, same as rc.1 through rc.4. Releases built by the signing workflow, starting with the first release after rc.5, add a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. No signed release has been published yet
 - **SDK publication is deferred**: the Rust SDK facade exists, but the crate remains `publish = false`
 
 The beta storage, invite, and audit decisions live in:

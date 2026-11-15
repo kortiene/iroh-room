@@ -89,9 +89,22 @@ restate them will be closed with a pointer here — but a report showing one is
   ([`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md))
 - **Persistent local audit.** `audit.ndjson` is retained locally and is not
   compliance-grade. ([`ADR-0003`](docs/decisions/ADR-0003-persistent-audit-posture.md))
-- **Unsigned release artifacts.** Archives carry SHA-256 checksums but no project
-  signature ([`WAIVER-PBETA-0004`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md)).
-  Verify checksums against the release page.
+- **Release artifact signing.** `v0.1.0-rc.5` and rc.1 through rc.4 carry
+  SHA-256 checksums and no project signature
+  ([`WAIVER-PBETA-0004`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md)).
+  That waiver is still in force: no signed release has been published.
+  Releases built by the signing workflow, starting with the first release
+  after rc.5, publish a SLSA build-provenance attestation for each archive
+  (`<archive>.sigstore.json`, checked with `gh attestation verify`) and a
+  keyless cosign signature over `SHA256SUMS` (`SHA256SUMS.sigstore.json`,
+  checked with `cosign verify-blob`). Those two `.sigstore.json` files are
+  different bundles. The `SHA256SUMS` attestation bundle is not uploaded;
+  `gh attestation verify SHA256SUMS` reads it from GitHub. Verify a signed
+  release with
+  [`scripts/verify-release-artifacts.sh`](scripts/verify-release-artifacts.sh)
+  and the steps in
+  [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md).
+  rc.1 through rc.5 fail that script at the attestation step by design.
 - **Transport metadata is not private.** Payloads are encrypted in transit;
   relay and path metadata are not hidden.
 - **Room content is not end-to-end encrypted.** v0.1 GA ships room content as
