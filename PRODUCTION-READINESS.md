@@ -109,6 +109,15 @@ Required evidence:
 - An independent human reviewer or firm covers every shipped trust surface and
   completes a final-candidate delta review. The existing non-author-agent v2
   audit covers governance/fork handling only.
+- **v0.1 GA exception (ROADMAP RB-1.3, ADR-0014 OD-2, decided 2026-11-15):**
+  the v0.1 GA candidate has no independent reviewer. For that candidate only,
+  the item above is met by the dated acceptance of WAIVER-PBETA-0003 plus the
+  completed internal structured self-review in
+  `docs/security/v0.1-self-review.md`, disclosed in `SECURITY.md` and the GA
+  release notes. WAIVER-PBETA-0003 now expires before v0.2 or any public beta
+  expansion, whichever comes first, superseding the "before GA" expiry in the
+  rc.5 sign-off record (which is not rewritten). The independent review
+  (`RB-SEC-010`, `RB-FC-009`) stays required for the full roadmap.
 
 ### P0.4 Invite And Access Revocation Story
 

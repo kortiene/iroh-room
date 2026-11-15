@@ -157,7 +157,7 @@ candidate unless a later RB-1.x amendment classifies them.
 | SDK publication | RB-SDK-002, RB-SDK-001 | #313, #306 | Publish `iroh-rooms` and its closure with versioning, ownership, and a release procedure; `RB-SDK-001` coverage reconciliation is scoped to the GA surface |
 | Schema-evolution decision | RB-DEC-001 | #232 | ADR-0013 (#360); fixes the compatibility contract the published SDK carries |
 | Encryption decision | RB-REL-007 | #343 | **OD-1 decided 2026-11-15 (RB-1.2):** v0.1 GA ships plaintext room content, encrypted in transit only, disclosed. `RB-SEC-011` (#268) and `RB-SEC-002` (#250) are `POST-GA`; `RB-REL-007` must add an encryption-claims entry |
-| Independent security review | RB-SEC-010, RB-FC-009 | #344, #353 | **Open decision OD-2** (ADR-0014): reviewer, scope, budget, timing, or explicit re-acceptance of WAIVER-PBETA-0003 |
+| Independent security review | — | #344, #353 (`POST-GA`) | **OD-2 decided 2026-11-15 (RB-1.3):** no independent review for v0.1 GA; WAIVER-PBETA-0003 accepted for v0.1 GA only and disclosed, with an internal structured self-review ([`docs/security/v0.1-self-review.md`](docs/security/v0.1-self-review.md)) as the gate evidence. `RB-SEC-010` and `RB-FC-009` are `POST-GA` |
 | Install/upgrade/rollback/uninstall on four platforms | RB-REL-004, RB-REL-005, RB-FC-004 | #265, #293, #347 | `RB-REL-005`'s dependency on RB-SEC-006 reads as the GA-P1 backup/restore state |
 | Real-network evidence | RB-NET-007, RB-NET-008, RB-FC-005 | #235, #236, #348 | Measured legs, or a dated maintainer acceptance of WAIVER-PBETA-0001/0002 for v0.1 GA only. `RB-FC-005` is scoped to Gate A |
 | Compatibility gate | RB-FC-006 | #349 | Scoped to v1, immutable-vector, prior-candidate (rc.5 data), and rollback compatibility; v2 migration is `POST-GA` |
@@ -192,6 +192,7 @@ into GA as a disclosed ADR-0001 limitation.
 | PRD Phase 3 task/agent events and agent-workspace surfaces | RB-PRD3-001..009 |
 | Live-pipe extensions | RB-PIPE-001..003 |
 | End-to-end content encryption and removal-triggered key rotation (OD-1, RB-1.2; v0.2 headline) | RB-SEC-002, RB-SEC-011..014, RB-ADM-005 |
+| Independent human/firm security review and final candidate audit (OD-2, RB-1.3) | RB-SEC-010, RB-FC-009 |
 
 None of these rows is part of the published SDK's GA surface: the overlay is
 behind the non-default `gossip_overlay` feature of `iroh-rooms-net` (not enabled
@@ -237,6 +238,34 @@ removal-triggered key rotation are the v0.2 headline.
   encryption path is unreachable in the shipped configuration, not a review of
   the cryptography.
 
+## RB-1.3 — OD-2 security review decision
+
+On 2026-11-15 the maintainer decided open decision OD-2
+([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md#open-decisions-for-the-maintainer)):
+**v0.1 GA ships with WAIVER-PBETA-0003 ("no independent security review
+completed") explicitly re-accepted and disclosed**, backed by an internal
+structured self-review instead of an independent reviewer or firm.
+
+- `RB-SEC-010` (#344) and `RB-FC-009` (#353) become `POST-GA`; their rows,
+  dependencies, and evidence are unchanged, and they remain mandatory for the
+  full roadmap.
+- For the v0.1 GA candidate only, gate item "Independent security review" is
+  satisfied by the dated acceptance of WAIVER-PBETA-0003 together with the
+  completed self-review record
+  [`docs/security/v0.1-self-review.md`](docs/security/v0.1-self-review.md):
+  threat-model rows T01–T30 with status, evidence, and owner; the
+  reachability inventory tied to `RB-REL-007` (#343), including the OD-1
+  unreachable-encryption check; a required `cargo-deny` check; and a fuzz
+  target for the CBOR and frame parsers. This is the same narrow exception
+  RB-1.1 made for WAIVER-PBETA-0001/0002; it does not complete any RB-1 row.
+- WAIVER-PBETA-0003's expiry moves from "before public beta expansion or GA"
+  to **before v0.2 or any public beta expansion, whichever comes first**. The
+  approved rc.5 sign-off record is not rewritten (preservation invariants);
+  this amendment supersedes its expiry additively.
+- `RB-FC-003` (#352) reads accordingly for the v0.1 GA candidate.
+- `SECURITY.md` and the v0.1 GA release notes state plainly that v0.1 GA had
+  no independent security review, only the internal structured self-review.
+
 ## Governance and entry decisions
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
@@ -279,7 +308,7 @@ removal-triggered key rotation are the v0.2 headline.
 | RB-SEC-007 | Implement explicit trust levels for agents. | PRE | PRD v0.3 §13.5 | `iroh-room` / #252 | RB-DEC-001 | Authorization matrix, CLI/SDK, and migration tests | Agent-security reviewer | not-started | Yes |
 | RB-SEC-008 | Implement room-level live-pipe policies beyond per-command allowlists. | PRE | PRD v0.3 §13.5 | `iroh-room` / #267 | RB-DEC-001; RB-SEC-007 | Policy lifecycle and fail-closed forwarding tests | Pipe-security reviewer | not-started | Yes |
 | RB-SEC-009 | Encrypt remaining local storage, including blobs, audit data, and recovery metadata. | PRE | PRD v0.3 §13.5 | `iroh-room` / #294 | RB-SEC-004; RB-SEC-006 | At-rest inspection, streaming, restart, and recovery tests | Security/data operator | not-started | Yes |
-| RB-SEC-010 | Complete an independent human/firm pre-candidate review of all shipped trust surfaces. | PRE | PRD v0.3 §13.5; production readiness | `iroh-room` / #344 | Every cohort-blocking PRE/COND row whose deliverable changes a shipped trust surface, excluding RB-SEC-010 | Published scope, findings, dispositions, and remediation verification | Independent human reviewer/firm | not-started | Yes |
+| RB-SEC-010 | Complete an independent human/firm pre-candidate review of all shipped trust surfaces. | PRE | PRD v0.3 §13.5; production readiness | `iroh-room` / #344 | Every cohort-blocking PRE/COND row whose deliverable changes a shipped trust surface, excluding RB-SEC-010 | Published scope, findings, dispositions, and remediation verification | Independent human reviewer/firm | not-started | No (POST-GA, RB-1.3) |
 | RB-SEC-011 | Make encrypted content writes reachable in shipping configuration and enforce the room encryption floor. | PRE | content-key rotation spec; threat model | `iroh-room` / #268 | RB-SEC-002 | CLI/SDK creation, mixed-floor rejection, upgrade, and restart tests | Security reviewer | partial | No (POST-GA, RB-1.2) |
 | RB-SEC-012 | Emit and page `WantKeyHistory` requests in production and complete newcomer/history recovery. | PRE | content-key rotation spec | `iroh-room` / #280 | RB-SEC-011 | Real session history recovery, pagination, authorization, and restart tests | Network/security reviewer | partial | No (POST-GA, RB-1.2) |
 | RB-SEC-013 | Replace zero key-distribution attribution IDs with durable, deterministic source provenance. | PRE | content-key rotation spec | `iroh-room` / #286 | RB-SEC-012 | Conflict ordering and history provenance tests | Protocol reviewer | not-started | No (POST-GA, RB-1.2) |
@@ -483,13 +512,13 @@ candidate and reruns every affected gate.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | RB-FC-001 | Tag one roadmap-complete cohort candidate and bind every evidence record to its exact commit and artifacts. | FC | ADR-0012; milestone #8 | `iroh-room` / #345 | All PRE/COND rows | Immutable tag, manifest, source commit, artifact digests | Release owner | not-started | Yes |
 | RB-FC-002 | Run `scripts/verify.sh` and every release-readiness online tier with no skips. | FC | release readiness | `iroh-room` / #346 | RB-FC-001 | Green logs on supported CI and named operator hosts | Linux/Intel Mac/Apple Silicon operators | not-started | Yes |
-| RB-FC-003 | Pass production preflight and all manual P0 sign-offs without using a waiver as row completion. | FC | production readiness | `iroh-room` / #352 | RB-FC-002 | Candidate production sign-off | Security/network/data/release owners | not-started | Yes |
+| RB-FC-003 | Pass production preflight and all manual P0 sign-offs without using a waiver as row completion. For the v0.1 GA candidate only, the P0.3 independent-review sign-off is met by the completed internal self-review record plus the accepted WAIVER-PBETA-0003 (RB-1.3). | FC | production readiness | `iroh-room` / #352 | RB-FC-002 | Candidate production sign-off | Security/network/data/release owners | not-started | Yes |
 | RB-FC-004 | Download, verify signature/provenance, install, execute, upgrade, rollback, and uninstall every supported artifact natively. | FC | release operations | `iroh-room` / #347 | RB-REL-001..005; RB-FC-001 | Per-platform artifact records | Native platform operators | not-started | Yes |
 | RB-FC-005 | Refresh Gate A and overlay real-network evidence against candidate-equivalent transport code. | FC | Gate A; #214 | `iroh-room` / #348 | RB-NET-005..008; RB-FC-001 | Structured home/CGNAT/VPS/cellular corpus | Network/hardware operators | not-started | Yes |
 | RB-FC-006 | Pass v1/v2 compatibility, immutable-vector, prior-candidate, migration, and rollback gates. | FC | compatibility; ADR-0004 | `iroh-room` / #349 | RB-V2D-008; RB-FC-001 | Fixture and published-binary migration evidence | Migration operator | not-started | Yes |
 | RB-FC-007 | Pass N=40 and v2 scale/performance/fault budgets on declared reference environments. | FC | #134; N=40 specs | `iroh-room` / #350 | RB-V2D-001; RB-FC-001 | Structured performance/fault result corpus | Cloud/reference-hardware operators | not-started | No (POST-GA, RB-1.1) |
 | RB-FC-008 | Complete backup, restore, recovery-phrase, encrypted-storage, and disaster-recovery drills. | FC | production readiness; security roadmap | `iroh-room` / #351 | RB-SEC-004..006; RB-SEC-009; RB-FC-001 | Fresh-host and corruption recovery records | Independent recovery operator | not-started | Yes |
-| RB-FC-009 | Complete final independent security audits and close every cohort-blocking finding. | FC | production readiness; RB-SEC-010; RB-V2D-009 | `iroh-room` / #353 | RB-FC-001..008 | Signed scope, reports, dispositions, and final delta | Independent human reviewers/firm | not-started | Yes |
+| RB-FC-009 | Complete final independent security audits and close every cohort-blocking finding. | FC | production readiness; RB-SEC-010; RB-V2D-009 | `iroh-room` / #353 | RB-FC-001..008 | Signed scope, reports, dispositions, and final delta | Independent human reviewers/firm | not-started | No (POST-GA, RB-1.3) |
 | RB-FC-010 | Reconcile README, guides, limitations, release notes, support, and protocol claims to the candidate. | FC | release/production readiness | `iroh-room` / #354 | RB-FC-001..009 | Documentation conformance and fresh-user rehearsal | Independent documentation operator | not-started | Yes |
 | RB-FC-011 | Confirm no open cohort-blocking issue and no advertised-but-unreachable functionality. | FC | ADR-0012 | `iroh-room` / #355 | RB-FC-010; RB-REL-007 | Issue/reachability audit signed by release owner | Independent release reviewer | not-started | Yes |
 | RB-FC-012 | Record final protocol, security, networking, platform, data, operations, and release-owner sign-offs. | FC | milestone #8 | `iroh-room` / #356 | RB-FC-001..011 | Named sign-off table linked from candidate | Named reviewers/owners | not-started | Yes |
@@ -561,3 +590,4 @@ afterwards.
 | RB-1.0 | 2026-08-06 | Initial finite baseline compiled from current repository and GitHub sources. | Proposed by ADR-0012; active on merge |
 | RB-1.1 | 2026-11-14 | Define the v0.1 GA candidate as the SDK (`iroh-rooms`) and the CLI built on it, for small private rooms; add `GA-P0`/`GA-P1`/`POST-GA` classes and row `RB-GA-001`; make SDK publication (RB-SDK-001/002) and RB-DEC-001 `GA-P0`; reclassify desktop (with its OS matrix), calls/SFU, v2, federation, availability, the 10k bootstrap, the large-room overlay, PRD3 task/agent work, and pipe extensions `POST-GA`; record open decisions OD-1..OD-3. | Proposed by ADR-0014; maintainer decisions 2026-11-14 (scope; SDK + CLI); active on merge |
 | RB-1.2 | 2026-11-15 | Decide OD-1 as option (b): v0.1 GA ships plaintext room content, encrypted in transit only, disclosed; reclassify `RB-SEC-002`, `RB-SEC-011..014`, and `RB-ADM-005` `POST-GA`; keep `RB-REL-007` `GA-P0` with an encryption-claims entry; move the rotation builder to the SDK `experimental` tier; narrow OD-2 to unreachability of the encryption path. | Maintainer decision 2026-11-15 (OD-1, option b); recorded in ADR-0014; active on merge |
+| RB-1.3 | 2026-11-15 | Decide OD-2: v0.1 GA ships with WAIVER-PBETA-0003 re-accepted and disclosed, backed by an internal structured self-review (`docs/security/v0.1-self-review.md`); reclassify `RB-SEC-010` and `RB-FC-009` `POST-GA`; let the accepted waiver plus the self-review record satisfy the security-review gate item for the v0.1 GA candidate only; align `RB-FC-003`; move the waiver's expiry to before v0.2 or public beta expansion. | Maintainer decision 2026-11-15 (OD-2, waiver option); recorded in ADR-0014; active on merge |

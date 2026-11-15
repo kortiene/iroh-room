@@ -5,6 +5,16 @@ It has not had an independent security review
 ([`WAIVER-PBETA-0003`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md)).
 Treat it accordingly, and please report what you find.
 
+**v0.1 GA will not have an independent security review either.** No outside
+reviewer or firm examines the v0.1 GA candidate. It gets only an internal
+structured self-review by the project, whose plan and evidence live in
+[`docs/security/v0.1-self-review.md`](docs/security/v0.1-self-review.md),
+alongside the [threat model](docs/security/threat-model.md). The maintainer
+accepted this gap for v0.1 GA only
+([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md)
+OD-2, roadmap amendment RB-1.3); an independent review remains required
+before v0.2 or any public beta expansion.
+
 ## Supported Versions
 
 Only the newest published release candidate receives security fixes.
