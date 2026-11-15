@@ -650,7 +650,7 @@ fn doc_local_references_resolve_to_real_files() {
         "PHASE-0-GO-NO-GO.md",
         "docs/getting-started.md",
         "crates/iroh-rooms-net/NOTES.md",
-        "crates/spike-nat/results/results.md",
+        "archive/spikes/spike-nat/results/results.md",
         "PRD.v0.3.md",
         "crates/iroh-rooms-core/src/event/constants.rs",
     ] {

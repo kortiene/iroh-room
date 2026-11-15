@@ -8,6 +8,7 @@
 | Governing decision | [`ADR-0012`](docs/decisions/ADR-0012-roadmap-completion-before-external-cohort.md) |
 | Cohort rule | Every cohort-blocking `PRE`, `COND`, and `FC` row must be complete before the external cohort starts |
 | Amendment rule | Scope changes require a reviewed, versioned RB-1.x amendment |
+| Active amendment | `RB-1.1` — v0.1 GA scope (SDK + CLI), [`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md); proposed until merged |
 
 RB-1 is the finite, auditable contract for completing the Iroh Rooms roadmap
 before the final external builder cohort. It compiles the repository's
@@ -116,6 +117,105 @@ All implementation and verification work must preserve these constraints:
 | Community and cohort | [`COMMUNITY.md`](COMMUNITY.md), [`docs/community/first-cohort.md`](docs/community/first-cohort.md), GitHub #99 through #103, milestones #5 and #8 |
 | Evidence only | Historical audits, release notes/sign-offs, closed milestones, GitHub review threads, workflow runs, and platform/network result corpora |
 
+## RB-1.1 — v0.1 GA scope
+
+[`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md)
+amends RB-1.0: **v0.1 GA is the Rust SDK (`iroh-rooms` crate) and the
+`iroh-rooms` CLI built on it, for small private rooms (the 5-member full-mesh
+cap)**. The SDK is published with its dependency closure (`iroh-rooms-core`,
+`iroh-rooms-crypto`, and `iroh-rooms-net` for the `experimental` tier); the CLI
+ships as signed binaries on the four platform triples that already ship. The
+classes below sit alongside `PRE`/`COND`/`FC`/`COHORT`/`NON-GOAL`; they decide
+what blocks the v0.1 GA candidate, not whether a row stays in the roadmap.
+
+| Code | Meaning |
+| --- | --- |
+| `GA-P0` | Must be complete, or explicitly dispositioned where the row says so, before the v0.1 GA candidate is tagged. |
+| `GA-P1` | Targeted for v0.1 GA. If incomplete at the candidate, recorded as a dated, named limitation in the GA release notes. |
+| `POST-GA` | Stays in RB-1 with its row, dependencies, and evidence unchanged; no longer blocks the v0.1 GA candidate or its cohort. Cohort-blocking column reads `No (POST-GA, RB-1.1)`. |
+
+For the v0.1 GA candidate, dependency expressions that name `POST-GA` or
+unclassified rows (for example `RB-SDK-001`'s list, or "all PRE/COND rows" in
+the `FC` gates) read as "the `GA-P0`/`GA-P1` rows that the expression names".
+Rows not named in this section keep their RB-1.0 classification and are
+**unclassified pending maintainer decision**; they do not block the v0.1 GA
+candidate unless a later RB-1.x amendment classifies them.
+
+### New row
+
+| ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RB-GA-001 | Keep `verify`, `msrv`, and `release-readiness` green on a pinned stable toolchain, and re-enable the scheduled `release-readiness` workflow. | PRE / GA-P0 | ADR-0014; 2026-11-14 production-readiness audit | `iroh-room` / CI-fix branch `ci/pin-toolchain-clippy-1.100` (issue to be materialized) | — | Pinned toolchain in workflows, green runs on `main`, scheduled workflow active | Maintainer (workflow re-enable is a repository setting) | partial | Yes |
+
+### v0.1 GA P0 gate
+
+| Gate item | Rows | Issues | Note |
+| --- | --- | --- | --- |
+| CI green on a pinned toolchain | RB-GA-001 | CI-fix branch | — |
+| Dependency remediation and supply-chain gate | RB-REL-003 | #238 | RustSec advisories resolved or dispositioned; `cargo-deny` and automated updates in CI |
+| Signed releases and provenance | RB-REL-001, RB-REL-002 | #237, #248 | Covers CLI archives; the SDK crates' provenance is the crates.io publication record plus the tagged source commit |
+| SDK publication | RB-SDK-002, RB-SDK-001 | #313, #306 | Publish `iroh-rooms` and its closure with versioning, ownership, and a release procedure; `RB-SDK-001` coverage reconciliation is scoped to the GA surface |
+| Schema-evolution decision | RB-DEC-001 | #232 | ADR-0013 (#360); fixes the compatibility contract the published SDK carries |
+| Encryption decision | RB-SEC-011, RB-SEC-002, RB-REL-007 | #268, #250, #343 | **Open decision OD-1** (ADR-0014): make encrypted writes and removal-triggered rotation reachable from the SDK and CLI, or ship plaintext and remove every implying claim |
+| Independent security review | RB-SEC-010, RB-FC-009 | #344, #353 | **Open decision OD-2** (ADR-0014): reviewer, scope, budget, timing, or explicit re-acceptance of WAIVER-PBETA-0003 |
+| Install/upgrade/rollback/uninstall on four platforms | RB-REL-004, RB-REL-005, RB-FC-004 | #265, #293, #347 | `RB-REL-005`'s dependency on RB-SEC-006 reads as the GA-P1 backup/restore state |
+| Real-network evidence | RB-NET-007, RB-NET-008, RB-FC-005 | #235, #236, #348 | Measured legs, or a dated maintainer acceptance of WAIVER-PBETA-0001/0002 for v0.1 GA only. `RB-FC-005` is scoped to Gate A |
+| Compatibility gate | RB-FC-006 | #349 | Scoped to v1, immutable-vector, prior-candidate (rc.5 data), and rollback compatibility; v2 migration is `POST-GA` |
+| Candidate gates | RB-FC-001, -002, -003, -010, -011, -012 | #345, #346, #352, #354, #355, #356 | Scoped to the v0.1 GA candidate |
+
+### v0.1 GA P1 targets
+
+| Area | Rows | Issues |
+| --- | --- | --- |
+| Access and audit | RB-SEC-001, RB-SEC-016, RB-SEC-017, RB-SEC-018 | #249, #239, #254, #269 |
+| Data | RB-SEC-006, RB-FC-008 (scoped to backup/restore of the GA storage posture), RB-SEC-004, RB-SEC-009 | #285, #351, #266, #294 |
+| Shipped admin-fork detector (ADR-0006) | RB-ADM-001, RB-ADM-002, RB-ADM-003, RB-ADM-004 | #230, #240, #260, #241 |
+| SDK/CLI surfaces | RB-UP-101..106, RB-CLI-001 | #255, #256, #257, #258, #259, #270, #261 |
+| Operations | RB-REL-006 | #299 |
+
+`RB-SEC-006` reads its `RB-SEC-004`/`RB-SEC-005` dependencies as "the GA
+storage posture". `RB-SEC-004` depends on the unclassified `RB-SEC-003`; if that
+row stays unclassified, at-rest encryption (`RB-SEC-004`/`RB-SEC-009`) carries
+into GA as a disclosed ADR-0001 limitation.
+
+### POST-GA
+
+| Area | Rows |
+| --- | --- |
+| Desktop/Tauri (PRD Phase 4), its OS matrix, and browser pipe UX | RB-PRD4-001..008, RB-COND-002, RB-PIPE-004 |
+| Calls and SFU (PRD Phase 6) | RB-PRD6-001..007 |
+| v2 replica protocol | RB-ENTRY-001..007, RB-V2C-001..014, RB-V2D-001..009 |
+| Federation and v2 Phase E | RB-V2E-001..004 |
+| Availability/always-on nodes (PRD Phase 5) | RB-PRD5-001..007 |
+| 10,000-member bootstrap | RB-COND-001 |
+| Large-room gossip overlay and N=40/v2 scale gate | RB-NET-001..006, RB-FC-007 |
+| PRD Phase 3 task/agent events and agent-workspace surfaces | RB-PRD3-001..009 |
+| Live-pipe extensions | RB-PIPE-001..003 |
+
+None of these rows is part of the published SDK's GA surface: the overlay is
+behind the non-default `gossip_overlay` feature of `iroh-rooms-net` (not enabled
+by the SDK or CLI), and `iroh-rooms-v2-core` is outside the SDK's dependency
+closure. The v0.1 GA CLI platform matrix is the four shipped triples, so
+`RB-COND-002` (desktop matrix, including the Windows decision) moves with
+Phase 4.
+
+`RB-COND-001`'s cohort-blocking column is left unedited in this amendment so
+the change does not touch the line adjacent to the pending `RB-DEC-001` edit
+(#360); this section controls its classification.
+
+### Unclassified pending maintainer decision
+
+- Follow open decision OD-1 (content encryption): `RB-SEC-012..014`,
+  `RB-ADM-005`.
+- New trust features not yet in the shipped SDK/CLI: `RB-SEC-003` device
+  verification, `RB-SEC-005` recovery phrase, `RB-SEC-007` agent trust levels,
+  `RB-SEC-008` room-level pipe policies, `RB-SEC-015` blocklist/moderation.
+- `RB-PRD3-010` user-facing room export.
+- Every `RB-CPT-*` row (separate `pi-rooms-cockpit` repository).
+- `RB-COH-001..008`: open decision OD-3, whether the external cohort runs
+  against the v0.1 GA candidate before the GA decision.
+- #162 remains open as the v2 trigger tracker.
+
 ## Governance and entry decisions
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
@@ -126,19 +226,19 @@ All implementation and verification work must preserve these constraints:
 | RB-GOV-004 | Create dependency-ordered GitHub issues and milestones for every required RB-1 row, including the Cockpit repository boundary. | PRE | ADR-0012 | `iroh-room` / #229 | RB-GOV-003 | Every required row links an owning issue; dependency audit complete | Maintainer/project operator | complete | Yes |
 | RB-DEC-001 | Decide D-9 schema evolution: lock-step rejection or forward-compatible handling, including registry and fixture rules. | PRE | `specs/content-and-moderation-event-schemas.md`; PR #186 | `iroh-room` / #232 | RB-GOV-004 | Accepted [`ADR-0013`](docs/decisions/ADR-0013-schema-evolution-lock-step.md) (lock-step; terminal v1 registry; additive advertised-floor v2 revisions); conformance matrix and product-event v2 placement recorded in ADR-0013; follow-up placement comments linked from #232 | Protocol reviewer | complete | Yes |
 | RB-COND-001 | Measure the complete 10,000-member bootstrap and re-evaluate proof-carrying light-client mode if it exceeds 5 MiB. | COND | #160; ADR-0004; ADR-0008 | `iroh-room` / #302 | RB-V2C-011..012 | Full-state fixture includes governance, proof, checkpoint, and member data; measured encoded/decoded sizes are recorded; an over-target result has an accepted implementation disposition | Performance operator | partial | Yes |
-| RB-COND-002 | Define the supported desktop OS/architecture matrix before Phase 4; explicitly decide Windows rather than inferring support from Tauri. | COND | PRD v0.3 Phase 4; release matrix | `iroh-room` / #231 | RB-GOV-004 | Accepted platform decision and mapped qualification rows | Release/platform owners | not-started | Yes |
+| RB-COND-002 | Define the supported desktop OS/architecture matrix before Phase 4; explicitly decide Windows rather than inferring support from Tauri. | COND | PRD v0.3 Phase 4; release matrix | `iroh-room` / #231 | RB-GOV-004 | Accepted platform decision and mapped qualification rows | Release/platform owners | not-started | No (POST-GA, RB-1.1) |
 
 ## Phase C entry corrections and admin-fork hardening
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-ENTRY-001 | Make moderation envelope and body stream identifiers consistent and tested. | PRE | PR #184 review | `iroh-room` / #242 | RB-DEC-001 | Positive/negative body and envelope tests | Protocol reviewer | not-started | Yes |
-| RB-ENTRY-002 | Classify canonical top-level non-map content as `InvalidContent` under the approved D-9 taxonomy. | PRE | PR #184 review | `iroh-room` / #243 | RB-DEC-001 | Exact rejection-vector and taxonomy tests | Protocol reviewer | not-started | Yes |
-| RB-ENTRY-003 | Replace taxonomy source-substring scanning with syntax-aware or explicit reachability coverage that excludes comments/tests. | PRE | PR #184 review | `iroh-room` / #244 | RB-DEC-001 | Mutation/regression test proves false textual references do not satisfy coverage | Independent reviewer | not-started | Yes |
-| RB-ENTRY-004 | Structurally parse and validate the frozen member-Merkle JSON fixture and its proof objects. | PRE | PR #184 review | `iroh-room` / #233 | RB-GOV-004 | Schema parse, canonical decode, root/proof verification tests | Independent vector reviewer | not-started | Yes |
-| RB-ENTRY-005 | Add an immutable successor/erratum for counter 3's `activi` proof copy without editing the frozen v1 artifact. | PRE | `v2-member-merkle.json`; frozen-vector policy | `iroh-room` / #245 | RB-ENTRY-004 | Bumped fixture/schema, protocol note, independently recomputed proof | Independent vector operator | not-started | Yes |
-| RB-ENTRY-006 | Correct the recorded audit claim so it names the actual governance/fork-only, non-author-agent scope. | PRE | PR #186 review; v2 audit | `iroh-room` / #234 | RB-GOV-004 | Additive erratum and corrected live pointers; audit record itself not rewritten | Maintainer + reviewer | not-started | Yes |
-| RB-ENTRY-007 | Reconcile legacy candidate domains, records, checkpoints, and fork envelopes through additive successor domains/schemas. | PRE | PR #186 review; #156/#157/#159/#161 | `iroh-room` / #246 | RB-DEC-001 | Domain registry, successor codecs/vectors, frozen legacy compatibility tests | Protocol + independent vector reviewers | not-started | Yes |
+| RB-ENTRY-001 | Make moderation envelope and body stream identifiers consistent and tested. | PRE | PR #184 review | `iroh-room` / #242 | RB-DEC-001 | Positive/negative body and envelope tests | Protocol reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-ENTRY-002 | Classify canonical top-level non-map content as `InvalidContent` under the approved D-9 taxonomy. | PRE | PR #184 review | `iroh-room` / #243 | RB-DEC-001 | Exact rejection-vector and taxonomy tests | Protocol reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-ENTRY-003 | Replace taxonomy source-substring scanning with syntax-aware or explicit reachability coverage that excludes comments/tests. | PRE | PR #184 review | `iroh-room` / #244 | RB-DEC-001 | Mutation/regression test proves false textual references do not satisfy coverage | Independent reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-ENTRY-004 | Structurally parse and validate the frozen member-Merkle JSON fixture and its proof objects. | PRE | PR #184 review | `iroh-room` / #233 | RB-GOV-004 | Schema parse, canonical decode, root/proof verification tests | Independent vector reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-ENTRY-005 | Add an immutable successor/erratum for counter 3's `activi` proof copy without editing the frozen v1 artifact. | PRE | `v2-member-merkle.json`; frozen-vector policy | `iroh-room` / #245 | RB-ENTRY-004 | Bumped fixture/schema, protocol note, independently recomputed proof | Independent vector operator | not-started | No (POST-GA, RB-1.1) |
+| RB-ENTRY-006 | Correct the recorded audit claim so it names the actual governance/fork-only, non-author-agent scope. | PRE | PR #186 review; v2 audit | `iroh-room` / #234 | RB-GOV-004 | Additive erratum and corrected live pointers; audit record itself not rewritten | Maintainer + reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-ENTRY-007 | Reconcile legacy candidate domains, records, checkpoints, and fork envelopes through additive successor domains/schemas. | PRE | PR #186 review; #156/#157/#159/#161 | `iroh-room` / #246 | RB-DEC-001 | Domain registry, successor codecs/vectors, frozen legacy compatibility tests | Protocol + independent vector reviewers | not-started | No (POST-GA, RB-1.1) |
 | RB-ADM-001 | Cache divergence results only by `membership_projection_generation`. | PRE | ADR-0006 follow-up | `iroh-room` / #230 | RB-GOV-004 | Cache invalidation tests across chat and membership mutations; T18 unchanged | Performance reviewer | not-started | Yes |
 | RB-ADM-002 | Implement the divergence severity predicate instead of unconditional CRITICAL severity. | PRE | ADR-0005/0006 | `iroh-room` / #240 | RB-ADM-001 | Severity conformance tests | Security reviewer | not-started | Yes |
 | RB-ADM-003 | Surface durable divergence/trust decisions to operators through CLI diagnostics and audit. | PRE | ADR-0006 | `iroh-room` / #260 | RB-ADM-002; RB-UP-105 | CLI/audit integration tests and operator runbook | Operations reviewer | not-started | Yes |
@@ -172,12 +272,12 @@ All implementation and verification work must preserve these constraints:
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-NET-001 | Bound `actor.subscribe` so one gossip mesh attempt cannot wedge indefinitely. | PRE | #192 | `iroh-room` / #192 | RB-GOV-004 | Timeout/cancellation/retry tests | Network reviewer | not-started | Yes |
-| RB-NET-002 | Emit durable mesh spawn, success, failure, and retry audit events. | PRE | #192 | `iroh-room` / #192 | RB-NET-001; RB-SEC-016 | Audit vocabulary and integration tests | Operations reviewer | partial | Yes |
-| RB-NET-003 | Detect an installed zero-neighbor mesh and resubscribe without churn. | PRE | #192 | `iroh-room` / #192 | RB-NET-001 | Neighbor-loss/recovery and rate-bound tests | Network reviewer | not-started | Yes |
-| RB-NET-004 | Build the structured real-network overlay measurement harness. | PRE | #214; overlay measurement spec | `iroh-room` / #214 | RB-NET-001..003 | Harness tests and schema-validated JSON output | Network test operator | not-started | Yes |
-| RB-NET-005 | Run O1 home↔CGNAT and O2 home↔VPS in both directions with `K=5`, path observation, IPv6/VPN trap controls, and no cascade. | PRE | #214; overlay measurement spec | `iroh-room` / #214 | RB-NET-004 | Per-run JSON + rolled-up findings on the candidate behavior | Home, CGNAT, VPS operators | not-started | Yes |
-| RB-NET-006 | Enable `gossip_overlay` and the paired larger-room cap in shipping binaries only after #192/#214 pass. | PRE | gossip overlay spec; #192/#214 | `iroh-room` / #283 | RB-NET-005 | Shipping-feature tests, docs, and clean N=5/10/20/40 matrix | Release/network reviewers | not-started | Yes |
+| RB-NET-001 | Bound `actor.subscribe` so one gossip mesh attempt cannot wedge indefinitely. | PRE | #192 | `iroh-room` / #192 | RB-GOV-004 | Timeout/cancellation/retry tests | Network reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-NET-002 | Emit durable mesh spawn, success, failure, and retry audit events. | PRE | #192 | `iroh-room` / #192 | RB-NET-001; RB-SEC-016 | Audit vocabulary and integration tests | Operations reviewer | partial | No (POST-GA, RB-1.1) |
+| RB-NET-003 | Detect an installed zero-neighbor mesh and resubscribe without churn. | PRE | #192 | `iroh-room` / #192 | RB-NET-001 | Neighbor-loss/recovery and rate-bound tests | Network reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-NET-004 | Build the structured real-network overlay measurement harness. | PRE | #214; overlay measurement spec | `iroh-room` / #214 | RB-NET-001..003 | Harness tests and schema-validated JSON output | Network test operator | not-started | No (POST-GA, RB-1.1) |
+| RB-NET-005 | Run O1 home↔CGNAT and O2 home↔VPS in both directions with `K=5`, path observation, IPv6/VPN trap controls, and no cascade. | PRE | #214; overlay measurement spec | `iroh-room` / #214 | RB-NET-004 | Per-run JSON + rolled-up findings on the candidate behavior | Home, CGNAT, VPS operators | not-started | No (POST-GA, RB-1.1) |
+| RB-NET-006 | Enable `gossip_overlay` and the paired larger-room cap in shipping binaries only after #192/#214 pass. | PRE | gossip overlay spec; #192/#214 | `iroh-room` / #283 | RB-NET-005 | Shipping-feature tests, docs, and clean N=5/10/20/40 matrix | Release/network reviewers | not-started | No (POST-GA, RB-1.1) |
 | RB-NET-007 | Run the missing home-NAT→CGNAT reverse Gate A leg. | PRE | Gate A results; production readiness | `iroh-room` / #235 | RB-GOV-004 | Dated natural + relay-only structured results | Home + CGNAT operators | not-started | Yes |
 | RB-NET-008 | Acquire cellular access and rerun forced-relay throughput with a representative transfer. | PRE | Gate A results; WAIVER-PBETA-0001 | `iroh-room` / #236 | RB-GOV-004 | Dated cellular natural/relay results meeting or dispositioning the measured threshold through implementation | Cellular hardware/operator | blocked | Yes |
 | RB-UP-101 | Implement deterministic `iroh-rooms room list --json`. | PRE | room-list spec; Cockpit UP-101 | `iroh-room` / #255 | RB-DEC-001 | CLI JSON schema and multi-room tests | — | not-started | Yes |
@@ -201,10 +301,10 @@ All implementation and verification work must preserve these constraints:
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-PIPE-001 | Add explicitly authorized terminal-sharing sessions. | PRE | PRD v0.3 §9.3 | `iroh-room` / #273 | RB-SEC-008 | Protocol/CLI/SDK security tests and operator warnings | Independent pipe-security reviewer | not-started | Yes |
-| RB-PIPE-002 | Add explicitly authorized Unix-socket forwarding. | PRE | PRD v0.3 §9.3 | `iroh-room` / #274 | RB-SEC-008 | Path/permission/authz and cross-platform tests | Linux/macOS operators | not-started | Yes |
-| RB-PIPE-003 | Add bounded multiplexed live-pipe services. | PRE | PRD v0.3 §9.3 | `iroh-room` / #275 | RB-SEC-008; RB-UP-106 | Stream-budget, fairness, teardown, and abuse tests | Performance/security reviewers | not-started | Yes |
-| RB-PIPE-004 | Add browser-native live-pipe UX without weakening loopback/authz defaults. | PRE | PRD v0.3 §9.3 | `iroh-room` / #315 | RB-PIPE-003; RB-PRD4-001 | Browser/desktop integration and security tests | Desktop/browser operators | not-started | Yes |
+| RB-PIPE-001 | Add explicitly authorized terminal-sharing sessions. | PRE | PRD v0.3 §9.3 | `iroh-room` / #273 | RB-SEC-008 | Protocol/CLI/SDK security tests and operator warnings | Independent pipe-security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PIPE-002 | Add explicitly authorized Unix-socket forwarding. | PRE | PRD v0.3 §9.3 | `iroh-room` / #274 | RB-SEC-008 | Path/permission/authz and cross-platform tests | Linux/macOS operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PIPE-003 | Add bounded multiplexed live-pipe services. | PRE | PRD v0.3 §9.3 | `iroh-room` / #275 | RB-SEC-008; RB-UP-106 | Stream-budget, fairness, teardown, and abuse tests | Performance/security reviewers | not-started | No (POST-GA, RB-1.1) |
+| RB-PIPE-004 | Add browser-native live-pipe UX without weakening loopback/authz defaults. | PRE | PRD v0.3 §9.3 | `iroh-room` / #315 | RB-PIPE-003; RB-PRD4-001 | Browser/desktop integration and security tests | Desktop/browser operators | not-started | No (POST-GA, RB-1.1) |
 
 ## PRD Phase 3 — Agent Workspace Alpha
 
@@ -212,53 +312,53 @@ All implementation and verification work must preserve these constraints:
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-PRD3-001 | Implement `task.created`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #247 | RB-DEC-001 | Schema, authorization, CLI/SDK, vectors, migration tests | Protocol reviewer | not-started | Yes |
-| RB-PRD3-002 | Implement `task.updated`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #262 | RB-PRD3-001 | State/concurrency, CLI/SDK, vectors, migration tests | Protocol reviewer | not-started | Yes |
-| RB-PRD3-003 | Implement `agent.output`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #263 | RB-DEC-001; RB-SEC-007 | Schema, authorization, display, vectors, migration tests | Agent-security reviewer | not-started | Yes |
-| RB-PRD3-004 | Implement `agent.error`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #276 | RB-PRD3-003 | Schema, display, redaction, vectors, migration tests | Agent-security reviewer | not-started | Yes |
-| RB-PRD3-005 | Implement `agent.artifact.shared`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #264 | RB-DEC-001; RB-SEC-007 | Blob authorization, schema, CLI/SDK, vectors, migration tests | Agent-security reviewer | not-started | Yes |
-| RB-PRD3-006 | Implement `agent.review.requested`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #277 | RB-PRD3-005 | Review lifecycle, authorization, CLI/SDK, vectors, migration tests | Agent-product reviewer | not-started | Yes |
-| RB-PRD3-007 | Stream live agent logs through authorized pipes. | PRE | PRD v0.3 Phase 3 | `iroh-room` / #278 | RB-SEC-008; RB-PRD3-003 | Backpressure, redaction, authz, reconnect, and UX tests | Agent/pipe reviewers | not-started | Yes |
-| RB-PRD3-008 | Serve agent-generated web previews through authorized pipes. | PRE | PRD v0.3 Phase 3 | `iroh-room` / #325 | RB-SEC-008; RB-PIPE-004 | End-to-end preview, teardown, warning, and authz tests | Desktop/browser operator | not-started | Yes |
-| RB-PRD3-009 | Integrate MX-Agent and MX-Loom through documented stable SDK surfaces. | PRE | PRD v0.3 Phase 3 | `iroh-room` / #336 | RB-SDK-001; RB-PRD3-001..008 | Two integration fixtures/demos and compatibility policy | External integration operator | not-started | Yes |
+| RB-PRD3-001 | Implement `task.created`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #247 | RB-DEC-001 | Schema, authorization, CLI/SDK, vectors, migration tests | Protocol reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-002 | Implement `task.updated`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #262 | RB-PRD3-001 | State/concurrency, CLI/SDK, vectors, migration tests | Protocol reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-003 | Implement `agent.output`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #263 | RB-DEC-001; RB-SEC-007 | Schema, authorization, display, vectors, migration tests | Agent-security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-004 | Implement `agent.error`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #276 | RB-PRD3-003 | Schema, display, redaction, vectors, migration tests | Agent-security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-005 | Implement `agent.artifact.shared`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #264 | RB-DEC-001; RB-SEC-007 | Blob authorization, schema, CLI/SDK, vectors, migration tests | Agent-security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-006 | Implement `agent.review.requested`. | PRE | PRD v0.3 §9.1/Phase 3 | `iroh-room` / #277 | RB-PRD3-005 | Review lifecycle, authorization, CLI/SDK, vectors, migration tests | Agent-product reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-007 | Stream live agent logs through authorized pipes. | PRE | PRD v0.3 Phase 3 | `iroh-room` / #278 | RB-SEC-008; RB-PRD3-003 | Backpressure, redaction, authz, reconnect, and UX tests | Agent/pipe reviewers | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-008 | Serve agent-generated web previews through authorized pipes. | PRE | PRD v0.3 Phase 3 | `iroh-room` / #325 | RB-SEC-008; RB-PIPE-004 | End-to-end preview, teardown, warning, and authz tests | Desktop/browser operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD3-009 | Integrate MX-Agent and MX-Loom through documented stable SDK surfaces. | PRE | PRD v0.3 Phase 3 | `iroh-room` / #336 | RB-SDK-001; RB-PRD3-001..008 | Two integration fixtures/demos and compatibility policy | External integration operator | not-started | No (POST-GA, RB-1.1) |
 | RB-PRD3-010 | Implement a user-facing room export with integrity and secret-exclusion guarantees. | PRE | PRD v0.3 Phase 3/§14 | `iroh-room` / #291 | RB-SEC-004; RB-SEC-006 | Export/import, integrity, redaction, and versioning tests | Data-recovery operator | not-started | Yes |
 
 ## PRD Phase 4 — Desktop Prototype
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-PRD4-001 | Build the Tauri desktop application shell and distribution pipeline. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #308 | RB-COND-002; RB-SDK-001 | Native builds, packaging, startup, update, and security tests | Supported desktop operators | not-started | Yes |
-| RB-PRD4-002 | Implement the desktop room list. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #316 | RB-PRD4-001; RB-UP-101 | Multi-room state and UX tests | Desktop operator | not-started | Yes |
-| RB-PRD4-003 | Implement the chat timeline. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #317 | RB-PRD4-001; RB-UP-102..103 | All-event, pagination, restart, and accessibility tests | Desktop/product reviewer | not-started | Yes |
-| RB-PRD4-004 | Implement the file panel. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #318 | RB-PRD4-001 | Share/fetch/availability/integrity UX tests | Desktop operator | not-started | Yes |
-| RB-PRD4-005 | Implement the pipe panel. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #319 | RB-PRD4-001; RB-SEC-008; RB-UP-104 | Open/connect/close/policy/audit UX tests | Pipe-security reviewer | not-started | Yes |
-| RB-PRD4-006 | Implement agent cards and trust/status controls. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #320 | RB-PRD4-001; RB-SEC-007; RB-PRD3-003..006 | Agent lifecycle and permission UX tests | Agent-product reviewer | not-started | Yes |
-| RB-PRD4-007 | Implement QR invite creation and scanning with secret-safe handling. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #321 | RB-PRD4-001; RB-SEC-001 | Expiry/revocation/wrong-identity/camera-permission tests | Camera-equipped desktop operators | not-started | Yes |
-| RB-PRD4-008 | Implement local database management, migration, backup, restore, and recovery UI. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #322 | RB-SEC-004..006; RB-PRD4-001 | Destructive-action safeguards and recovery drills | Data-recovery operator | not-started | Yes |
+| RB-PRD4-001 | Build the Tauri desktop application shell and distribution pipeline. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #308 | RB-COND-002; RB-SDK-001 | Native builds, packaging, startup, update, and security tests | Supported desktop operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-002 | Implement the desktop room list. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #316 | RB-PRD4-001; RB-UP-101 | Multi-room state and UX tests | Desktop operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-003 | Implement the chat timeline. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #317 | RB-PRD4-001; RB-UP-102..103 | All-event, pagination, restart, and accessibility tests | Desktop/product reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-004 | Implement the file panel. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #318 | RB-PRD4-001 | Share/fetch/availability/integrity UX tests | Desktop operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-005 | Implement the pipe panel. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #319 | RB-PRD4-001; RB-SEC-008; RB-UP-104 | Open/connect/close/policy/audit UX tests | Pipe-security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-006 | Implement agent cards and trust/status controls. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #320 | RB-PRD4-001; RB-SEC-007; RB-PRD3-003..006 | Agent lifecycle and permission UX tests | Agent-product reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-007 | Implement QR invite creation and scanning with secret-safe handling. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #321 | RB-PRD4-001; RB-SEC-001 | Expiry/revocation/wrong-identity/camera-permission tests | Camera-equipped desktop operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD4-008 | Implement local database management, migration, backup, restore, and recovery UI. | PRE | PRD v0.3 Phase 4 | `iroh-room` / #322 | RB-SEC-004..006; RB-PRD4-001 | Destructive-action safeguards and recovery drills | Data-recovery operator | not-started | No (POST-GA, RB-1.1) |
 
 ## PRD Phase 5 — Availability Layer
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-PRD5-001 | Ship a user-owned always-on node. | PRE | PRD v0.3 Phase 5/§14 | `iroh-room` / #303 | RB-V2C-009; RB-REL-005 | Deployment, restart, upgrade, monitoring, and failure tests | Always-on host operator | not-started | Yes |
-| RB-PRD5-002 | Ship a room archive peer. | PRE | PRD v0.3 Phase 5/§14 | `iroh-room` / #309 | RB-PRD5-001 | Authorization, retention, recovery, and availability tests | Archive operator | not-started | Yes |
-| RB-PRD5-003 | Define and implement room blob-pinning policy. | PRE | PRD v0.3 Phase 5 | `iroh-room` / #310 | RB-PRD5-001 | Policy lifecycle, quota, eviction, and integrity tests | Storage operator | not-started | Yes |
-| RB-PRD5-004 | Implement improved offline catch-up with bounded resources and clear progress. | PRE | PRD v0.3 Phase 5 | `iroh-room` / #311 | RB-V2C-005..012; RB-UP-106 | Long-offline, partial provider, restart, and progress tests | Slow/lossy network operator | not-started | Yes |
-| RB-PRD5-005 | Ship optional self-hosted relay configuration and operations guidance. | PRE | PRD v0.3 Phase 5/§14 | `iroh-room` / #304 | RB-NET-005; RB-REL-006 | Deployment, failover, upgrade, abuse, and real-network tests | Relay host/operator | not-started | Yes |
-| RB-PRD5-006 | Ship an organization-owned availability node profile. | PRE | PRD v0.3 §14 | `iroh-room` / #323 | RB-PRD5-001..003 | Multi-room policy, isolation, operations, and recovery tests | Organization-node operator | not-started | Yes |
-| RB-PRD5-007 | Ship the optional storage-pinning service. | PRE | PRD v0.3 §14 | `iroh-room` / #326 | RB-PRD5-003; RB-PRD5-006 | Authz, quota, billing-free operation, integrity, and recovery tests | Storage-service operator | not-started | Yes |
+| RB-PRD5-001 | Ship a user-owned always-on node. | PRE | PRD v0.3 Phase 5/§14 | `iroh-room` / #303 | RB-V2C-009; RB-REL-005 | Deployment, restart, upgrade, monitoring, and failure tests | Always-on host operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD5-002 | Ship a room archive peer. | PRE | PRD v0.3 Phase 5/§14 | `iroh-room` / #309 | RB-PRD5-001 | Authorization, retention, recovery, and availability tests | Archive operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD5-003 | Define and implement room blob-pinning policy. | PRE | PRD v0.3 Phase 5 | `iroh-room` / #310 | RB-PRD5-001 | Policy lifecycle, quota, eviction, and integrity tests | Storage operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD5-004 | Implement improved offline catch-up with bounded resources and clear progress. | PRE | PRD v0.3 Phase 5 | `iroh-room` / #311 | RB-V2C-005..012; RB-UP-106 | Long-offline, partial provider, restart, and progress tests | Slow/lossy network operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD5-005 | Ship optional self-hosted relay configuration and operations guidance. | PRE | PRD v0.3 Phase 5/§14 | `iroh-room` / #304 | RB-NET-005; RB-REL-006 | Deployment, failover, upgrade, abuse, and real-network tests | Relay host/operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD5-006 | Ship an organization-owned availability node profile. | PRE | PRD v0.3 §14 | `iroh-room` / #323 | RB-PRD5-001..003 | Multi-room policy, isolation, operations, and recovery tests | Organization-node operator | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD5-007 | Ship the optional storage-pinning service. | PRE | PRD v0.3 §14 | `iroh-room` / #326 | RB-PRD5-003; RB-PRD5-006 | Authz, quota, billing-free operation, integrity, and recovery tests | Storage-service operator | not-started | No (POST-GA, RB-1.1) |
 
 ## PRD Phase 6 — Calls Prototype and future call stages
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-PRD6-001 | Implement call signaling with `call.started` and `call.ended` room events. | PRE | PRD v0.3 §9.4/Phase 6 | `iroh-room` / #284 | RB-DEC-001; RB-PRD3-001..006 | Schemas, authorization, vectors, migration, and reconnect tests | Protocol reviewer | not-started | Yes |
-| RB-PRD6-002 | Implement authorized 1:1 WebRTC calls. | PRE | PRD v0.3 §9.4/Phase 6 | `iroh-room` / #292 | RB-PRD6-001 | Audio/video, NAT/relay, teardown, and permission tests | Two media-device operators | not-started | Yes |
-| RB-PRD6-003 | Render call state in the room timeline. | PRE | PRD v0.3 Phase 6 | `iroh-room` / #327 | RB-PRD4-003; RB-PRD6-001 | Ordering, missed-event, restart, and accessibility tests | Desktop/product reviewer | not-started | Yes |
-| RB-PRD6-004 | Implement the basic desktop call UI. | PRE | PRD v0.3 Phase 6 | `iroh-room` / #337 | RB-PRD4-001; RB-PRD6-002..003 | Permission, device selection, failure, and teardown tests | Supported desktop/media operators | not-started | Yes |
-| RB-PRD6-005 | Complete the small-group WebRTC mesh experiment and implement the accepted result. | PRE | PRD v0.3 §9.4/Phase 6 | `iroh-room` / #298 | RB-PRD6-002 | Three-plus endpoint performance/network results and product decision | Three-plus media operators | not-started | Yes |
-| RB-PRD6-006 | Implement the peer-selected SFU stage after direct/small-group validation. | PRE | PRD v0.3 §9.4 | `iroh-room` / #305 | RB-PRD6-005 | Selection/failover/authz/privacy/performance evidence | SFU host + media operators | not-started | Yes |
-| RB-PRD6-007 | Implement the optional Jitsi bridge without making Jitsi authoritative for room membership. | PRE | PRD v0.3 §9.4 | `iroh-room` / #312 | RB-PRD6-006 | Bridge authz, lifecycle, metadata, failure, and operations tests | Jitsi host/operator | not-started | Yes |
+| RB-PRD6-001 | Implement call signaling with `call.started` and `call.ended` room events. | PRE | PRD v0.3 §9.4/Phase 6 | `iroh-room` / #284 | RB-DEC-001; RB-PRD3-001..006 | Schemas, authorization, vectors, migration, and reconnect tests | Protocol reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD6-002 | Implement authorized 1:1 WebRTC calls. | PRE | PRD v0.3 §9.4/Phase 6 | `iroh-room` / #292 | RB-PRD6-001 | Audio/video, NAT/relay, teardown, and permission tests | Two media-device operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD6-003 | Render call state in the room timeline. | PRE | PRD v0.3 Phase 6 | `iroh-room` / #327 | RB-PRD4-003; RB-PRD6-001 | Ordering, missed-event, restart, and accessibility tests | Desktop/product reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD6-004 | Implement the basic desktop call UI. | PRE | PRD v0.3 Phase 6 | `iroh-room` / #337 | RB-PRD4-001; RB-PRD6-002..003 | Permission, device selection, failure, and teardown tests | Supported desktop/media operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD6-005 | Complete the small-group WebRTC mesh experiment and implement the accepted result. | PRE | PRD v0.3 §9.4/Phase 6 | `iroh-room` / #298 | RB-PRD6-002 | Three-plus endpoint performance/network results and product decision | Three-plus media operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD6-006 | Implement the peer-selected SFU stage after direct/small-group validation. | PRE | PRD v0.3 §9.4 | `iroh-room` / #305 | RB-PRD6-005 | Selection/failover/authz/privacy/performance evidence | SFU host + media operators | not-started | No (POST-GA, RB-1.1) |
+| RB-PRD6-007 | Implement the optional Jitsi bridge without making Jitsi authoritative for room membership. | PRE | PRD v0.3 §9.4 | `iroh-room` / #312 | RB-PRD6-006 | Bridge authz, lifecycle, metadata, failure, and operations tests | Jitsi host/operator | not-started | No (POST-GA, RB-1.1) |
 
 ## V2 Phase C — network and storage
 
@@ -267,43 +367,43 @@ All implementation and verification work must preserve these constraints:
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-V2C-001 | Register `/iroh-rooms/event/2` on the router without changing v1 ALPN behavior. | PRE | #134; #162 | `iroh-room` / #271 | RB-GOV-003; RB-ENTRY-001..007 | Dual-ALPN routing and downgrade/replay tests | Protocol/network reviewer | not-started | Yes |
-| RB-V2C-002 | Implement the authenticated v2 replica/client handshake. | PRE | #134 Phase C | `iroh-room` / #281 | RB-V2C-001; RB-ENTRY-007 | Golden handshake vectors and adversarial tests | Independent protocol reviewer | not-started | Yes |
-| RB-V2C-003 | Implement v2 publish and subscription flows with bounded fanout/backpressure. | PRE | #134 Phase C | `iroh-room` / #287 | RB-V2C-002 | Conformance, backpressure, reconnect, and authorization tests | Network/performance reviewer | not-started | Yes |
-| RB-V2C-004 | Implement bounded batch fetch for content and governance dependencies. | PRE | #134 Phase C | `iroh-room` / #288 | RB-V2C-002 | Missing/duplicate/malicious batch tests | Network reviewer | not-started | Yes |
-| RB-V2C-005 | Implement #155 range reconciliation and the spec-owned envelope. | PRE | #155; ADR-0007 | `iroh-room` / #289 | RB-ENTRY-007; RB-V2C-002 | Additive codecs/vectors, convergence, partition, and bound tests | Independent vector/network reviewers | not-started | Yes |
-| RB-V2C-006 | Implement stream checkpoints and range-resume behavior. | PRE | #134 Phase C; #155 | `iroh-room` / #296 | RB-V2C-005 | Checkpoint/resume/crash/compaction conformance tests | Storage/network reviewer | not-started | Yes |
-| RB-V2C-007 | Implement #157's stable replica identity separately from rotatable Iroh Endpoint IDs. | PRE | #157; ADR-0009 | `iroh-room` / #272 | RB-ENTRY-007 | Successor descriptor codecs/vectors and endpoint-rotation tests | Independent vector reviewer | not-started | Yes |
-| RB-V2C-008 | Implement #156 durability descriptors, receipt classes, and full receipt/descriptor vectors. | PRE | #156; ADR-0010 | `iroh-room` / #282 | RB-ENTRY-007; RB-V2C-007 | Additive codecs/vectors and fsync/group-commit/replicated-WAL tests | Storage + independent vector reviewers | not-started | Yes |
-| RB-V2C-009 | Implement and operate 3–7 durable community replicas. | PRE | #134 §5/Phase C | `iroh-room` / #300 | RB-V2C-003..008 | Multi-node deployment, restart, durability, monitoring, and upgrade evidence | 3–7 hosts and test operators | not-started | Yes |
-| RB-V2C-010 | Implement replica persistence receipts and W-quorum assembly. | PRE | #134 Phase C; #156 | `iroh-room` / #307 | RB-V2C-008..009 | Quorum, timeout, conflicting receipt, and durability tests | Multi-replica operator | not-started | Yes |
-| RB-V2C-011 | Implement #161 successor governance snapshots and admin-transition proofs. | PRE | #161; ADR-0008 | `iroh-room` / #290 | RB-ENTRY-007; RB-V2C-008 | Additive snapshot/proof codecs/vectors and transition tests | Independent vector reviewer | not-started | Yes |
-| RB-V2C-012 | Implement snapshot startup, segmented storage, and compaction without losing verification history. | PRE | #134 Phase C; #161 | `iroh-room` / #301 | RB-V2C-006; RB-V2C-011 | Crash, corruption, compaction, bootstrap, and retained-proof tests | Storage/recovery operator | not-started | Yes |
-| RB-V2C-013 | Implement #159 replica genesis, policy, readiness, handoff, quarantine, incident, recovery, and cancellation records. | PRE | #159; ADR-0011 | `iroh-room` / #314 | RB-ENTRY-007; RB-V2C-007..012 | Additive public vectors, store/crash conformance, and lifecycle tests | Independent vector + operations reviewers | not-started | Yes |
-| RB-V2C-014 | Cut and document an internal v2 protocol beta after Phase C, without starting the external cohort. | PRE | #162 migration trigger | `iroh-room` / #324 | RB-V2C-001..013 | Immutable tag/artifacts, compatibility statement, and beta scope | Release/protocol owners | not-started | Yes |
+| RB-V2C-001 | Register `/iroh-rooms/event/2` on the router without changing v1 ALPN behavior. | PRE | #134; #162 | `iroh-room` / #271 | RB-GOV-003; RB-ENTRY-001..007 | Dual-ALPN routing and downgrade/replay tests | Protocol/network reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-002 | Implement the authenticated v2 replica/client handshake. | PRE | #134 Phase C | `iroh-room` / #281 | RB-V2C-001; RB-ENTRY-007 | Golden handshake vectors and adversarial tests | Independent protocol reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-003 | Implement v2 publish and subscription flows with bounded fanout/backpressure. | PRE | #134 Phase C | `iroh-room` / #287 | RB-V2C-002 | Conformance, backpressure, reconnect, and authorization tests | Network/performance reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-004 | Implement bounded batch fetch for content and governance dependencies. | PRE | #134 Phase C | `iroh-room` / #288 | RB-V2C-002 | Missing/duplicate/malicious batch tests | Network reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-005 | Implement #155 range reconciliation and the spec-owned envelope. | PRE | #155; ADR-0007 | `iroh-room` / #289 | RB-ENTRY-007; RB-V2C-002 | Additive codecs/vectors, convergence, partition, and bound tests | Independent vector/network reviewers | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-006 | Implement stream checkpoints and range-resume behavior. | PRE | #134 Phase C; #155 | `iroh-room` / #296 | RB-V2C-005 | Checkpoint/resume/crash/compaction conformance tests | Storage/network reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-007 | Implement #157's stable replica identity separately from rotatable Iroh Endpoint IDs. | PRE | #157; ADR-0009 | `iroh-room` / #272 | RB-ENTRY-007 | Successor descriptor codecs/vectors and endpoint-rotation tests | Independent vector reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-008 | Implement #156 durability descriptors, receipt classes, and full receipt/descriptor vectors. | PRE | #156; ADR-0010 | `iroh-room` / #282 | RB-ENTRY-007; RB-V2C-007 | Additive codecs/vectors and fsync/group-commit/replicated-WAL tests | Storage + independent vector reviewers | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-009 | Implement and operate 3–7 durable community replicas. | PRE | #134 §5/Phase C | `iroh-room` / #300 | RB-V2C-003..008 | Multi-node deployment, restart, durability, monitoring, and upgrade evidence | 3–7 hosts and test operators | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-010 | Implement replica persistence receipts and W-quorum assembly. | PRE | #134 Phase C; #156 | `iroh-room` / #307 | RB-V2C-008..009 | Quorum, timeout, conflicting receipt, and durability tests | Multi-replica operator | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-011 | Implement #161 successor governance snapshots and admin-transition proofs. | PRE | #161; ADR-0008 | `iroh-room` / #290 | RB-ENTRY-007; RB-V2C-008 | Additive snapshot/proof codecs/vectors and transition tests | Independent vector reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-012 | Implement snapshot startup, segmented storage, and compaction without losing verification history. | PRE | #134 Phase C; #161 | `iroh-room` / #301 | RB-V2C-006; RB-V2C-011 | Crash, corruption, compaction, bootstrap, and retained-proof tests | Storage/recovery operator | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-013 | Implement #159 replica genesis, policy, readiness, handoff, quarantine, incident, recovery, and cancellation records. | PRE | #159; ADR-0011 | `iroh-room` / #314 | RB-ENTRY-007; RB-V2C-007..012 | Additive public vectors, store/crash conformance, and lifecycle tests | Independent vector + operations reviewers | not-started | No (POST-GA, RB-1.1) |
+| RB-V2C-014 | Cut and document an internal v2 protocol beta after Phase C, without starting the external cohort. | PRE | #162 migration trigger | `iroh-room` / #324 | RB-V2C-001..013 | Immutable tag/artifacts, compatibility statement, and beta scope | Release/protocol owners | not-started | No (POST-GA, RB-1.1) |
 
 ## V2 Phase D — production hardening
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-V2D-001 | Test and harden multi-replica failure, partition, recovery, and equivocation. | PRE | #134 Phase D | `iroh-room` / #328 | RB-V2C-014 | Deterministic fault suite plus real multi-host results | 3–7 replica operators | not-started | Yes |
-| RB-V2D-002 | Ship admin-threshold configuration and transition UX. | PRE | #134 Phase D | `iroh-room` / #329 | RB-V2C-014 | CLI/SDK/desktop, quorum-loss, and transition tests | Governance/security reviewer | not-started | Yes |
-| RB-V2D-003 | Ship replica/community recovery UX. | PRE | #134 Phase D; #159 | `iroh-room` / #330 | RB-V2C-013..014 | Incident, handoff, quarantine, and recovery drills | Operations/recovery operators | not-started | Yes |
-| RB-V2D-004 | Integrate native invite revocation into v2 UX and replica enforcement. | PRE | #134 Phase D | `iroh-room` / #331 | RB-SEC-001; RB-V2C-014 | Cross-version revocation and offline-replica tests | Security reviewer | not-started | Yes |
-| RB-V2D-005 | Integrate key rotation into v2 UX and replica lifecycle. | PRE | #134 Phase D | `iroh-room` / #332 | RB-SEC-002; RB-SEC-011..014; RB-V2C-014 | Rotation, late replica, removal, recovery, and migration tests | Independent security reviewer | not-started | Yes |
-| RB-V2D-006 | Implement abuse controls, moderation, quotas, alerts, and operator dashboards. | PRE | #134 Phase D | `iroh-room` / #333 | RB-SEC-015; RB-UP-105..106; RB-V2C-014 | Adversarial load, quota, privacy, and operator-response tests | Abuse/performance/operations reviewers | not-started | Yes |
-| RB-V2D-007 | Pass direct, relay, lossy, mobile, slow-link, and constrained-device phase gates. | PRE | #134 Phase D | `iroh-room` / #334 | RB-V2C-014; RB-NET-007..008 | Structured multi-environment result corpus | Cellular, home, CGNAT, VPS, constrained-device operators | blocked | Yes |
-| RB-V2D-008 | Implement and dry-run v1→v2 migration with rollback and immutable v1 verification. | PRE | #134 §20/Phase D; #162 | `iroh-room` / #335 | RB-V2C-014; RB-REL-005 | Published prior-candidate fixtures, dry runs, rollback, and byte-preservation tests | Migration/data operator | not-started | Yes |
-| RB-V2D-009 | Complete an independent pre-Phase-E review of v2 core, runtime, store, network, migration, and operator trust surfaces. | PRE | #134 hardening; production readiness | `iroh-room` / #338 | RB-V2D-001..008 | Human/firm audit, finding dispositions, and remediation verification; RB-FC-009 owns the final-candidate delta | Independent human reviewer/firm | not-started | Yes |
+| RB-V2D-001 | Test and harden multi-replica failure, partition, recovery, and equivocation. | PRE | #134 Phase D | `iroh-room` / #328 | RB-V2C-014 | Deterministic fault suite plus real multi-host results | 3–7 replica operators | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-002 | Ship admin-threshold configuration and transition UX. | PRE | #134 Phase D | `iroh-room` / #329 | RB-V2C-014 | CLI/SDK/desktop, quorum-loss, and transition tests | Governance/security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-003 | Ship replica/community recovery UX. | PRE | #134 Phase D; #159 | `iroh-room` / #330 | RB-V2C-013..014 | Incident, handoff, quarantine, and recovery drills | Operations/recovery operators | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-004 | Integrate native invite revocation into v2 UX and replica enforcement. | PRE | #134 Phase D | `iroh-room` / #331 | RB-SEC-001; RB-V2C-014 | Cross-version revocation and offline-replica tests | Security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-005 | Integrate key rotation into v2 UX and replica lifecycle. | PRE | #134 Phase D | `iroh-room` / #332 | RB-SEC-002; RB-SEC-011..014; RB-V2C-014 | Rotation, late replica, removal, recovery, and migration tests | Independent security reviewer | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-006 | Implement abuse controls, moderation, quotas, alerts, and operator dashboards. | PRE | #134 Phase D | `iroh-room` / #333 | RB-SEC-015; RB-UP-105..106; RB-V2C-014 | Adversarial load, quota, privacy, and operator-response tests | Abuse/performance/operations reviewers | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-007 | Pass direct, relay, lossy, mobile, slow-link, and constrained-device phase gates. | PRE | #134 Phase D | `iroh-room` / #334 | RB-V2C-014; RB-NET-007..008 | Structured multi-environment result corpus | Cellular, home, CGNAT, VPS, constrained-device operators | blocked | No (POST-GA, RB-1.1) |
+| RB-V2D-008 | Implement and dry-run v1→v2 migration with rollback and immutable v1 verification. | PRE | #134 §20/Phase D; #162 | `iroh-room` / #335 | RB-V2C-014; RB-REL-005 | Published prior-candidate fixtures, dry runs, rollback, and byte-preservation tests | Migration/data operator | not-started | No (POST-GA, RB-1.1) |
+| RB-V2D-009 | Complete an independent pre-Phase-E review of v2 core, runtime, store, network, migration, and operator trust surfaces. | PRE | #134 hardening; production readiness | `iroh-room` / #338 | RB-V2D-001..008 | Human/firm audit, finding dispositions, and remediation verification; RB-FC-009 owns the final-candidate delta | Independent human reviewer/firm | not-started | No (POST-GA, RB-1.1) |
 
 ## V2 Phase E — future architecture included before cohort
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RB-V2E-001 | Specify and implement cross-community federation. | PRE | #134 Phase E; #162 | `iroh-room` / #339 | RB-V2D-009 | Accepted spec, separate wire version where required, multi-community conformance | Independent protocol reviewer + community-node operators | not-started | Yes |
-| RB-V2E-002 | Specify and implement per-stream replica groups. | PRE | #134 Phase E | `iroh-room` / #340 | RB-V2D-009 | Placement, failover, authorization, and migration tests | Multi-region replica operators | not-started | Yes |
-| RB-V2E-003 | Specify and implement regional placement policy. | PRE | #134 Phase E | `iroh-room` / #341 | RB-V2E-002 | Region-loss, policy, privacy, and operations evidence | Multi-region infrastructure/operator | not-started | Yes |
-| RB-V2E-004 | Specify and implement mandatory group encryption for the Phase E profile. | PRE | #134 Phase E; #162 | `iroh-room` / #342 | RB-V2D-005; RB-V2E-001..003 | Independent vectors, membership/rotation/recovery tests, security audit | Independent cryptography reviewer | not-started | Yes |
+| RB-V2E-001 | Specify and implement cross-community federation. | PRE | #134 Phase E; #162 | `iroh-room` / #339 | RB-V2D-009 | Accepted spec, separate wire version where required, multi-community conformance | Independent protocol reviewer + community-node operators | not-started | No (POST-GA, RB-1.1) |
+| RB-V2E-002 | Specify and implement per-stream replica groups. | PRE | #134 Phase E | `iroh-room` / #340 | RB-V2D-009 | Placement, failover, authorization, and migration tests | Multi-region replica operators | not-started | No (POST-GA, RB-1.1) |
+| RB-V2E-003 | Specify and implement regional placement policy. | PRE | #134 Phase E | `iroh-room` / #341 | RB-V2E-002 | Region-loss, policy, privacy, and operations evidence | Multi-region infrastructure/operator | not-started | No (POST-GA, RB-1.1) |
+| RB-V2E-004 | Specify and implement mandatory group encryption for the Phase E profile. | PRE | #134 Phase E; #162 | `iroh-room` / #342 | RB-V2D-005; RB-V2E-001..003 | Independent vectors, membership/rotation/recovery tests, security audit | Independent cryptography reviewer | not-started | No (POST-GA, RB-1.1) |
 
 ## Cockpit and upstream ergonomics — enumerated backlog and explicit futures
 
@@ -366,7 +466,7 @@ candidate and reruns every affected gate.
 | RB-FC-004 | Download, verify signature/provenance, install, execute, upgrade, rollback, and uninstall every supported artifact natively. | FC | release operations | `iroh-room` / #347 | RB-REL-001..005; RB-FC-001 | Per-platform artifact records | Native platform operators | not-started | Yes |
 | RB-FC-005 | Refresh Gate A and overlay real-network evidence against candidate-equivalent transport code. | FC | Gate A; #214 | `iroh-room` / #348 | RB-NET-005..008; RB-FC-001 | Structured home/CGNAT/VPS/cellular corpus | Network/hardware operators | not-started | Yes |
 | RB-FC-006 | Pass v1/v2 compatibility, immutable-vector, prior-candidate, migration, and rollback gates. | FC | compatibility; ADR-0004 | `iroh-room` / #349 | RB-V2D-008; RB-FC-001 | Fixture and published-binary migration evidence | Migration operator | not-started | Yes |
-| RB-FC-007 | Pass N=40 and v2 scale/performance/fault budgets on declared reference environments. | FC | #134; N=40 specs | `iroh-room` / #350 | RB-V2D-001; RB-FC-001 | Structured performance/fault result corpus | Cloud/reference-hardware operators | not-started | Yes |
+| RB-FC-007 | Pass N=40 and v2 scale/performance/fault budgets on declared reference environments. | FC | #134; N=40 specs | `iroh-room` / #350 | RB-V2D-001; RB-FC-001 | Structured performance/fault result corpus | Cloud/reference-hardware operators | not-started | No (POST-GA, RB-1.1) |
 | RB-FC-008 | Complete backup, restore, recovery-phrase, encrypted-storage, and disaster-recovery drills. | FC | production readiness; security roadmap | `iroh-room` / #351 | RB-SEC-004..006; RB-SEC-009; RB-FC-001 | Fresh-host and corruption recovery records | Independent recovery operator | not-started | Yes |
 | RB-FC-009 | Complete final independent security audits and close every cohort-blocking finding. | FC | production readiness; RB-SEC-010; RB-V2D-009 | `iroh-room` / #353 | RB-FC-001..008 | Signed scope, reports, dispositions, and final delta | Independent human reviewers/firm | not-started | Yes |
 | RB-FC-010 | Reconcile README, guides, limitations, release notes, support, and protocol claims to the candidate. | FC | release/production readiness | `iroh-room` / #354 | RB-FC-001..009 | Documentation conformance and fresh-user rehearsal | Independent documentation operator | not-started | Yes |
@@ -428,8 +528,14 @@ historical `Phase C` or Cockpit milestone names.
 8. **RB7 — Post-cohort:** fix findings, re-cut/re-gate as required, and make the
    GA decision.
 
+Under RB-1.1 the v0.1 GA track (SDK + CLI) runs ahead of this order: complete the `GA-P0`
+gate and as many `GA-P1` targets as practical, tag the v0.1 GA candidate, then
+pass its scoped `FC` gates. `POST-GA` rows continue on the RB3 rails above
+afterwards.
+
 ## Amendment log
 
 | Version | Date | Change | Approval |
 | --- | --- | --- | --- |
 | RB-1.0 | 2026-08-06 | Initial finite baseline compiled from current repository and GitHub sources. | Proposed by ADR-0012; active on merge |
+| RB-1.1 | 2026-11-14 | Define the v0.1 GA candidate as the SDK (`iroh-rooms`) and the CLI built on it, for small private rooms; add `GA-P0`/`GA-P1`/`POST-GA` classes and row `RB-GA-001`; make SDK publication (RB-SDK-001/002) and RB-DEC-001 `GA-P0`; reclassify desktop (with its OS matrix), calls/SFU, v2, federation, availability, the 10k bootstrap, the large-room overlay, PRD3 task/agent work, and pipe extensions `POST-GA`; record open decisions OD-1..OD-3. | Proposed by ADR-0014; maintainer decisions 2026-11-14 (scope; SDK + CLI); active on merge |

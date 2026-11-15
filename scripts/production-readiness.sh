@@ -141,7 +141,7 @@ require_text ".github/ISSUE_TEMPLATE/bug_report.md" "full data-directory backups
 require_text "CONTRIBUTING.md" "Production Readiness" "contributing links production readiness"
 require_text "README.md" "Production Readiness" "readme links production readiness"
 
-RESULTS_MD="crates/spike-nat/results/results.md"
+RESULTS_MD="archive/spikes/spike-nat/results/results.md"
 if [[ -f "$RESULTS_MD" ]] && ! grep -Fq "pending manual two-host run" "$RESULTS_MD"; then
   record "Gate A measured results present" "PASS" "$RESULTS_MD"
 else

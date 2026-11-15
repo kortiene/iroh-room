@@ -47,7 +47,7 @@ See §7 for the full disposition and the NO-GO escalation branch.
 
 | Gate | Scope | Status | Evidence |
 |---|---|---|---|
-| **A** | Real-network NAT hole-punching (Day 1) | **MEASURED 2026-07-03/04, both environments — CONDITIONAL GO** | 37 committed runs (`crates/spike-nat/results/`): S1 home-NAT↔cloud + S2 cellular-CGNAT↔{cloud, home-NAT}. Establishment + direct hole-punch + relay reachability PASS both environments/directions (incl. inbound-to-CGNAT); carrier confirmation ✓ (S1 event+pipe, S2 event ALPN); direct corroborated by #43 SDK-daemon (`mixed` = relay warm-standby label, unchanged at `--settle 30`); residual: cellular forced-relay throughput 0.1–0.2 Mbit/s on small samples (< 1 Mbit/s target) + home-NAT→CGNAT reverse leg |
+| **A** | Real-network NAT hole-punching (Day 1) | **MEASURED 2026-07-03/04, both environments — CONDITIONAL GO** | 37 committed runs (`archive/spikes/spike-nat/results/`): S1 home-NAT↔cloud + S2 cellular-CGNAT↔{cloud, home-NAT}. Establishment + direct hole-punch + relay reachability PASS both environments/directions (incl. inbound-to-CGNAT); carrier confirmation ✓ (S1 event+pipe, S2 event ALPN); direct corroborated by #43 SDK-daemon (`mixed` = relay warm-standby label, unchanged at `--settle 30`); residual: cellular forced-relay throughput 0.1–0.2 Mbit/s on small samples (< 1 Mbit/s target) + home-NAT→CGNAT reverse leg |
 | **B** | Event Plane byte-level correctness (Days 2–3) | **GO (measured, CI-reproducible)** | `iroh-rooms-core` golden vectors + full `PHASE-0-SPIKE.md` §8 reject/flag taxonomy + strict-CBOR property tests |
 | **C** | The two decisions D1+D2, and recent-sync converges on ≥1 path (Day 5) | **GO** | D1 measured (`spike-transport`); D2 hand-roll built and converges (`iroh-rooms-core/src/sync`); see caveat below |
 | **D** | Sync convergence hardening — arrival-order-independent, bounded (Day 6) | **GO (measured in-sim/loopback)** | `iroh-rooms-core` `tests/sync_convergence.rs` + `tests/sync_restart.rs` |
@@ -96,8 +96,8 @@ non-symmetric scenario; relay usable ≥1 Mbit/s and RTT ≤ ~300 ms):
   NAT, full CLI flow). S2 event ALPN: the real transport carried a signed genesis
   from the cellular CGNAT to the cloud peer in 1.35 s.
 
-Evidence: [`crates/spike-nat/NOTES.md`](crates/spike-nat/NOTES.md) §6 (findings
-block), [`crates/spike-nat/results/results.md`](crates/spike-nat/results/results.md)
+Evidence: [`archive/spikes/spike-nat/NOTES.md`](archive/spikes/spike-nat/NOTES.md) §6 (findings
+block), [`archive/spikes/spike-nat/results/results.md`](archive/spikes/spike-nat/results/results.md)
 (37 committed runs), and
 [`crates/iroh-rooms-net/NOTES.md`](crates/iroh-rooms-net/NOTES.md) §"Gate A
 (real-network)". Both required environments are now measured; the remaining
@@ -172,8 +172,8 @@ which cannot be asserted until Gate A runs. Hence CONDITIONAL, not GO. Blob
 QUIC over ALPN `/iroh-rooms/event/1` remains the Room Event Plane transport;
 `iroh-gossip` is not adopted for the load-bearing log (parked as an optional
 off-critical-path liveness/admin-tip carrier). Measured comparison from
-[`crates/spike-transport/NOTES.md`](crates/spike-transport/NOTES.md) and
-[`crates/spike-transport/results/results.md`](crates/spike-transport/results/results.md)
+[`archive/spikes/spike-transport/NOTES.md`](archive/spikes/spike-transport/NOTES.md) and
+[`archive/spikes/spike-transport/results/results.md`](archive/spikes/spike-transport/results/results.md)
 (IR-0006/#10, landed PR #69):
 
 - **Propagation latency, N=2..5:** mesh median 16 ms vs gossip median 16–17 ms
@@ -308,8 +308,8 @@ Open decisions deferred to MVP time (recorded as open, not blocking):
 ## 7. Failed / not-green gate → mitigation, and the MVP go/no-go
 
 The one gate that was unmeasured, **Gate A, is now measured across BOTH required
-environments (2026-07-03/04)**: `crates/spike-nat/results/` holds 37 per-run JSONs
-and `crates/spike-nat/results/results.md` / `crates/iroh-rooms-net/NOTES.md`
+environments (2026-07-03/04)**: `archive/spikes/spike-nat/results/` holds 37 per-run JSONs
+and `archive/spikes/spike-nat/results/results.md` / `crates/iroh-rooms-net/NOTES.md`
 §"Gate A" record the measured state. Across S1 (home-NAT ↔ cloud) and S2 (cellular
 CGNAT ↔ {cloud, home-NAT}), a direct hole-punched path establishes on every run,
 establishment passes both directions (incl. inbound-to-CGNAT), relay fallback is
@@ -335,7 +335,7 @@ unconditional).**
   0.1–0.2 Mbit/s on 256 KiB slow-start-dominated samples (below the ≥1 Mbit/s
   target; natural S2 sessions used the healthy direct path).
 - **Blocking exit condition (P0) — SATISFIED:** the P0 exit condition was to
-  execute the `spike-nat` §4 runbook (`crates/spike-nat/NOTES.md`) on two machines
+  execute the `spike-nat` §4 runbook (`archive/spikes/spike-nat/NOTES.md`) on two machines
   across ≥2 real NAT environments (VPN off, ≥1 likely-symmetric/CGNAT case), both
   directions × {natural, relay-only}, and commit the per-run JSON. That is **done**
   (2026-07-03/04; 37 JSONs; `results.md` regenerated) — so the substrate assumption
@@ -366,7 +366,7 @@ The preview-cadence tracking of the above is mechanized by
 [`RELEASE-READINESS.md`](RELEASE-READINESS.md) (IR-0306): its Sign-off records
 Gate A's status per candidate build (P1 — measured 2026-07-03/04, both
 environments; non-blocking for a *developer* preview — pointing at the same
-`crates/spike-nat/results/results.md`), while `scripts/release-readiness.sh`
+`archive/spikes/spike-nat/results/results.md`), while `scripts/release-readiness.sh`
 mechanizes the P0 test gate this memo's Gates B–E are drawn from.
 
 ---
@@ -379,12 +379,12 @@ mechanizes the P0 test gate this memo's Gates B–E are drawn from.
 | #7 | IR-0003 | [`protocol-conformance-test-vectors.md`](specs/protocol-conformance-test-vectors.md) | [`iroh-rooms-core/tests/conformance/`](crates/iroh-rooms-core/tests/conformance/) | [`tests/protocol_conformance.rs`](crates/iroh-rooms-core/tests/protocol_conformance.rs) (empty `DEFERRED` list) | Gate B |
 | #8 | IR-0004 | [`sqlite-event-store-prototype.md`](specs/sqlite-event-store-prototype.md) | [`iroh-rooms-core/src/store/`](crates/iroh-rooms-core/src/store/) | [`tests/store_e2e.rs`](crates/iroh-rooms-core/tests/store_e2e.rs) | Gate C/D (ADR-2) |
 | #9 | IR-0005 | [`full-mesh-quic-event-transport.md`](specs/full-mesh-quic-event-transport.md) | [`iroh-rooms-net/`](crates/iroh-rooms-net/) | [`NOTES.md`](crates/iroh-rooms-net/NOTES.md), [`tests/loopback.rs`](crates/iroh-rooms-net/tests/loopback.rs) (T1/T2 admission) | ADR-1, Gate E |
-| #10 | IR-0006 | [`measure-gossip-vs-full-mesh-transport.md`](specs/measure-gossip-vs-full-mesh-transport.md) | [`spike-transport/`](crates/spike-transport/) | [`NOTES.md`](crates/spike-transport/NOTES.md), [`results/results.md`](crates/spike-transport/results/results.md) | ADR-1 (Gate C/D1) |
+| #10 | IR-0006 | [`measure-gossip-vs-full-mesh-transport.md`](specs/measure-gossip-vs-full-mesh-transport.md) | [`spike-transport/`](archive/spikes/spike-transport/) | [`NOTES.md`](archive/spikes/spike-transport/NOTES.md), [`results/results.md`](archive/spikes/spike-transport/results/results.md) | ADR-1 (Gate C/D1) |
 | #11 | IR-0007 | [`bounded-recent-sync-prototype.md`](specs/bounded-recent-sync-prototype.md) | [`iroh-rooms-core/src/sync/`](crates/iroh-rooms-core/src/sync/) | [`tests/sync_convergence.rs`](crates/iroh-rooms-core/tests/sync_convergence.rs), [`tests/sync_restart.rs`](crates/iroh-rooms-core/tests/sync_restart.rs) | ADR-2, Gate C/D |
 | #12 | IR-0008 | [`membership-fold-prototype.md`](specs/membership-fold-prototype.md) | [`iroh-rooms-core/src/membership/`](crates/iroh-rooms-core/src/membership/) | [`tests/membership_fold.rs`](crates/iroh-rooms-core/tests/membership_fold.rs) | Gate D |
-| #13 | IR-0009 | [`prototype-blob-acl-path.md`](specs/prototype-blob-acl-path.md) | [`spike-blobs/`](crates/spike-blobs/) | [`NOTES.md`](crates/spike-blobs/NOTES.md), [`tests/blob_acl.rs`](crates/spike-blobs/tests/blob_acl.rs) (49 tests) | Day 8 (soft) |
+| #13 | IR-0009 | [`prototype-blob-acl-path.md`](specs/prototype-blob-acl-path.md) | [`spike-blobs/`](archive/spikes/spike-blobs/) | [`NOTES.md`](archive/spikes/spike-blobs/NOTES.md), [`tests/blob_acl.rs`](archive/spikes/spike-blobs/tests/blob_acl.rs) (49 tests) | Day 8 (soft) |
 | #14 | IR-0010 | [`live-tcp-pipe-path.md`](specs/live-tcp-pipe-path.md) | [`iroh-rooms-net/src/pipe/`](crates/iroh-rooms-net/src/pipe/) | [`tests/pipe_e2e.rs`](crates/iroh-rooms-net/tests/pipe_e2e.rs) (P1–P6) | Day 9 (soft) |
-| #43 | IR-0012 | [`measure-real-nat-hole-punching-connectivity.md`](specs/measure-real-nat-hole-punching-connectivity.md) | [`spike-nat/`](crates/spike-nat/) | [`NOTES.md`](crates/spike-nat/NOTES.md), [`results/results.md`](crates/spike-nat/results/results.md) **(pending)** | **Gate A** |
+| #43 | IR-0012 | [`measure-real-nat-hole-punching-connectivity.md`](specs/measure-real-nat-hole-punching-connectivity.md) | [`spike-nat/`](archive/spikes/spike-nat/) | [`NOTES.md`](archive/spikes/spike-nat/NOTES.md), [`results/results.md`](archive/spikes/spike-nat/results/results.md) **(pending)** | **Gate A** |
 
 Note: IR-0007 and IR-0009 landed commits reference the IR number, not the `#`
 issue number — mapping is via the spec headers.
