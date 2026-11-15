@@ -156,7 +156,7 @@ candidate unless a later RB-1.x amendment classifies them.
 | Signed releases and provenance | RB-REL-001, RB-REL-002 | #237, #248 | Covers CLI archives; the SDK crates' provenance is the crates.io publication record plus the tagged source commit |
 | SDK publication | RB-SDK-002, RB-SDK-001 | #313, #306 | Publish `iroh-rooms` and its closure with versioning, ownership, and a release procedure; `RB-SDK-001` coverage reconciliation is scoped to the GA surface |
 | Schema-evolution decision | RB-DEC-001 | #232 | ADR-0013 (#360); fixes the compatibility contract the published SDK carries |
-| Encryption decision | RB-SEC-011, RB-SEC-002, RB-REL-007 | #268, #250, #343 | **Open decision OD-1** (ADR-0014): make encrypted writes and removal-triggered rotation reachable from the SDK and CLI, or ship plaintext and remove every implying claim |
+| Encryption decision | RB-REL-007 | #343 | **OD-1 decided 2026-11-15 (RB-1.2):** v0.1 GA ships plaintext room content, encrypted in transit only, disclosed. `RB-SEC-011` (#268) and `RB-SEC-002` (#250) are `POST-GA`; `RB-REL-007` must add an encryption-claims entry |
 | Independent security review | RB-SEC-010, RB-FC-009 | #344, #353 | **Open decision OD-2** (ADR-0014): reviewer, scope, budget, timing, or explicit re-acceptance of WAIVER-PBETA-0003 |
 | Install/upgrade/rollback/uninstall on four platforms | RB-REL-004, RB-REL-005, RB-FC-004 | #265, #293, #347 | `RB-REL-005`'s dependency on RB-SEC-006 reads as the GA-P1 backup/restore state |
 | Real-network evidence | RB-NET-007, RB-NET-008, RB-FC-005 | #235, #236, #348 | Measured legs, or a dated maintainer acceptance of WAIVER-PBETA-0001/0002 for v0.1 GA only. `RB-FC-005` is scoped to Gate A |
@@ -191,6 +191,7 @@ into GA as a disclosed ADR-0001 limitation.
 | Large-room gossip overlay and N=40/v2 scale gate | RB-NET-001..006, RB-FC-007 |
 | PRD Phase 3 task/agent events and agent-workspace surfaces | RB-PRD3-001..009 |
 | Live-pipe extensions | RB-PIPE-001..003 |
+| End-to-end content encryption and removal-triggered key rotation (OD-1, RB-1.2; v0.2 headline) | RB-SEC-002, RB-SEC-011..014, RB-ADM-005 |
 
 None of these rows is part of the published SDK's GA surface: the overlay is
 behind the non-default `gossip_overlay` feature of `iroh-rooms-net` (not enabled
@@ -205,8 +206,6 @@ the change does not touch the line adjacent to the pending `RB-DEC-001` edit
 
 ### Unclassified pending maintainer decision
 
-- Follow open decision OD-1 (content encryption): `RB-SEC-012..014`,
-  `RB-ADM-005`.
 - New trust features not yet in the shipped SDK/CLI: `RB-SEC-003` device
   verification, `RB-SEC-005` recovery phrase, `RB-SEC-007` agent trust levels,
   `RB-SEC-008` room-level pipe policies, `RB-SEC-015` blocklist/moderation.
@@ -215,6 +214,28 @@ the change does not touch the line adjacent to the pending `RB-DEC-001` edit
 - `RB-COH-001..008`: open decision OD-3, whether the external cohort runs
   against the v0.1 GA candidate before the GA decision.
 - #162 remains open as the v2 trigger tracker.
+
+## RB-1.2 — OD-1 content encryption decision
+
+On 2026-11-15 the maintainer decided open decision OD-1
+([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md#open-decisions-for-the-maintainer))
+as option (b): **v0.1 GA ships room content as plaintext, encrypted in transit
+only** (iroh QUIC/TLS between admitted peers), with the gap disclosed in the
+README, `SECURITY.md`, and threat model T27. End-to-end content encryption and
+removal-triggered key rotation are the v0.2 headline.
+
+- `RB-SEC-002` (#250), `RB-SEC-011` (#268), `RB-SEC-012..014` (#280, #286,
+  #295), and `RB-ADM-005` (#297) become `POST-GA`; their rows, dependencies,
+  and evidence are unchanged.
+- `RB-REL-007` (#343) stays `GA-P0` and must include an encryption-claims
+  entry: no CLI, SDK, or doc surface may imply content confidentiality beyond
+  transport encryption to admitted peers.
+- `build_member_removed_with_rotation` moves from the stable
+  `iroh_rooms::room` re-exports to `iroh_rooms::experimental::rotation`, so the
+  published stable tier does not promise rotation.
+- OD-2 (`RB-SEC-010` #344, `RB-FC-009` #353) narrows to confirming the
+  encryption path is unreachable in the shipped configuration, not a review of
+  the cryptography.
 
 ## Governance and entry decisions
 
@@ -243,14 +264,14 @@ the change does not touch the line adjacent to the pending `RB-DEC-001` edit
 | RB-ADM-002 | Implement the divergence severity predicate instead of unconditional CRITICAL severity. | PRE | ADR-0005/0006 | `iroh-room` / #240 | RB-ADM-001 | Severity conformance tests | Security reviewer | not-started | Yes |
 | RB-ADM-003 | Surface durable divergence/trust decisions to operators through CLI diagnostics and audit. | PRE | ADR-0006 | `iroh-room` / #260 | RB-ADM-002; RB-UP-105 | CLI/audit integration tests and operator runbook | Operations reviewer | not-started | Yes |
 | RB-ADM-004 | Detect cross-partition divergence without accepting forged advertised state. | PRE | ADR-0005/0006 | `iroh-room` / #241 | RB-ADM-001 | Partition/rejoin adversarial conformance suite | Independent security reviewer | not-started | Yes |
-| RB-ADM-005 | Resolve cross-epoch rotation conflicts on concurrent removals while preserving full carrier-chain `admin_seq` and T18. | PRE | ADR-0006; content-key rotation spec | `iroh-room` / #297 | RB-SEC-002; RB-SEC-014 | Conflict/restart/arrival-order tests plus Vector 18 compatibility | Protocol/security reviewer | not-started | Yes |
+| RB-ADM-005 | Resolve cross-epoch rotation conflicts on concurrent removals while preserving full carrier-chain `admin_seq` and T18. | PRE | ADR-0006; content-key rotation spec | `iroh-room` / #297 | RB-SEC-002; RB-SEC-014 | Conflict/restart/arrival-order tests plus Vector 18 compatibility | Protocol/security reviewer | not-started | No (POST-GA, RB-1.2) |
 
 ## Security, storage, rotation, and audit
 
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | RB-SEC-001 | Implement native invite revocation and product-visible revocation status. | PRE | PRD v0.3 §13.5; ADR-0002 | `iroh-room` / #249 | RB-DEC-001 | Wire/store/CLI/SDK tests including offline and replay cases | Independent security reviewer | not-started | Yes |
-| RB-SEC-002 | Make member removal trigger end-to-end room-key rotation through shipped CLI and SDK surfaces. | PRE | PRD v0.3 §13.5; content-key rotation spec | `iroh-room` / #250 | RB-DEC-001 | Production caller, multi-peer removal, restart, and removed-member denial tests | Security reviewer | partial | Yes |
+| RB-SEC-002 | Make member removal trigger end-to-end room-key rotation through shipped CLI and SDK surfaces. | PRE | PRD v0.3 §13.5; content-key rotation spec | `iroh-room` / #250 | RB-DEC-001 | Production caller, multi-peer removal, restart, and removed-member denial tests | Security reviewer | partial | No (POST-GA, RB-1.2) |
 | RB-SEC-003 | Implement device verification with user-visible state and recovery behavior. | PRE | PRD v0.3 §13.5 | `iroh-room` / #251 | RB-DEC-001 | Protocol/store/CLI/SDK verification tests | Independent security reviewer | not-started | Yes |
 | RB-SEC-004 | Encrypt the local database, including persisted room keys, with migration and key-management procedures. | PRE | PRD v0.3 §13.5; ADR-0001 | `iroh-room` / #266 | RB-SEC-003 | At-rest inspection, migration, wrong-key, backup, and recovery tests | Security + data-recovery operators | not-started | Yes |
 | RB-SEC-005 | Implement and document the recovery phrase lifecycle. | PRE | PRD v0.3 §13.5 | `iroh-room` / #279 | RB-SEC-003; RB-SEC-004 | Generate/restore/rotate/loss tests and user runbook | Independent security reviewer | not-started | Yes |
@@ -259,10 +280,10 @@ the change does not touch the line adjacent to the pending `RB-DEC-001` edit
 | RB-SEC-008 | Implement room-level live-pipe policies beyond per-command allowlists. | PRE | PRD v0.3 §13.5 | `iroh-room` / #267 | RB-DEC-001; RB-SEC-007 | Policy lifecycle and fail-closed forwarding tests | Pipe-security reviewer | not-started | Yes |
 | RB-SEC-009 | Encrypt remaining local storage, including blobs, audit data, and recovery metadata. | PRE | PRD v0.3 §13.5 | `iroh-room` / #294 | RB-SEC-004; RB-SEC-006 | At-rest inspection, streaming, restart, and recovery tests | Security/data operator | not-started | Yes |
 | RB-SEC-010 | Complete an independent human/firm pre-candidate review of all shipped trust surfaces. | PRE | PRD v0.3 §13.5; production readiness | `iroh-room` / #344 | Every cohort-blocking PRE/COND row whose deliverable changes a shipped trust surface, excluding RB-SEC-010 | Published scope, findings, dispositions, and remediation verification | Independent human reviewer/firm | not-started | Yes |
-| RB-SEC-011 | Make encrypted content writes reachable in shipping configuration and enforce the room encryption floor. | PRE | content-key rotation spec; threat model | `iroh-room` / #268 | RB-SEC-002 | CLI/SDK creation, mixed-floor rejection, upgrade, and restart tests | Security reviewer | partial | Yes |
-| RB-SEC-012 | Emit and page `WantKeyHistory` requests in production and complete newcomer/history recovery. | PRE | content-key rotation spec | `iroh-room` / #280 | RB-SEC-011 | Real session history recovery, pagination, authorization, and restart tests | Network/security reviewer | partial | Yes |
-| RB-SEC-013 | Replace zero key-distribution attribution IDs with durable, deterministic source provenance. | PRE | content-key rotation spec | `iroh-room` / #286 | RB-SEC-012 | Conflict ordering and history provenance tests | Protocol reviewer | not-started | Yes |
-| RB-SEC-014 | Persist unresolved poison state, epoch commitments, and conflict candidates across crashes. | PRE | content-key rotation spec | `iroh-room` / #295 | RB-SEC-013 | Unresolvable-conflict crash/reopen tests; no silent unpoisoning | Independent security reviewer | not-started | Yes |
+| RB-SEC-011 | Make encrypted content writes reachable in shipping configuration and enforce the room encryption floor. | PRE | content-key rotation spec; threat model | `iroh-room` / #268 | RB-SEC-002 | CLI/SDK creation, mixed-floor rejection, upgrade, and restart tests | Security reviewer | partial | No (POST-GA, RB-1.2) |
+| RB-SEC-012 | Emit and page `WantKeyHistory` requests in production and complete newcomer/history recovery. | PRE | content-key rotation spec | `iroh-room` / #280 | RB-SEC-011 | Real session history recovery, pagination, authorization, and restart tests | Network/security reviewer | partial | No (POST-GA, RB-1.2) |
+| RB-SEC-013 | Replace zero key-distribution attribution IDs with durable, deterministic source provenance. | PRE | content-key rotation spec | `iroh-room` / #286 | RB-SEC-012 | Conflict ordering and history provenance tests | Protocol reviewer | not-started | No (POST-GA, RB-1.2) |
+| RB-SEC-014 | Persist unresolved poison state, epoch commitments, and conflict candidates across crashes. | PRE | content-key rotation spec | `iroh-room` / #295 | RB-SEC-013 | Unresolvable-conflict crash/reopen tests; no silent unpoisoning | Independent security reviewer | not-started | No (POST-GA, RB-1.2) |
 | RB-SEC-015 | Implement the v1/v2 blocklist and moderation product surface selected by D-9. | PRE | PRD v0.3 §13.1; threat model T09; #158 | `iroh-room` / #253 | RB-DEC-001 | Protocol, CLI/SDK, abuse, and migration tests | Abuse/security reviewer | not-started | Yes |
 | RB-SEC-016 | Implement audit retention, rotation, and privacy controls. | PRE | ADR-0003; production readiness | `iroh-room` / #239 | RB-GOV-004 | Bounded retention, rotation, permissions, and redaction tests | Operations/privacy reviewer | not-started | Yes |
 | RB-SEC-017 | Add tamper-evident audit sequencing and verification. | PRE | ADR-0003; production readiness | `iroh-room` / #254 | RB-SEC-016 | Mutation/truncation/reordering detection tests | Independent security reviewer | not-started | Yes |
@@ -539,3 +560,4 @@ afterwards.
 | --- | --- | --- | --- |
 | RB-1.0 | 2026-08-06 | Initial finite baseline compiled from current repository and GitHub sources. | Proposed by ADR-0012; active on merge |
 | RB-1.1 | 2026-11-14 | Define the v0.1 GA candidate as the SDK (`iroh-rooms`) and the CLI built on it, for small private rooms; add `GA-P0`/`GA-P1`/`POST-GA` classes and row `RB-GA-001`; make SDK publication (RB-SDK-001/002) and RB-DEC-001 `GA-P0`; reclassify desktop (with its OS matrix), calls/SFU, v2, federation, availability, the 10k bootstrap, the large-room overlay, PRD3 task/agent work, and pipe extensions `POST-GA`; record open decisions OD-1..OD-3. | Proposed by ADR-0014; maintainer decisions 2026-11-14 (scope; SDK + CLI); active on merge |
+| RB-1.2 | 2026-11-15 | Decide OD-1 as option (b): v0.1 GA ships plaintext room content, encrypted in transit only, disclosed; reclassify `RB-SEC-002`, `RB-SEC-011..014`, and `RB-ADM-005` `POST-GA`; keep `RB-REL-007` `GA-P0` with an encryption-claims entry; move the rotation builder to the SDK `experimental` tier; narrow OD-2 to unreachability of the encryption path. | Maintainer decision 2026-11-15 (OD-1, option b); recorded in ADR-0014; active on merge |

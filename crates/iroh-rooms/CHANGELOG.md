@@ -7,6 +7,14 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- **Breaking (stable tier, before first publish):** `build_member_removed_with_rotation`
+  is no longer re-exported from `iroh_rooms::room`; it now lives at
+  `iroh_rooms::experimental::rotation` (with `DistributionError`), behind the
+  `experimental` feature. v0.1 GA ships room content as plaintext, encrypted
+  in transit only (ADR-0014 OD-1, decided 2026-11-15; roadmap RB-1.2), so the
+  published stable tier does not promise content-key rotation. Use
+  `iroh_rooms::room::build_member_removed` for removals.
+
 ## 0.1.0-rc.5 - 2026-08-01
 
 - Landed the **content-key rotation lifecycle** (issue #191 step 6, spec

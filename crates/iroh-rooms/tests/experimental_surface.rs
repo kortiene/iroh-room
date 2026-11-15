@@ -25,7 +25,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use iroh_rooms::experimental::{blob, pipe_runtime, session, store, sync};
+use iroh_rooms::experimental::{blob, pipe_runtime, rotation, session, store, sync};
 
 /// Force a type path to resolve at compile time (the drift guard). `?Sized` so a
 /// `dyn Trait` re-export (e.g. `dyn SyncTransport`) can be named too.
@@ -346,4 +346,13 @@ fn pipe_runtime_helpers_are_pure() {
         !pipe_runtime::is_loopback_target(&public),
         "a public address must not classify as loopback"
     );
+}
+
+/// The content-key rotation builder lives in the experimental tier (ADR-0014
+/// OD-1, roadmap RB-1.2): v0.1 GA ships plaintext content, so the stable
+/// `room` module must not promise rotation.
+#[test]
+fn rotation_builder_is_experimental() {
+    assert!(!name_of::<rotation::DistributionError>().is_empty());
+    assert!(!std::any::type_name_of_val(&rotation::build_member_removed_with_rotation).is_empty());
 }
