@@ -159,6 +159,11 @@ jobs:
   checksums:
     name: SHA256SUMS
     needs: artifacts
+    # A dry run skips tag-guard. The default success() check then skips this
+    # job too, even after every build succeeded, because a skipped ancestor
+    # counts as "not success". The status function below makes GitHub evaluate
+    # the condition, and the builds' result is what matters.
+    if: ${{ !cancelled() && needs.artifacts.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
