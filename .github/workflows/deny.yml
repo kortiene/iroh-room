@@ -29,7 +29,7 @@ jobs:
     # A new advisory should not block unrelated PRs' other checks, but it does
     # fail this job so it is visible and can be made required.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check ${{ matrix.checks }}

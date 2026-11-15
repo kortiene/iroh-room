@@ -44,7 +44,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -90,7 +90,7 @@ jobs:
 
       # Keep the artifacts reachable even when the tag has no release yet, so a
       # tag pushed ahead of its notes is not a lost build.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: iroh-rooms-${{ matrix.target }}
           path: |
