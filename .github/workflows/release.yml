@@ -1,7 +1,8 @@
 name: release
 
 # Builds the Production Beta CLI archive + checksum for every supported platform
-# triple, then (unless this is a dry run) attaches them to a draft release.
+# triple, then (unless this is a dry run) attests those bytes, signs SHA256SUMS,
+# and attaches the assets to a draft release.
 #
 # Build jobs are contents: read and have no id-token. A dependency's build.rs
 # must not be able to mint a Sigstore certificate in this workflow's name.
@@ -9,18 +10,20 @@ name: release
 # call `gh release`.
 #
 # SHA256SUMS is written by `checksums`, which does not set `environment`.
-# `sign-and-publish` is the only job that sets `environment: release` and the
-# only job with contents: write. Referencing an environment that does not
-# exist creates it with no protection rules, so `release` must already exist
-# with a required reviewer before this workflow is merged. A dry run skips
+# `sign-and-publish` is the only job that sets `environment: release`, and the
+# only job with contents: write, id-token: write, or attestations: write.
+# Referencing an environment that does not exist creates it with no protection
+# rules, so `release` must already exist with a required reviewer before this
+# workflow is merged. A dry run skips
 # `sign-and-publish` entirely (its `if` is false) and therefore never
 # references that environment. Checksums stay on the other job so a dry run
 # still uploads SHA256SUMS without creating `release`.
 #
-# The job token on `sign-and-publish` is contents: write only. Reading
-# environment protection rules (GET /repos/{owner}/{repo}/environments/release)
-# requires administration read, so this workflow does not call that API: the
-# call would 403 on every real release.
+# The job token on `sign-and-publish` is contents: write, id-token: write, and
+# attestations: write. Reading environment protection rules
+# (GET /repos/{owner}/{repo}/environments/release) requires administration
+# read, so this workflow does not call that API: the call would 403 on every
+# real release.
 #
 # A non-dry run fails in `tag-guard`, before any build and before any release
 # API call, unless github.ref is refs/tags/v<VER> and VER is the
@@ -36,9 +39,12 @@ name: release
 # There is no tag ruleset, so before any release write the publish job checks
 # that refs/tags/v<VER> still peels to GITHUB_SHA.
 #
-# id-token, attestations, and artifact-metadata are intentionally absent.
-# The follow-up that adds them must attest and sign only after this job's
-# re-verify of the archives and SHA256SUMS, which runs before any release write.
+# id-token and attestations are granted only on sign-and-publish, after that
+# job re-verifies the archive bytes, the .sha256 lines, SHA256SUMS, and that
+# the tag still peels to GITHUB_SHA. artifact-metadata is not granted.
+# actions/attest writes a storage record only when push-to-registry is true,
+# and this job attests local files. Nothing is uploaded until gh attestation
+# verify and cosign verify-blob have succeeded.
 
 on:
   push:
@@ -50,13 +56,14 @@ on:
         required: true
         type: string
       dry_run:
-        description: "Build archives and SHA256SUMS only. Skip the tag-ref guard and do not create or modify a GitHub release."
+        description: "Build archives and SHA256SUMS only. Skip the tag-ref guard, signing, and every release write."
         required: false
         type: boolean
         default: false
 
-# Least privilege by default. sign-and-publish replaces this with contents: write.
-# Unspecified scopes (including id-token) are not granted.
+# Least privilege by default. sign-and-publish is the only job that sets
+# contents: write, id-token: write, and attestations: write. Every other job
+# keeps contents: read and does not set id-token. Unspecified scopes are none.
 permissions:
   contents: read
 
@@ -357,11 +364,19 @@ jobs:
     needs: [tag-guard, artifacts, checksums]
     # tag-guard must have succeeded, so a dry run (guard skipped) never
     # reaches environment: release. The dry_run clause is the same gate.
+    # Attest, cosign, and verify run only in this job. A dry run does not
+    # produce Sigstore bundles; it proves the build, the checksums, and that
+    # the workflow file is valid.
     if: ${{ !cancelled() && needs.tag-guard.result == 'success' && needs.artifacts.result == 'success' && needs.checksums.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true) }}
     runs-on: ubuntu-24.04
     environment: release
+    # artifact-metadata is omitted. actions/attest@v4.2.2 calls
+    # createStorageRecord only when push-to-registry is true (src/attest.ts).
+    # These subjects are files, and that input stays at its default false.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -373,10 +388,10 @@ jobs:
           path: downloaded
           merge-multiple: false
 
-      # Re-verify, then confirm the tag still peels to this SHA, then write.
-      # This job is the only one that holds contents: write. Attest and sign
-      # (a later change) only after the re-verify below.
-      - name: Attach assets to a draft release
+      # Re-verify the archives, the .sha256 lines, and SHA256SUMS, then peel
+      # the tag. Attest and sign run only after this step. This step does not
+      # create or upload a release.
+      - name: Re-verify release assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -489,8 +504,353 @@ jobs:
           fi
 
           # No tag ruleset: the tag can move between build and publish. Peel
-          # annotated tags to the commit and refuse anything other than this SHA.
-          # This is the last read before a release mutation.
+          # annotated tags to the commit and refuse anything other than this
+          # SHA before signing. The upload step peels again as the last read
+          # before it creates or uploads.
+          ref_type="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.type)"
+          ref_sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.sha)"
+          case "$ref_type" in
+            commit)
+              tag_commit="$ref_sha"
+              ;;
+            tag)
+              peeled_type="$(gh api "repos/${GH_REPO}/git/tags/${ref_sha}" --jq .object.type)"
+              tag_commit="$(gh api "repos/${GH_REPO}/git/tags/${ref_sha}" --jq .object.sha)"
+              if [[ "$peeled_type" != "commit" ]]; then
+                echo "::error::annotated tag ${tag} peels to ${peeled_type}, not a commit"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::refs/tags/${tag} points at ${ref_type}, not a commit or annotated tag"
+              exit 1
+              ;;
+          esac
+          if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::refs/tags/${tag} peels to ${tag_commit}, not ${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "refs/tags/${tag} peels to ${tag_commit}"
+
+          # Attest steps interpolate this into subject-path. Reject anything
+          # that is not a Cargo version token so the path cannot grow a new
+          # expression or a second line.
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::crate version ${version} has characters this job will not interpolate"
+            exit 1
+          fi
+          {
+            echo "RELEASE_VERSION=${version}"
+            echo "RELEASE_SHORT=${short}"
+          } >> "$GITHUB_ENV"
+
+      # One bundle per file. A multi-subject actions/attest call writes a
+      # single bundle, and each archive is uploaded as its own
+      # <archive>.sigstore.json. No predicate input: the action's default is
+      # SLSA build provenance. push-to-registry stays false.
+      - name: Attest x86_64-apple-darwin archive
+        id: attest-darwin-amd64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/iroh-rooms-${{ env.RELEASE_VERSION }}-x86_64-apple-darwin-${{ env.RELEASE_SHORT }}.tar.gz
+
+      - name: Attest aarch64-apple-darwin archive
+        id: attest-darwin-arm64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/iroh-rooms-${{ env.RELEASE_VERSION }}-aarch64-apple-darwin-${{ env.RELEASE_SHORT }}.tar.gz
+
+      - name: Attest x86_64-unknown-linux-gnu archive
+        id: attest-linux-amd64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/iroh-rooms-${{ env.RELEASE_VERSION }}-x86_64-unknown-linux-gnu-${{ env.RELEASE_SHORT }}.tar.gz
+
+      - name: Attest aarch64-unknown-linux-gnu archive
+        id: attest-linux-arm64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/iroh-rooms-${{ env.RELEASE_VERSION }}-aarch64-unknown-linux-gnu-${{ env.RELEASE_SHORT }}.tar.gz
+
+      - name: Attest SHA256SUMS
+        id: attest-sha256sums
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/SHA256SUMS
+
+      # The installer's own default at this commit is v3.1.4. Set it anyway so
+      # the cosign version sits next to the action SHA. The action checks the
+      # downloaded binary against the checksums in that commit.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      # Archive bundles are named <archive>.sigstore.json and uploaded.
+      # SHA256SUMS.sigstore.json is the cosign bundle, not the attestation
+      # bundle. The attestation bundle stays under RUNNER_TEMP so the two
+      # files cannot overwrite each other. gh attestation verify SHA256SUMS
+      # reads the attestation actions/attest stored for that digest.
+      - name: Save attestation bundles and sign SHA256SUMS
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+          RELEASE_SHORT: ${{ env.RELEASE_SHORT }}
+          BUNDLE_DARWIN_AMD64: ${{ steps.attest-darwin-amd64.outputs.bundle-path }}
+          BUNDLE_DARWIN_ARM64: ${{ steps.attest-darwin-arm64.outputs.bundle-path }}
+          BUNDLE_LINUX_AMD64: ${{ steps.attest-linux-amd64.outputs.bundle-path }}
+          BUNDLE_LINUX_ARM64: ${{ steps.attest-linux-arm64.outputs.bundle-path }}
+          BUNDLE_SHA256SUMS: ${{ steps.attest-sha256sums.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          version="$(awk -F ' *= *' '
+            /^\[package\]/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && $1 == "version" { gsub(/"/, "", $2); print $2; exit }
+          ' crates/iroh-rooms-cli/Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not read version from crates/iroh-rooms-cli/Cargo.toml"
+            exit 1
+          fi
+          short="${GITHUB_SHA:0:12}"
+          if [[ ! "$short" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "::error::GITHUB_SHA does not start with 12 hex characters"
+            exit 1
+          fi
+          if [[ "$version" != "$RELEASE_VERSION" || "$short" != "$RELEASE_SHORT" ]]; then
+            echo "::error::attested name ${RELEASE_VERSION}/${RELEASE_SHORT} does not match ${version}/${short}"
+            exit 1
+          fi
+
+          cd release-assets
+          copy_bundle() {
+            local src="$1"
+            local dest="$2"
+            if [[ ! -s "$src" ]]; then
+              echo "::error::attestation bundle missing or empty for ${dest}"
+              exit 1
+            fi
+            cp "$src" "$dest"
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::failed to save ${dest}"
+              exit 1
+            fi
+          }
+          copy_bundle "$BUNDLE_DARWIN_AMD64" "iroh-rooms-${version}-x86_64-apple-darwin-${short}.tar.gz.sigstore.json"
+          copy_bundle "$BUNDLE_DARWIN_ARM64" "iroh-rooms-${version}-aarch64-apple-darwin-${short}.tar.gz.sigstore.json"
+          copy_bundle "$BUNDLE_LINUX_AMD64" "iroh-rooms-${version}-x86_64-unknown-linux-gnu-${short}.tar.gz.sigstore.json"
+          copy_bundle "$BUNDLE_LINUX_ARM64" "iroh-rooms-${version}-aarch64-unknown-linux-gnu-${short}.tar.gz.sigstore.json"
+          mkdir -p "${RUNNER_TEMP}/attestation-bundles"
+          copy_bundle "$BUNDLE_SHA256SUMS" "${RUNNER_TEMP}/attestation-bundles/SHA256SUMS.sigstore.json"
+
+          cosign version
+          # Keyless: no --key. This job's id-token is the GitHub OIDC credential.
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          if [[ ! -s SHA256SUMS.sigstore.json ]]; then
+            echo "::error::cosign did not write SHA256SUMS.sigstore.json"
+            exit 1
+          fi
+
+      # Fail the job before any release write if the bundles or the cosign
+      # signature do not verify. --certificate-identity is exact, not a regexp.
+      # The second gh invocation on each file checks the local bundle.
+      - name: Verify attestations and SHA256SUMS signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          version="$(awk -F ' *= *' '
+            /^\[package\]/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && $1 == "version" { gsub(/"/, "", $2); print $2; exit }
+          ' crates/iroh-rooms-cli/Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not read version from crates/iroh-rooms-cli/Cargo.toml"
+            exit 1
+          fi
+          short="${GITHUB_SHA:0:12}"
+          if [[ ! "$short" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "::error::GITHUB_SHA does not start with 12 hex characters"
+            exit 1
+          fi
+          expected_ref="refs/tags/v${version}"
+          if [[ "$GITHUB_REF" != "$expected_ref" ]]; then
+            echo "::error::GITHUB_REF ${GITHUB_REF} is not ${expected_ref}"
+            exit 1
+          fi
+
+          cd release-assets
+          repo="kortiene/iroh-room"
+          identity="https://github.com/kortiene/iroh-room/.github/workflows/release.yml@${GITHUB_REF}"
+          issuer="https://token.actions.githubusercontent.com"
+          sums_bundle="${RUNNER_TEMP}/attestation-bundles/SHA256SUMS.sigstore.json"
+          if [[ ! -s "$sums_bundle" ]]; then
+            echo "::error::SHA256SUMS attestation bundle is missing"
+            exit 1
+          fi
+          if [[ ! -s SHA256SUMS.sigstore.json ]]; then
+            echo "::error::SHA256SUMS.sigstore.json is missing"
+            exit 1
+          fi
+          if cmp -s SHA256SUMS.sigstore.json "$sums_bundle"; then
+            echo "::error::SHA256SUMS.sigstore.json matches the attestation bundle; expected the cosign bundle"
+            exit 1
+          fi
+
+          triples=(
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+          )
+          for triple in "${triples[@]}"; do
+            archive="iroh-rooms-${version}-${triple}-${short}.tar.gz"
+            if [[ ! -f "$archive" || ! -s "${archive}.sigstore.json" ]]; then
+              echo "::error::missing ${archive} or ${archive}.sigstore.json"
+              exit 1
+            fi
+            echo "gh attestation verify ${archive}"
+            gh attestation verify "$archive" \
+              --repo "$repo" \
+              --cert-identity "$identity" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+            gh attestation verify "$archive" \
+              --bundle "${archive}.sigstore.json" \
+              --repo "$repo" \
+              --cert-identity "$identity" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+          done
+
+          echo "gh attestation verify SHA256SUMS"
+          gh attestation verify SHA256SUMS \
+            --repo "$repo" \
+            --cert-identity "$identity" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
+          gh attestation verify SHA256SUMS \
+            --bundle "$sums_bundle" \
+            --repo "$repo" \
+            --cert-identity "$identity" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
+
+          cosign verify-blob SHA256SUMS \
+            --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            --certificate-github-workflow-sha "$GITHUB_SHA"
+
+      # Do not wipe release-assets. The bundles were written there after the
+      # re-verify copy. Peel again immediately before the first release write.
+      - name: Attach assets to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          version="$(awk -F ' *= *' '
+            /^\[package\]/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && $1 == "version" { gsub(/"/, "", $2); print $2; exit }
+          ' crates/iroh-rooms-cli/Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not read version from crates/iroh-rooms-cli/Cargo.toml"
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::crate version ${version} has characters this job will not interpolate"
+            exit 1
+          fi
+          expected_ref="refs/tags/v${version}"
+          if [[ "$RELEASE_REF" != "$expected_ref" ]]; then
+            echo "::error::refusing to publish: ${RELEASE_REF} is not ${expected_ref}"
+            exit 1
+          fi
+          tag="v${version}"
+          short="${GITHUB_SHA:0:12}"
+          if [[ ! "$short" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "::error::GITHUB_SHA does not start with 12 hex characters"
+            exit 1
+          fi
+
+          cd release-assets
+          triples=(
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+          )
+          expected=(SHA256SUMS SHA256SUMS.sigstore.json)
+          for triple in "${triples[@]}"; do
+            archive="iroh-rooms-${version}-${triple}-${short}.tar.gz"
+            expected+=("$archive" "${archive}.sha256" "${archive}.sigstore.json")
+          done
+          for name in "${expected[@]}"; do
+            if [[ ! -f "$name" ]]; then
+              echo "::error::missing required release file ${name}"
+              find . -maxdepth 1 -type f -print
+              exit 1
+            fi
+            if [[ "$name" == *.sigstore.json && ! -s "$name" ]]; then
+              echo "::error::${name} is empty"
+              exit 1
+            fi
+          done
+          file_count=0
+          for file in *; do
+            if [[ ! -f "$file" ]]; then
+              continue
+            fi
+            file_count=$((file_count + 1))
+            found=0
+            for name in "${expected[@]}"; do
+              if [[ "$file" == "$name" ]]; then
+                found=1
+                break
+              fi
+            done
+            if [[ "$found" -ne 1 ]]; then
+              echo "::error::unexpected release file ${file}"
+              exit 1
+            fi
+          done
+          if [[ "$file_count" -ne "${#expected[@]}" ]]; then
+            echo "::error::expected ${#expected[@]} release files, found ${file_count}"
+            exit 1
+          fi
+
+          for sumfile in *.tar.gz.sha256; do
+            line="$(cat "$sumfile")"
+            name="$(basename "${sumfile%.sha256}")"
+            recorded="${line%% *}"
+            filename="${line#*  }"
+            actual="$(sha256sum "$name" | awk '{print $1}')"
+            if [[ "$recorded" != "$actual" || "$filename" != "$name" ]]; then
+              echo "::error::$sumfile does not match $name"
+              exit 1
+            fi
+            if ! grep -Fxq "$line" SHA256SUMS; then
+              echo "::error::SHA256SUMS is missing the line from $sumfile"
+              exit 1
+            fi
+          done
+          sum_lines="$(grep -cve '^$' SHA256SUMS || true)"
+          if [[ "$sum_lines" -ne 4 ]]; then
+            echo "::error::SHA256SUMS does not have 4 entries, found ${sum_lines}"
+            exit 1
+          fi
+
           ref_type="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.type)"
           ref_sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.sha)"
           case "$ref_type" in
@@ -548,14 +908,30 @@ jobs:
             exit 1
           fi
 
-          gh release upload "$tag" \
-            ./*.tar.gz \
-            ./*.tar.gz.sha256 \
-            SHA256SUMS
+          gh release upload "$tag" "${expected[@]}"
 
           is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
           if [[ "$is_draft" != "true" ]]; then
             echo "::error::release ${tag} is no longer a draft after upload"
             exit 1
           fi
+          if ! asset_list="$(gh release view "$tag" --json assets --jq '.assets[].name' | LC_ALL=C sort)"; then
+            echo "::error::could not read draft assets for ${tag}"
+            exit 1
+          fi
+          expected_list="$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)"
+          mapfile -t asset_names <<< "$asset_list"
+          mapfile -t expected_names <<< "$expected_list"
+          if [[ "${#asset_names[@]}" -ne "${#expected_names[@]}" ]]; then
+            echo "::error::draft ${tag} has ${#asset_names[@]} assets, expected ${#expected_names[@]}"
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected_list" "$asset_list"
+            exit 1
+          fi
+          for i in "${!expected_names[@]}"; do
+            if [[ "${asset_names[$i]}" != "${expected_names[$i]}" ]]; then
+              echo "::error::draft asset list does not match the expected names"
+              printf 'expected:\n%s\nactual:\n%s\n' "$expected_list" "$asset_list"
+              exit 1
+            fi
+          done
           echo "Draft ${tag} still unpublished"
