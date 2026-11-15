@@ -12,7 +12,10 @@ where feasible); the **experimental** tier may change on any release.
   commands, built on the stable `iroh_rooms::room::build_member_removed` /
   `build_member_left` builders (roadmap RB-1.4, `RB-GA-002`, #379). Removed members
   lose access to new messages, files and pipes once peers see the removal;
-  they keep what they already had. No SDK API change.
+  they keep what they already had. `room remove` seals the removed device out
+  of admission and forwarding once the removal is folded, including during the
+  push's flush. `room leave` run again re-delivers the stored `member.left`
+  and does not author a second event. No SDK API change.
 - **Breaking (stable tier, before first publish):** `build_member_removed_with_rotation`
   is no longer re-exported from `iroh_rooms::room`; it now lives at
   `iroh_rooms::experimental::rotation` (with `DistributionError`), behind the

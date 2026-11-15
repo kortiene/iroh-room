@@ -71,6 +71,24 @@ const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// ephemeral `send` node tears down (spec §5 step 5 / R3).
 const FLUSH_GRACE: Duration = Duration::from_millis(300);
 
+/// Test-only override for the departure flush, in milliseconds. `0` keeps
+/// [`FLUSH_GRACE`]. The removal and leave-retry paths read it so a test can
+/// hold the node up long enough for a peer to send during that window.
+#[cfg(test)]
+pub(crate) static FLUSH_GRACE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn flush_grace() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = FLUSH_GRACE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    FLUSH_GRACE
+}
+
 /// The result of a `room send`, for the caller to present.
 pub struct SendSummary {
     /// The authored message's event id.
@@ -905,6 +923,157 @@ pub(crate) async fn run_push(
     Ok(delivered)
 }
 
+/// Like [`run_push`], but the node is a managed room session.
+///
+/// Admission is a live [`SnapshotAdmission`] the pump refreshes from the fold,
+/// and the [`PeerManager`] tears a departed device down as soon as the removal
+/// is published — routing is revoked before this function's flush sleep. The
+/// terminal removal is queued *before* that reconcile, so the removed device
+/// still learns it; anything accepted afterwards is not forwarded to it.
+///
+/// `dial_set` is the pre-departure roster (the removed device included) plus
+/// any `--peer` address hints. The connected-peer count is the union of who
+/// was connected at publish time and who is still connected after the flush,
+/// so a device torn down after receiving its terminal removal still counts.
+///
+/// # Errors
+/// Returns an error if the engine or node cannot start, the frame cannot be
+/// published, or shutdown fails. The caller persists the frame locally either
+/// way.
+#[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
+pub(crate) async fn run_managed_push(
+    home: &Path,
+    store: EventStore,
+    room_id: &RoomId,
+    secret_key: SecretKey,
+    device_seed: [u8; 32],
+    dial_set: Vec<EndpointAddr>,
+    timeout: Duration,
+    mode: NetMode,
+    frame: Vec<u8>,
+) -> Result<usize> {
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(device_seed),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let opening = AdmissionView::from_snapshot(&engine.snapshot(), &engine.fail_closed_subjects());
+    let admission_cell = Arc::new(Mutex::new(opening));
+    let admission: Arc<dyn Admission> = Arc::new(SnapshotAdmission::new(admission_cell.clone()));
+    let cfg = NetConfig {
+        mode,
+        ..NetConfig::default()
+    };
+    let audit_sink = audit::sink(home)?;
+    let node = Node::spawn_room(
+        secret_key,
+        admission,
+        audit_sink,
+        engine,
+        cfg,
+        DEFAULT_TICK,
+        dial_set.clone(),
+        admission_cell,
+        None,
+    )
+    .await
+    .context("could not bring up the network node")?;
+
+    let ids: Vec<EndpointId> = dial_set.iter().map(|a| a.id).collect();
+    // Give already-listening siblings a moment to finish dialing, but do not
+    // burn the rest of `timeout` on a member who is actually offline.
+    await_roster(&node, &ids, timeout).await;
+    let mut reached = connected_ids(&node, &ids);
+
+    let publish = node
+        .publish(frame)
+        .await
+        .context("could not publish the departure frame");
+
+    tokio::time::sleep(flush_grace()).await;
+    reached.extend(connected_ids(&node, &ids));
+    let shutdown = node.shutdown().await;
+    publish?;
+    shutdown.context("could not shut down the network node")?;
+    Ok(reached.len())
+}
+
+/// Bring up an ephemeral node, dial `dial_set`, and let the normal connect
+/// handshake serve what this store already holds. Nothing is authored.
+///
+/// This is how a stored `member.left` is re-delivered: `publish` of an event
+/// the store already has is a duplicate and does not fan out, but the peer's
+/// `WantMembership` pull still receives that one event.
+///
+/// # Errors
+/// Returns an error if the engine or node cannot start, or shutdown fails.
+#[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
+pub(crate) async fn run_sync(
+    home: &Path,
+    store: EventStore,
+    room_id: &RoomId,
+    secret_key: SecretKey,
+    device_seed: [u8; 32],
+    admission: AllowlistAdmission,
+    dial_set: Vec<EndpointAddr>,
+    timeout: Duration,
+    mode: NetMode,
+) -> Result<usize> {
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(device_seed),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let cfg = NetConfig {
+        mode,
+        ..NetConfig::default()
+    };
+    let audit_sink = audit::sink(home)?;
+    let node = Node::spawn(
+        secret_key,
+        Arc::new(admission),
+        audit_sink,
+        engine,
+        cfg,
+        DEFAULT_TICK,
+    )
+    .await
+    .context("could not bring up the network node")?;
+
+    let ids: Vec<EndpointId> = dial_set.iter().map(|a| a.id).collect();
+    for addr in dial_set {
+        node.connect_to(addr);
+    }
+    let _ = wait_for_any_connected(&node, &ids, timeout).await;
+    tokio::time::sleep(flush_grace()).await;
+    let delivered = connected_count(&node, &ids);
+    node.shutdown()
+        .await
+        .context("could not shut down the network node")?;
+    Ok(delivered)
+}
+
+/// After the first peer connects, wait briefly for the rest of `ids` so a
+/// removal reaches every member that is already listening. Returns as soon as
+/// all of them are up, and does not extend a timeout that found nobody.
+async fn await_roster(node: &Node, ids: &[EndpointId], timeout: Duration) {
+    let connected = wait_for_any_connected(node, ids, timeout).await;
+    if connected == 0 || connected == ids.len() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    while tokio::time::Instant::now() < deadline {
+        if connected_count(node, ids) == ids.len() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Wait up to `timeout` for at least one of `ids` to reach `Connected`. Returns the
 /// count connected at the moment the first connects, or 0 on timeout.
 async fn wait_for_any_connected(node: &Node, ids: &[EndpointId], timeout: Duration) -> usize {
@@ -923,9 +1092,15 @@ async fn wait_for_any_connected(node: &Node, ids: &[EndpointId], timeout: Durati
 
 /// How many of `ids` are currently `Connected`.
 fn connected_count(node: &Node, ids: &[EndpointId]) -> usize {
+    connected_ids(node, ids).len()
+}
+
+/// Which of `ids` are currently `Connected`.
+fn connected_ids(node: &Node, ids: &[EndpointId]) -> BTreeSet<EndpointId> {
     ids.iter()
-        .filter(|id| node.peer_state(**id) == Some(PeerConnState::Connected))
-        .count()
+        .copied()
+        .filter(|id| node.peer_state(*id) == Some(PeerConnState::Connected))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

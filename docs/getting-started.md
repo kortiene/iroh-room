@@ -591,7 +591,11 @@ iroh-rooms room leave <ROOM_ID>
 
 `room remove` is admin-only: anyone else gets `error[insufficient_role]` (exit 3) and
 nothing is written. The admin cannot `room leave` (v1 rooms have a single immutable
-admin), and nobody can `room remove` themselves.
+admin), and nobody can `room remove` themselves. Once the removal is stored, the
+admin's node stops forwarding newer events to the removed device for the rest of
+that push. `room leave` is safe to run again: if your `member.left` is already
+stored, the command re-delivers that same event when a peer is reachable and does
+not write a second one.
 
 **What removal does and does not do.** Removed members lose access to new messages,
 files and pipes once peers see the removal; they keep what they already had. Room

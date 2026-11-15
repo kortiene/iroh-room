@@ -405,16 +405,41 @@ fn member_leave_marks_self_removed_everywhere_it_replicates() {
     assert_eq!(field(&out, "stored"), Some("yes"));
     assert_eq!(status_of(bob, &room_str, &bob.id).as_deref(), Some("left"));
 
-    // Leaving again is refused (no longer an active member).
-    let out = run(&bob.home, &leave_args(&room_str));
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not_a_member"));
+    // Leaving again re-delivers the stored member.left and does not author another.
+    let before = event_count(bob, &room);
+    let again = ok(&bob.home, &leave_args(&room_str));
+    assert_eq!(field(&again, "event"), field(&out, "event"));
+    assert_eq!(field(&again, "stored"), Some("yes"));
+    assert_eq!(event_count(bob, &room), before);
+    assert_eq!(status_of(bob, &room_str, &bob.id).as_deref(), Some("left"));
 
     // The admin folds the same verdict once the event reaches its store.
     replicate(bob, &alice, &room);
     assert_eq!(
         status_of(&alice, &room_str, &bob.id).as_deref(),
         Some("left")
+    );
+}
+
+#[test]
+fn removed_member_cannot_use_leave_to_author_or_resync() {
+    let (alice, members, room_str, room) = room_with(1);
+    let bob = &members[0];
+    ok(&alice.home, &remove_args(&room_str, &bob.id));
+    replicate(&alice, bob, &room);
+    let before = event_count(bob, &room);
+
+    let out = run(&bob.home, &leave_args(&room_str));
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not_a_member"),
+        "an admin removal is not a pending self-leave; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        event_count(bob, &room),
+        before,
+        "a rejected leave writes nothing"
     );
 }
 
