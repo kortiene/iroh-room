@@ -71,7 +71,7 @@ So Gate A needs a purpose-built **measurement** harness. It is small, and most o
 
 ## 4. Owning component and where the code lives
 
-**Decision: build a dedicated throwaway spike crate `crates/spike-nat`, mirroring `crates/spike-blobs`.** Rationale:
+**Decision: build a dedicated throwaway spike crate `archive/spikes/spike-nat`, mirroring `archive/spikes/spike-blobs`.** Rationale:
 
 - It matches the Spike Plan Day 1 literal deliverable — *"`spike-nat` binary + results table"* — and the repo's established throwaway-spike pattern (`spike-blobs` is isolated in the workspace so CI proves it builds but it never touches shipping crates).
 - Gate A's load-bearing question is about the **iroh substrate itself** (does hole-punching work on real NATs), which is independent of our ALPN/framing. A bare `iroh::Endpoint` echo probe is exactly what Day 1 specifies ("minimal `iroh::Endpoint` … open one bidi stream; echo bytes") and isolates the substrate assumption from our code.
@@ -79,10 +79,10 @@ So Gate A needs a purpose-built **measurement** harness. It is small, and most o
 
 The **confirmation pass** (§6.6) then re-uses the *already-shipping* `net-smoke --real` and the pipe ALPN unchanged — no new code — to show the real carrier also crosses NAT. The one small allowed touch to a shipping crate, if measured to be necessary, is an **additive, read-only path-type print** in `net-smoke`'s real-network branch (a log line, no behavioural change); if we want to avoid even that, path type for the confirmation pass is read from `RUST_LOG=iroh=debug` traces instead (§6.2). Default: **no shipping-crate edit**; the probe crate carries all measurement code.
 
-`crates/spike-nat` layout:
+`archive/spikes/spike-nat` layout:
 
 ```text
-crates/spike-nat/
+archive/spikes/spike-nat/
   Cargo.toml            # publish = false; iroh = "=1.0.1"; tokio; anyhow; serde/serde_json; clap or hand-rolled args
   src/main.rs           # the `nat-probe` binary (listen | dial subcommands)
   src/probe.rs          # endpoint bring-up, path-watcher classification, metric capture
@@ -91,7 +91,7 @@ crates/spike-nat/
   results/              # committed run outputs: <date>-<scenario>.json + a rolled-up results.md
 ```
 
-Add `crates/spike-nat` to the workspace `members` list with the same "throwaway spike, kept in workspace so CI proves it builds" comment `spike-blobs` carries. Pin `iroh = "=1.0.1"` (the proven pin) and keep zero 0.x crates.
+Add `archive/spikes/spike-nat` to the workspace `members` list with the same "throwaway spike, kept in workspace so CI proves it builds" comment `spike-blobs` carries. Pin `iroh = "=1.0.1"` (the proven pin) and keep zero 0.x crates.
 
 ---
 
@@ -170,8 +170,8 @@ Acceptance requires "relay fallback confirmed to work when direct hole-punching 
 
 `ProbeResult` (serde) serializes to one JSON object per run (schema = the §5 field table). The harness also renders/updates:
 
-- `crates/spike-nat/results/<run_at_utc-date>-<scenario>-<direction>[-relay].json` — one per run, committed.
-- `crates/spike-nat/results/results.md` — the rolled-up scenario × direction × path-type × TTFB × RTT × throughput × setup-time table.
+- `archive/spikes/spike-nat/results/<run_at_utc-date>-<scenario>-<direction>[-relay].json` — one per run, committed.
+- `archive/spikes/spike-nat/results/results.md` — the rolled-up scenario × direction × path-type × TTFB × RTT × throughput × setup-time table.
 - The same table, pasted into **`crates/iroh-rooms-net/NOTES.md`** replacing the current `_(pending real-network rig)_` placeholder row under *"Gate A (real-network)"*.
 - A short **Gate A findings block** (GO/NO-GO verdict + the two-decision implication for open decision #12) suitable for lifting verbatim into the Gate E memo (#15).
 
@@ -243,7 +243,7 @@ Evaluate the collected results against the spike's hard thresholds:
 1. **Confirm the iroh 1.0.1 path/relay API surface (do this first, it de-risks everything).**
    - Locate the pinned `iroh 1.0.1` source; confirm the connection-type watcher (name, `ConnectionType` variants), `remote_info`/addr accessor, home-relay watcher, and the relay-force / direct-disable config knobs. Record the confirmed names in `spike-nat/NOTES.md` (mirroring how IR-0005 `NOTES.md` reconciled the accept-gate API).
    - If the watcher is absent/awkward, confirm the `RUST_LOG=iroh=debug` log-line fallback and the `remote_info` addr-set cross-check (§6.2).
-2. **Scaffold `crates/spike-nat`.** Add to workspace `members` with the throwaway-spike comment. `Cargo.toml`: `publish = false`, `iroh = "=1.0.1"`, `tokio` (`rt-multi-thread`, `macros`, `time`, `net`, `sync`), `anyhow`, `serde`/`serde_json`, args parsing. Zero 0.x crates. Inherit workspace lints (`unsafe_code = "forbid"`).
+2. **Scaffold `archive/spikes/spike-nat`.** Add to workspace `members` with the throwaway-spike comment. `Cargo.toml`: `publish = false`, `iroh = "=1.0.1"`, `tokio` (`rt-multi-thread`, `macros`, `time`, `net`, `sync`), `anyhow`, `serde`/`serde_json`, args parsing. Zero 0.x crates. Inherit workspace lints (`unsafe_code = "forbid"`).
 3. **Implement `src/probe.rs`.** Endpoint bring-up (`presets::N0`, default relay; `--relay-only` variant), the `/iroh-rooms/nat-probe/1` echo `ProtocolHandler`, dial-by-`EndpointId`, one bidi stream, and the metric capture (TTFB via monotonic `Instant`, `--ping` RTT, `--xfer` throughput). Implement §6.2 path-type settle-and-sample.
 4. **Implement `src/report.rs`.** `ProbeResult` serde struct = the §5 field table; JSON emitter (`--json <path>`); `results.md` table renderer.
 5. **Implement `src/main.rs`.** `listen` / `dial` subcommands and flags (`--relay-only`, `--addr`, `--ping`, `--xfer`, `--json`, `--seed`). Human-readable summary on stdout plus JSON on `--json`.
@@ -311,7 +311,7 @@ Mapped to the issue's acceptance criteria:
 1. Two physical machines on two genuinely different real NATs are available to the operator (home/office broadband + mobile hotspot, or a cloud VM as one endpoint). This is the one prerequisite the spike names and IR-0005 `NOTES.md` records as previously missing ("no two-NAT rig during this phase").
 2. The default n0 discovery + relay stack (`dns.iroh.link`, n0 relays) is reachable from both environments and is the stack under test — self-hosted relay is out of scope unless a NO-GO triggers escalation.
 3. `iroh = 1.0.1` (the proven pin) exposes a usable connection-type/path watcher and a relay-force / direct-disable configuration; if a specific name differs, Step 1 reconciles it and the `RUST_LOG` fallback covers the gap.
-4. A throwaway `crates/spike-nat` (mirroring `spike-blobs`) is the accepted home; the shipping crates remain unmodified except, at most, an additive read-only log line in `net-smoke`'s real branch (avoidable via `RUST_LOG`).
+4. A throwaway `archive/spikes/spike-nat` (mirroring `spike-blobs`) is the accepted home; the shipping crates remain unmodified except, at most, an additive read-only log line in `net-smoke`'s real branch (avoidable via `RUST_LOG`).
 5. Gate A concerns n=2 traversal only; event-plane fan-out at n≤5 is covered elsewhere (IR-0107, loopback) and is not re-measured here.
 6. Monotonic `Instant` timing and operator-supplied UTC stamps are acceptable provenance; no wall-clock is used in any decision path (consistent with the protocol's clock discipline).
 

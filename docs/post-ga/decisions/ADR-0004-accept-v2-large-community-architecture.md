@@ -44,7 +44,7 @@ any v2 interoperability is claimed.
 | Phase | Scope | Status |
 |---|---|---|
 | **A** | v1 guardrails (byte-bounded queues, adaptive sync, batched SQLite, cached projection, ceiling warning) | ✅ complete — closed milestone "v1 hardening + N=40 measurement" |
-| **B** | v2 crypto core: IDs, governance state machine, fork handling, member Merkle, content-event validation, golden vectors (#140) | ✅ complete — implemented, golden-vectored, and **independently audited APPROVED** (`docs/audits/v2-governance-fork-audit-2026-07-30.md`) |
+| **B** | v2 crypto core: IDs, governance state machine, fork handling, member Merkle, content-event validation, golden vectors (#140) | ✅ complete — implemented, golden-vectored, and **independently audited APPROVED** (`docs/post-ga/audits/v2-governance-fork-audit-2026-07-30.md`) |
 | **C** | v2 network + storage (ALPN, replica receipts/quorum, range reconciliation, checkpoints, snapshot startup) | ⬜ not started — next phase |
 | **D** | production hardening (multi-replica failure/equivocation, threshold/recovery/rotation UX, abuse controls, migration tooling) | future |
 | **E** | federation, per-stream replica groups, regional placement, mandatory group encryption | future (separate specs) |

@@ -81,7 +81,7 @@ Key inputs, verified in-repo:
 - **The manual gated online tiers** and their exact commands are documented in the README
   ("Run the gated online tier locally …").
 - **Gate A (real-NAT hole-punching)** is still **PENDING** — the `nat-probe` harness
-  (`crates/spike-nat`, IR-0012) is CI-proven on loopback but the two-host cross-network run
+  (`archive/spikes/spike-nat`, IR-0012) is CI-proven on loopback but the two-host cross-network run
   and its go/no-go verdict are owed (feeds Gate E / #15). See `crates/iroh-rooms-net/NOTES.md`.
 
 ## 4. Owning artifact & placement decision
@@ -152,7 +152,7 @@ gate, but they prove product-level ACs and are **release-blocking**. Run with
 
 | Item | Why not auto-P0 | Where recorded |
 | --- | --- | --- |
-| **Gate A real-NAT run** (`nat-probe`, two hosts on different networks, both directions, natural + `--relay-only`) | Requires two real hosts; cannot run in a single-machine script. For a *developer preview* it is a documented residual risk, not a blocker — but the maintainer must record its current status and paste the latest `crates/spike-nat/results/results.md`. | Checklist "Known limitations" + a required "Gate A status:" field |
+| **Gate A real-NAT run** (`nat-probe`, two hosts on different networks, both directions, natural + `--relay-only`) | Requires two real hosts; cannot run in a single-machine script. For a *developer preview* it is a documented residual risk, not a blocker — but the maintainer must record its current status and paste the latest `archive/spikes/spike-nat/results/results.md`. | Checklist "Known limitations" + a required "Gate A status:" field |
 | **Live-tail display gap** — streaming `room tail` renders only `message.text` (agent.status/file rows appear only under `--offline`) | Cosmetic; offline read is complete | Known limitations |
 | **DX metric timings** (PRD §17.2) — first identity <1 min, two-peer room <3 min, first pipe <5 min | Human-timed, environment-dependent | Demo-verification section (record measured values) |
 
@@ -314,7 +314,7 @@ Behaviour:
    - any P0 red → `release-readiness: NOT READY (<n> P0 checks failing: <names>)` and
      `exit 1`.
 4. **P1 items are surfaced but never flip the verdict**: the script prints
-   `gate-a: <reads crates/spike-nat/results/results.md presence>` and a reminder line, but
+   `gate-a: <reads archive/spikes/spike-nat/results/results.md presence>` and a reminder line, but
    Gate A never blocks (it can't run here).
 
 The script does **not** run in `verify.yml` (it would drag the flaky online tiers into the

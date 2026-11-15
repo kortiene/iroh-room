@@ -5,8 +5,8 @@
 | **Issue** | #27 — [IR-0202] Implement file import into blob store |
 | **Parent** | #3 |
 | **Labels** | type/feature, area/cli, area/blob, priority/p1, risk/medium |
-| **Dependencies** | #13 — [IR-0009] Prototype blob ACL path (landed: `crates/spike-blobs`, findings in `crates/spike-blobs/NOTES.md`) |
-| **Traceability** | `PRD.v0.3.md` §9.2 (Blob Plane / MVP file-sharing flow, steps 1–3), §11.2 (`file.shared` event), §15.6 (Share File — AC1/AC2/AC3). Spike: Blob Plane ACL confirmation (`crates/spike-blobs`). `PHASE-0-SPIKE.md` Event Protocol §7 (`file.shared` schema), §4 (BLAKE3-256 content hash). |
+| **Dependencies** | #13 — [IR-0009] Prototype blob ACL path (landed: `archive/spikes/spike-blobs`, findings in `archive/spikes/spike-blobs/NOTES.md`) |
+| **Traceability** | `PRD.v0.3.md` §9.2 (Blob Plane / MVP file-sharing flow, steps 1–3), §11.2 (`file.shared` event), §15.6 (Share File — AC1/AC2/AC3). Spike: Blob Plane ACL confirmation (`archive/spikes/spike-blobs`). `PHASE-0-SPIKE.md` Event Protocol §7 (`file.shared` schema), §4 (BLAKE3-256 content hash). |
 | **Status** | Planning — spec only. No production code changed by this document. |
 | **Type** | Feature (first shipping Blob Plane code: the local producer/import half of `file share`). |
 
@@ -29,7 +29,7 @@ forward-compatible: the `file.shared` it persists locally propagates through the
 sync engine unchanged once peers reconcile, and the durably-imported blob is exactly what the
 serve ALPN will later serve.
 
-The blob-ACL spike (#13 / `crates/spike-blobs`) already confirmed the `iroh-blobs 0.103.0`
+The blob-ACL spike (#13 / `archive/spikes/spike-blobs`) already confirmed the `iroh-blobs 0.103.0`
 import + provider path against `iroh 1.0.1` (the pin the shipping `iroh-rooms-net` already
 uses); this issue lifts the **import** portion of that spike into production, using a
 **persistent** store instead of the spike's in-memory one.
@@ -42,9 +42,9 @@ This document is detailed enough to execute without re-deriving scope.
 
 **Read before starting:**
 
-- `crates/spike-blobs/NOTES.md` — the confirmed version decision (`iroh-blobs =0.103.0` on
+- `archive/spikes/spike-blobs/NOTES.md` — the confirmed version decision (`iroh-blobs =0.103.0` on
   `iroh 1.0.1`), the real provider API, and (§4) the verified-streaming / independent-BLAKE3
-  recompute discipline. `crates/spike-blobs/src/net.rs::Provider::import` is the exact import
+  recompute discipline. `archive/spikes/spike-blobs/src/net.rs::Provider::import` is the exact import
   pattern to lift: `store.blobs().add_bytes(data)` → assert `tag.hash == blake3(data)`.
 - `specs/prototype-blob-acl-path.md` — the parent spike spec; §5/§6 describe the serve gate
   that this issue does **not** build (it is the follow-up).
@@ -68,7 +68,7 @@ This document is detailed enough to execute without re-deriving scope.
 - **No `file` CLI subcommand and no `build_file_shared` core builder exist yet.** Every other
   content type has a pure builder re-exported from `event/mod.rs` (`build_message_text`,
   `build_member_*`, `build_room_created`, `build_pipe_*`); `file.shared` is the one gap.
-- **No shipping crate depends on `iroh-blobs` yet.** Only the throwaway `crates/spike-blobs`
+- **No shipping crate depends on `iroh-blobs` yet.** Only the throwaway `archive/spikes/spike-blobs`
   does. This issue introduces `iroh-blobs =0.103.0` as a production dependency of
   `crates/iroh-rooms-net` (which already carries the `iroh 1.0.1` stack).
 - **The producer command pattern is well-established.** `crates/iroh-rooms-cli/src/message.rs`

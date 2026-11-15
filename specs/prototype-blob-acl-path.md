@@ -6,7 +6,7 @@
 | **Parent** | #1 (Phase 0 epic) |
 | **Labels** | type/spike, type/security, area/blob, priority/p1, risk/medium |
 | **Traceability** | `PRD.v0.3.md` §9.2 (Blob Plane), §15.6 (Share File), §18.2 (Availability Risk); also §11.2 (`file.shared`), §13.1/§13.3.6 (content-addressed, verified artifacts), §14 (Availability Model). `PHASE-0-SPIKE.md` Membership & Ordering §5 (pipe/blob authorization at connect-accept time), Spike Plan **Day 8** (Blob Plane ACL confirmation), Test Vectors §16, Event Protocol §7 (`file.shared` schema), Pinned Crate Versions (`iroh-blobs` note) + Residual Risks #3, #10. |
-| **Status** | Implemented — all ACs met. Findings: `crates/spike-blobs/NOTES.md`. |
+| **Status** | Implemented — all ACs met. Findings: `archive/spikes/spike-blobs/NOTES.md`. |
 | **Type** | Spike / prototype (throwaway-grade code + a written findings note). No production-code or shipping-API commitment. |
 
 ---
@@ -137,7 +137,7 @@ Create a **new, isolated, throwaway crate** so the spike never contaminates the 
 crates' dependency tree:
 
 ```
-crates/spike-blobs/
+archive/spikes/spike-blobs/
   Cargo.toml
   src/main.rs            # the runnable demo (provider + fetcher, all scenarios)
   src/acl.rs             # the authorization fixture + gate logic (the reusable shape)
@@ -146,7 +146,7 @@ crates/spike-blobs/
   NOTES.md               # the findings note (version + ACL API observations) — a deliverable
 ```
 
-Add `crates/spike-blobs` to the workspace `members` list **only for the spike**; if leaving
+Add `archive/spikes/spike-blobs` to the workspace `members` list **only for the spike**; if leaving
 it in `main` is undesirable, gate it behind a `spikes` workspace or mark it clearly. (Open
 question OQ-1.) Keep it out of any shipping build target.
 
@@ -254,7 +254,7 @@ Work top to bottom; each step is independently observable.
 
 ### 6.2 Step 1 — Scaffold the spike crate
 
-Create `crates/spike-blobs` per §4, add the confirmed deps, wire `tracing` so every ACL
+Create `archive/spikes/spike-blobs` per §4, add the confirmed deps, wire `tracing` so every ACL
 decision (`accept`/`reject`/`Permission`) logs with the peer identity and hash. Verify it
 builds and is clippy-clean (or scoped out of `verify.sh` per OQ-1).
 
@@ -412,7 +412,7 @@ Maps issue #13 ACs + Day-8 soft GATE + Test Vector §16 to this spike. All must 
   PRD §14/§18.2) — covers the test plan's "unavailable provider state".
 - [x] **AC8 — Day-8 soft GATE.** Both per-hash and per-node gating deny correctly.
 - [x] **AC9 — No production code changed.** `iroh-rooms-core` / `iroh-rooms-cli` untouched;
-  spike isolated in `crates/spike-blobs`; `scripts/verify.sh` remains green (or the spike is
+  spike isolated in `archive/spikes/spike-blobs`; `scripts/verify.sh` remains green (or the spike is
   explicitly scoped out per OQ-1).
 
 **Test plan coverage (issue):** authorized member → AC1; unauthorized peer → AC2; wrong hash →
@@ -439,7 +439,7 @@ AC3 + AC4; unavailable provider state → AC7.
 
 ## 11. Open questions
 
-- **OQ-1 (workspace integration):** Should `crates/spike-blobs` be a permanent workspace member
+- **OQ-1 (workspace integration):** Should `archive/spikes/spike-blobs` be a permanent workspace member
   (and thus subject to `verify.sh`), an opt-in spikes workspace, or live on a throwaway branch
   only? Recommended: isolated crate kept clippy-clean and included, so CI proves it builds, with
   a follow-up to remove or graduate it.
@@ -460,7 +460,7 @@ AC3 + AC4; unavailable provider state → AC7.
 
 ## 12. Definition of done
 
-1. `crates/spike-blobs` builds and runs the §5.5 scenario matrix, demonstrating AC1–AC8.
+1. `archive/spikes/spike-blobs` builds and runs the §5.5 scenario matrix, demonstrating AC1–AC8.
 2. Automated tests cover the gate scenarios (§6.7 #1–#5 at minimum; #6 if reproducible).
 3. `NOTES.md` satisfies the §7 checklist (AC5).
 4. No production code changed; `scripts/verify.sh` green or spike explicitly scoped out (AC9).

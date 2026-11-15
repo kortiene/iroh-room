@@ -100,7 +100,7 @@ list, the CLI, and the release artifacts published on this repository.
 
 Out of scope: vulnerabilities in [iroh](https://github.com/n0-computer/iroh) and
 other upstream dependencies (report those upstream, and tell us so we can pin or
-patch), the spike crates under `crates/spike-*` (throwaway measurement
+patch), the spike crates under `archive/spikes/spike-*` (throwaway measurement
 harnesses), and anything requiring an attacker to already control the victim's
 local machine or data directory.
 

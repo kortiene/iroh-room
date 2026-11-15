@@ -2,7 +2,7 @@
 //! path classification and relay-url extraction, read from iroh's live transport
 //! state.
 //!
-//! Ported (verbatim match-arm logic) from `crates/spike-nat`
+//! Ported (verbatim match-arm logic) from `archive/spikes/spike-nat`
 //! (`probe.rs::classify_remote_info` / `report.rs::PathType`) — both crates pin the
 //! identical `iroh = "=1.0.1"`, so the `RemoteInfo`/`TransportAddr`/
 //! `TransportAddrUsage` surface is byte-for-byte the same; this is a mechanical

@@ -253,7 +253,7 @@ Coverage: **40/40 specs, 43/43 issues (all closed), 39/39 PRs (38 merged, #65 su
 ### 3c. Orphan code (shipped, but in no PRD section / spec)
 
 - `net/demo.rs:1-13` — self-declared prototype scaffolding ("will be dropped when the CLI wires real identities") that was never dropped. **Cleanup candidate.**
-- `crates/spike-blobs` — superseded by the shipped blob plane; its own NOTES.md §7.5 flags graduation/removal as a follow-up. Costs CI time on every PR. **Removal candidate.**
+- `archive/spikes/spike-blobs` — superseded by the shipped blob plane; its own NOTES.md §7.5 flags graduation/removal as a follow-up. Costs CI time on every PR. **Removal candidate.**
 - `manager.rs:29-35` `DialEntry.addr` `#[allow(dead_code)]` — documented future no-op (hint-change detection). Benign, tracked.
 - Everything else the code sweep surfaced as "orphan candidates" (access predicates, sync trust layer, anti-amplification, SimNet, admission subsystem, net_smoke, docs-conformance suites) **traces cleanly to P-11…P-24 or docs specs** — not orphans; scope creep verdict: none.
 - `agents/` (578 files, 22 ADW run dirs): **gitignored and untracked** (`git ls-files agents` = 0) — local pipeline artifacts, not shipped; no action needed.
@@ -301,7 +301,7 @@ Coverage: **40/40 specs, 43/43 issues (all closed), 39/39 PRs (38 merged, #65 su
 | CI gates | verify.yml runs verify.sh only on PR/push; the six online tiers run **only via manual release-readiness.sh** — a green CI does not attest them (by design, but a scheduled CI job could). diagnostics_cli tier is a no-op row (D-7). `--skip-online` can never yield READY ✓ | .github/workflows/verify.yml; release-readiness.sh:59-70 | Medium |
 | Observability | **CLI installs no tracing subscriber** — TracingAudit/TracingPipeAudit output dropped; mitigated by StderrAudit on tail/members/send/join/pipe (not fetch); no persistent audit sink (promised in net/audit.rs:7-8); Node::logs bounded reject ring polled by tail | main.rs:1-48 (verified: no subscriber) | Medium |
 | Security posture | No security review performed (disclosed); plaintext local storage (doc-disclosed, no code warning); residuals #1–#9 accepted and documented — #8 (admin-key compromise = total unrecoverable loss) is the named largest; branch-protection claims in CONTRIBUTING not machine-verifiable from checkout | PHASE-0-SPIKE Residual Risks; RELEASE-READINESS | Medium (accepted for preview; blocking for beta via R-58) |
-| Spikes | spike-transport: claims CI-reproven, decision reflected in net (no iroh-gossip dep) ✓. spike-nat: harness ✓, measurement pending (Gate A). spike-blobs: superseded, removal flagged by its own NOTES §7.5, still costing CI on every PR | crates/spike-*/NOTES.md | Low |
+| Spikes | spike-transport: claims CI-reproven, decision reflected in net (no iroh-gossip dep) ✓. spike-nat: harness ✓, measurement pending (Gate A). spike-blobs: superseded, removal flagged by its own NOTES §7.5, still costing CI on every PR | archive/spikes/spike-*/NOTES.md | Low |
 | Dependencies | iroh =1.0.1 / iroh-blobs =0.103.0 (pre-production — open decision #10) / dalek =3.0.0-rc.0 lockstep; lockfile committed; spikes off the shipping dep tree | Cargo.tomls; go-no-go §5 | Medium (0.103 churn watch) |
 
 ## 5. Backlog restructuring proposal (NOT EXECUTED — review, then run)
@@ -318,7 +318,7 @@ Coverage: **40/40 specs, 43/43 issues (all closed), 39/39 PRs (38 merged, #65 su
 | IR-0315 | `specs/basic-blocklist.md` | R-38 after decision D-2 (or PRD erratum instead) | D-2 | M |
 | IR-0316 | `specs/persistent-audit-sink.md` | R-44 residue: file/SQLite AuditSink + PipeAuditSink | P2 | M |
 | IR-0317 | `specs/protocol-doc-errata.md` | Doc-only batch: BIND_CONTEXT 28B, expiry comparator (spike→match code), member.removed in PRD §9.1, PRD §12 table reconciliation, capability_secret prose, 25MB↔100MiB per D-4 | P1 | S |
-| — | (no spec — runbook execution) | **Gate A manual two-host run**: execute crates/spike-nat/NOTES.md §4, commit per-run JSON + regenerated results.md, fill the §6 findings block, update PHASE-0-GO-NO-GO §2 and RELEASE-READINESS sign-off | **P0** | S |
+| — | (no spec — runbook execution) | **Gate A manual two-host run**: execute archive/spikes/spike-nat/NOTES.md §4, commit per-run JSON + regenerated results.md, fill the §6 findings block, update PHASE-0-GO-NO-GO §2 and RELEASE-READINESS sign-off | **P0** | S |
 
 UP-103 (text-mode live-tail display gap): **do not spec** — IR-0308 supersedes it; revisit only if NDJSON is rejected.
 
@@ -352,8 +352,8 @@ gh issue create --repo kortiene/iroh-room \
 gh issue create --repo kortiene/iroh-room \
   --title "[Gate A] Execute the real-NAT two-host runbook and commit results" \
   --label "type/measurement,area/net,priority/p0,risk/high" --milestone "M4 - Preview Exit" \
-  --body "Run crates/spike-nat/NOTES.md §4 on two machines on different real networks (both directions × natural/relay-only).
-Commit per-run JSON under crates/spike-nat/results/, regenerate results.md, fill NOTES.md §6 findings,
+  --body "Run archive/spikes/spike-nat/NOTES.md §4 on two machines on different real networks (both directions × natural/relay-only).
+Commit per-run JSON under archive/spikes/spike-nat/results/, regenerate results.md, fill NOTES.md §6 findings,
 update PHASE-0-GO-NO-GO.md §2 Gate A row and the RELEASE-READINESS sign-off Gate-A field.
 GO rubric: NOTES.md §5. This is the declared P0 blocking exit condition for any external preview."
 

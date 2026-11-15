@@ -5,7 +5,7 @@
 - **Owners:** Protocol lead, release owner
 - **Issue:** #156 — `[SPEC] §25 #7: Durability class (fsync vs group commit vs replicated WAL)`
 - **Related:** #134 §§3, 5.2, 10.2–10.4, 13.4, 15.2, 19, 21–22, 25 #7; #157; #159; ADR-0004; ADR-0009
-- **Normative profile:** [`specs/v2-replica-durability-class.md`](../../specs/v2-replica-durability-class.md)
+- **Normative profile:** [`v2-replica-durability-class.md`](../specs/v2-replica-durability-class.md)
 
 > **Additive resolution note (ADR-0011, 2026-08-03):** ADR-0011 resolves the
 > future-tense #159 clauses below. Same-identity recovery is permitted only when

@@ -5,7 +5,7 @@
 - **Owners:** Protocol lead, release owner
 - **Issue:** #159 — `[SPEC] §25 #5: Replica replacement, equivocation, recovery UX`
 - **Related:** #134 §§5.2, 7.2–7.3, 10, 11, 13.4, 19, 25 #5; #155–#157; #161; ADR-0004; ADR-0007–ADR-0010
-- **Normative profile:** [`specs/v2-replica-replacement-recovery.md`](../../specs/v2-replica-replacement-recovery.md)
+- **Normative profile:** [`v2-replica-replacement-recovery.md`](../specs/v2-replica-replacement-recovery.md)
 
 ## Context
 

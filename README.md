@@ -208,9 +208,9 @@ crates/iroh-rooms-net/    iroh transport, blob serving, live pipe runtime
 crates/iroh-rooms-cli/    CLI binary: identity, room, file, pipe, agent
 crates/iroh-rooms/        Rust SDK facade and examples
 crates/iroh-rooms-v2-core/  Pure v2 crypto core (unused this phase): canonical CBOR, BLAKE3/Ed25519 ids, governance state machine, fork detection, member Merkle map. Wire encodings, domain strings, signatures, and rejection codes are pinned by FROZEN golden vectors under tests/golden/ (issue #153); any drift requires an explicit schema-version bump
-crates/spike-nat/         Real-network NAT measurement harness
-crates/spike-transport/   Full-mesh versus gossip transport comparison
-crates/spike-N40/         Loopback harness measuring where v1 transport breaks at N=40
+archive/spikes/spike-nat/         Real-network NAT measurement harness
+archive/spikes/spike-transport/   Full-mesh versus gossip transport comparison
+archive/spikes/spike-N40/         Loopback harness measuring where v1 transport breaks at N=40
 specs/                    Implementation specs and acceptance criteria
 docs/                     Guides, operations docs, ADRs, release records
 scripts/                  Verification and release scripts

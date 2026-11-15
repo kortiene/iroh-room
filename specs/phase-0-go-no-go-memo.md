@@ -113,12 +113,12 @@ date (2026-07-02). Evidence — especially Gate A — can change. **Before writi
 the executing agent MUST re-confirm the load-bearing items** and update the memo if
 they have moved:
 
-1. **Gate A status.** Read `crates/spike-nat/NOTES.md` §6 and
-   `crates/spike-nat/results/results.md`, and `crates/iroh-rooms-net/NOTES.md` §"Gate A".
+1. **Gate A status.** Read `archive/spikes/spike-nat/NOTES.md` §6 and
+   `archive/spikes/spike-nat/results/results.md`, and `crates/iroh-rooms-net/NOTES.md` §"Gate A".
    Determine whether the real two-host run has since been executed. Today it reads
    *"Gate A (real-network) — STATUS: NOT YET RUN"* and the results table is a
    `_(pending manual two-host run)_` placeholder — i.e. **PENDING**, no measured
-   numbers. If per-run JSON now exists under `crates/spike-nat/results/`, treat
+   numbers. If per-run JSON now exists under `archive/spikes/spike-nat/results/`, treat
    Gate A as measured and switch the recommendation from CONDITIONAL to
    unconditional per §6.7.
 2. **Pinned versions.** Confirm `iroh`/`iroh-blobs`/`iroh-gossip` versions actually
@@ -164,8 +164,8 @@ Then one paragraph per gate. Required content and evidence per gate:
   green loopback run is NOT Gate A"* — CI cannot prove NAT traversal. No
   establishment-success / TTFB / path-type / RTT / throughput numbers exist yet.
   This is the only gate without measured evidence and drives the conditional
-  recommendation. Cite `crates/spike-nat/NOTES.md`,
-  `crates/spike-nat/results/results.md`, and `crates/iroh-rooms-net/NOTES.md`
+  recommendation. Cite `archive/spikes/spike-nat/NOTES.md`,
+  `archive/spikes/spike-nat/results/results.md`, and `crates/iroh-rooms-net/NOTES.md`
   §"Gate A". Link the rubric thresholds (targets, not results): establish both
   directions ≤10 s in every scenario; a direct hole-punched path in ≥1
   non-symmetric scenario; relay usable ≥1 Mbit/s and RTT ≤ ~300 ms.
@@ -211,7 +211,7 @@ State: **ADR-1 is CONFIRMED (ratified) by measurement, not revised.** Full-mesh
 direct QUIC over ALPN `/iroh-rooms/event/1` remains the Room Event Plane transport;
 `iroh-gossip` is not adopted for the load-bearing log (parked as an optional
 off-critical-path liveness/admin-tip carrier). Cite the measured comparison from
-`crates/spike-transport/NOTES.md` and `crates/spike-transport/results/results.md`
+`archive/spikes/spike-transport/NOTES.md` and `archive/spikes/spike-transport/results/results.md`
 (IR-0006/#10, landed PR #69):
 - Propagation latency N=2..5: mesh median 16 ms vs gossip median 16–17 ms —
   statistically indistinguishable, confirming *"gossip buys nothing at N≤5"*
@@ -325,7 +325,7 @@ from §5):
   - *Blocking exit condition (P0):* execute the `spike-nat` §4 runbook on two
     machines on different real networks (VPN off, ≥1 likely-symmetric/CGNAT case),
     both directions × {natural, relay-only}, commit the per-run JSON and regenerate
-    `crates/spike-nat/results/results.md`, and confirm the Gate A rubric before
+    `archive/spikes/spike-nat/results/results.md`, and confirm the Gate A rubric before
     declaring the substrate assumption proven / before any external preview.
   - *Mitigation if Gate A returns NO-GO:* this does **not** auto-fail the MVP —
     relay fallback is the PRD §18.1 mitigation and the rubric already accepts
@@ -361,12 +361,12 @@ agent should paste this into the memo (§6.8), trimming columns to fit.
 | #7 | IR-0003 | `protocol-conformance-test-vectors.md` | `iroh-rooms-core/tests/conformance/` | `tests/protocol_conformance.rs` (empty `DEFERRED` list) | Gate B |
 | #8 | IR-0004 | `sqlite-event-store-prototype.md` | `iroh-rooms-core/src/store/` | `tests/store_e2e.rs` | Gate C/D (ADR-2) |
 | #9 | IR-0005 | `full-mesh-quic-event-transport.md` | `iroh-rooms-net/` | `NOTES.md`, `tests/loopback.rs` (T1/T2 admission) | ADR-1, Gate E |
-| #10 | IR-0006 | `measure-gossip-vs-full-mesh-transport.md` | `spike-transport/` | `NOTES.md`, `results/results.md` | ADR-1 (Gate C/D1) |
+| #10 | IR-0006 | `docs/post-ga/specs/measure-gossip-vs-full-mesh-transport.md` | `archive/spikes/spike-transport/` | `NOTES.md`, `results/results.md` | ADR-1 (Gate C/D1) |
 | #11 | IR-0007 | `bounded-recent-sync-prototype.md` | `iroh-rooms-core/src/sync/` | `tests/sync_convergence.rs`, `tests/sync_restart.rs` | ADR-2, Gate C/D |
 | #12 | IR-0008 | `membership-fold-prototype.md` | `iroh-rooms-core/src/membership/` | `tests/membership_fold.rs` | Gate D |
-| #13 | IR-0009 | `prototype-blob-acl-path.md` | `spike-blobs/` | `NOTES.md`, `tests/blob_acl.rs` (49 tests) | Day 8 (soft) |
+| #13 | IR-0009 | `prototype-blob-acl-path.md` | `archive/spikes/spike-blobs/` | `NOTES.md`, `tests/blob_acl.rs` (49 tests) | Day 8 (soft) |
 | #14 | IR-0010 | `live-tcp-pipe-path.md` | `iroh-rooms-net/src/pipe/` | `tests/pipe_e2e.rs` (P1–P6) | Day 9 (soft) |
-| #43 | IR-0012 | `measure-real-nat-hole-punching-connectivity.md` | `spike-nat/` | `NOTES.md`, `results/results.md` **(pending)** | **Gate A** |
+| #43 | IR-0012 | `measure-real-nat-hole-punching-connectivity.md` | `archive/spikes/spike-nat/` | `NOTES.md`, `results/results.md` **(pending)** | **Gate A** |
 
 Note in the memo: IR-0007 and IR-0009 landed commits reference the IR number, not
 the `#` issue number — mapping is via the spec headers.

@@ -39,7 +39,7 @@ No `rusqlite`/`libsqlite3-sys`, `EMFILE`, kqueue, tokio, `getrandom`, or firewal
 
 ## One defect found during qualification — fixed in #220
 
-The first run (2026-08-02, SHA `3acf956`) was NOT QUALIFIED: two `spike-N40` `self_check` tests (`n5_metrics_render_markdown_and_json_without_panic`, `n5_disconnect_peer_drops_then_redials_and_delivery_recovers`) panicked because they `.expect()`-ed `process_rss_bytes()`, which reads Linux-only `/proc/self/status` (`crates/spike-N40/src/rss.rs` is Linux-only by design). All **shipping-crate** tests passed even on that first run (the only failures were the two `spike-N40` tests) — the platform hole was, in practice, a single spike-crate harness bug, not a portability defect.
+The first run (2026-08-02, SHA `3acf956`) was NOT QUALIFIED: two `spike-N40` `self_check` tests (`n5_metrics_render_markdown_and_json_without_panic`, `n5_disconnect_peer_drops_then_redials_and_delivery_recovers`) panicked because they `.expect()`-ed `process_rss_bytes()`, which reads Linux-only `/proc/self/status` (`archive/spikes/spike-N40/src/rss.rs` is Linux-only by design). All **shipping-crate** tests passed even on that first run (the only failures were the two `spike-N40` tests) — the platform hole was, in practice, a single spike-crate harness bug, not a portability defect.
 
 **Fix (#220, merged `edeae8d`):** tolerate non-Linux at the two RSS call sites (`self_check.rs` baseline + `cluster_metrics` per-sample) via `.unwrap_or(0)`; the shipping measurement binary (`main.rs`) is deliberately left fail-closed on non-Linux to preserve the no-fabricated-number stance for release measurement. Linux unchanged. The 2026-08-03 re-run at `edeae8d` is green.
 
