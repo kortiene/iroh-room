@@ -35,7 +35,7 @@ ed25519-dalek = "=3.0.0-rc.0"
 # `mul_base_clamped` on the curve crate the dalek pin above already brings in —
 # using it directly avoids a second, differently-versioned X25519 dependency
 # (`x25519-dalek` would drag its own curve25519 line into the tree).
-curve25519-dalek = "=5.0.0-rc.0"
+curve25519-dalek = "=5.0.0"
 # HKDF-SHA-256 wrap KDF (spec D3: salt = room_id, no salt-less shortcut).
 # 0.13 is the digest-0.11 line matching the in-tree `sha2 0.11`.
 hkdf = "0.13"
