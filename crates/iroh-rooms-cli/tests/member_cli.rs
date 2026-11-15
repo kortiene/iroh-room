@@ -230,8 +230,12 @@ fn admin_remove_marks_member_removed_and_prints_honest_note() {
         "remove must print the honest v0.1 GA note; got:\n{out}"
     );
     assert!(
-        out.contains("run `room tail` to sync it to peers"),
-        "an undelivered removal must point at room tail; got:\n{out}"
+        out.contains("only learns of the removal if it was online during `room remove`"),
+        "an undelivered removal must say the removed device learns it only if it was online; got:\n{out}"
+    );
+    assert!(
+        out.contains("`room tail` syncs the stored removal only to the remaining members"),
+        "room tail syncs the removal only to remaining members; got:\n{out}"
     );
     assert_eq!(
         status_of(&alice, &room, &bob.id).as_deref(),
@@ -522,6 +526,54 @@ fn count_member_left(p: &Peer, room: &RoomId) -> usize {
             matches!(event.event.content, Content::MemberLeft(_))
         })
         .count()
+}
+
+#[test]
+fn repeat_leave_with_no_original_reason_does_not_claim_one_was_kept() {
+    let (_alice, members, room_str, room) = room_with(1);
+    let bob = &members[0];
+    let first = ok(&bob.home, &leave_args(&room_str));
+    let event = field(&first, "event").expect("event id");
+
+    let mut again_args = vec![
+        "room",
+        "leave",
+        room_str.as_str(),
+        "--reason",
+        "added later",
+    ];
+    again_args.extend_from_slice(&OFFLINE);
+    let again = ok(&bob.home, &again_args);
+    assert_eq!(field(&again, "event"), Some(event));
+    assert!(
+        again.contains("re-synced the existing member.left"),
+        "stdout: {again}"
+    );
+    assert!(
+        !again.contains("kept the original"),
+        "the stored leave had no reason; stdout: {again}"
+    );
+    assert_eq!(count_member_left(bob, &room), 1);
+}
+
+#[test]
+fn leave_retry_uses_the_latest_departure_not_an_older_removal() {
+    let (alice, members, room_str, room) = room_with(1);
+    let bob = &members[0];
+    // An older admin removal must not block a later self-leave's retry.
+    ok(&alice.home, &remove_args(&room_str, &bob.id));
+    invite_and_join(&alice, bob, &room_str, &room);
+    replicate(&alice, bob, &room);
+
+    let first = ok(&bob.home, &leave_args(&room_str));
+    assert_eq!(field(&first, "left"), Some(room_str.as_str()));
+    let again = ok(&bob.home, &leave_args(&room_str));
+    assert_eq!(field(&again, "event"), field(&first, "event"));
+    assert!(
+        again.contains("re-synced the existing member.left"),
+        "the latest departure is the self-leave, so the retry is allowed; stdout: {again}"
+    );
+    assert_eq!(count_member_left(bob, &room), 1);
 }
 
 #[test]

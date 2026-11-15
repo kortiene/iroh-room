@@ -1000,12 +1000,40 @@ pub(crate) async fn run_managed_push(
     Ok(reached.len())
 }
 
-/// Bring up an ephemeral node, dial `dial_set`, and let the normal connect
-/// handshake serve what this store already holds. Nothing is authored.
+/// What one [`run_sync`] session observed about the dial set.
+pub(crate) struct SyncReport {
+    /// Dial targets that were `Connected` at the end of the flush.
+    pub connected: usize,
+    /// Connected peers whose membership claim did not cover this store, so the
+    /// handshake served them the missing authorization closure (the stored
+    /// `member.left`, when that is what they lacked).
+    pub informed: usize,
+    /// Connected peers whose membership claim already covered this store, so
+    /// nothing new was served. They already had the stored `member.left`.
+    pub already_known: usize,
+}
+
+/// Dial `dial_set` and run the ordinary connect handshake. Nothing is authored:
+/// `publish` is not called, so an event already in `store` is not written again.
 ///
-/// This is how a stored `member.left` is re-delivered: `publish` of an event
-/// the store already has is a duplicate and does not fan out, but the peer's
-/// `WantMembership` pull still receives that one event.
+/// Each peer that connects is served the authorization closure it does not
+/// already claim (`WantMembership`). That is how a stored `member.left` reaches
+/// a peer who lacked it. Peers whose claim already covers the closure are
+/// counted in [`SyncReport::already_known`] and are not served a second copy.
+///
+/// **What the resync exposes.** The leaver's node also pulls, the same way any
+/// member session does: `WantMembership` and bounded `WantRecentChat`. Until a
+/// peer folds this `member.left`, that peer still treats the leaver as active
+/// and will answer those pulls. For the length of this short session the leaver
+/// can therefore receive membership frames and recent chat that those peers
+/// still serve to an active member — including chat sent after the leaver's
+/// own store recorded the leave but before the peer had seen it. That is the
+/// same rule as the rest of v0.1: access lasts until the peer sees the
+/// departure, not before. A peer who was offline learns nothing from this
+/// attempt. No second `member.left` is signed, and the session does not extend
+/// access after a peer has folded the leave (a managed peer then drops the
+/// link). The exposure is acceptable because the retry exists only to make
+/// reachable peers see the departure they would still have served until then.
 ///
 /// # Errors
 /// Returns an error if the engine or node cannot start, or shutdown fails.
@@ -1020,7 +1048,7 @@ pub(crate) async fn run_sync(
     dial_set: Vec<EndpointAddr>,
     timeout: Duration,
     mode: NetMode,
-) -> Result<usize> {
+) -> Result<SyncReport> {
     let engine = SyncEngine::open_with_local_device(
         store,
         *room_id,
@@ -1050,11 +1078,60 @@ pub(crate) async fn run_sync(
     }
     let _ = wait_for_any_connected(&node, &ids, timeout).await;
     tokio::time::sleep(flush_grace()).await;
-    let delivered = connected_count(&node, &ids);
+    let logs = node.logs().await.unwrap_or_default();
+    let connected_ids = connected_ids(&node, &ids);
+    let (informed, already_known) = classify_membership_serves(&logs, &connected_ids);
+    let report = SyncReport {
+        connected: connected_ids.len(),
+        informed,
+        already_known,
+    };
     node.shutdown()
         .await
         .context("could not shut down the network node")?;
-    Ok(delivered)
+    Ok(report)
+}
+
+/// Split connected peers by the engine's `membership.serve` lines.
+///
+/// A peer whose every serve had `frames=0` already covered the membership
+/// closure. A serve with `frames>0` means this node sent them something they
+/// lacked. A connected peer with no serve line is counted as informed so the
+/// retry does not claim they already had the leave.
+fn classify_membership_serves(logs: &[String], connected: &BTreeSet<EndpointId>) -> (usize, usize) {
+    let mut frames: BTreeMap<String, u64> = BTreeMap::new();
+    for line in logs {
+        let Some(rest) = line.strip_prefix("membership.serve ") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let (Some(peer), Some(count)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Some(peer) = peer.strip_prefix("peer=") else {
+            continue;
+        };
+        let Some(count) = count.strip_prefix("frames=") else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u64>() else {
+            continue;
+        };
+        let seen = frames.entry(peer.to_owned()).or_insert(0);
+        *seen = (*seen).max(count);
+    }
+    let mut informed = 0usize;
+    let mut already_known = 0usize;
+    for id in connected {
+        let key = hex::encode(id.as_bytes());
+        match frames.get(&key) {
+            Some(0) => already_known += 1,
+            // A missing serve line is not evidence the peer already had the
+            // leave, so it is not counted as already-known.
+            Some(_) | None => informed += 1,
+        }
+    }
+    (informed, already_known)
 }
 
 /// After the first peer connects, wait briefly for the rest of `ids` so a

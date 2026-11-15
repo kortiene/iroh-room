@@ -593,8 +593,10 @@ iroh-rooms room leave <ROOM_ID>
 nothing is written. The admin cannot `room leave` (v1 rooms have a single immutable
 admin), and nobody can `room remove` themselves. Once the removal is stored, the
 admin's node stops forwarding newer events to the removed device for the rest of
-that push. If `room remove` reaches no peers, the removal is still stored; run
-`room tail` to sync it (running `room remove` again is rejected). `room leave` is
+that push. If `room remove` reaches no peers, the removal is still stored. The
+removed device only learns of the removal if it was online during `room remove`.
+`room tail` syncs that stored removal only to the remaining members (running
+`room remove` again is rejected). `room leave` is
 safe to run again: if your `member.left` is already stored, the command re-syncs
 that same event when a peer is reachable and does not write a second one. Its
 stdout says it re-synced the existing `member.left`; a different `--reason` is

@@ -158,7 +158,7 @@ Per-code reference:
 | `identity_not_found` | Usage | `2` | no local identity exists | run `iroh-rooms identity create --name <name>` first |
 | `room_not_found` | Usage | `2` | no room with this id is known locally | create a room, or join an invite ticket first |
 | `no_discovery_hint` | Usage | `2` | invite ticket has no admin discovery hint | pass `--peer <admin-addr>` |
-| `not_a_member` | Auth | `3` | caller is not an active room member | ask the admin to invite you and complete `room join` first |
+| `not_a_member` | Auth | `3` | caller or target is not an active room member, including a target that already left or was removed | ask the admin to invite you and complete `room join` first |
 | `unbound_device` | Auth | `3` | sender has no bound device in membership state | complete `room join` first |
 | `insufficient_role` | Auth | `3` | role does not permit the operation | ask the admin to invite you with the intended role |
 | `expired_invite` | Auth | `3` | invite expired or was consumed | ask the admin for a fresh `room invite` |

@@ -45,7 +45,6 @@ use iroh_rooms_core::event::RejectReason;
 use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, RoomMembership, Status};
 use iroh_rooms_core::store::EventStore;
 
-use crate::display::{self, MemberDisplayState};
 use crate::error::{CodedResultExt, ErrorCode};
 use crate::identity;
 use crate::message::{
@@ -92,9 +91,17 @@ pub struct DepartureSummary {
     pub attempted: usize,
     /// This call re-synced an already-stored `member.left` instead of authoring one.
     pub redelivered: bool,
-    /// A repeat leave was given a `--reason` different from the stored event, and
-    /// that stored reason was left unchanged.
+    /// A repeat leave was given a `--reason` different from a stored reason, and
+    /// that stored reason was left unchanged. Never set when the stored event
+    /// had no reason.
     pub kept_original_reason: bool,
+    /// On a leave retry: connected peers who were served membership they lacked.
+    pub informed: usize,
+    /// On a leave retry: connected peers whose membership claim already covered
+    /// this store, so they already had the `member.left`.
+    pub already_known: usize,
+    /// On a leave retry: dial targets that were not connected at the end.
+    pub offline: usize,
 }
 
 /// Remove `member_hex` from `room_id` (admin only) by authoring a
@@ -194,6 +201,9 @@ pub async fn remove(
         attempted,
         redelivered: false,
         kept_original_reason: false,
+        informed: 0,
+        already_known: 0,
+        offline: 0,
     })
 }
 
@@ -285,12 +295,19 @@ pub async fn leave(
         attempted,
         redelivered: false,
         kept_original_reason: false,
+        informed: 0,
+        already_known: 0,
+        offline: 0,
     })
 }
 
 /// Re-deliver the caller's already-stored `member.left` without authoring
 /// another. Fails with `not_a_member` when this identity did not leave itself
-/// (unknown, invited, or admin-removed).
+/// (unknown, invited, or the latest departure is an admin removal).
+///
+/// The session is [`crate::message::run_sync`]. See that function for what the
+/// resync exposes, to whom, and why that exposure matches the v0.1 rule that
+/// access lasts until a peer sees the departure.
 #[allow(clippy::too_many_arguments)] // distinct inputs of one linear flow
 async fn redeliver_pending_leave(
     home: &Path,
@@ -317,14 +334,22 @@ async fn redeliver_pending_leave(
         );
     }
     let event_id = pending.event_id;
-    // A different `--reason` does not rewrite the stored event.
-    let kept_original_reason = reason.is_some_and(|given| pending.reason.as_deref() != Some(given));
+    // A different `--reason` does not rewrite a stored reason. When the stored
+    // event had no reason, there is nothing to say was "kept".
+    let kept_original_reason = match (reason, pending.reason.as_deref()) {
+        (Some(given), Some(stored)) => given != stored,
+        _ => false,
+    };
 
     let self_device = endpoint_id_of(secret.device.device_key())?;
     let dial_set = build_dial_set(snapshot, self_device, peer_addrs);
     let attempted = dial_set.len();
-    let delivered = if dial_set.is_empty() {
-        0
+    let report = if dial_set.is_empty() {
+        crate::message::SyncReport {
+            connected: 0,
+            informed: 0,
+            already_known: 0,
+        }
     } else {
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
         let admission = build_admission(snapshot);
@@ -341,41 +366,110 @@ async fn redeliver_pending_leave(
         ))
         .await
         {
-            Ok(n) => n,
+            Ok(report) => report,
             Err(err) => {
                 eprintln!("warning: live delivery unavailable: {err:#}");
-                0
+                crate::message::SyncReport {
+                    connected: 0,
+                    informed: 0,
+                    already_known: 0,
+                }
             }
         }
     };
+    let offline = attempted.saturating_sub(report.connected);
     Ok(DepartureSummary {
         kind: DepartureKind::Left,
         event_id,
         room_id: *room_id,
         subject: *caller,
-        delivered,
+        delivered: report.connected,
         attempted,
         redelivered: true,
         kept_original_reason,
+        informed: report.informed,
+        already_known: report.already_known,
+        offline,
     })
 }
 
-/// Whether `caller`'s folded departure is their own `member.left` and not an
-/// admin `member.removed` (a removal dominates a concurrent self-leave).
+/// Whether the caller's **latest** departure event is their own `member.left`.
+///
+/// An older `member.removed` does not count once a later self-leave is the
+/// current departure (removed, re-invited, rejoined, then left). A later
+/// `member.removed` does: the admin removal is the departure that stands.
 fn left_itself(
     snapshot: &MembershipSnapshot,
     store: &EventStore,
     room_id: &RoomId,
     caller: &IdentityKey,
 ) -> Result<bool> {
-    let Some(status) = snapshot.status(caller) else {
+    if snapshot.status(caller) != Some(Status::Removed) {
         return Ok(false);
+    }
+    latest_departure_is_self_leave(store, room_id, caller)
+}
+
+/// `true` when the highest-`(lamport, event_id)` departure naming `caller` is
+/// a self-authored `member.left`.
+fn latest_departure_is_self_leave(
+    store: &EventStore,
+    room_id: &RoomId,
+    caller: &IdentityKey,
+) -> Result<bool> {
+    let mut best: Option<(u64, EventId, bool)> = None;
+    let consider = |best: &mut Option<(u64, EventId, bool)>,
+                    lamport: u64,
+                    event_id: EventId,
+                    self_leave: bool| {
+        let replace = best
+            .as_ref()
+            .is_none_or(|(prev_l, prev_id, _)| (lamport, event_id) > (*prev_l, *prev_id));
+        if replace {
+            *best = Some((lamport, event_id, self_leave));
+        }
     };
-    let (removed_ids, left_ids) = display::departure_sets(store, room_id)?;
-    Ok(
-        display::member_display_state(status, caller, &removed_ids, &left_ids)
-            == MemberDisplayState::Left,
-    )
+    for stored in store
+        .by_type(room_id, EventType::MemberLeft)
+        .with_context(|| format!("could not read member.left events for room {room_id}"))?
+    {
+        let Ok(event) = SignedEvent::decode(&stored.wire.signed) else {
+            continue;
+        };
+        let Content::MemberLeft(content) = event.content else {
+            continue;
+        };
+        if content.member_id != *caller {
+            continue;
+        }
+        consider(
+            &mut best,
+            stored.lamport.unwrap_or(0),
+            stored.event_id,
+            event.sender_id == *caller,
+        );
+    }
+    for stored in store
+        .by_type(room_id, EventType::MemberRemoved)
+        .with_context(|| format!("could not read member.removed events for room {room_id}"))?
+    {
+        let Ok(event) = SignedEvent::decode(&stored.wire.signed) else {
+            continue;
+        };
+        let Content::MemberRemoved(content) = event.content else {
+            continue;
+        };
+        if content.member_id != *caller {
+            continue;
+        }
+        consider(
+            &mut best,
+            stored.lamport.unwrap_or(0),
+            stored.event_id,
+            false,
+        );
+    }
+    Ok(best.is_some_and(|(_, _, self_leave)| self_leave))
 }
 
 /// One stored self-authored `member.left`, plus the reason it was signed with.
@@ -542,43 +636,103 @@ fn validate_reason(reason: Option<&str>) -> Result<()> {
 
 /// Print a departure summary, with the honest v0.1 GA wording for removals.
 pub fn print_departure(summary: &DepartureSummary) {
+    for line in departure_lines(summary) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_departure`] writes, in order.
+fn departure_lines(summary: &DepartureSummary) -> Vec<String> {
+    let mut lines = Vec::new();
     match summary.kind {
-        DepartureKind::Removed => println!("removed: {}", summary.subject),
-        DepartureKind::Left => println!("left: {}", summary.room_id),
+        DepartureKind::Removed => lines.push(format!("removed: {}", summary.subject)),
+        DepartureKind::Left => lines.push(format!("left: {}", summary.room_id)),
     }
     if summary.redelivered {
-        println!("resync: re-synced the existing member.left");
+        lines.push("resync: re-synced the existing member.left".to_owned());
         if summary.kept_original_reason {
-            println!("reason: kept the original");
+            lines.push("reason: kept the original".to_owned());
         }
     }
-    println!("event: {}", summary.event_id);
-    println!("room: {}", summary.room_id);
-    println!("stored: yes");
-    if summary.delivered == 0 {
+    lines.push(format!("event: {}", summary.event_id));
+    lines.push(format!("room: {}", summary.room_id));
+    lines.push("stored: yes".to_owned());
+    if summary.redelivered {
+        lines.extend(leave_retry_delivery_lines(summary));
+    } else if summary.delivered == 0 {
         if summary.attempted == 0 {
-            println!("delivered: 0 (no other members to reach — stored locally only)");
+            lines.push("delivered: 0 (no other members to reach — stored locally only)".to_owned());
         } else if summary.kind == DepartureKind::Left {
-            println!(
+            lines.push(
                 "delivered: 0 (no peers online — stored locally only; run `room leave` again \
                  when peers are reachable to re-deliver this same member.left)"
+                    .to_owned(),
             );
         } else {
-            println!(
-                "delivered: 0 (no peers online — the removal is stored; run `room tail` to sync \
-                 it to peers)"
+            lines.push(
+                "delivered: 0 (no peers online — the removal is stored. The removed device \
+                 only learns of the removal if it was online during `room remove`. `room tail` \
+                 syncs the stored removal only to the remaining members)"
+                    .to_owned(),
             );
         }
     } else {
-        println!("delivered: {} connected peer(s)", summary.delivered);
+        lines.push(format!(
+            "delivered: {} connected peer(s)",
+            summary.delivered
+        ));
     }
     if summary.kind == DepartureKind::Removed {
-        println!(
+        lines.push(
             "note: removed members lose access to new messages, files and pipes once peers see \
              the removal; they keep what they already had (room content is not end-to-end \
              encrypted)"
+                .to_owned(),
         );
     }
+    lines
+}
+
+/// Leave-retry delivery lines. Peers who already had the `member.left` are not
+/// described as a reason to run `room leave` again. Only peers that were not
+/// reached get that hint.
+fn leave_retry_delivery_lines(summary: &DepartureSummary) -> Vec<String> {
+    let mut lines = Vec::new();
+    if summary.informed > 0 {
+        lines.push(format!(
+            "delivered: {} peer(s) learned this member.left",
+            summary.informed
+        ));
+    }
+    if summary.already_known > 0 {
+        lines.push(format!(
+            "already: {} reachable peer(s) already had this member.left",
+            summary.already_known
+        ));
+    }
+    if summary.offline > 0 {
+        lines.push(format!(
+            "offline: {} peer(s) not reached — run `room leave` again when they are reachable \
+             to re-deliver this same member.left",
+            summary.offline
+        ));
+    } else if summary.informed == 0 && summary.already_known == 0 {
+        if summary.attempted == 0 {
+            lines.push("delivered: 0 (no other members to reach — stored locally only)".to_owned());
+        } else if summary.delivered > 0 {
+            lines.push(format!(
+                "delivered: {} connected peer(s)",
+                summary.delivered
+            ));
+        } else {
+            lines.push(
+                "delivered: 0 (no peers online — stored locally only; run `room leave` again \
+                 when peers are reachable to re-deliver this same member.left)"
+                    .to_owned(),
+            );
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -596,6 +750,73 @@ mod tests {
         assert!(validate_reason(Some("a\nb")).is_err());
         assert!(validate_reason(Some(&"x".repeat(super::MAX_REASON_BYTES + 1))).is_err());
         assert!(validate_reason(Some("spam")).is_ok());
+    }
+
+    use super::{departure_lines, DepartureKind, DepartureSummary};
+    use iroh_rooms_core::event::ids::{EventId, RoomId};
+    use iroh_rooms_core::event::keys::IdentityKey;
+
+    fn sample(redelivered: bool) -> DepartureSummary {
+        DepartureSummary {
+            kind: DepartureKind::Left,
+            event_id: EventId::from_bytes([1; 32]),
+            room_id: RoomId::from_bytes([2; 32]),
+            subject: IdentityKey::from_bytes([3; 32]),
+            delivered: 0,
+            attempted: 2,
+            redelivered,
+            kept_original_reason: false,
+            informed: 0,
+            already_known: 0,
+            offline: 0,
+        }
+    }
+
+    #[test]
+    fn leave_retry_does_not_ask_again_when_reachable_peers_already_have_it() {
+        let mut summary = sample(true);
+        summary.already_known = 2;
+        summary.delivered = 2;
+        let text = departure_lines(&summary).join("\n");
+        assert!(text.contains("already had this member.left"), "{text}");
+        assert!(
+            !text.contains("run `room leave` again"),
+            "reachable peers already have the leave; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn leave_retry_reports_already_known_separately_from_offline() {
+        let mut summary = sample(true);
+        summary.already_known = 1;
+        summary.offline = 1;
+        summary.delivered = 1;
+        summary.attempted = 2;
+        let text = departure_lines(&summary).join("\n");
+        assert!(
+            text.contains("1 reachable peer(s) already had this member.left"),
+            "{text}"
+        );
+        assert!(text.contains("1 peer(s) not reached"), "{text}");
+        assert!(text.contains("run `room leave` again"), "{text}");
+    }
+
+    #[test]
+    fn undelivered_remove_says_tail_reaches_only_remaining_members() {
+        let mut summary = sample(false);
+        summary.kind = DepartureKind::Removed;
+        summary.delivered = 0;
+        summary.attempted = 1;
+        let text = departure_lines(&summary).join("\n");
+        assert!(
+            text.contains("only learns of the removal if it was online during `room remove`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`room tail` syncs the stored removal only to the remaining members"),
+            "{text}"
+        );
+        assert!(!text.contains("sync it to peers"), "{text}");
     }
 }
 
