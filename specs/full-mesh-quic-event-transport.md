@@ -45,7 +45,7 @@ What this issue delivers, mapped to the issue scope:
 3. **Per-peer bidirectional stream framing for `WireEvent` push** → a per-peer connection manager holding one logical bidi stream per peer and a length-prefixed frame codec carrying `SyncMessage` frames (live push = `Events`).
 4. **Reject unknown `EndpointId` at accept time** → the `ProtocolHandler` resolves `Connection::remote_id()` (the QUIC/TLS-authenticated `device_id`) against an `Admission` authorizer and closes the connection **before** calling `accept_bi()` if the device is not a bound Active member; a local audit record is written.
 
-The honest scope boundary (so this stays a Phase-0 spike, not the whole CLI): the adapter exposes an **async API and a small `net-smoke` binary**; full wiring into the `iroh-rooms` CLI binary (a runtime, room lifecycle, `room tail` output) is **out of scope** here and tracked separately. The adapter's authorizer is a `device_id → identity → Active?` allowlist with the **same shape** the membership fold (`MembershipSnapshot`) produces, so swapping the fixture for the real fold is a re-point, not a reshape (the reusable-shape pattern proven by `crates/spike-blobs`).
+The honest scope boundary (so this stays a Phase-0 spike, not the whole CLI): the adapter exposes an **async API and a small `net-smoke` binary**; full wiring into the `iroh-rooms` CLI binary (a runtime, room lifecycle, `room tail` output) is **out of scope** here and tracked separately. The adapter's authorizer is a `device_id → identity → Active?` allowlist with the **same shape** the membership fold (`MembershipSnapshot`) produces, so swapping the fixture for the real fold is a re-point, not a reshape (the reusable-shape pattern proven by `archive/spikes/spike-blobs`).
 
 ---
 
@@ -78,7 +78,7 @@ Read before implementing.
 
 ### 2.3 Proven iroh patterns already in the repo
 
-`crates/spike-blobs` (IR-0009, landed) already stands up the iroh 1.0 stack and is the **reference for endpoint/router setup, the authenticated-identity gate, and the loopback test rig**:
+`archive/spikes/spike-blobs` (IR-0009, landed) already stands up the iroh 1.0 stack and is the **reference for endpoint/router setup, the authenticated-identity gate, and the loopback test rig**:
 
 - Pinned `iroh = "=1.0.1"` (resolved against the crates.io index 2026-06-29; `iroh-base 1.0.1` transitively). Async via `tokio = { version = "1", features = ["rt-multi-thread","macros","time","sync"] }`. `tracing` + `tracing-subscriber` for observability.
 - `Endpoint::builder(presets::Minimal).secret_key(secret).relay_mode(RelayMode::Disabled).bind().await` for a loopback-only endpoint; `Router::builder(endpoint).accept(ALPN, handler).spawn()`.

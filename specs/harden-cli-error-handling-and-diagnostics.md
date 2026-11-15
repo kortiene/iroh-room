@@ -158,10 +158,10 @@ assertion so all five timeout sites are uniform.
   `remote_info` call, no `ConnectionType`/`RemoteInfo` usage, and no relay URL rendered
   anywhere in `iroh-rooms-net`/`-cli`. The **reference implementation exists only in the
   `spike-nat` crate** (not a dependency): `classify_remote_info(info: Option<&RemoteInfo>)
-  -> (PathType, Option<String>)` (`crates/spike-nat/src/probe.rs:464`) iterates
+  -> (PathType, Option<String>)` (`archive/spikes/spike-nat/src/probe.rs:464`) iterates
   `info.addrs()`, tests `TransportAddrUsage::Active`, and maps `TransportAddr::Ip` ⇒ direct
   / `TransportAddr::Relay(url)` ⇒ relay; `PathType { Direct, Relay, Mixed, None }` with
-  `label()` and `is_hole_punched()` (`crates/spike-nat/src/report.rs:62`). Project memory
+  `label()` and `is_hole_punched()` (`archive/spikes/spike-nat/src/report.rs:62`). Project memory
   *iroh 1.0.1 has no ConnectionType watcher* confirms this is the only correct path in this
   iroh version.
 - **The only verbosity precedent** is `pipe expose -v` (`cli.rs:209`), which gates

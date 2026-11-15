@@ -5,7 +5,7 @@
 - **Owners:** Protocol lead, release owner
 - **Issue:** #157 — `[SPEC] §25 #2: Replica key vs Iroh Endpoint ID rotation`
 - **Related:** #134 §§6.3, 7.2–7.3, 10.3, 11.2, 13.4, 25 #2; #146; #159; #161; ADR-0004; ADR-0008
-- **Normative profile:** [`specs/v2-replica-endpoint-identity.md`](../../specs/v2-replica-endpoint-identity.md)
+- **Normative profile:** [`v2-replica-endpoint-identity.md`](../specs/v2-replica-endpoint-identity.md)
 
 > **Additive resolution note (ADR-0011, 2026-08-03):** the future-tense #159
 > clauses below are now resolved semantically by ADR-0011: zero-weight staging,

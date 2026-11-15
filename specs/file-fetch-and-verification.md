@@ -5,8 +5,8 @@
 | **Issue** | #29 — [IR-0204] Implement file fetch and verification |
 | **Parent** | #3 |
 | **Labels** | type/feature, type/security, area/cli, area/blob, priority/p1, risk/medium |
-| **Dependencies** | #28 — [IR-0203] `file.shared` validation hardening (landed). #13 — [IR-0009] Prototype blob ACL path (landed: `crates/spike-blobs`; findings in `crates/spike-blobs/NOTES.md`). #26 — [IR-0201] Hardened recent-history sync (landed). Also builds directly on #27 — [IR-0202] File import into the blob store (landed: `iroh_rooms_net::BlobStore`, `iroh-rooms file share`). |
-| **Traceability** | `PRD.v0.3.md` §15.6 (Share File — AC4/AC5/AC6: authorized fetch, content-hash verification, honest unavailable), §17.1 (DX timing targets), §9.2 (Blob Plane 6-step flow, steps 4–6), §14 (Availability Model). Spike: Blob Plane ACL confirmation (`crates/spike-blobs/NOTES.md`); `PHASE-0-SPIKE.md` Membership & Ordering §5 (blob serve gate), Event Protocol §7 (`file.shared`), §4 (BLAKE3-256). |
+| **Dependencies** | #28 — [IR-0203] `file.shared` validation hardening (landed). #13 — [IR-0009] Prototype blob ACL path (landed: `archive/spikes/spike-blobs`; findings in `archive/spikes/spike-blobs/NOTES.md`). #26 — [IR-0201] Hardened recent-history sync (landed). Also builds directly on #27 — [IR-0202] File import into the blob store (landed: `iroh_rooms_net::BlobStore`, `iroh-rooms file share`). |
+| **Traceability** | `PRD.v0.3.md` §15.6 (Share File — AC4/AC5/AC6: authorized fetch, content-hash verification, honest unavailable), §17.1 (DX timing targets), §9.2 (Blob Plane 6-step flow, steps 4–6), §14 (Availability Model). Spike: Blob Plane ACL confirmation (`archive/spikes/spike-blobs/NOTES.md`); `PHASE-0-SPIKE.md` Membership & Ordering §5 (blob serve gate), Event Protocol §7 (`file.shared`), §4 (BLAKE3-256). |
 | **Status** | Planning — spec only. No production code changed by this document. |
 | **Type** | Feature (the network/serve + consumer half of the Blob Plane: the follow-up IR-0202 §4.3 explicitly deferred). |
 
@@ -40,7 +40,7 @@ shared `Router` with the two-gate ACL, (b) add `file fetch` with the independent
 BLAKE3 recompute, (c) optionally broadcast the `file.shared` frame at share time,
 (d) map "no provider online" to honest "unavailable" language.*
 
-The blob-ACL spike (#13 / `crates/spike-blobs`) already proved the serve gate and the
+The blob-ACL spike (#13 / `archive/spikes/spike-blobs`) already proved the serve gate and the
 verified fetch against `iroh-blobs 0.103.0` / `iroh 1.0.1` (the exact pins the shipping
 `iroh-rooms-net` already carries). This issue lifts that spike into production, driven
 by the **real** membership fold and the **real** `file.shared` reference — no new
@@ -54,7 +54,7 @@ This document is detailed enough to execute without re-deriving scope.
 
 **Read before starting:**
 
-- `crates/spike-blobs/NOTES.md` and `crates/spike-blobs/src/net.rs` — the confirmed
+- `archive/spikes/spike-blobs/NOTES.md` and `archive/spikes/spike-blobs/src/net.rs` — the confirmed
   serve-gate wiring and the verified-fetch client. `spawn_event_gate` is the exact
   two-gate loop to lift (`EventMask { connected: Intercept, get: Intercept,
   get_many: Intercept, push: Disabled, observe: None }` over
@@ -67,7 +67,7 @@ This document is detailed enough to execute without re-deriving scope.
   `classify_get_error` map the getter error to the `FetchOutcome`
   (`Fetched | DeniedAtConnect | DeniedPerHash | HashMismatch | Unavailable`) using
   `iroh_blobs::protocol::ERR_PERMISSION`.
-- `crates/spike-blobs/src/acl.rs` — the `AuthContext` (fold-shaped:
+- `archive/spikes/spike-blobs/src/acl.rs` — the `AuthContext` (fold-shaped:
   `device_to_identity`, `active_members`, `referenced_hashes`;
   `is_active(device)` / `is_referenced(hash)`). This is the shape the production gate
   sources from the real fold + the real `file.shared` set.

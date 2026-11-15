@@ -217,7 +217,7 @@ These are intentionally absent; do not treat the omission as a coverage gap.
 > certificate, store, or crash vector to this Phase-B fixture family. The Phase
 > C implementation must add explicitly versioned successor receipt/class/
 > descriptor vectors without rewriting these files. See
-> [`specs/v2-replica-durability-class.md`](../../../../docs/post-ga/specs/v2-replica-durability-class.md).
+> [`v2-replica-durability-class.md`](../../../../docs/post-ga/specs/v2-replica-durability-class.md).
 
 > **Additive correction (#159, 2026-08-03):** ADR-0011 specifies governed
 > zero-weight staging, atomic full-policy activation/replacement, permanent
@@ -241,4 +241,4 @@ These are intentionally absent; do not treat the omission as a coverage gap.
 > supplemental leaves without statement mutation; boundary-size positives;
 > structural-only propose/commit rejection; and omission/duplicate/order/root/
 > count/oversized/truncated/unavailable/overflow negatives. See
-> [`specs/v2-replica-replacement-recovery.md`](../../../../docs/post-ga/specs/v2-replica-replacement-recovery.md).
+> [`v2-replica-replacement-recovery.md`](../../../../docs/post-ga/specs/v2-replica-replacement-recovery.md).

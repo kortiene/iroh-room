@@ -5,7 +5,7 @@
 - **Owners:** Protocol lead, release owner
 - **Issue:** #161 — `[SPEC] §25 #3: Governance snapshot encoding + admin-transition proof`
 - **Related:** #134 §§7.6, 14, 15; #147–#151; #160; ADR-0004
-- **Normative profile:** [`specs/v2-governance-snapshot-transition-proof.md`](../../specs/v2-governance-snapshot-transition-proof.md)
+- **Normative profile:** [`v2-governance-snapshot-transition-proof.md`](../specs/v2-governance-snapshot-transition-proof.md)
 
 ## Context
 

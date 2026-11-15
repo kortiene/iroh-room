@@ -5,7 +5,7 @@
 - **Owners:** Protocol lead, release owner
 - **Issue:** #155 — `[SPEC] §25 #1: Range-reconciliation algorithm + spec-owned envelope`
 - **Related:** #134 §§12.2–13.4 / §25 #1, ADR-0004, #161
-- **Normative profile:** [`specs/v2-range-reconciliation-envelope.md`](../../specs/v2-range-reconciliation-envelope.md)
+- **Normative profile:** [`v2-range-reconciliation-envelope.md`](../specs/v2-range-reconciliation-envelope.md)
 
 ## Context
 

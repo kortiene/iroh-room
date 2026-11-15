@@ -33,7 +33,7 @@ Both decisions were adversarially verified against the actual mid-2026 stack (ir
 > late-join history gap, auth/admission model, implementation complexity)
 > were measured at N=2..5 on deterministic loopback and confirm the
 > recommendation; none were disproven. Findings and the measured comparison
-> table are in `crates/spike-transport/NOTES.md`.
+> table are in `archive/spikes/spike-transport/NOTES.md`.
 >
 > **Ceiling is a documented contract, not an enforced one (measured):** the
 > ≤5-peer / ≤10-link bound below is the declared operating band, but nothing in
@@ -891,7 +891,7 @@ Front-loaded because it is hand-rolled regardless of D1/D2, and a subtle canonic
 > auth check. No measured surprise crossed the Day-4 flip trigger. Residual
 > Open Decision 13 (admin-tip carrier) resolved: mesh `AdminTip` control
 > frame only for MVP. Full findings and the measured table in
-> `crates/spike-transport/NOTES.md`.
+> `archive/spikes/spike-transport/NOTES.md`.
 
 ### Day 5 — Decision 2: iroh-docs vs. hand-rolled reconciliation (sync substrate)
 
@@ -932,7 +932,7 @@ The genuinely hard primitive is range-based set reconciliation on reconnect. Log
 
 > **COMPLETE (IR-0009):** GATE GO — 49 tests pass (38 unit + 11 integration).
 > Confirmed `iroh-blobs 0.103.0` / `iroh 1.0.1`. Full findings in
-> `crates/spike-blobs/NOTES.md`.
+> `archive/spikes/spike-blobs/NOTES.md`.
 
 ### Day 9 — Live Pipe Plane confirmation (near-free win)
 
@@ -986,9 +986,9 @@ These are the items that **genuinely cannot be settled within the spike** — ei
 12. **D1/D2 are recommended, not measured-yet.** Both recommendations (mesh, hand-roll) are adversarially confirmed at the *design* level, but Gate A/C require the Day-1/4/5 measurements to confirm hole-punching success and that the chosen sync path actually converges a reconnected peer on real NATs. A NO-GO at Gate A (no usable path on a real symmetric-NAT pair) would force a relay-infrastructure decision the spike cannot pre-make.
     > **D1 half measured (IR-0006):** the transport decision is now
     > measurement-backed — see the ADR-1 annotation above and
-    > `crates/spike-transport/NOTES.md`. D2 (iroh-docs vs. hand-roll) remains
+    > `archive/spikes/spike-transport/NOTES.md`. D2 (iroh-docs vs. hand-roll) remains
     > recommended-but-not-measured pending Day 5.
-13. ~~**`admin_seq` / admin-tip advertisement transport.** Whether admin-tip advertisement rides the mesh pull RPC, an optional gossip liveness channel, or both, is a Day-4 measurement-informed choice; the *mechanism* is specified (§0) but the *carrier* is open.~~ **Decided (IR-0006):** the mesh `SyncMessage::AdminTip` control frame on the existing authenticated link is sufficient for MVP; gossip's liveness-topic carrier is prototyped and measured (freshness 3–6 ms vs. mesh's 18–21 ms on a 2-node loopback probe) but not adopted — the freshness gap is immaterial at MVP scale and a gossip tip is, by construction, a weaker-trust unauthenticated hint that can only ever trigger a re-check on the authenticated mesh path. Revisit only if a much larger room makes mesh's O(n²) control-frame fanout costly. Rationale in `crates/spike-transport/NOTES.md` §5.
+13. ~~**`admin_seq` / admin-tip advertisement transport.** Whether admin-tip advertisement rides the mesh pull RPC, an optional gossip liveness channel, or both, is a Day-4 measurement-informed choice; the *mechanism* is specified (§0) but the *carrier* is open.~~ **Decided (IR-0006):** the mesh `SyncMessage::AdminTip` control frame on the existing authenticated link is sufficient for MVP; gossip's liveness-topic carrier is prototyped and measured (freshness 3–6 ms vs. mesh's 18–21 ms on a 2-node loopback probe) but not adopted — the freshness gap is immaterial at MVP scale and a gossip tip is, by construction, a weaker-trust unauthenticated hint that can only ever trigger a re-check on the authenticated mesh path. Revisit only if a much larger room makes mesh's O(n²) control-frame fanout costly. Rationale in `archive/spikes/spike-transport/NOTES.md` §5.
 14. **Phase-5 sync substrate (iroh-docs vs. build Meyer RBSR vs. p2panda).** Deferred by design. The spike parks iroh-docs as the leading candidate (with the `m/`+`c/` prefix-free-key mapping ready) but the real decision arrives only when full divergent-history reconciliation enters scope.
 
 ---

@@ -23,7 +23,7 @@
 //!   plus its JSON and Markdown emitters.
 //!
 //! [`spike-blobs`]: https://docs.rs/spike-blobs
-//! [`NOTES.md`]: https://github.com/kortiene/iroh-room/blob/main/crates/spike-nat/NOTES.md
+//! [`NOTES.md`]: https://github.com/kortiene/iroh-room/blob/main/archive/spikes/spike-nat/NOTES.md
 
 pub mod probe;
 pub mod report;

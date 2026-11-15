@@ -26,7 +26,7 @@ room bricks.
 This is not hypothetical. Root-causing the N=40 gossip collapse (PR #190) showed
 the harness accidentally produced exactly this collision and the shipped path
 tore a 40-node cluster down within one 5s window. The gossip overlay was
-exonerated; this fail-closed path was the cause. `crates/spike-N40/src/workload.rs`
+exonerated; this fail-closed path was the cause. `archive/spikes/spike-N40/src/workload.rs`
 still carries the workaround comment.
 
 It is also reachable through shipped code rather than only through races:

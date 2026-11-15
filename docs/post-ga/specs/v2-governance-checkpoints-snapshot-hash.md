@@ -15,7 +15,7 @@
 > #134 §7.6 bootstrap checkpoint or snapshot encoding. The normative format is
 > now [`v2-governance-snapshot-transition-proof.md`](v2-governance-snapshot-transition-proof.md),
 > with rationale in
-> [`ADR-0008`](../docs/decisions/ADR-0008-governance-snapshot-transition-proof.md).
+> [`ADR-0008`](../decisions/ADR-0008-governance-snapshot-transition-proof.md).
 > Existing candidate code and vectors remain byte-stable and must not be
 > reinterpreted as the new format.
 

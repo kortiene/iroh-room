@@ -91,7 +91,7 @@ Read before implementing:
     **--all-features**`. New code must be pedantic-clean; **`--all-features` means any new cargo
     feature is exercised by CI.**
   - Existing error enums are **hand-rolled** (`Display` + `std::error::Error`), no `thiserror`.
-  - Heavier/experimental work is sometimes isolated into its own crate (`crates/spike-blobs`), but
+  - Heavier/experimental work is sometimes isolated into its own crate (`archive/spikes/spike-blobs`), but
     that one is explicitly throwaway; the store is a load-bearing MVP component.
 
 **There is no existing store, `rusqlite`, or persistence code in the workspace.** This issue
