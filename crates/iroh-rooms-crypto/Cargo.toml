@@ -35,7 +35,7 @@ ed25519-dalek = "=3.0.0-rc.0"
 # `mul_base_clamped` on the curve crate the dalek pin above already brings in —
 # using it directly avoids a second, differently-versioned X25519 dependency
 # (`x25519-dalek` would drag its own curve25519 line into the tree).
-curve25519-dalek = "=5.0.0-rc.0"
+curve25519-dalek = "=5.0.0"
 # HKDF-SHA-256 wrap KDF (spec D3: salt = room_id, no salt-less shortcut).
 # 0.13 is the digest-0.11 line matching the in-tree `sha2 0.11`.
 hkdf = "0.13"
@@ -46,16 +46,17 @@ hkdf = "0.13"
 # no zeroize feature; this is the activation that covers it.
 sha2 = { version = "0.11", features = ["zeroize"] }
 # AES-256-GCM (key 32 B, nonce 12 B, tag 16 B) for wrap + content AEAD.
-# Default features minus `getrandom`: that feature would drag aead's legacy
-# rand_core 0.6 / getrandom 0.2 stack into the lock for RNG APIs this crate
-# never uses (it calls `getrandom` 0.4 directly, below). `zeroize` wipes the
-# cipher's derived GHASH subkey on drop.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
-# aes-gcm's `zeroize` feature does NOT forward to the block cipher, and an
-# `Aes256Gcm` holds the full expanded round-key schedule (whose first words
-# are the raw key). A direct dependency turns on the wipe-on-drop there too,
-# so dropped cipher objects don't outlive the crate's Zeroizing discipline.
-aes = { version = "0.8", features = ["zeroize"] }
+# Default features minus `rand_core`/`getrandom`: those would compile aead's
+# RNG-keygen APIs, which this crate never uses (it calls `getrandom` 0.4
+# directly, below). `zeroize` wipes the cipher's derived GHASH subkey on
+# drop.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# aes-gcm 0.11's `zeroize` feature now forwards to the block cipher
+# (`aes?/zeroize`), but the direct dependency keeps that activation explicit
+# instead of trusting upstream's feature map: an `Aes256Gcm` holds the full
+# expanded round-key schedule (whose first words are the raw key), so dropped
+# cipher objects must not outlive the crate's Zeroizing discipline.
+aes = { version = "0.9", features = ["zeroize"] }
 # OS CSPRNG for room keys, ephemeral wrap secrets, and nonces (spec D3).
 getrandom = "0.4"
 # Zeroize room keys, ephemeral secrets, and derived wrap keys on drop.
