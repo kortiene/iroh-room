@@ -683,7 +683,6 @@ jobs:
 
           cd release-assets
           repo="kortiene/iroh-room"
-          workflow="kortiene/iroh-room/.github/workflows/release.yml"
           identity="https://github.com/kortiene/iroh-room/.github/workflows/release.yml@${GITHUB_REF}"
           issuer="https://token.actions.githubusercontent.com"
           sums_bundle="${RUNNER_TEMP}/attestation-bundles/SHA256SUMS.sigstore.json"
@@ -715,30 +714,39 @@ jobs:
             echo "gh attestation verify ${archive}"
             gh attestation verify "$archive" \
               --repo "$repo" \
-              --signer-workflow "$workflow" \
-              --source-ref "$GITHUB_REF"
+              --cert-identity "$identity" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
             gh attestation verify "$archive" \
               --bundle "${archive}.sigstore.json" \
               --repo "$repo" \
-              --signer-workflow "$workflow" \
-              --source-ref "$GITHUB_REF"
+              --cert-identity "$identity" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
           done
 
           echo "gh attestation verify SHA256SUMS"
           gh attestation verify SHA256SUMS \
             --repo "$repo" \
-            --signer-workflow "$workflow" \
-            --source-ref "$GITHUB_REF"
+            --cert-identity "$identity" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
           gh attestation verify SHA256SUMS \
             --bundle "$sums_bundle" \
             --repo "$repo" \
-            --signer-workflow "$workflow" \
-            --source-ref "$GITHUB_REF"
+            --cert-identity "$identity" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
 
           cosign verify-blob SHA256SUMS \
             --bundle SHA256SUMS.sigstore.json \
             --certificate-identity "$identity" \
-            --certificate-oidc-issuer "$issuer"
+            --certificate-oidc-issuer "$issuer" \
+            --certificate-github-workflow-sha "$GITHUB_SHA"
 
       # Do not wipe release-assets. The bundles were written there after the
       # re-verify copy. Peel again immediately before the first release write.
