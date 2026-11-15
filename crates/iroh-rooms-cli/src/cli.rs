@@ -8,6 +8,8 @@
 //! iroh-rooms [--data-dir <PATH>] room create <NAME>
 //! iroh-rooms [--data-dir <PATH>] room members <ROOM_ID>
 //! iroh-rooms [--data-dir <PATH>] room invite <ROOM_ID> --invitee <IDENTITY_ID> [--role <ROLE>] [--expires <DURATION>]
+//! iroh-rooms [--data-dir <PATH>] room remove <ROOM_ID> <MEMBER_ID> [--reason <TEXT>] [--peer <ADDR>]...
+//! iroh-rooms [--data-dir <PATH>] room leave <ROOM_ID> [--reason <TEXT>] [--peer <ADDR>]...
 //! ```
 
 use std::path::PathBuf;
@@ -368,6 +370,55 @@ enum RoomAction {
         #[arg(long, hide = true)]
         loopback: bool,
     },
+    /// Remove a member from the room (admin only) and push the removal to peers.
+    ///
+    /// Removed members lose access to new messages, files and pipes once peers
+    /// see the removal; they keep what they already had.
+    Remove {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The member's identity id (64-char lowercase hex, as shown by `room members`).
+        member: String,
+        /// Optional reason recorded in the removal event (display only).
+        #[arg(long)]
+        reason: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Best-effort connect timeout as <int>{ms|s|m}, e.g. 5s.
+        #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
+        timeout: String,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+    /// Leave the room voluntarily and push the departure to peers.
+    Leave {
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// The room id printed by `room create` (blake3:<hex>).
+        room_id: String,
+        /// Optional reason recorded in the leave event (display only).
+        #[arg(long)]
+        reason: Option<String>,
+        // Backticks would render literally in clap `--help`.
+        #[allow(clippy::doc_markdown)]
+        /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        /// Best-effort connect timeout as <int>{ms|s|m}, e.g. 5s.
+        #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
+        timeout: String,
+        /// Use the loopback/CI network stack instead of real-network discovery.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
     /// Stream the room timeline live, or read it offline with --offline.
     Tail {
         // Backticks would render literally in clap `--help`.
@@ -639,6 +690,46 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                 loopback,
             ))?;
             message::print_send(&summary);
+        }
+        RoomAction::Remove {
+            room_id,
+            member,
+            reason,
+            peers,
+            timeout,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
+            let summary = runtime()?.block_on(crate::member::remove(
+                home,
+                &room_id,
+                &member,
+                reason.as_deref(),
+                &peers,
+                timeout,
+                loopback,
+            ))?;
+            crate::member::print_departure(&summary);
+        }
+        RoomAction::Leave {
+            room_id,
+            reason,
+            peers,
+            timeout,
+            loopback,
+        } => {
+            let room_id = parse_room_id(&room_id)?;
+            let timeout = message::parse_timeout(&timeout).coded(ErrorCode::InvalidArgument)?;
+            let summary = runtime()?.block_on(crate::member::leave(
+                home,
+                &room_id,
+                reason.as_deref(),
+                &peers,
+                timeout,
+                loopback,
+            ))?;
+            crate::member::print_departure(&summary);
         }
         RoomAction::Tail {
             room_id,

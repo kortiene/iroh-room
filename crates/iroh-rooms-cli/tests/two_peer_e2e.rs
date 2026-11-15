@@ -1275,9 +1275,7 @@ async fn authorized_file_fetch_saves_and_verifies_blob() {
 /// (`error[peer_unauthorized]:`, exit 3), distinct from `blob_unavailable`
 /// (the self-only-provider case above) and from the pre-check `not_a_member`
 /// (`file_cli.rs::fetch_non_member_is_refused_with_not_a_member_code`, fully
-/// offline). The CLI ships no member-removal/leave command, so there is no way
-/// to make an *already-active* Room-A member fail Room A's own connect gate —
-/// this instead drives a real Gate 1 denial deterministically by pointing the
+/// offline). Rather than removing an *already-active* Room-A member, this drives a real Gate 1 denial deterministically by pointing the
 /// sole named provider at a peer from a wholly unrelated room: Bob is a
 /// genuine active member of Room A (Alice's converged room), but the seeded
 /// `file.shared` names Charlie's device as its only provider, and Charlie is
@@ -1413,4 +1411,169 @@ async fn every_provider_refused_is_peer_unauthorized() {
     );
 
     drop(charlie_tail);
+}
+
+// ── GA-P0 member removal (`room remove` / `room leave`), online tier ──────────
+
+/// Poll `home`'s roster until `member_id` reads `status`, or panic after `timeout`.
+fn wait_until_member_status(
+    home: &TempDir,
+    room: &str,
+    member_id: &str,
+    status: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let roster = members_json(home, room);
+        let hit = roster["members"].as_array().is_some_and(|members| {
+            members.iter().any(|m| {
+                m["identity_id"].as_str() == Some(member_id) && m["status"].as_str() == Some(status)
+            })
+        });
+        if hit {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "member {member_id} did not reach {status} within {timeout:?}; roster: {roster}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `room remove` over live loopback: Alice removes Bob while Bob's `room tail`
+/// runs; the removal reaches Bob (terminal delivery), Bob's CLI then refuses to
+/// open a session, and a message Alice sends afterwards is not in Bob's store —
+/// he keeps only what he already had.
+#[test]
+#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+fn admin_removal_reaches_member_and_withholds_new_messages() {
+    let c = converge_two_member_room();
+
+    // Bob runs a session so the removal can be pushed to him.
+    let bob_tail = ChildSession::spawn(c.bob_home.path(), &["room", "tail", &c.room, "--loopback"]);
+    let bob_addr = parse_listening(
+        &bob_tail
+            .wait_for_line("listening:", WAIT)
+            .unwrap_or_else(|err| panic!("bob tail never listened: {err}")),
+    );
+
+    let out = one_shot(
+        c.alice_home.path(),
+        &[
+            "room",
+            "remove",
+            &c.room,
+            &c.bob_id,
+            "--peer",
+            &bob_addr,
+            "--timeout",
+            "10s",
+            "--loopback",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "room remove must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("removed:"), "stdout: {stdout}");
+    assert_eq!(
+        extract_field(&stdout, "delivered"),
+        Some("1 connected peer(s)"),
+        "the removal must be pushed to Bob's live session; stdout: {stdout}"
+    );
+
+    // Bob's own store learns his removal (terminal delivery).
+    wait_until_member_status(&c.bob_home, &c.room, &c.bob_id, "removed", WAIT);
+    drop(bob_tail);
+
+    // The honest CLI refuses to start a session for a removed identity, so Bob
+    // cannot even dial back in (a patched client that does dial is rejected at
+    // Alice's admission — see the net `removed_device_cannot_pull_new_events_from_honest_peer`).
+    let bob_retry = one_shot(
+        c.bob_home.path(),
+        &["room", "tail", &c.room, "--peer", &bob_addr, "--loopback"],
+    );
+    assert!(
+        !bob_retry.status.success(),
+        "a removed member's tail must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&bob_retry.stderr).contains("not an active member"),
+        "stderr: {}",
+        String::from_utf8_lossy(&bob_retry.stderr)
+    );
+
+    // A post-removal message is authored by Alice but never reaches Bob's store.
+    let send = one_shot(
+        c.alice_home.path(),
+        &[
+            "room",
+            "send",
+            &c.room,
+            "after-removal",
+            "--timeout",
+            "2s",
+            "--loopback",
+        ],
+    );
+    assert!(send.status.success());
+    let bob_log = one_shot(
+        c.bob_home.path(),
+        &["room", "tail", &c.room, "--offline", "--json"],
+    );
+    assert!(bob_log.status.success(), "bob offline read must work");
+    let alice_log = one_shot(
+        c.alice_home.path(),
+        &["room", "tail", &c.room, "--offline", "--json"],
+    );
+    assert!(
+        String::from_utf8_lossy(&alice_log.stdout).contains("after-removal"),
+        "control: Alice's own log must hold the post-removal message"
+    );
+    assert!(
+        !String::from_utf8_lossy(&bob_log.stdout).contains("after-removal"),
+        "a removed member must not receive messages sent after the removal"
+    );
+}
+
+/// `room leave` over live loopback: Bob leaves while Alice's session runs; Alice
+/// folds Bob's departure.
+#[test]
+#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+fn member_leave_reaches_admin() {
+    let c = converge_two_member_room();
+    let alice_tail = ChildSession::spawn(
+        c.alice_home.path(),
+        &["room", "tail", &c.room, "--loopback"],
+    );
+    let alice_addr = parse_listening(
+        &alice_tail
+            .wait_for_line("listening:", WAIT)
+            .unwrap_or_else(|err| panic!("alice tail never listened: {err}")),
+    );
+    let out = one_shot(
+        c.bob_home.path(),
+        &[
+            "room",
+            "leave",
+            &c.room,
+            "--peer",
+            &alice_addr,
+            "--timeout",
+            "10s",
+            "--loopback",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "room leave must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_until_member_status(&c.alice_home, &c.room, &c.bob_id, "left", WAIT);
+    drop(alice_tail);
+    let _ = &c.alice_id;
 }
