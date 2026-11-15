@@ -71,6 +71,24 @@ const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// ephemeral `send` node tears down (spec §5 step 5 / R3).
 const FLUSH_GRACE: Duration = Duration::from_millis(300);
 
+/// Test-only override for the departure flush, in milliseconds. `0` keeps
+/// [`FLUSH_GRACE`]. The removal and leave-retry paths read it so a test can
+/// hold the node up long enough for a peer to send during that window.
+#[cfg(test)]
+pub(crate) static FLUSH_GRACE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn flush_grace() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = FLUSH_GRACE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    FLUSH_GRACE
+}
+
 /// The result of a `room send`, for the caller to present.
 pub struct SendSummary {
     /// The authored message's event id.
@@ -846,7 +864,7 @@ fn role_label(role: Role) -> &'static str {
 ///
 /// Consumes `store` (moved into the engine) and the wire `frame`.
 #[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
-async fn run_push(
+pub(crate) async fn run_push(
     home: &Path,
     store: EventStore,
     room_id: &RoomId,
@@ -905,6 +923,229 @@ async fn run_push(
     Ok(delivered)
 }
 
+/// Like [`run_push`], but the node is a managed room session.
+///
+/// Admission is a live [`SnapshotAdmission`] the pump refreshes from the fold,
+/// and the [`PeerManager`] tears a departed device down as soon as the removal
+/// is published — routing is revoked before this function's flush sleep. The
+/// terminal removal is queued *before* that reconcile, so the removed device
+/// still learns it; anything accepted afterwards is not forwarded to it.
+///
+/// `dial_set` is the pre-departure roster (the removed device included) plus
+/// any `--peer` address hints. The connected-peer count is the union of who
+/// was connected at publish time and who is still connected after the flush,
+/// so a device torn down after receiving its terminal removal still counts.
+///
+/// # Errors
+/// Returns an error if the engine or node cannot start, the frame cannot be
+/// published, or shutdown fails. The caller persists the frame locally either
+/// way.
+#[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
+pub(crate) async fn run_managed_push(
+    home: &Path,
+    store: EventStore,
+    room_id: &RoomId,
+    secret_key: SecretKey,
+    device_seed: [u8; 32],
+    dial_set: Vec<EndpointAddr>,
+    timeout: Duration,
+    mode: NetMode,
+    frame: Vec<u8>,
+) -> Result<usize> {
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(device_seed),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let opening = AdmissionView::from_snapshot(&engine.snapshot(), &engine.fail_closed_subjects());
+    let admission_cell = Arc::new(Mutex::new(opening));
+    let admission: Arc<dyn Admission> = Arc::new(SnapshotAdmission::new(admission_cell.clone()));
+    let cfg = NetConfig {
+        mode,
+        ..NetConfig::default()
+    };
+    let audit_sink = audit::sink(home)?;
+    let node = Node::spawn_room(
+        secret_key,
+        admission,
+        audit_sink,
+        engine,
+        cfg,
+        DEFAULT_TICK,
+        dial_set.clone(),
+        admission_cell,
+        None,
+    )
+    .await
+    .context("could not bring up the network node")?;
+
+    let ids: Vec<EndpointId> = dial_set.iter().map(|a| a.id).collect();
+    // Give already-listening siblings a moment to finish dialing, but do not
+    // burn the rest of `timeout` on a member who is actually offline.
+    await_roster(&node, &ids, timeout).await;
+    let mut reached = connected_ids(&node, &ids);
+
+    let publish = node
+        .publish(frame)
+        .await
+        .context("could not publish the departure frame");
+
+    tokio::time::sleep(flush_grace()).await;
+    reached.extend(connected_ids(&node, &ids));
+    let shutdown = node.shutdown().await;
+    publish?;
+    shutdown.context("could not shut down the network node")?;
+    Ok(reached.len())
+}
+
+/// What one [`run_sync`] session observed about the dial set.
+pub(crate) struct SyncReport {
+    /// Dial targets whose link was `Connected` when the session ended.
+    pub connected: usize,
+    /// Dial targets the remote refused (`PeerConnState::Unauthorized`).
+    ///
+    /// The dial loop records that state when `open_bi` fails because the remote
+    /// closed with the admission `REJECT_CODE` (`dial_loop`'s
+    /// `Established::RemoteRejected` arm). A listener that has already folded
+    /// this departure and uses live admission does that: the leaver is no
+    /// longer active, so the accept path closes before reading any event.
+    pub refused: usize,
+    /// Dial targets that never reached `Connected` or `Unauthorized` (no path,
+    /// or still connecting when the timeout expired).
+    pub offline: usize,
+}
+
+/// Dial `dial_set` and run the ordinary connect handshake. Nothing is authored:
+/// `publish` is not called, so an event already in `store` is not written again.
+///
+/// Each peer that accepts the link is served the authorization closure it does
+/// not already claim (`WantMembership`). That is how a stored `member.left`
+/// reaches a peer who still admits this device. A peer that has already folded
+/// the departure and uses live admission refuses the dial; that shows up here
+/// as [`SyncReport::refused`], not as offline. Only [`SyncReport::offline`]
+/// peers are ones a later `room leave` might still reach.
+///
+/// **What the resync exposes.** The leaver's node also pulls, the same way any
+/// member session does: `WantMembership` and bounded `WantRecentChat`. Until a
+/// peer folds this `member.left`, that peer still treats the leaver as active
+/// and will answer those pulls. For the length of this short session the leaver
+/// can therefore receive membership frames and recent chat that those peers
+/// still serve to an active member — including chat sent after the leaver's
+/// own store recorded the leave but before the peer had seen it. That is the
+/// same rule as the rest of v0.1: access lasts until the peer sees the
+/// departure, not before. A peer who was offline learns nothing from this
+/// attempt. No second `member.left` is signed, and the session does not extend
+/// access after a peer has folded the leave (a managed peer then drops the
+/// link). The exposure is acceptable because the retry exists only to make
+/// reachable peers see the departure they would still have served until then.
+///
+/// # Errors
+/// Returns an error if the engine or node cannot start, or shutdown fails.
+#[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
+pub(crate) async fn run_sync(
+    home: &Path,
+    store: EventStore,
+    room_id: &RoomId,
+    secret_key: SecretKey,
+    device_seed: [u8; 32],
+    admission: AllowlistAdmission,
+    dial_set: Vec<EndpointAddr>,
+    timeout: Duration,
+    mode: NetMode,
+) -> Result<SyncReport> {
+    let engine = SyncEngine::open_with_local_device(
+        store,
+        *room_id,
+        SyncConfig::default(),
+        Some(device_seed),
+    )
+    .map_err(|err| anyhow!("could not open sync engine: {err}"))?;
+    let cfg = NetConfig {
+        mode,
+        ..NetConfig::default()
+    };
+    let audit_sink = audit::sink(home)?;
+    let node = Node::spawn(
+        secret_key,
+        Arc::new(admission),
+        audit_sink,
+        engine,
+        cfg,
+        DEFAULT_TICK,
+    )
+    .await
+    .context("could not bring up the network node")?;
+
+    let ids: Vec<EndpointId> = dial_set.iter().map(|a| a.id).collect();
+    for addr in dial_set {
+        node.connect_to(addr);
+    }
+    await_dial_outcome(&node, &ids, timeout).await;
+    // A peer that accepted the link still needs a moment to pull the stored
+    // departure. A refusal is already terminal by the time we get here.
+    tokio::time::sleep(flush_grace()).await;
+    let report = classify_dial_outcome(&node, &ids);
+    node.shutdown()
+        .await
+        .context("could not shut down the network node")?;
+    Ok(report)
+}
+
+/// Wait until every dial target is `Connected`, `Unauthorized`, or `Offline`,
+/// or until `timeout`. A refusal is `Unauthorized` (the remote closed with the
+/// admission reject code); a missing path stays `Offline` or `Connecting`.
+async fn await_dial_outcome(node: &Node, ids: &[EndpointId], timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let pending = ids
+            .iter()
+            .any(|id| matches!(node.peer_state(*id), None | Some(PeerConnState::Connecting)));
+        if !pending || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `Unauthorized` is a refusal. `Connected` accepted the link. Everything else
+/// (including a dial that never left `Connecting`) is offline.
+fn classify_dial_outcome(node: &Node, ids: &[EndpointId]) -> SyncReport {
+    let mut connected = 0usize;
+    let mut refused = 0usize;
+    let mut offline = 0usize;
+    for id in ids {
+        match node.peer_state(*id) {
+            Some(PeerConnState::Connected) => connected += 1,
+            Some(PeerConnState::Unauthorized) => refused += 1,
+            Some(PeerConnState::Offline | PeerConnState::Connecting) | None => offline += 1,
+        }
+    }
+    SyncReport {
+        connected,
+        refused,
+        offline,
+    }
+}
+
+/// After the first peer connects, wait briefly for the rest of `ids` so a
+/// removal reaches every member that is already listening. Returns as soon as
+/// all of them are up, and does not extend a timeout that found nobody.
+async fn await_roster(node: &Node, ids: &[EndpointId], timeout: Duration) {
+    let connected = wait_for_any_connected(node, ids, timeout).await;
+    if connected == 0 || connected == ids.len() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    while tokio::time::Instant::now() < deadline {
+        if connected_count(node, ids) == ids.len() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Wait up to `timeout` for at least one of `ids` to reach `Connected`. Returns the
 /// count connected at the moment the first connects, or 0 on timeout.
 async fn wait_for_any_connected(node: &Node, ids: &[EndpointId], timeout: Duration) -> usize {
@@ -923,9 +1164,15 @@ async fn wait_for_any_connected(node: &Node, ids: &[EndpointId], timeout: Durati
 
 /// How many of `ids` are currently `Connected`.
 fn connected_count(node: &Node, ids: &[EndpointId]) -> usize {
+    connected_ids(node, ids).len()
+}
+
+/// Which of `ids` are currently `Connected`.
+fn connected_ids(node: &Node, ids: &[EndpointId]) -> BTreeSet<EndpointId> {
     ids.iter()
-        .filter(|id| node.peer_state(**id) == Some(PeerConnState::Connected))
-        .count()
+        .copied()
+        .filter(|id| node.peer_state(*id) == Some(PeerConnState::Connected))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

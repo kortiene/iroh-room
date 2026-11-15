@@ -323,7 +323,8 @@ iroh-rooms room members <ROOM_ID> --json
 **Tickets are secrets.** An invite ticket is a **scoped, key-bound, single-room capability**:
 it names the invitee's identity key and carries a secret out-of-band inside the ticket
 string. Expiry is supported; **native revocation is not** (spike §6 "MVP limitations") — the
-only way to undo an invite is to remove the subject. Anyone who gets the ticket before it
+only way to undo an invite is to remove the subject (`room remove <ROOM_ID> <MEMBER_ID>`, see
+[Remove a member or leave](#remove-a-member-or-leave)). Anyone who gets the ticket before it
 expires can attempt to join as the named key. Phase 2.5 Production Beta accepts this
 bounded leaked-ticket model in `docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md`.
 Handle tickets like passwords.
@@ -569,6 +570,46 @@ causally-complete rows (default 200).
 > indefinitely; a JSON-array framing does not apply).
 
 ---
+
+### Remove a member or leave
+
+The room admin removes a member (or cancels an open invite) with `room remove`; any
+non-admin member leaves with `room leave`. Both append a signed departure event
+(`member.removed` / `member.left`), store it locally, and push it to the peers you
+name with `--peer` (and to the room's known members). Departure is sticky: a removed
+or departed identity cannot rejoin with its old invite — the admin must issue a fresh
+`room invite`. Removing a member frees its slot under the 5-member ceiling.
+
+```sh
+# Terminal A — Alice (admin). Substitute <ROOM_ID> and <BOB_ID>.
+# Add --peer <BOB_LISTENING_ADDR> on a LAN / in CI so the removal reaches Bob directly.
+iroh-rooms room remove <ROOM_ID> <BOB_ID> --reason "project ended"
+
+# Terminal B — Bob (non-admin). Leave the room yourself:
+iroh-rooms room leave <ROOM_ID>
+```
+
+`room remove` is admin-only: anyone else gets `error[insufficient_role]` (exit 3) and
+nothing is written. The admin cannot `room leave` (v1 rooms have a single immutable
+admin), and nobody can `room remove` themselves. Once the removal is stored, the
+admin's node stops forwarding newer events to the removed device for the rest of
+that push. If `room remove` reaches no peers, the removal is still stored. The
+removed device only learns of the removal if it was connected to a peer when that peer first received the removal.
+`room tail` syncs that stored removal only to the remaining members (running
+`room remove` again is rejected). `room leave` is
+safe to run again: if your `member.left` is already stored, the command re-syncs
+that same event when a peer is reachable and does not write a second one. Its
+stdout says it re-synced the existing `member.left`; a different `--reason` is
+not applied, and the output says the original reason was kept.
+
+**What removal does and does not do.** Removed members lose access to new messages,
+files and pipes once peers see the removal; they keep what they already had. Room
+content is not end-to-end encrypted in v0.1 (ADR-0014 OD-1), so nothing they already
+synced or downloaded is revoked. Peers that have folded the removal refuse the
+removed device at connect, stop serving it blobs, and tear down its pipes; a peer
+that has not yet seen the removal (for example one that was offline) still treats the
+member as active until it syncs. After removal, `room members` and `room tail
+--offline` show the member as `status=removed` (or `status=left` after `room leave`).
 
 ## Step 5 — Share and verify a file
 
