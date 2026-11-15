@@ -50,7 +50,7 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 # rand_core 0.6 / getrandom 0.2 stack into the lock for RNG APIs this crate
 # never uses (it calls `getrandom` 0.4 directly, below). `zeroize` wipes the
 # cipher's derived GHASH subkey on drop.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # aes-gcm's `zeroize` feature does NOT forward to the block cipher, and an
 # `Aes256Gcm` holds the full expanded round-key schedule (whose first words
 # are the raw key). A direct dependency turns on the wipe-on-drop there too,
