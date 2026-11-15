@@ -962,3 +962,86 @@ async fn managed_room_reconnect_delivers_no_duplicates() {
         .await
         .expect("shutdown bob (restarted)");
 }
+
+// ===========================================================================
+// GA-P0 member removal: an honest peer withholds new events from a removed device
+// ===========================================================================
+
+/// A removed device that ignores its own removal (it never ingests the
+/// `member.removed`, and its own admission still admits the admin — the
+/// "patched client" case) cannot pull **new** room events from an honest peer:
+/// the honest managed node rejects its connection as `Unauthorized` at connect
+/// time, so a message published after the removal never reaches it. It keeps
+/// only what it already held (plaintext content, ADR-0014 OD-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_device_cannot_pull_new_events_from_honest_peer() {
+    let admin = Actor::new(41);
+    let member = Actor::new(42);
+
+    let (room_id, genesis_id, genesis_bytes) = mk_genesis(&admin);
+    let (invite_id, invite_bytes) =
+        mk_invite(&admin, room_id, &[genesis_id], member.identity(), 7, T0 + 1);
+    let (join_id, join_bytes) = mk_join(&member, room_id, &[invite_id], 7, T0 + 2);
+    let (pre_id, pre_bytes) = mk_message(&admin, room_id, join_id, 1);
+    let (remove_id, remove_bytes) =
+        mk_remove(&admin, room_id, &[pre_id], member.identity(), T0 + 200);
+
+    // The removed device holds everything up to (not including) the removal: it
+    // keeps the pre-removal message it already had.
+    let member_events = [
+        genesis_bytes.clone(),
+        invite_bytes.clone(),
+        join_bytes.clone(),
+        pre_bytes.clone(),
+    ];
+    let member_node =
+        spawn_static_node(&member, make_engine(room_id, &member_events), &[&admin]).await;
+
+    // The honest admin has folded the removal.
+    let admin_events = [
+        genesis_bytes,
+        invite_bytes,
+        join_bytes,
+        pre_bytes,
+        remove_bytes,
+    ];
+    let admin_node = spawn_room_node(&admin, make_engine(room_id, &admin_events), vec![]).await;
+
+    // The removed device dials the honest peer: rejected at connect.
+    member_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    admin_node
+        .wait_for_state(member.endpoint_id(), PeerConnState::Unauthorized, WAIT)
+        .await
+        .expect("honest peer must reject the removed device at connect (NotActive)");
+
+    // New content published after the removal never reaches the removed device.
+    let (post_id, post_bytes) = mk_message(&admin, room_id, remove_id, 2);
+    admin_node
+        .publish(post_bytes)
+        .await
+        .expect("admin publishes a post-removal message");
+    // Retry the dial once more, then give any (wrongful) delivery ample time.
+    member_node.connect_to(admin_node.endpoint_addr().expect("admin addr"));
+    assert!(
+        member_node
+            .wait_until_contains(post_id, Duration::from_secs(3))
+            .await
+            .is_err(),
+        "a removed device must not receive events published after its removal"
+    );
+    assert!(
+        member_node
+            .wait_until_contains(remove_id, Duration::from_millis(200))
+            .await
+            .is_err(),
+        "the honest peer serves the removed device nothing over a rejected link"
+    );
+    // It keeps what it already had.
+    member_node
+        .wait_until_contains(pre_id, Duration::from_millis(200))
+        .await
+        .expect("the removed device keeps the content it already held");
+
+    admin_node.shutdown().await.expect("shutdown admin");
+    member_node.shutdown().await.expect("shutdown member");
+}

@@ -146,12 +146,14 @@ candidate unless a later RB-1.x amendment classifies them.
 | ID | Exact deliverable | Class | Source | Owner / issue | Dependencies | Completion evidence | Hardware / external role | Status | Cohort-blocking |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | RB-GA-001 | Keep `verify`, `msrv`, and `release-readiness` green on a pinned stable toolchain, and re-enable the scheduled `release-readiness` workflow. | PRE / GA-P0 | ADR-0014; 2026-11-14 production-readiness audit | `iroh-room` / CI-fix branch `ci/pin-toolchain-clippy-1.100` (issue to be materialized) | — | Pinned toolchain in workflows, green runs on `main`, scheduled workflow active | Maintainer (workflow re-enable is a repository setting) | partial | Yes |
+| RB-GA-002 | Ship CLI member removal: `room remove <ROOM_ID> <MEMBER_ID>` (admin only) and `room leave <ROOM_ID>`, with docs that say removed members lose access to new messages, files and pipes once peers see the removal and keep what they already had. | GA-P0 | RB-1.4; #343 reachability inventory; threat model T07/T09/T18 | `iroh-room` / #379 | — | CLI commands with CI-tier and online tests; README, getting-started, threat-model, and self-review updates | — | partial | Yes |
 
 ### v0.1 GA P0 gate
 
 | Gate item | Rows | Issues | Note |
 | --- | --- | --- | --- |
 | CI green on a pinned toolchain | RB-GA-001 | CI-fix branch | — |
+| CLI member removal | RB-GA-002 | #379 | **RB-1.4:** `room remove` / `room leave`; removal is enforced by peers once they see it, with no key rotation (OD-1) |
 | Dependency remediation and supply-chain gate | RB-REL-003 | #238 | RustSec advisories resolved or dispositioned; `cargo-deny` and automated updates in CI |
 | Signed releases and provenance | RB-REL-001, RB-REL-002 | #237, #248 | Covers CLI archives; the SDK crates' provenance is the crates.io publication record plus the tagged source commit |
 | SDK publication | RB-SDK-002, RB-SDK-001 | #313, #306 | Publish `iroh-rooms` and its closure with versioning, ownership, and a release procedure; `RB-SDK-001` coverage reconciliation is scoped to the GA surface |
@@ -265,6 +267,27 @@ structured self-review instead of an independent reviewer or firm.
 - `RB-FC-003` (#352) reads accordingly for the v0.1 GA candidate.
 - `SECURITY.md` and the v0.1 GA release notes state plainly that v0.1 GA had
   no independent security review, only the internal structured self-review.
+
+## RB-1.4 — CLI member removal
+
+On 2026-11-15 the maintainer made CLI member removal a v0.1 GA P0 item (option
+B of the member-removal review). The SDK already exposes `build_member_removed`
+and `build_member_left` and the core and net layers already enforce removal,
+but the CLI had no command to author either event, so a CLI operator could not
+remove a member or leave a room, and the T07/T09 mitigations were unreachable
+from the shipped binary.
+
+- New row `RB-GA-002` (`GA-P0`, #379): `room remove <ROOM_ID> <MEMBER_ID>` (admin
+  only; `insufficient_role` otherwise) and `room leave <ROOM_ID>`, following
+  the `room send` pattern (SDK builder, validate, fold, push, store).
+- Docs must use the honest wording: removed members lose access to new
+  messages, files and pipes once peers see the removal; they keep what they
+  already had. There is no key rotation in v0.1 GA (RB-1.2).
+- Threat-model rows T07, T09, and T18 are reworded accordingly; their status
+  does not change. T09's disposition for v0.1 GA is admin removal plus sticky
+  departure, with no blocklist.
+- `RB-SEC-002` (#250) and `RB-ADM-005` (#297) stay `POST-GA` (RB-1.2); this
+  amendment does not bring rotation or admin transfer into GA.
 
 ## Governance and entry decisions
 
@@ -591,3 +614,4 @@ afterwards.
 | RB-1.1 | 2026-11-14 | Define the v0.1 GA candidate as the SDK (`iroh-rooms`) and the CLI built on it, for small private rooms; add `GA-P0`/`GA-P1`/`POST-GA` classes and row `RB-GA-001`; make SDK publication (RB-SDK-001/002) and RB-DEC-001 `GA-P0`; reclassify desktop (with its OS matrix), calls/SFU, v2, federation, availability, the 10k bootstrap, the large-room overlay, PRD3 task/agent work, and pipe extensions `POST-GA`; record open decisions OD-1..OD-3. | Proposed by ADR-0014; maintainer decisions 2026-11-14 (scope; SDK + CLI); active on merge |
 | RB-1.2 | 2026-11-15 | Decide OD-1 as option (b): v0.1 GA ships plaintext room content, encrypted in transit only, disclosed; reclassify `RB-SEC-002`, `RB-SEC-011..014`, and `RB-ADM-005` `POST-GA`; keep `RB-REL-007` `GA-P0` with an encryption-claims entry; move the rotation builder to the SDK `experimental` tier; narrow OD-2 to unreachability of the encryption path. | Maintainer decision 2026-11-15 (OD-1, option b); recorded in ADR-0014; active on merge |
 | RB-1.3 | 2026-11-15 | Decide OD-2: v0.1 GA ships with WAIVER-PBETA-0003 re-accepted and disclosed, backed by an internal structured self-review (`docs/security/v0.1-self-review.md`); reclassify `RB-SEC-010` and `RB-FC-009` `POST-GA`; let the accepted waiver plus the self-review record satisfy the security-review gate item for the v0.1 GA candidate only; align `RB-FC-003`; move the waiver's expiry to before v0.2 or public beta expansion. | Maintainer decision 2026-11-15 (OD-2, waiver option); recorded in ADR-0014; active on merge |
+| RB-1.4 | 2026-11-15 | Add `GA-P0` row `RB-GA-002` (#379): CLI `room remove` (admin only) and `room leave`, with honest removal wording (peers enforce removal once they see it; removed members keep what they already had); reword threat-model T07/T09/T18; record T09's v0.1 GA disposition as admin removal plus sticky departure. | Maintainer decision 2026-11-15 (member removal, option B, GA-P0); active on merge |

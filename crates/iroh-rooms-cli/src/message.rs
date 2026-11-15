@@ -846,7 +846,7 @@ fn role_label(role: Role) -> &'static str {
 ///
 /// Consumes `store` (moved into the engine) and the wire `frame`.
 #[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
-async fn run_push(
+pub(crate) async fn run_push(
     home: &Path,
     store: EventStore,
     room_id: &RoomId,

@@ -230,7 +230,7 @@ fn reject_next_action(r: &RejectReason) -> Option<&'static str> {
             Some("ask the admin to re-issue the invite for your identity id")
         }
         RejectReason::RoomFull => {
-            Some("this room is at the supported 5-member ceiling; remove a member before inviting another")
+            Some("this room is at the supported 5-member ceiling; `room remove` a member before inviting another")
         }
         RejectReason::InsufficientRole => {
             Some("ask the admin to invite you with the intended role")

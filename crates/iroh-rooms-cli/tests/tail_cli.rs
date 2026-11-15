@@ -738,8 +738,8 @@ fn tail_offline_text_genesis_shows_room_name_in_content_summary() {
 // ── AC3: removed / left member representation ─────────────────────────────────
 //
 // These tests seed a `rooms.db` directly using the core event builders (no CLI
-// invite/join needed) because there is no `room leave` / `member remove` command
-// yet. The chain is: genesis → invite → join → departure (left | removed |
+// invite/join needed) so the departure shapes (including concurrent left + removed)
+// are deterministic. The chain is: genesis → invite → join → departure (left | removed |
 // concurrent left + removed). The CLI commands `room tail --offline` and
 // `room tail --offline --json` are then called over the seeded store and their
 // output is asserted.

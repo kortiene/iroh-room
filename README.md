@@ -111,7 +111,7 @@ Read these before trusting Iroh Rooms with real work:
 - **No guaranteed offline delivery**: a peer may need to be online and serving for another peer to fetch data
 - **Files up to 100 MiB, and the cap is not free**: the enforced share cap is `MAX_SHARED_FILE_BYTES` = 100 MiB. A 100 MiB fetch was measured at ~134.6 MB consumer RSS (the collector allocates the next power of two) and ~2.004x disk use (the payload is written to the out path and re-imported into the blob store), and there is no GC or delete path in non-test code
 - **Plaintext local storage**: beta storage is scoped to trusted local machines
-- **Room content is plaintext too, encrypted in transit only**: v0.1 GA does not end-to-end encrypt room content ([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md) OD-1); end-to-end encryption is planned for v0.2. The content-key rotation lifecycle is implemented in the protocol and the sync engine (encrypted content envelopes, per-epoch room keys, `member.key_distribution`), but the shipped CLI has no member-removal or rotation command and no way to turn on encrypted writes — so rooms you operate with this binary carry plaintext content and gain no forward secrecy after a member departs
+- **Room content is plaintext too, encrypted in transit only**: v0.1 GA does not end-to-end encrypt room content ([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md) OD-1); end-to-end encryption is planned for v0.2. The content-key rotation lifecycle is implemented in the protocol and the sync engine (encrypted content envelopes, per-epoch room keys, `member.key_distribution`), but the shipped CLI has no rotation command and no way to turn on encrypted writes — so rooms you operate with this binary carry plaintext content and gain no forward secrecy after a member departs. `room remove` and `room leave` do not rotate keys: removed members lose access to new messages, files and pipes once peers see the removal; they keep what they already had
 - **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
 - **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
 - **Local audit only**: `audit.ndjson` is useful for incident reconstruction, not compliance-grade audit
@@ -163,7 +163,7 @@ Per-code reference:
 | `insufficient_role` | Auth | `3` | role does not permit the operation | ask the admin to invite you with the intended role |
 | `expired_invite` | Auth | `3` | invite expired or was consumed | ask the admin for a fresh `room invite` |
 | `bad_capability` | Auth | `3` | invite capability secret does not match | ask the admin to re-issue the invite |
-| `room_full` | Auth | `3` | joining would exceed the supported active-member ceiling | remove a member before inviting another |
+| `room_full` | Auth | `3` | joining would exceed the supported active-member ceiling | `room remove` a member before inviting another |
 | `wrong_identity` | Auth | `3` | local identity does not match the ticket binding | run `identity show`, then ask the admin to re-issue the invite for that identity |
 | `peer_unauthorized` | Auth | `3` | reachable peer refused this caller | ask the admin to confirm membership has synced |
 | `bad_signature` | Integrity | `4` | event signature failed verification | structural rejection, not user-fixable |
@@ -196,7 +196,7 @@ Iroh Rooms has three layers:
 - **Blob plane**: file import, hash verification, access-controlled serve and fetch
 - **Pipe plane**: authenticated TCP-over-QUIC forwarding for loopback services, with explicit per-member allow lists
 
-Room state is derived from an append-only event log. Peers validate signed events locally and converge by syncing the event set they are allowed to see. Access to files and pipes comes from the current membership snapshot, so removed members lose those capabilities.
+Room state is derived from an append-only event log. Peers validate signed events locally and converge by syncing the event set they are allowed to see. Access to files and pipes comes from the current membership snapshot, so removed members lose those capabilities. In the CLI the admin removes a member with `iroh-rooms room remove <ROOM_ID> <MEMBER_ID>` and a member leaves with `iroh-rooms room leave <ROOM_ID>`; removed members lose access to new messages, files and pipes once peers see the removal; they keep what they already had.
 
 The implementation uses iroh for peer connectivity and QUIC transport. The protocol contract is documented in [`docs/protocol.md`](docs/protocol.md), and the conformance suite lives under `crates/iroh-rooms-core/tests/`.
 

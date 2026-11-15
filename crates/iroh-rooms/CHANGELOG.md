@@ -7,6 +7,12 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- **CLI (`iroh-rooms` binary):** new `room remove <ROOM_ID> <MEMBER_ID>` (admin
+  only; `insufficient_role`, exit 3, otherwise) and `room leave <ROOM_ID>`
+  commands, built on the stable `iroh_rooms::room::build_member_removed` /
+  `build_member_left` builders (roadmap RB-1.4, `RB-GA-002`, #379). Removed members
+  lose access to new messages, files and pipes once peers see the removal;
+  they keep what they already had. No SDK API change.
 - **Breaking (stable tier, before first publish):** `build_member_removed_with_rotation`
   is no longer re-exported from `iroh_rooms::room`; it now lives at
   `iroh_rooms::experimental::rotation` (with `DistributionError`), behind the

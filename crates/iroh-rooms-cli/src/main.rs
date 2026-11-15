@@ -15,6 +15,7 @@ mod file;
 mod identity;
 mod invite;
 mod join;
+mod member;
 mod message;
 mod paths;
 mod pipe;
