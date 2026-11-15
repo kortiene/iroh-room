@@ -229,6 +229,10 @@ fn admin_remove_marks_member_removed_and_prints_honest_note() {
         out.contains("they keep what they already had"),
         "remove must print the honest v0.1 GA note; got:\n{out}"
     );
+    assert!(
+        out.contains("run `room tail` to sync it to peers"),
+        "an undelivered removal must point at room tail; got:\n{out}"
+    );
     assert_eq!(
         status_of(&alice, &room, &bob.id).as_deref(),
         Some("removed")
@@ -332,13 +336,39 @@ fn remove_rejects_self_unknown_already_removed_and_bad_ids() {
 
     let out = run(&alice.home, &remove_args(&room_str, "not-hex"));
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid member identity id"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid member identity id"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("64 hex characters"),
+        "the error must describe what the parser accepts; stderr: {stderr}"
+    );
+    // `IdentityKey` parsing accepts either hex case. Uppercase is not a bad id.
+    let upper = "A".repeat(64);
+    let out = run(&alice.home, &remove_args(&room_str, &upper));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is not a member"),
+        "uppercase hex must parse; stderr: {stderr}"
+    );
+    assert!(!stderr.contains("invalid member identity id"));
 
     ok(&alice.home, &remove_args(&room_str, &bob.id));
     let before = event_count(&alice, &room);
     let out = run(&alice.home, &remove_args(&room_str, &bob.id));
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("already left or been removed"));
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "already removed is a membership denial (exit 3), same class as not_a_member"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error[not_a_member]"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("already left or been removed"),
+        "stderr: {stderr}"
+    );
     assert_eq!(event_count(&alice, &room), before);
 }
 
@@ -405,11 +435,19 @@ fn member_leave_marks_self_removed_everywhere_it_replicates() {
     assert_eq!(field(&out, "stored"), Some("yes"));
     assert_eq!(status_of(bob, &room_str, &bob.id).as_deref(), Some("left"));
 
-    // Leaving again re-delivers the stored member.left and does not author another.
+    // Leaving again re-syncs the stored member.left and does not author another.
     let before = event_count(bob, &room);
     let again = ok(&bob.home, &leave_args(&room_str));
     assert_eq!(field(&again, "event"), field(&out, "event"));
     assert_eq!(field(&again, "stored"), Some("yes"));
+    assert!(
+        again.contains("re-synced the existing member.left"),
+        "a repeat leave must say it re-synced; got:\n{again}"
+    );
+    assert!(
+        !again.contains("kept the original"),
+        "no new --reason was given, so the reason line stays quiet; got:\n{again}"
+    );
     assert_eq!(event_count(bob, &room), before);
     assert_eq!(status_of(bob, &room_str, &bob.id).as_deref(), Some("left"));
 
@@ -419,6 +457,71 @@ fn member_leave_marks_self_removed_everywhere_it_replicates() {
         status_of(&alice, &room_str, &bob.id).as_deref(),
         Some("left")
     );
+
+    // Removing someone who already left is the same membership denial.
+    let out = run(&alice.home, &remove_args(&room_str, &bob.id));
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[not_a_member]"),
+        "already left is exit 3; stderr: {stderr}"
+    );
+    assert!(stderr.contains("already left or been removed"));
+}
+
+#[test]
+fn repeat_leave_with_a_different_reason_keeps_the_original_event() {
+    let (_alice, members, room_str, room) = room_with(1);
+    let bob = &members[0];
+    let mut first_args = vec![
+        "room",
+        "leave",
+        room_str.as_str(),
+        "--reason",
+        "first reason",
+    ];
+    first_args.extend_from_slice(&OFFLINE);
+    let first = ok(&bob.home, &first_args);
+    let event = field(&first, "event").expect("event id");
+
+    let mut again_args = vec![
+        "room",
+        "leave",
+        room_str.as_str(),
+        "--reason",
+        "other reason",
+    ];
+    again_args.extend_from_slice(&OFFLINE);
+    let again = ok(&bob.home, &again_args);
+    assert_eq!(field(&again, "event"), Some(event));
+    assert!(
+        again.contains("re-synced the existing member.left"),
+        "stdout: {again}"
+    );
+    assert!(
+        again.contains("kept the original"),
+        "a different --reason must say the original was kept; stdout: {again}"
+    );
+    assert_eq!(
+        count_member_left(bob, &room),
+        1,
+        "the retry must not author a second member.left"
+    );
+}
+
+fn count_member_left(p: &Peer, room: &RoomId) -> usize {
+    let store = store(p);
+    let ctx = ValidationContext::for_room(*room);
+    store
+        .room_event_ids(room)
+        .unwrap()
+        .into_iter()
+        .filter(|id| {
+            let bytes = store.get(id).unwrap().unwrap().wire.to_bytes();
+            let event = validate_wire_bytes(&bytes, &ctx).unwrap();
+            matches!(event.event.content, Content::MemberLeft(_))
+        })
+        .count()
 }
 
 #[test]

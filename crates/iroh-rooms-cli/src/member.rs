@@ -90,6 +90,11 @@ pub struct DepartureSummary {
     pub delivered: usize,
     /// Number of peers we tried to reach.
     pub attempted: usize,
+    /// This call re-synced an already-stored `member.left` instead of authoring one.
+    pub redelivered: bool,
+    /// A repeat leave was given a `--reason` different from the stored event, and
+    /// that stored reason was left unchanged.
+    pub kept_original_reason: bool,
 }
 
 /// Remove `member_hex` from `room_id` (admin only) by authoring a
@@ -100,7 +105,7 @@ pub struct DepartureSummary {
 /// Fails — leaving the store untouched — if an argument is invalid, no local
 /// identity exists, the room is unknown, the caller is not the room admin
 /// (`insufficient_role`), the subject is the caller, unknown to the room, or
-/// already removed, or on a store error.
+/// already removed (`not_a_member`, exit 3), or on a store error.
 #[allow(clippy::too_many_arguments)] // one linear orchestration; each arg is a distinct CLI input
 pub async fn remove(
     home: &Path,
@@ -115,9 +120,7 @@ pub async fn remove(
     let subject: IdentityKey = member_hex
         .trim()
         .parse()
-        .map_err(|err| {
-            anyhow!("invalid member identity id (expected 64-char lowercase hex): {err}")
-        })
+        .map_err(|err| anyhow!("invalid member identity id (expected 64 hex characters): {err}"))
         .coded(ErrorCode::InvalidArgument)?;
     validate_reason(reason)?;
     let peer_addrs = parse_peers(peers)?;
@@ -150,7 +153,7 @@ pub async fn remove(
             "{subject} is not a member of room {room_id}"
         ),
         Some(Status::Removed) => crate::bail_coded!(
-            ErrorCode::InvalidArgument,
+            ErrorCode::Reject(RejectReason::NotAMember),
             "{subject} has already left or been removed from room {room_id}"
         ),
         Some(Status::Active | Status::Invited) => {}
@@ -189,6 +192,8 @@ pub async fn remove(
         subject,
         delivered,
         attempted,
+        redelivered: false,
+        kept_original_reason: false,
     })
 }
 
@@ -197,7 +202,8 @@ pub async fn remove(
 ///
 /// If this identity already stored its own `member.left` (peers were offline
 /// the first time), a later `room leave` re-delivers that same event and does
-/// not author another one. A `--reason` on that retry is ignored.
+/// not author another one. A different `--reason` on that retry is not applied;
+/// stdout says the existing event was re-synced and the original reason was kept.
 ///
 /// # Errors
 /// Fails — leaving the store untouched — if an argument is invalid, no local
@@ -277,6 +283,8 @@ pub async fn leave(
         subject: caller,
         delivered,
         attempted,
+        redelivered: false,
+        kept_original_reason: false,
     })
 }
 
@@ -296,7 +304,7 @@ async fn redeliver_pending_leave(
     timeout: Duration,
     loopback: bool,
 ) -> Result<DepartureSummary> {
-    let Some(event_id) = pending_self_leave(&store, room_id, caller)? else {
+    let Some(pending) = pending_self_leave(&store, room_id, caller)? else {
         crate::bail_coded!(
             ErrorCode::Reject(RejectReason::NotAMember),
             "you are not an active member of room {room_id} (this identity is {caller})"
@@ -308,12 +316,9 @@ async fn redeliver_pending_leave(
             "you are not an active member of room {room_id} (this identity is {caller})"
         );
     }
-    if reason.is_some() {
-        eprintln!(
-            "note: already left room {room_id}; re-delivering the existing member.left and \
-             ignoring --reason"
-        );
-    }
+    let event_id = pending.event_id;
+    // A different `--reason` does not rewrite the stored event.
+    let kept_original_reason = reason.is_some_and(|given| pending.reason.as_deref() != Some(given));
 
     let self_device = endpoint_id_of(secret.device.device_key())?;
     let dial_set = build_dial_set(snapshot, self_device, peer_addrs);
@@ -350,6 +355,8 @@ async fn redeliver_pending_leave(
         subject: *caller,
         delivered,
         attempted,
+        redelivered: true,
+        kept_original_reason,
     })
 }
 
@@ -371,16 +378,23 @@ fn left_itself(
     )
 }
 
+/// One stored self-authored `member.left`, plus the reason it was signed with.
+struct PendingLeave {
+    event_id: EventId,
+    reason: Option<String>,
+    lamport: u64,
+}
+
 /// The newest self-authored `member.left` for `caller` in `room_id`, if any.
 fn pending_self_leave(
     store: &EventStore,
     room_id: &RoomId,
     caller: &IdentityKey,
-) -> Result<Option<EventId>> {
+) -> Result<Option<PendingLeave>> {
     let rows = store
         .by_type(room_id, EventType::MemberLeft)
         .with_context(|| format!("could not read member.left events for room {room_id}"))?;
-    let mut best: Option<(u64, EventId)> = None;
+    let mut best: Option<PendingLeave> = None;
     for stored in rows {
         let Ok(event) = SignedEvent::decode(&stored.wire.signed) else {
             continue;
@@ -391,12 +405,19 @@ fn pending_self_leave(
         if content.member_id != *caller || event.sender_id != *caller {
             continue;
         }
-        let key = (stored.lamport.unwrap_or(0), stored.event_id);
-        if best.is_none_or(|current| key > current) {
-            best = Some(key);
+        let lamport = stored.lamport.unwrap_or(0);
+        let newer = best
+            .as_ref()
+            .is_none_or(|current| (lamport, stored.event_id) > (current.lamport, current.event_id));
+        if newer {
+            best = Some(PendingLeave {
+                event_id: stored.event_id,
+                reason: content.reason,
+                lamport,
+            });
         }
     }
-    Ok(best.map(|(_, id)| id))
+    Ok(best)
 }
 
 /// Self-validate and fold-check a freshly built departure, then persist it and
@@ -525,6 +546,12 @@ pub fn print_departure(summary: &DepartureSummary) {
         DepartureKind::Removed => println!("removed: {}", summary.subject),
         DepartureKind::Left => println!("left: {}", summary.room_id),
     }
+    if summary.redelivered {
+        println!("resync: re-synced the existing member.left");
+        if summary.kept_original_reason {
+            println!("reason: kept the original");
+        }
+    }
     println!("event: {}", summary.event_id);
     println!("room: {}", summary.room_id);
     println!("stored: yes");
@@ -538,8 +565,8 @@ pub fn print_departure(summary: &DepartureSummary) {
             );
         } else {
             println!(
-                "delivered: 0 (no peers online — stored locally only; peers learn it when they \
-                 next sync with you)"
+                "delivered: 0 (no peers online — the removal is stored; run `room tail` to sync \
+                 it to peers)"
             );
         }
     } else {
