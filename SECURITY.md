@@ -84,9 +84,13 @@ restate them will be closed with a pointer here — but a report showing one is
   Verify checksums against the release page.
 - **Transport metadata is not private.** Payloads are encrypted in transit;
   relay and path metadata are not hidden.
-- **Content-key rotation is not reachable from the CLI.** The protocol and
-  engine implement it, but the shipped CLI exposes no command to trigger it, so
-  CLI-operated rooms store and exchange room content in plaintext form.
+- **Room content is not end-to-end encrypted.** v0.1 GA ships room content as
+  plaintext, encrypted in transit only between admitted peers
+  ([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md)
+  OD-1). The protocol and engine implement content-key rotation, but the
+  shipped CLI has no member-removal or rotation command and no way to turn on
+  encrypted writes, so CLI-operated rooms store and exchange room content in
+  plaintext form. End-to-end encryption is planned after GA (v0.2).
 
 The full inventory, including threats that are only partially mitigated, is in
 [`docs/security/threat-model.md`](docs/security/threat-model.md). Read it before

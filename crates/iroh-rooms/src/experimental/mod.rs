@@ -19,10 +19,12 @@
 //! [`session`] (transport + admission + connection state), [`sync`] (the
 //! sans-IO reconciliation engine + transport trait), [`store`] (local
 //! persistence), [`blob`] ([`crate::files`]' runtime half), and
-//! [`pipe_runtime`] ([`crate::pipes`]' runtime half).
+//! [`pipe_runtime`] ([`crate::pipes`]' runtime half), plus [`rotation`]
+//! (the content-key rotation builder, unsupported at v0.1 GA).
 
 pub mod blob;
 pub mod pipe_runtime;
+pub mod rotation;
 pub mod session;
 pub mod store;
 pub mod sync;
