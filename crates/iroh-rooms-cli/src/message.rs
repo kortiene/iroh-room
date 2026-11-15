@@ -1002,24 +1002,30 @@ pub(crate) async fn run_managed_push(
 
 /// What one [`run_sync`] session observed about the dial set.
 pub(crate) struct SyncReport {
-    /// Dial targets that were `Connected` at the end of the flush.
+    /// Dial targets whose link was `Connected` when the session ended.
     pub connected: usize,
-    /// Connected peers whose membership claim did not cover this store, so the
-    /// handshake served them the missing authorization closure (the stored
-    /// `member.left`, when that is what they lacked).
-    pub informed: usize,
-    /// Connected peers whose membership claim already covered this store, so
-    /// nothing new was served. They already had the stored `member.left`.
-    pub already_known: usize,
+    /// Dial targets the remote refused (`PeerConnState::Unauthorized`).
+    ///
+    /// The dial loop records that state when `open_bi` fails because the remote
+    /// closed with the admission `REJECT_CODE` (`dial_loop`'s
+    /// `Established::RemoteRejected` arm). A listener that has already folded
+    /// this departure and uses live admission does that: the leaver is no
+    /// longer active, so the accept path closes before reading any event.
+    pub refused: usize,
+    /// Dial targets that never reached `Connected` or `Unauthorized` (no path,
+    /// or still connecting when the timeout expired).
+    pub offline: usize,
 }
 
 /// Dial `dial_set` and run the ordinary connect handshake. Nothing is authored:
 /// `publish` is not called, so an event already in `store` is not written again.
 ///
-/// Each peer that connects is served the authorization closure it does not
-/// already claim (`WantMembership`). That is how a stored `member.left` reaches
-/// a peer who lacked it. Peers whose claim already covers the closure are
-/// counted in [`SyncReport::already_known`] and are not served a second copy.
+/// Each peer that accepts the link is served the authorization closure it does
+/// not already claim (`WantMembership`). That is how a stored `member.left`
+/// reaches a peer who still admits this device. A peer that has already folded
+/// the departure and uses live admission refuses the dial; that shows up here
+/// as [`SyncReport::refused`], not as offline. Only [`SyncReport::offline`]
+/// peers are ones a later `room leave` might still reach.
 ///
 /// **What the resync exposes.** The leaver's node also pulls, the same way any
 /// member session does: `WantMembership` and bounded `WantRecentChat`. Until a
@@ -1076,62 +1082,51 @@ pub(crate) async fn run_sync(
     for addr in dial_set {
         node.connect_to(addr);
     }
-    let _ = wait_for_any_connected(&node, &ids, timeout).await;
+    await_dial_outcome(&node, &ids, timeout).await;
+    // A peer that accepted the link still needs a moment to pull the stored
+    // departure. A refusal is already terminal by the time we get here.
     tokio::time::sleep(flush_grace()).await;
-    let logs = node.logs().await.unwrap_or_default();
-    let connected_ids = connected_ids(&node, &ids);
-    let (informed, already_known) = classify_membership_serves(&logs, &connected_ids);
-    let report = SyncReport {
-        connected: connected_ids.len(),
-        informed,
-        already_known,
-    };
+    let report = classify_dial_outcome(&node, &ids);
     node.shutdown()
         .await
         .context("could not shut down the network node")?;
     Ok(report)
 }
 
-/// Split connected peers by the engine's `membership.serve` lines.
-///
-/// A peer whose every serve had `frames=0` already covered the membership
-/// closure. A serve with `frames>0` means this node sent them something they
-/// lacked. A connected peer with no serve line is counted as informed so the
-/// retry does not claim they already had the leave.
-fn classify_membership_serves(logs: &[String], connected: &BTreeSet<EndpointId>) -> (usize, usize) {
-    let mut frames: BTreeMap<String, u64> = BTreeMap::new();
-    for line in logs {
-        let Some(rest) = line.strip_prefix("membership.serve ") else {
-            continue;
-        };
-        let mut parts = rest.split_whitespace();
-        let (Some(peer), Some(count)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let Some(peer) = peer.strip_prefix("peer=") else {
-            continue;
-        };
-        let Some(count) = count.strip_prefix("frames=") else {
-            continue;
-        };
-        let Ok(count) = count.parse::<u64>() else {
-            continue;
-        };
-        let seen = frames.entry(peer.to_owned()).or_insert(0);
-        *seen = (*seen).max(count);
+/// Wait until every dial target is `Connected`, `Unauthorized`, or `Offline`,
+/// or until `timeout`. A refusal is `Unauthorized` (the remote closed with the
+/// admission reject code); a missing path stays `Offline` or `Connecting`.
+async fn await_dial_outcome(node: &Node, ids: &[EndpointId], timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let pending = ids
+            .iter()
+            .any(|id| matches!(node.peer_state(*id), None | Some(PeerConnState::Connecting)));
+        if !pending || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let mut informed = 0usize;
-    let mut already_known = 0usize;
-    for id in connected {
-        let key = hex::encode(id.as_bytes());
-        match frames.get(&key) {
-            Some(0) => already_known += 1,
-            // A missing serve line is not evidence the peer already had the
-            // leave, so it is not counted as already-known.
-            Some(_) | None => informed += 1,
+}
+
+/// `Unauthorized` is a refusal. `Connected` accepted the link. Everything else
+/// (including a dial that never left `Connecting`) is offline.
+fn classify_dial_outcome(node: &Node, ids: &[EndpointId]) -> SyncReport {
+    let mut connected = 0usize;
+    let mut refused = 0usize;
+    let mut offline = 0usize;
+    for id in ids {
+        match node.peer_state(*id) {
+            Some(PeerConnState::Connected) => connected += 1,
+            Some(PeerConnState::Unauthorized) => refused += 1,
+            Some(PeerConnState::Offline | PeerConnState::Connecting) | None => offline += 1,
         }
     }
-    (informed, already_known)
+    SyncReport {
+        connected,
+        refused,
+        offline,
+    }
 }
 
 /// After the first peer connects, wait briefly for the rest of `ids` so a

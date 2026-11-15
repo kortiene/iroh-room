@@ -235,7 +235,11 @@ fn reject_next_action(r: &RejectReason) -> Option<&'static str> {
         RejectReason::InsufficientRole => {
             Some("ask the admin to invite you with the intended role")
         }
-        RejectReason::NotAMember | RejectReason::UnboundDevice => {
+        RejectReason::NotAMember => Some(
+            "if you are not an active member, ask the admin to invite you and complete `room join` \
+             first; if the target already left or was removed, they are already out of the room",
+        ),
+        RejectReason::UnboundDevice => {
             Some("ask the admin to invite you and complete `room join` first")
         }
         _ => None,

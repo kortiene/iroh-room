@@ -95,12 +95,13 @@ pub struct DepartureSummary {
     /// that stored reason was left unchanged. Never set when the stored event
     /// had no reason.
     pub kept_original_reason: bool,
-    /// On a leave retry: connected peers who were served membership they lacked.
-    pub informed: usize,
-    /// On a leave retry: connected peers whose membership claim already covered
-    /// this store, so they already had the `member.left`.
-    pub already_known: usize,
-    /// On a leave retry: dial targets that were not connected at the end.
+    /// On a leave retry: dial targets that accepted the link.
+    pub connected: usize,
+    /// On a leave retry: dial targets that refused the connection
+    /// (`PeerConnState::Unauthorized`).
+    pub refused: usize,
+    /// On a leave retry: dial targets that were not connected and did not refuse
+    /// (unreachable, or still connecting at the timeout).
     pub offline: usize,
 }
 
@@ -201,8 +202,8 @@ pub async fn remove(
         attempted,
         redelivered: false,
         kept_original_reason: false,
-        informed: 0,
-        already_known: 0,
+        connected: 0,
+        refused: 0,
         offline: 0,
     })
 }
@@ -295,8 +296,8 @@ pub async fn leave(
         attempted,
         redelivered: false,
         kept_original_reason: false,
-        informed: 0,
-        already_known: 0,
+        connected: 0,
+        refused: 0,
         offline: 0,
     })
 }
@@ -347,8 +348,8 @@ async fn redeliver_pending_leave(
     let report = if dial_set.is_empty() {
         crate::message::SyncReport {
             connected: 0,
-            informed: 0,
-            already_known: 0,
+            refused: 0,
+            offline: 0,
         }
     } else {
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
@@ -371,13 +372,12 @@ async fn redeliver_pending_leave(
                 eprintln!("warning: live delivery unavailable: {err:#}");
                 crate::message::SyncReport {
                     connected: 0,
-                    informed: 0,
-                    already_known: 0,
+                    refused: 0,
+                    offline: attempted,
                 }
             }
         }
     };
-    let offline = attempted.saturating_sub(report.connected);
     Ok(DepartureSummary {
         kind: DepartureKind::Left,
         event_id,
@@ -387,17 +387,20 @@ async fn redeliver_pending_leave(
         attempted,
         redelivered: true,
         kept_original_reason,
-        informed: report.informed,
-        already_known: report.already_known,
-        offline,
+        connected: report.connected,
+        refused: report.refused,
+        offline: report.offline,
     })
 }
 
-/// Whether the caller's **latest** departure event is their own `member.left`.
+/// Whether the caller's standing departure is their own `member.left`.
 ///
-/// An older `member.removed` does not count once a later self-leave is the
-/// current departure (removed, re-invited, rejoined, then left). A later
-/// `member.removed` does: the admin removal is the departure that stands.
+/// The fold's `Status::Removed` covers both a self-leave and an admin removal.
+/// A retry is allowed only when every `member.removed` naming `caller` is a
+/// causal ancestor of the newest self-leave. That keeps a later self-leave
+/// after a rejoin (the old removal is an ancestor) and refuses a concurrent or
+/// later removal, which the fold treats as `removed` even when the leave has
+/// the higher Lamport.
 fn left_itself(
     snapshot: &MembershipSnapshot,
     store: &EventStore,
@@ -407,48 +410,9 @@ fn left_itself(
     if snapshot.status(caller) != Some(Status::Removed) {
         return Ok(false);
     }
-    latest_departure_is_self_leave(store, room_id, caller)
-}
-
-/// `true` when the highest-`(lamport, event_id)` departure naming `caller` is
-/// a self-authored `member.left`.
-fn latest_departure_is_self_leave(
-    store: &EventStore,
-    room_id: &RoomId,
-    caller: &IdentityKey,
-) -> Result<bool> {
-    let mut best: Option<(u64, EventId, bool)> = None;
-    let consider = |best: &mut Option<(u64, EventId, bool)>,
-                    lamport: u64,
-                    event_id: EventId,
-                    self_leave: bool| {
-        let replace = best
-            .as_ref()
-            .is_none_or(|(prev_l, prev_id, _)| (lamport, event_id) > (*prev_l, *prev_id));
-        if replace {
-            *best = Some((lamport, event_id, self_leave));
-        }
+    let Some(pending) = pending_self_leave(store, room_id, caller)? else {
+        return Ok(false);
     };
-    for stored in store
-        .by_type(room_id, EventType::MemberLeft)
-        .with_context(|| format!("could not read member.left events for room {room_id}"))?
-    {
-        let Ok(event) = SignedEvent::decode(&stored.wire.signed) else {
-            continue;
-        };
-        let Content::MemberLeft(content) = event.content else {
-            continue;
-        };
-        if content.member_id != *caller {
-            continue;
-        }
-        consider(
-            &mut best,
-            stored.lamport.unwrap_or(0),
-            stored.event_id,
-            event.sender_id == *caller,
-        );
-    }
     for stored in store
         .by_type(room_id, EventType::MemberRemoved)
         .with_context(|| format!("could not read member.removed events for room {room_id}"))?
@@ -462,14 +426,32 @@ fn latest_departure_is_self_leave(
         if content.member_id != *caller {
             continue;
         }
-        consider(
-            &mut best,
-            stored.lamport.unwrap_or(0),
-            stored.event_id,
-            false,
-        );
+        if !is_causal_ancestor(store, stored.event_id, pending.event_id)? {
+            return Ok(false);
+        }
     }
-    Ok(best.is_some_and(|(_, _, self_leave)| self_leave))
+    Ok(true)
+}
+
+/// Whether `ancestor` is a strict causal ancestor of `descendant`.
+fn is_causal_ancestor(store: &EventStore, ancestor: EventId, descendant: EventId) -> Result<bool> {
+    let mut stack = store
+        .parents_of(&descendant)
+        .with_context(|| format!("could not read parents of {descendant}"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(id) = stack.pop() {
+        if id == ancestor {
+            return Ok(true);
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        let parents = store
+            .parents_of(&id)
+            .with_context(|| format!("could not read parents of {id}"))?;
+        stack.extend(parents);
+    }
+    Ok(false)
 }
 
 /// One stored self-authored `member.left`, plus the reason it was signed with.
@@ -671,8 +653,9 @@ fn departure_lines(summary: &DepartureSummary) -> Vec<String> {
         } else {
             lines.push(
                 "delivered: 0 (no peers online — the removal is stored. The removed device \
-                 only learns of the removal if it was online during `room remove`. `room tail` \
-                 syncs the stored removal only to the remaining members)"
+                 only learns of the removal if it was connected to a peer when that peer first \
+                 received the removal. `room tail` syncs the stored removal only to the \
+                 remaining members)"
                     .to_owned(),
             );
         }
@@ -693,21 +676,21 @@ fn departure_lines(summary: &DepartureSummary) -> Vec<String> {
     lines
 }
 
-/// Leave-retry delivery lines. Peers who already had the `member.left` are not
-/// described as a reason to run `room leave` again. Only peers that were not
-/// reached get that hint.
+/// Leave-retry delivery lines. A refused dial is not a reason to run
+/// `room leave` again. Only peers that were unreachable get that hint.
 fn leave_retry_delivery_lines(summary: &DepartureSummary) -> Vec<String> {
     let mut lines = Vec::new();
-    if summary.informed > 0 {
+    if summary.connected > 0 {
         lines.push(format!(
-            "delivered: {} peer(s) learned this member.left",
-            summary.informed
+            "delivered: {} connected peer(s)",
+            summary.connected
         ));
     }
-    if summary.already_known > 0 {
+    if summary.refused > 0 {
         lines.push(format!(
-            "already: {} reachable peer(s) already had this member.left",
-            summary.already_known
+            "refused: {} peer(s) refused the connection (it likely already has your departure, \
+             or you were removed)",
+            summary.refused
         ));
     }
     if summary.offline > 0 {
@@ -716,21 +699,8 @@ fn leave_retry_delivery_lines(summary: &DepartureSummary) -> Vec<String> {
              to re-deliver this same member.left",
             summary.offline
         ));
-    } else if summary.informed == 0 && summary.already_known == 0 {
-        if summary.attempted == 0 {
-            lines.push("delivered: 0 (no other members to reach — stored locally only)".to_owned());
-        } else if summary.delivered > 0 {
-            lines.push(format!(
-                "delivered: {} connected peer(s)",
-                summary.delivered
-            ));
-        } else {
-            lines.push(
-                "delivered: 0 (no peers online — stored locally only; run `room leave` again \
-                 when peers are reachable to re-deliver this same member.left)"
-                    .to_owned(),
-            );
-        }
+    } else if summary.connected == 0 && summary.refused == 0 && summary.attempted == 0 {
+        lines.push("delivered: 0 (no other members to reach — stored locally only)".to_owned());
     }
     lines
 }
@@ -766,37 +736,35 @@ mod tests {
             attempted: 2,
             redelivered,
             kept_original_reason: false,
-            informed: 0,
-            already_known: 0,
+            connected: 0,
+            refused: 0,
             offline: 0,
         }
     }
 
     #[test]
-    fn leave_retry_does_not_ask_again_when_reachable_peers_already_have_it() {
+    fn leave_retry_does_not_ask_again_when_peers_refuse() {
         let mut summary = sample(true);
-        summary.already_known = 2;
-        summary.delivered = 2;
+        summary.refused = 2;
+        summary.attempted = 2;
         let text = departure_lines(&summary).join("\n");
-        assert!(text.contains("already had this member.left"), "{text}");
+        assert!(text.contains("refused the connection"), "{text}");
+        assert!(text.contains("likely already has your departure"), "{text}");
         assert!(
             !text.contains("run `room leave` again"),
-            "reachable peers already have the leave; got:\n{text}"
+            "a refusal is not a reason to retry; got:\n{text}"
         );
+        assert!(!text.contains("offline:"), "{text}");
     }
 
     #[test]
-    fn leave_retry_reports_already_known_separately_from_offline() {
+    fn leave_retry_reports_refused_separately_from_offline() {
         let mut summary = sample(true);
-        summary.already_known = 1;
+        summary.refused = 1;
         summary.offline = 1;
-        summary.delivered = 1;
         summary.attempted = 2;
         let text = departure_lines(&summary).join("\n");
-        assert!(
-            text.contains("1 reachable peer(s) already had this member.left"),
-            "{text}"
-        );
+        assert!(text.contains("1 peer(s) refused the connection"), "{text}");
         assert!(text.contains("1 peer(s) not reached"), "{text}");
         assert!(text.contains("run `room leave` again"), "{text}");
     }
@@ -809,7 +777,10 @@ mod tests {
         summary.attempted = 1;
         let text = departure_lines(&summary).join("\n");
         assert!(
-            text.contains("only learns of the removal if it was online during `room remove`"),
+            text.contains(
+                "only learns of the removal if it was connected to a peer when that peer first \
+                 received the removal"
+            ),
             "{text}"
         );
         assert!(
@@ -840,7 +811,8 @@ mod live {
     use iroh_rooms_core::store::EventStore;
     use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
     use iroh_rooms_net::{
-        AllowlistAdmission, NetConfig, NetMode, Node, TracingAudit, DEFAULT_TICK,
+        Admission, AdmissionView, AllowlistAdmission, NetConfig, NetMode, Node, SnapshotAdmission,
+        TracingAudit, DEFAULT_TICK,
     };
     use tokio::sync::broadcast;
 
@@ -967,6 +939,47 @@ mod live {
             )
             .await
             .expect("listener")
+        })
+    }
+
+    /// A listener whose admission follows the folded roster. A device that has
+    /// already left is `NotActive` and the accept path closes with the
+    /// admission reject code.
+    fn spawn_live_listener<'a>(
+        party: &'a Party,
+        room: RoomId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Node> + Send + 'a>> {
+        Box::pin(async move {
+            let secret = SecretKeys::load(party.home.path()).expect("keys");
+            let store = EventStore::open(&party.home.path().join(DB_FILE)).expect("store");
+            let engine = SyncEngine::open_with_local_device(
+                store,
+                room,
+                SyncConfig::default(),
+                Some(secret.device_seed()),
+            )
+            .expect("engine");
+            let opening =
+                AdmissionView::from_snapshot(&engine.snapshot(), &engine.fail_closed_subjects());
+            let cell = std::sync::Arc::new(std::sync::Mutex::new(opening));
+            let admission: std::sync::Arc<dyn Admission> =
+                std::sync::Arc::new(SnapshotAdmission::new(cell.clone()));
+            Node::spawn_room(
+                SecretKey::from_bytes(&secret.device_seed()),
+                admission,
+                std::sync::Arc::new(TracingAudit),
+                engine,
+                NetConfig {
+                    mode: NetMode::Loopback,
+                    ..NetConfig::default()
+                },
+                DEFAULT_TICK,
+                Vec::new(),
+                cell,
+                None,
+            )
+            .await
+            .expect("live listener")
         })
     }
 
@@ -1152,6 +1165,61 @@ mod live {
             1,
             "the peer stores exactly one member.left"
         );
+        alice_node.shutdown().await.expect("shutdown alice");
+    }
+
+    /// Alice has already folded Bob's leave and is listening with live
+    /// admission. Bob's retry must see `Unauthorized` and report refused, not
+    /// offline, and must not suggest another leave.
+    #[tokio::test]
+    async fn leave_retry_reports_live_admission_peer_who_folded_the_leave_as_refused() {
+        message::FLUSH_GRACE_OVERRIDE_MS.store(300, std::sync::atomic::Ordering::Relaxed);
+        let (alice, members, room) = joined_room(&["Bob"]);
+        let bob = &members[0];
+        let first = leave(
+            bob.home.path(),
+            &room,
+            None,
+            &[],
+            Duration::from_millis(300),
+            true,
+        )
+        .await
+        .expect("leave while alice is offline");
+        replicate(bob, &alice, &room);
+        let alice_node = spawn_live_listener(&alice, room).await;
+        let peers = vec![render_endpoint_addr(
+            &alice_node.endpoint_addr().expect("alice addr"),
+        )];
+        let second = leave(
+            bob.home.path(),
+            &room,
+            None,
+            &peers,
+            Duration::from_secs(8),
+            true,
+        )
+        .await
+        .expect("retry against a peer who already folded the leave");
+        assert_eq!(second.event_id, first.event_id);
+        assert!(
+            second.refused >= 1,
+            "the dialer must record the live-admission reject as refused (connected={} refused={} offline={})",
+            second.connected, second.refused, second.offline
+        );
+        assert_eq!(
+            second.offline, 0,
+            "a refusal is not an unreachable peer (connected={} refused={} offline={})",
+            second.connected, second.refused, second.offline
+        );
+        let text = super::departure_lines(&second).join("\n");
+        assert!(text.contains("refused the connection"), "{text}");
+        assert!(text.contains("likely already has your departure"), "{text}");
+        assert!(
+            !text.contains("run `room leave` again"),
+            "no retry hint when the only peer refused; got:\n{text}"
+        );
+        assert!(!text.contains("offline:"), "{text}");
         alice_node.shutdown().await.expect("shutdown alice");
     }
 }

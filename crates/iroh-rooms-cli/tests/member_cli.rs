@@ -22,7 +22,8 @@ use tempfile::TempDir;
 use iroh_rooms_core::event::content::Content;
 use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
 use iroh_rooms_core::event::{
-    build_member_joined, build_pipe_opened, DeviceBinding, HashRef, IdentityKey, RoomId, SigningKey,
+    build_member_joined, build_member_left, build_member_removed, build_message_text,
+    build_pipe_opened, DeviceBinding, HashRef, IdentityKey, RoomId, SigningKey,
 };
 use iroh_rooms_core::membership::{
     blob_serve_allowed, pipe_connect_allowed, BlobDecision, DenyReason, MembershipSnapshot,
@@ -230,8 +231,11 @@ fn admin_remove_marks_member_removed_and_prints_honest_note() {
         "remove must print the honest v0.1 GA note; got:\n{out}"
     );
     assert!(
-        out.contains("only learns of the removal if it was online during `room remove`"),
-        "an undelivered removal must say the removed device learns it only if it was online; got:\n{out}"
+        out.contains(
+            "only learns of the removal if it was connected to a peer when that peer first \
+             received the removal"
+        ),
+        "an undelivered removal must say when the removed device learns it; got:\n{out}"
     );
     assert!(
         out.contains("`room tail` syncs the stored removal only to the remaining members"),
@@ -574,6 +578,85 @@ fn leave_retry_uses_the_latest_departure_not_an_older_removal() {
         "the latest departure is the self-leave, so the retry is allowed; stdout: {again}"
     );
     assert_eq!(count_member_left(bob, &room), 1);
+}
+
+#[test]
+fn concurrent_removal_refuses_leave_retry_even_with_higher_leave_lamport() {
+    let (alice, members, room_str, room) = room_with(1);
+    let bob = &members[0];
+    let heads = store(&alice).heads(&room).unwrap();
+    let (alice_id, alice_dev) = secrets(&alice);
+    let (bob_id, bob_dev) = secrets(bob);
+    let message = build_message_text(
+        &alice_id,
+        &alice_dev,
+        &room,
+        "concurrent-branch",
+        None,
+        None,
+        &[],
+        &heads,
+        now_ms(),
+    );
+    let message = validate_wire_bytes(&message.to_bytes(), &ValidationContext::for_room(room))
+        .expect("message");
+    let leave_wire = build_member_left(
+        &bob_id,
+        &bob_dev,
+        &room,
+        None,
+        &[message.event_id],
+        now_ms(),
+    );
+    let leave_ev = validate_wire_bytes(&leave_wire.to_bytes(), &ValidationContext::for_room(room))
+        .expect("leave");
+    let removal = build_member_removed(
+        &alice_id,
+        &alice_dev,
+        &room,
+        &bob_id.identity_key(),
+        None,
+        None,
+        &heads,
+        now_ms(),
+    );
+    let removal = validate_wire_bytes(&removal.to_bytes(), &ValidationContext::for_room(room))
+        .expect("removal");
+    let mut bob_store = store(bob);
+    bob_store.insert(&message).unwrap();
+    bob_store.insert(&leave_ev).unwrap();
+    bob_store.insert(&removal).unwrap();
+    let leave_lamport = bob_store
+        .get(&leave_ev.event_id)
+        .unwrap()
+        .unwrap()
+        .lamport
+        .unwrap();
+    let removal_lamport = bob_store
+        .get(&removal.event_id)
+        .unwrap()
+        .unwrap()
+        .lamport
+        .unwrap();
+    drop(bob_store);
+    assert!(
+        leave_lamport > removal_lamport,
+        "the fixture must give the leave the higher Lamport ({leave_lamport} vs {removal_lamport})"
+    );
+
+    let before = event_count(bob, &room);
+    let out = run(&bob.home, &leave_args(&room_str));
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[not_a_member]"),
+        "a concurrent removal is the standing departure; stderr: {stderr}"
+    );
+    assert_eq!(
+        event_count(bob, &room),
+        before,
+        "the refused retry writes nothing"
+    );
 }
 
 #[test]

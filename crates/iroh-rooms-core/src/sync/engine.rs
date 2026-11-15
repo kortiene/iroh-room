@@ -2410,14 +2410,7 @@ impl SyncEngine {
             }
         };
         let covered = match self.covered_by_claim(have) {
-            // Empty serve: the peer's claim already covers this membership
-            // closure, including any stored `member.left`. The CLI leave-retry
-            // reads this line to avoid telling the operator to re-run leave
-            // when every reachable peer already has it.
-            Ok(Coverage::Everything) => {
-                self.log(&format!("membership.serve peer={from} frames=0"));
-                return;
-            }
+            Ok(Coverage::Everything) => return, // converged: nothing to serve
             Ok(Coverage::Set(covered)) => covered,
             Err(e) => {
                 self.log(&format!("have-claim expansion failed: {e}"));
@@ -2441,10 +2434,6 @@ impl SyncEngine {
         }
         stored.sort_by(causal_order);
         let frames = self.frames_from_stored(&stored, "WantMembership");
-        self.log(&format!(
-            "membership.serve peer={from} frames={}",
-            frames.len()
-        ));
         self.emit_events(from, frames, out);
     }
 

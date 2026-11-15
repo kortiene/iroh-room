@@ -17,8 +17,9 @@ where feasible); the **experimental** tier may change on any release.
   push's flush. `room leave` run again re-syncs the stored `member.left`
   (stdout says so; a different `--reason` is not applied) and does not author
   a second event. If `room remove` reaches no peers, the message says the
-  removed device only learns of the removal if it was online during that
-  command, and that `room tail` syncs the stored removal only to the remaining
+  removed device only learns of the removal if it was connected to a peer
+  when that peer first received the removal, and that `room tail` syncs the
+  stored removal only to the remaining
   members. Removing someone already gone is `not_a_member` (exit 3). No SDK
   API change.
 - **Breaking (stable tier, before first publish):** `build_member_removed_with_rotation`

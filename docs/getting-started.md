@@ -594,7 +594,7 @@ nothing is written. The admin cannot `room leave` (v1 rooms have a single immuta
 admin), and nobody can `room remove` themselves. Once the removal is stored, the
 admin's node stops forwarding newer events to the removed device for the rest of
 that push. If `room remove` reaches no peers, the removal is still stored. The
-removed device only learns of the removal if it was online during `room remove`.
+removed device only learns of the removal if it was connected to a peer when that peer first received the removal.
 `room tail` syncs that stored removal only to the remaining members (running
 `room remove` again is rejected). `room leave` is
 safe to run again: if your `member.left` is already stored, the command re-syncs
