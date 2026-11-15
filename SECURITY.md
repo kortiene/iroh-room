@@ -2,7 +2,7 @@
 
 Iroh Rooms is a pre-1.0 Production Beta for a small cohort of technical builders.
 It has not had an independent security review
-([`WAIVER-PBETA-0003`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md)).
+([`WAIVER-PBETA-0003`](docs/releases/v0.1.0-rc.6-production-beta-signoff.md)).
 Treat it accordingly, and please report what you find.
 
 **v0.1 GA will not have an independent security review either.** No outside
@@ -21,8 +21,8 @@ Only the newest published release candidate receives security fixes.
 
 | Version | Supported | Notes |
 | --- | --- | --- |
-| `v0.1.0-rc.5` | Yes | current candidate; the only release-owner-approved build since `rc.1` |
-| `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.5` |
+| `v0.1.0-rc.6` | Yes | current candidate; release-owner approval is pending the signed practice run (`rc.5` remains the last release-owner-approved build until that approval) |
+| `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.6` |
 | `v0.1.0-rc.1` | No | superseded |
 | source builds off `main` | Best effort | report anyway, and name the commit |
 

@@ -3,18 +3,19 @@
 These recipes are for the first builder cohort. They intentionally use explicit
 data directories so participants do not mix beta data with personal state.
 
-Supported binary artifacts for `v0.1.0-rc.5`: `x86_64-apple-darwin`,
+Supported binary artifacts for `v0.1.0-rc.6`: `x86_64-apple-darwin`,
 `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
 `aarch64-unknown-linux-gnu`, each built on a native runner and checksummed. Any
 other platform builds from source.
 
 Source builders should use the exact release tag rather than `main`. The
 shipping dependency graph requires Rust 1.91 or newer in practice (the iroh 1.0
-stack declares `rust-version = "1.91"`); the `v0.1.0-rc.5` artifacts were built
-with Rust 1.97.1.
+stack declares `rust-version = "1.91"`); the `v0.1.0-rc.6` verify and release
+workflows are pinned to Rust 1.100.0. Published artifact checksums are recorded
+after the signed run.
 
 ```bash
-git clone --branch v0.1.0-rc.5 --depth 1 \
+git clone --branch v0.1.0-rc.6 --depth 1 \
   https://github.com/kortiene/iroh-room.git
 cd iroh-room
 cargo build --locked --release -p iroh-rooms-cli
@@ -22,7 +23,7 @@ export PATH="$PWD/target/release:$PATH"
 iroh-rooms --version
 ```
 
-Expected: `iroh-rooms 0.1.0-rc.5`. Do not continue with a different version.
+Expected: `iroh-rooms 0.1.0-rc.6`. Do not continue with a different version.
 
 Before running any recipe:
 
@@ -33,7 +34,7 @@ iroh-rooms --version
 Expected:
 
 ```text
-iroh-rooms 0.1.0-rc.5
+iroh-rooms 0.1.0-rc.6
 ```
 
 ## Safety Rules

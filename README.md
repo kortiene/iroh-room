@@ -2,14 +2,14 @@
 
 Iroh Rooms is a local-first collaboration runtime for small trusted groups. It lets people and agents create a private room, exchange signed messages, share verified files, expose a loopback-only live TCP pipe, and keep the room state on their own machines instead of a central application server.
 
-The current release is `v0.1.0-rc.5`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
+The current release is `v0.1.0-rc.5`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app. The candidate under preparation is `v0.1.0-rc.6`.
 
 The external builder cohort is deferred until every cohort-blocking `PRE` row
 in the approved [`RB-1 roadmap baseline`](ROADMAP.md) is complete, every
 cohort-blocking `COND` row is explicitly resolved, and every cohort-blocking
 `FC` gate passes on the exact roadmap-complete candidate. The existing rc.5
-release is not that candidate, and historical cohort preparation is not cohort
-evidence.
+release is not that candidate, and neither is the `v0.1.0-rc.6` candidate.
+Historical cohort preparation is not cohort evidence.
 
 ## What you can do with it
 
@@ -37,7 +37,7 @@ Start with one of these paths:
 - **Review roadmap and cohort status**: start with [`ROADMAP.md`](ROADMAP.md), then read [`docs/community/first-cohort.md`](docs/community/first-cohort.md)
 - **Share a local preview**: follow [`docs/live-pipe-preview.md`](docs/live-pipe-preview.md)
 - **Implement or audit the protocol**: read [`docs/protocol.md`](docs/protocol.md)
-- **Understand release status**: read [`docs/releases/v0.1.0-rc.5-release-notes.md`](docs/releases/v0.1.0-rc.5-release-notes.md)
+- **Understand release status**: read [`docs/releases/v0.1.0-rc.6-release-notes.md`](docs/releases/v0.1.0-rc.6-release-notes.md)
 - **Review security posture**: read [`docs/security/threat-model.md`](docs/security/threat-model.md)
 - **Report a vulnerability**: follow [`SECURITY.md`](SECURITY.md), not a public issue
 
@@ -88,7 +88,7 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 
 ## Current beta scope
 
-`v0.1.0-rc.5` supports:
+`v0.1.0-rc.6` supports:
 
 - local identity and device creation
 - room creation
@@ -100,7 +100,7 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 - local best-effort audit at `<IROH_ROOMS_HOME>/audit.ndjson`
 - a Rust SDK facade in `crates/iroh-rooms`, source/workspace use only
 
-Prebuilt binaries for this candidate ship for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner and published with a SHA-256 checksum on the [`v0.1.0-rc.5` release](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.5). This candidate is checksum-only, as are rc.1 through rc.4. Releases built by the signing workflow, starting with the first release after rc.5, also publish a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. Verify those with `scripts/verify-release-artifacts.sh`, described in [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md). No signed release has been published yet. Builders on any other platform should build from source.
+Prebuilt binaries for this candidate (`v0.1.0-rc.6`) are built for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner. rc.1 through rc.5 are checksum-only; the newest published tag is [`v0.1.0-rc.5`](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.5). Releases built by the signing workflow, starting with the first release after rc.5, also publish a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. Verify those with `scripts/verify-release-artifacts.sh`, described in [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md). No signed release has been published yet. Builders on any other platform should build from source.
 
 ## Limits you should understand
 
@@ -115,7 +115,7 @@ Read these before trusting Iroh Rooms with real work:
 - **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
 - **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
 - **Local audit only**: `audit.ndjson` is useful for incident reconstruction, not compliance-grade audit
-- **Release artifacts**: this candidate's archives have SHA-256 checksums and no project signature, same as rc.1 through rc.4. Releases built by the signing workflow, starting with the first release after rc.5, add a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. No signed release has been published yet
+- **Release artifacts**: rc.1 through rc.5 have SHA-256 checksums and no project signature. Releases built by the signing workflow, starting with this candidate, add a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. No signed release has been published yet
 - **SDK publication is deferred**: the Rust SDK facade exists, but the crate remains `publish = false`
 
 The beta storage, invite, and audit decisions live in:
@@ -258,7 +258,7 @@ Useful starting points:
 - [`crates/iroh-rooms/examples/example_agent/README.md`](crates/iroh-rooms/examples/example_agent/README.md)
 - [`docs/sdk-coverage.md`](docs/sdk-coverage.md)
 
-The SDK crate is not published for `v0.1.0-rc.5`. Use it from the workspace source until the release notes say otherwise.
+The SDK crate is not published for `v0.1.0-rc.6`. Use it from the workspace source until the release notes say otherwise.
 
 ## Contribute
 

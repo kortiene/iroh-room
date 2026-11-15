@@ -5,7 +5,7 @@ Status: deferred; do not recruit or start until the RB-1 activation gate passes
 Duration: 30 days from milestone #8 activation
 
 Release target: the exact tagged roadmap-complete cohort candidate, not
-`v0.1.0-rc.5`
+`v0.1.0-rc.6`
 
 ## Activation Gate
 
