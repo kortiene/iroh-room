@@ -269,18 +269,18 @@ fn every_relative_link_in_memo_resolves() {
 fn memo_gate_a_verdict_matches_spike_nat_source() {
     // Spec §5.1 / §6.7: the memo's Gate A verdict is only honest if it matches the
     // repo. Gate A is "measured" once per-run JSON is committed under
-    // crates/spike-nat/results/ (and the placeholder results table is replaced).
+    // archive/spikes/spike-nat/results/ (and the placeholder results table is replaced).
     // If it has been measured, the memo must NOT still say PENDING; if not, the
     // memo must say PENDING and recommend CONDITIONAL.
     let content = memo();
     let memo_marks_gate_a_pending = content.contains("PENDING");
 
-    let results_md = read("crates/spike-nat/results/results.md");
+    let results_md = read("archive/spikes/spike-nat/results/results.md");
     let placeholder_present = results_md.contains("pending manual two-host run");
 
-    let results_dir = workspace_root().join("crates/spike-nat/results");
+    let results_dir = workspace_root().join("archive/spikes/spike-nat/results");
     let has_run_json = std::fs::read_dir(&results_dir)
-        .expect("crates/spike-nat/results must exist")
+        .expect("archive/spikes/spike-nat/results must exist")
         .filter_map(Result::ok)
         .any(|e| e.path().extension().is_some_and(|ext| ext == "json"));
 
@@ -344,7 +344,7 @@ fn memo_pinned_versions_match_crate_manifests() {
     let content = memo();
     let checks = [
         ("iroh", "crates/iroh-rooms-net/Cargo.toml"),
-        ("iroh-gossip", "crates/spike-transport/Cargo.toml"),
+        ("iroh-gossip", "archive/spikes/spike-transport/Cargo.toml"),
         ("iroh-blobs", "crates/iroh-rooms-net/Cargo.toml"),
         ("ed25519-dalek", "crates/iroh-rooms-core/Cargo.toml"),
     ];

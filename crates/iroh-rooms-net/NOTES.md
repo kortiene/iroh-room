@@ -135,12 +135,12 @@ uplink read 0.1–0.2 Mbit/s on 256 KiB samples (below the ≥1 Mbit/s target �
 larger-sample re-measure is owed), and the home-NAT→CGNAT reverse leg was not run.
 Refresh: a 2026-07-07 operator-local ↔ `demo1` cloud run passed both directions,
 natural and relay-only; relay-only measured 4.1 Mbit/s BtoA and 1.3 Mbit/s AtoB.
-Findings block: `crates/spike-nat/NOTES.md` §6.
+Findings block: `archive/spikes/spike-nat/NOTES.md` §6.
 Tooling: a compile-time `relay-only-test` build seam (PR #107, off by default) now
 supports a controlled relay-only run for the owed cellular re-measure and the
 reverse leg — it is tooling, not evidence, and discharges neither residual.
 
-Two complementary runs close Gate A (see `crates/spike-nat/NOTES.md` for the full
+Two complementary runs close Gate A (see `archive/spikes/spike-nat/NOTES.md` for the full
 runbook):
 
 1. **Substrate probe** — `nat-probe` measures the iroh substrate directly (bare
@@ -164,7 +164,7 @@ least relay fallback, with a direct hole-punched path in ≥1 non-symmetric scen
 and usable relay throughput (≥1 Mbit/s, RTT ≤ ~300 ms).
 
 Measured results, 2026-07-03/04, both environments (full per-run table:
-`crates/spike-nat/results/results.md`, 37 runs). S1 = home-NAT ↔ cloud
+`archive/spikes/spike-nat/results/results.md`, 37 runs). S1 = home-NAT ↔ cloud
 (non-symmetric); S2 = cellular CGNAT hotspot ↔ {cloud, home-NAT}
 (likely-symmetric):
 
@@ -257,18 +257,18 @@ a relay forwards only ciphertext. The Gate-A notes must record path type but mus
   change transactionally inside the `Node` pump.
 - Deterministic double-connect tie-break (D8 / OQ-4) — still a follow-up.
 - **Gate A measured; keep refresh evidence current.** The measurement harness is
-  landed (`crates/spike-nat` / `nat-probe`, IR-0012), S1/S2 are committed, and
+  landed (`archive/spikes/spike-nat` / `nat-probe`, IR-0012), S1/S2 are committed, and
   a 2026-07-07 local↔`demo1` refresh is recorded. Remaining work is sign-off on
   the cellular relay-throughput caveat and the home-NAT→CGNAT reverse leg.
 - ~~ADR-1 mesh choice validated only on this landed loopback carrier, not
   measured against gossip.~~ **Closed by IR-0006** (#10): `spike-transport`
   measured full-mesh against a minimal `iroh-gossip` backend at N=2..5 and
   ratified ADR-1 (mesh admission-before-bytes corroborates T2 above; see
-  `crates/spike-transport/NOTES.md` for the measured table and decision).
+  `archive/spikes/spike-transport/NOTES.md` for the measured table and decision).
 
 ## Gossip overlay for Events fan-out (issue #171 / #154 GO decision) — Phase A landed
 
-`#154` closed GO: a gossip overlay **is** warranted for N>5. `crates/spike-N40`
+`#154` closed GO: a gossip overlay **is** warranted for N>5. `archive/spikes/spike-N40`
 measured the full-mesh topology collapsing under fan-out amplification
 (pre-`b0622ec` N=25 = 661 MB backlog, `accepted=0`, `frames_sent=0`; N=40 panics
 the QUIC layer at 1560 in-process connections) while every connectivity signal

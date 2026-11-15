@@ -94,7 +94,7 @@ never produce a READY verdict).
 
 | Item | Why not auto-P0 | Where recorded |
 | --- | --- | --- |
-| **Gate A real-NAT run** (`nat-probe`, two hosts on different networks, both directions, natural + `--relay-only`) | Requires two real hosts; cannot run in a single-machine script. Documented residual risk for a *developer preview*, not a blocker — but the maintainer must record its current status. | [Known MVP limitations](#known-mvp-limitations); [Sign-off](#sign-off) "Gate A status" field; `crates/spike-nat/results/results.md` |
+| **Gate A real-NAT run** (`nat-probe`, two hosts on different networks, both directions, natural + `--relay-only`) | Requires two real hosts; cannot run in a single-machine script. Documented residual risk for a *developer preview*, not a blocker — but the maintainer must record its current status. | [Known MVP limitations](#known-mvp-limitations); [Sign-off](#sign-off) "Gate A status" field; `archive/spikes/spike-nat/results/results.md` |
 | **Live-tail display gap** — streaming `room tail` renders only `message.text` (`agent.status`/`file.shared` rows appear only under `--offline`) | Cosmetic; the offline read is complete | [Known MVP limitations](#known-mvp-limitations) |
 | **DX metric timings** (PRD §17.2) — first identity <1 min, two-peer room <3 min, first pipe <5 min | Human-timed, environment-dependent | [Demo verification](#demo-verification) (record measured values) |
 
@@ -154,7 +154,7 @@ not discovered by a user:
   ≥1 Mbit/s target — a larger-sample re-measure is owed), and the home-NAT→CGNAT
   reverse leg was not run. See
   [`crates/iroh-rooms-net/NOTES.md`](crates/iroh-rooms-net/NOTES.md) §"Gate A
-  (real-network)" and [`crates/spike-nat/results/results.md`](crates/spike-nat/results/results.md).
+  (real-network)" and [`archive/spikes/spike-nat/results/results.md`](archive/spikes/spike-nat/results/results.md).
   A 2026-07-07 local↔`demo1` refresh also passed both directions, natural and
   relay-only; relay-only measured 4.1 Mbit/s BtoA and 1.3 Mbit/s AtoB.
 - **★ No cloud inbox; no guaranteed offline delivery.** Files and pipes
@@ -311,6 +311,6 @@ its output below; do not hand-wave this section.
 | --- | --- |
 | Verdict | `<READY / NOT READY>` |
 | `release-readiness: …` line | `<paste the exact line scripts/release-readiness.sh printed>` |
-| Gate A status | `<PENDING / measured — link crates/spike-nat/results/results.md>` |
+| Gate A status | `<PENDING / measured — link archive/spikes/spike-nat/results/results.md>` |
 | Reviewer | `<name>` |
 | Date | `<YYYY-MM-DD>` |

@@ -96,7 +96,7 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # The gossip overlay for `Events` fan-out (issue #171 / spec §4 D1). The exact
-# pin `crates/spike-transport` reconciled against `iroh = "=1.0.1"` with zero
+# pin `archive/spikes/spike-transport` reconciled against `iroh = "=1.0.1"` with zero
 # API drift (spike-transport/NOTES.md §1). Optional: enabled by the
 # `gossip_overlay` feature so the default build stays on the full-mesh path
 # the v1 spike measured. See `src/gossip.rs` for the integration notes.
