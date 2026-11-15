@@ -117,12 +117,8 @@ built_at_utc: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 binary: iroh-rooms
 
 This archive is checksummed by the adjacent .sha256 file. This build script
-does not sign the archive. Releases built by the signing workflow, starting
-with the first release after rc.5, also publish a GitHub build-provenance
-attestation (<archive>.sigstore.json, verified with gh attestation verify)
-and a keyless cosign signature over SHA256SUMS (SHA256SUMS.sigstore.json,
-verified with cosign verify-blob). v0.1.0-rc.1 through v0.1.0-rc.5 are
-checksum-only. No signed release has been published yet.
+does not sign. Signing and provenance, if any, are published as separate
+assets on the GitHub release; verify with scripts/verify-release-artifacts.sh.
 EOF
 
 mkdir -p "$DIST_DIR"

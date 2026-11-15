@@ -77,28 +77,72 @@ The OIDC issuer is `https://token.actions.githubusercontent.com`. There is no
 project-held signing key. macOS code signing and notarization are not part of
 these artifacts; a browser download may still be quarantined by Gatekeeper.
 
-Verify a signed release with the repository script (it downloads the assets,
-or reads a directory you already have). `v0.1.0-rc.1` through `v0.1.0-rc.5`
-fail at the attestation step by design:
+Verify a signed release with the repository script. It peels
+`refs/tags/v<VERSION>` and always passes that commit to `gh attestation verify
+--source-digest` and to `cosign verify-blob --certificate-github-workflow-sha`.
+`--commit` is optional: when you pass it, it must be that same 40-hex commit,
+and the archive name's 12-hex suffix must be its first 12 digits.
+`v0.1.0-rc.1` through `v0.1.0-rc.5` fail at the attestation step by design,
+after `gh auth status` has succeeded. If `gh` is not logged in, the script
+exits 3 and says `gh not authenticated` before it looks at attestations.
 
 ```bash
 scripts/verify-release-artifacts.sh v<VERSION> <TRIPLE>
-# assets already on disk, and you know the tagged commit:
+# assets already on disk:
+scripts/verify-release-artifacts.sh --dir ./assets v<VERSION> <TRIPLE>
+# also require the peeled commit to be this SHA:
 scripts/verify-release-artifacts.sh --dir ./assets --commit <FULL_SHA> v<VERSION> <TRIPLE>
 ```
 
 `<TRIPLE>` is `x86_64-apple-darwin`, `aarch64-apple-darwin`,
-`x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`. `--commit` must be
-the full 40-hex source digest. The script then passes `--source-digest` to
-`gh attestation verify` and `--certificate-github-workflow-sha` to
-`cosign verify-blob`, which is what the workflow's own self-verify does with
-`GITHUB_SHA`. The online `gh` path needs `gh auth login`.
+`x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`.
 
-`gh` is required, and it must provide `gh attestation verify`. If `cosign` is
-missing after the checksums and the `gh attestation verify` checks have
-passed, the script exits 3 and says the signature was not checked. Exit 0
-means the checksum, both archive attestation checks, the online `SHA256SUMS`
-attestation, and `cosign verify-blob` all passed.
+The online path needs GitHub CLI **2.68.0 or newer**. That release added
+`--source-digest` (and `--source-ref`); `--deny-self-hosted-runners` is older
+and the script requires it too. It probes `gh attestation verify --help` and
+exits 3 when either flag is missing. The signature check needs **cosign v3 or
+newer** (`cosign verify-blob --bundle`). The release workflow installs cosign
+v3.1.4. If `cosign` is missing or older after the `gh` checks have passed, the
+script exits 3 and says the signature was not checked. Exit 0 means the
+checksum, both archive attestation checks, the online `SHA256SUMS`
+attestation, and `cosign verify-blob` all passed. `--offline` skips the tag
+peel, the GitHub attestation lookup, and cosign, prints
+`PARTIAL: online checks skipped`, and exits 1. It is not a successful
+verification.
+
+Fetch the assets with `gh` (this needs `gh auth login` on current GitHub CLI
+builds for a private lookup; a public release also accepts the curl URLs
+below):
+
+```bash
+gh release download v<VERSION> -R kortiene/iroh-room \
+  -p 'iroh-rooms-<VERSION>-<TRIPLE>-*' \
+  -p 'SHA256SUMS*'
+```
+
+`iroh-rooms-<VERSION>-<TRIPLE>-*` is the archive, its `.sha256`, and
+`<archive>.sigstore.json`. `SHA256SUMS*` is `SHA256SUMS` and
+`SHA256SUMS.sigstore.json`. `gh release download` fails the whole command when
+a pattern matches nothing, which is what happens for `SHA256SUMS*` on rc.1
+through rc.5. Those tags only have the archive and the `.sha256`.
+
+No-login path. `curl` does not use `gh auth`. `gh attestation verify --bundle`
+and `cosign verify-blob` read the files you downloaded. They do not call the
+GitHub attestation API. The `SHA256SUMS` build-provenance attestation is not
+one of those files, so this path does not check it. The online
+`gh attestation verify` (no `--bundle`) does, and that command needs
+`gh auth login`.
+
+```bash
+TAG=v<VERSION>
+ARCHIVE=iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz
+BASE="https://github.com/kortiene/iroh-room/releases/download/${TAG}"
+curl -fsSL -o "$ARCHIVE" "${BASE}/${ARCHIVE}"
+curl -fsSL -o "${ARCHIVE}.sha256" "${BASE}/${ARCHIVE}.sha256"
+curl -fsSL -o "${ARCHIVE}.sigstore.json" "${BASE}/${ARCHIVE}.sigstore.json"
+curl -fsSL -o SHA256SUMS "${BASE}/SHA256SUMS"
+curl -fsSL -o SHA256SUMS.sigstore.json "${BASE}/SHA256SUMS.sigstore.json"
+```
 
 The same checks by hand, from a directory that contains the assets:
 
@@ -111,34 +155,41 @@ IDENTITY="https://github.com/kortiene/iroh-room/.github/workflows/release.yml@re
 sha256sum -c "${ARCHIVE}.sha256"
 sha256sum -c --ignore-missing SHA256SUMS
 
+# Online. Needs `gh auth login` and GitHub CLI 2.68.0 or newer.
 gh attestation verify "$ARCHIVE" \
   --repo kortiene/iroh-room \
   --cert-identity "$IDENTITY" \
   --source-ref "refs/tags/${TAG}" \
+  --source-digest "<FULL_SHA>" \
   --deny-self-hosted-runners
+# No-login. The bundle file is the attestation; this does not call the
+# GitHub attestation API.
 gh attestation verify "$ARCHIVE" \
   --bundle "${ARCHIVE}.sigstore.json" \
   --repo kortiene/iroh-room \
   --cert-identity "$IDENTITY" \
   --source-ref "refs/tags/${TAG}" \
+  --source-digest "<FULL_SHA>" \
   --deny-self-hosted-runners
+# Online only. The SHA256SUMS attestation bundle is not a release asset.
 gh attestation verify SHA256SUMS \
   --repo kortiene/iroh-room \
   --cert-identity "$IDENTITY" \
   --source-ref "refs/tags/${TAG}" \
+  --source-digest "<FULL_SHA>" \
   --deny-self-hosted-runners
 
 cosign verify-blob SHA256SUMS \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity "$IDENTITY" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha "<FULL_SHA>"
 ```
 
-Add `--source-digest <FULL_SHA>` to each `gh attestation verify` and
-`--certificate-github-workflow-sha <FULL_SHA>` to `cosign verify-blob` when you
-know the tagged commit. `shasum` has no `--ignore-missing`; on macOS check the
-per-archive `.sha256`, or pass that one line to `shasum -a 256 -c`. The script
-does that fallback itself.
+`<FULL_SHA>` is the commit `refs/tags/${TAG}` peels to. The script looks that
+up itself. `shasum` has no `--ignore-missing`; on macOS check the per-archive
+`.sha256`, or pass that one line to `shasum -a 256 -c`. The script does that
+fallback itself.
 
 Install after the checks succeed.
 

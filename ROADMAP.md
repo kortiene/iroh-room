@@ -292,7 +292,9 @@ from the shipped binary.
 ## RB-1.5 — release signing role
 
 On 2026-11-15 the maintainer approved Sigstore keyless signing for release
-artifacts (design for #237 / #248). There is no long-lived signing key to
+artifacts (design for #237 / #248,
+<https://github.com/kortiene/iroh-room/issues/237#issuecomment-6896502278>).
+There is no long-lived signing key to
 custody. `RB-REL-001`'s hardware / external role is therefore
 **release-workflow owner + release-environment reviewer** (the `release`
 environment's required reviewer). The row's deliverable, dependencies,
@@ -626,4 +628,4 @@ afterwards.
 | RB-1.2 | 2026-11-15 | Decide OD-1 as option (b): v0.1 GA ships plaintext room content, encrypted in transit only, disclosed; reclassify `RB-SEC-002`, `RB-SEC-011..014`, and `RB-ADM-005` `POST-GA`; keep `RB-REL-007` `GA-P0` with an encryption-claims entry; move the rotation builder to the SDK `experimental` tier; narrow OD-2 to unreachability of the encryption path. | Maintainer decision 2026-11-15 (OD-1, option b); recorded in ADR-0014; active on merge |
 | RB-1.3 | 2026-11-15 | Decide OD-2: v0.1 GA ships with WAIVER-PBETA-0003 re-accepted and disclosed, backed by an internal structured self-review (`docs/security/v0.1-self-review.md`); reclassify `RB-SEC-010` and `RB-FC-009` `POST-GA`; let the accepted waiver plus the self-review record satisfy the security-review gate item for the v0.1 GA candidate only; align `RB-FC-003`; move the waiver's expiry to before v0.2 or public beta expansion. | Maintainer decision 2026-11-15 (OD-2, waiver option); recorded in ADR-0014; active on merge |
 | RB-1.4 | 2026-11-15 | Add `GA-P0` row `RB-GA-002` (#379): CLI `room remove` (admin only) and `room leave`, with honest removal wording (peers enforce removal once they see it; removed members keep what they already had); reword threat-model T07/T09/T18; record T09's v0.1 GA disposition as admin removal plus sticky departure. | Maintainer decision 2026-11-15 (member removal, option B, GA-P0); active on merge |
-| RB-1.5 | 2026-11-15 | `RB-REL-001`: hardware / external role becomes "release-workflow owner + release-environment reviewer". Keyless Sigstore signing has no signing key to custody. Deliverable, dependencies, evidence, status (`not-started`), and cohort-blocking flag unchanged. | Maintainer decision 2026-11-15 (signed-release design D8); active on merge |
+| RB-1.5 | 2026-11-15 | `RB-REL-001`: hardware / external role becomes "release-workflow owner + release-environment reviewer". Keyless Sigstore signing has no signing key to custody. Deliverable, dependencies, evidence, status (`not-started`), and cohort-blocking flag unchanged. | Maintainer decision 2026-11-15 (signed-release design D8), <https://github.com/kortiene/iroh-room/issues/237#issuecomment-6896502278>; active on merge |

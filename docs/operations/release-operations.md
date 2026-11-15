@@ -154,18 +154,49 @@ Immutable releases are on, so a published release cannot be overwritten.
 
 If a draft for the tag already exists and has any assets, the job refuses to
 upload (`draft <tag> already has N assets`). A re-run after a partial upload
-requires deleting that draft by hand first (`gh release delete v<VERSION>`).
-Delete a draft only. The job also refuses to modify a release that is no longer
-a draft.
+requires deleting that draft by hand first. Read the draft flag, and delete
+only when it is still `true`:
+
+```bash
+gh release view v<VERSION> --json isDraft
+gh release delete v<VERSION> --yes
+```
+
+Never pass `--cleanup-tag`. That flag deletes `refs/tags/v<VERSION>` along
+with the release, and the next run would no longer be on the tag ref
+`tag-guard` requires. Do not delete a release whose `isDraft` is `false`.
+The job also refuses to modify a published release. Immutable releases are on.
 
 ### Before Sekou publishes the draft
 
 Drafts stay unpublished until Sekou publishes them. Before publishing:
 
-1. Peel `refs/tags/v<VERSION>` and compare the commit to the source digest in
-   the attestation and to the run's `GITHUB_SHA`. Those three have to be the
+1. Peel `refs/tags/v<VERSION>` and compare that commit to the attestation's
+   source digest and to the run's `GITHUB_SHA`. Those three have to be the
    same commit. The workflow peels the tag again immediately before upload;
    this check is the release owner's, on the draft he is about to publish.
+
+   The `^{}` line is the peeled commit. A lightweight tag has no `^{}` line;
+   its single SHA is the commit. When both lines are present, the `^{}` line
+   wins:
+
+```bash
+git ls-remote origin 'refs/tags/v<VERSION>^{}' 'refs/tags/v<VERSION>'
+```
+
+   The source digest recorded in the attestation, from a downloaded archive
+   (GitHub CLI 2.68.0 or newer, `gh auth login`):
+
+```bash
+gh attestation verify <archive> \
+  --repo kortiene/iroh-room \
+  --cert-identity "https://github.com/kortiene/iroh-room/.github/workflows/release.yml@refs/tags/v<VERSION>" \
+  --source-ref "refs/tags/v<VERSION>" \
+  --source-digest "<GITHUB_SHA>" \
+  --deny-self-hosted-runners \
+  --format json \
+  --jq '.[].verificationResult.signature.certificate.sourceRepositoryDigest'
+```
 2. Download the draft assets (or point `--dir` at a directory that has them)
    and run, for each supported triple:
 
