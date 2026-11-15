@@ -57,7 +57,7 @@ where feasible); the **experimental** tier may change on any release.
 - Fixed the three stacked defects behind the N=40 gossip-overlay load collapse
   (the reason rc.4 held #171/#173 out of shipped binaries), isolated by a
   seven-step single-variable experiment ladder on the corrected spike-N40
-  harness (`crates/spike-N40/results/results-gossip.md`):
+  harness (`archive/spikes/spike-N40/results/results-gossip.md`):
   - **iroh-gossip message-size kill-switch** (`iroh-rooms-net`):
     `spawn_gossip_actor` now sets `max_message_size` to the 1 MiB wire frame
     cap. The 4096-byte default was a whole-connection kill-switch — one
@@ -142,12 +142,12 @@ where feasible); the **experimental** tier may change on any release.
   façade's `experimental` feature no longer enable `gossip_overlay`, so this
   release's runtime topology and active-member ceiling are **unchanged from
   rc.3**: full mesh, `MAX_ACTIVE_MEMBERS = 5`. The reason is the project's own
-  gate. `specs/gossip-overlay-events-fan-out.md` Step 8 raises the cap "only
+  gate. `docs/post-ga/specs/gossip-overlay-events-fan-out.md` Step 8 raises the cap "only
   after Step 7 passes", and Step 7's acceptance criterion is "no cascade at
   1 event/s, connectedness >95%, delivery >95% at every N". Re-running the
   matrix through the committed spike-N40 harness measures the opposite — a
   cascade at 1 event/s with both figures under 95%, at N=5 as well as N=40
-  (`crates/spike-N40/results/results-gossip.md`). The overlay code stays
+  (`archive/spikes/spike-N40/results/results-gossip.md`). The overlay code stays
   compiled, tested under `--all-features`, and available to a consumer that
   opts in explicitly via `iroh-rooms-net/gossip_overlay`; it is simply not what
   a shipped binary runs. What the overlay does, for when it is re-enabled:

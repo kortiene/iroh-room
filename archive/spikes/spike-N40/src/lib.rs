@@ -1,6 +1,6 @@
 //! `spike-n40` — the #145 measurement harness for the post-`b0622ec`-guardrail
 //! v1 full-mesh event transport at N=5/10/20/40 loopback nodes (spec
-//! `specs/measure-n40-v1-guardrails.md`).
+//! `docs/post-ga/specs/measure-n40-v1-guardrails.md`).
 //!
 //! `PHASE-0-SPIKE.md:43-49` recorded the pre-guardrail N=25 collapse: at idle,
 //! `frames_sent=0`, `accepted=0`, 661 MB inbound backlog, and under load 22

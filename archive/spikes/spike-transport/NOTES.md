@@ -1,7 +1,7 @@
 # IR-0006 Day-4 Gossip-vs-Full-Mesh Transport Comparison — Findings & Decision Memo
 
 This is the written findings deliverable required by **AC4** and spec §9
-(`specs/measure-gossip-vs-full-mesh-transport.md`). It records the
+(`docs/post-ga/specs/measure-gossip-vs-full-mesh-transport.md`). It records the
 `iroh-gossip 0.101` API reconciliation, the measured comparison table, a
 per-dimension verdict against each ADR-1 claim, the **D1 decision**, the
 Residual Open Decision 13 resolution, and the surprises found while building

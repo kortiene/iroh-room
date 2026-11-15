@@ -6,7 +6,7 @@
 - **Decision owner:** Maintainer, with protocol review (RB-1 `RB-DEC-001`)
 - **Related:** RB-1 [`RB-DEC-001`](https://github.com/kortiene/iroh-room/issues/232)
   and [`RB-SEC-015`](https://github.com/kortiene/iroh-room/issues/253);
-  [`ADR-0004`](ADR-0004-accept-v2-large-community-architecture.md);
+  [`ADR-0004`](../post-ga/decisions/ADR-0004-accept-v2-large-community-architecture.md);
   [`ADR-0012`](ADR-0012-roadmap-completion-before-external-cohort.md);
   `docs/audits/feature-complete-audit-2026-07-02.md` P-26 / decision D-9;
   `docs/protocol.md` §6/§9/§11;

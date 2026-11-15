@@ -273,7 +273,7 @@ measured the full-mesh topology collapsing under fan-out amplification
 (pre-`b0622ec` N=25 = 661 MB backlog, `accepted=0`, `frames_sent=0`; N=40 panics
 the QUIC layer at 1560 in-process connections) while every connectivity signal
 still read healthy. Issue #171 lands the surgical fan-out replacement that
-decision named. Spec: `specs/gossip-overlay-events-fan-out.md`. Integration
+decision named. Spec: `docs/post-ga/specs/gossip-overlay-events-fan-out.md`. Integration
 notes: `src/gossip.rs`.
 
 **What landed (Phase A — the overlay, behind a feature flag):**
