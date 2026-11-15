@@ -55,7 +55,7 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 # `Aes256Gcm` holds the full expanded round-key schedule (whose first words
 # are the raw key). A direct dependency turns on the wipe-on-drop there too,
 # so dropped cipher objects don't outlive the crate's Zeroizing discipline.
-aes = { version = "0.8", features = ["zeroize"] }
+aes = { version = "0.9", features = ["zeroize"] }
 # OS CSPRNG for room keys, ephemeral wrap secrets, and nonces (spec D3).
 getrandom = "0.4"
 # Zeroize room keys, ephemeral secrets, and derived wrap keys on drop.
