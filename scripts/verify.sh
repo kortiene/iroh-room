@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# sign-and-publish's environment: and RELEASE_ENVIRONMENT must be the same
+# name. The check does not decide what that name is.
+scripts/check-release-environment.sh
+
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
