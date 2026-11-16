@@ -180,12 +180,21 @@ below is what ties this check to this attempt. It keeps statuses whose
 and drops statuses from earlier attempts.
 
 Set `run_id`, `attempt`, and `sha` for this attempt. `name` is the
-environment name read above. A non-zero exit means stop. The earliest
-`waiting` status for this job must be earlier than the first `queued` status
-created after that wait, and that `queued` status must be at or before the
-job's `started_at`.
+environment name read above. The block is a subshell, so
+`set -euo pipefail` applies only there. A failing check does not close an
+interactive shell. The subshell's exit status is the result. A non-zero
+exit means do not publish. The earliest `waiting` status for this job must
+be earlier than the first `queued` status created after that wait, and that
+`queued` status must be at or before the job's `started_at`.
+
+Deployment and status lists are requested with `per_page=100` and
+`gh api --paginate`. Each page is its own JSON array. `jq -r '.[].id'`
+reads every deployment page, and `jq -s 'add // []'` flattens every status
+page, so a status that is not on the first page still reaches the job filter.
 
 ```bash
+(
+set -euo pipefail
 : "${name:?}"
 : "${run_id:?}"
 : "${attempt:?}"
@@ -194,10 +203,10 @@ job_json="$(gh api "repos/kortiene/iroh-room/actions/runs/${run_id}/attempts/${a
 job_id="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].id else error("expected one sign-and-publish job") end')"
 started_at="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].started_at else error("expected one sign-and-publish job") end')"
 statuses="$(
-  gh api "repos/kortiene/iroh-room/deployments?environment=${name}&sha=${sha}" \
+  gh api --paginate "repos/kortiene/iroh-room/deployments?environment=${name}&sha=${sha}&per_page=100" \
     | jq -r '.[].id' \
     | while IFS= read -r dep_id; do
-        gh api "repos/kortiene/iroh-room/deployments/${dep_id}/statuses"
+        gh api --paginate "repos/kortiene/iroh-room/deployments/${dep_id}/statuses?per_page=100" || exit 1
       done \
     | jq -s 'add // []'
 )"
@@ -221,9 +230,11 @@ printf '%s\n' "$statuses" \
             end
         end
     '
+)
 ```
 
-A passing check prints `true`.
+A passing check prints `true` and the subshell exits 0. Any other exit
+means do not publish.
 
 ### What the publish job does
 
