@@ -47,8 +47,8 @@ user-writable install directory.
 `v0.1.0-rc.1` through `v0.1.0-rc.5` publish a per-archive `.sha256` and nothing
 else. Those candidates are checksum-only
 ([`WAIVER-PBETA-0004`](../releases/v0.1.0-rc.5-production-beta-signoff.md)
-covered that gap and is eligible for retirement for `v0.1.0-rc.6`; retired
-when the release owner approves that sign-off. See
+covered that gap and is retired for `v0.1.0-rc.6`. The release owner approved
+that sign-off on 2026-11-16. See
 [`v0.1.0-rc.6-production-beta-signoff.md`](../releases/v0.1.0-rc.6-production-beta-signoff.md)).
 Verify the signed release with the script below. Pin Actions run
 [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
