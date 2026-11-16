@@ -88,7 +88,7 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 
 ## Current beta scope
 
-`v0.1.0-rc.6` supports:
+The `v0.1.0-rc.6` candidate, once tagged, supports:
 
 - local identity and device creation
 - room creation

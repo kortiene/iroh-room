@@ -21,7 +21,8 @@ Only the newest published release candidate receives security fixes.
 
 | Version | Supported | Notes |
 | --- | --- | --- |
-| `v0.1.0-rc.6` | Yes | current candidate; release-owner approval is pending the signed practice run (`rc.5` remains the last release-owner-approved build until that approval) |
+| `v0.1.0-rc.5` | Yes | current published release; the last release-owner-approved build |
+| `v0.1.0-rc.6` | No | pending candidate; not yet supported until it is published and approved |
 | `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.5` (last approved), or `rc.6` once approved |
 | `v0.1.0-rc.1` | No | superseded |
 | source builds off `main` | Best effort | report anyway, and name the commit |
