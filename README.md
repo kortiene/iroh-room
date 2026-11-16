@@ -2,7 +2,7 @@
 
 Iroh Rooms is a local-first collaboration runtime for small trusted groups. It lets people and agents create a private room, exchange signed messages, share verified files, expose a loopback-only live TCP pipe, and keep the room state on their own machines instead of a central application server.
 
-The current release is `v0.1.0-rc.5`, a controlled Production Beta for technical builders. It is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app. The candidate under preparation is `v0.1.0-rc.6`.
+The newest published release is `v0.1.0-rc.6`, a signed prerelease. The last release-owner-approved controlled Production Beta is `v0.1.0-rc.5`. That approved build is ready for narrow, supervised use in private CLI-first rooms. rc.6 is published and signed; its Production Beta sign-off is still pending. Neither build is a general public launch, hosted chat service, compliance product, or polished GUI app.
 
 The external builder cohort is deferred until every cohort-blocking `PRE` row
 in the approved [`RB-1 roadmap baseline`](ROADMAP.md) is complete, every
@@ -88,7 +88,7 @@ For smaller recipes, use [`docs/community/demo-recipes.md`](docs/community/demo-
 
 ## Current beta scope
 
-The `v0.1.0-rc.6` candidate, once tagged, supports:
+The published `v0.1.0-rc.6` release supports:
 
 - local identity and device creation
 - room creation
@@ -100,7 +100,7 @@ The `v0.1.0-rc.6` candidate, once tagged, supports:
 - local best-effort audit at `<IROH_ROOMS_HOME>/audit.ndjson`
 - a Rust SDK facade in `crates/iroh-rooms`, source/workspace use only
 
-Prebuilt binaries for this candidate (`v0.1.0-rc.6`) are built for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner. rc.1 through rc.5 are checksum-only; the newest published tag is [`v0.1.0-rc.5`](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.5). Releases built by the signing workflow, starting with the first release after rc.5, also publish a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. Verify those with `scripts/verify-release-artifacts.sh`, described in [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md). No signed release has been published yet. Builders on any other platform should build from source.
+Prebuilt binaries for `v0.1.0-rc.6` are published for four platform triples: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`. Each is built on a native runner. rc.1 through rc.5 are checksum-only. The newest published tag is [`v0.1.0-rc.6`](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.6), a signed prerelease. It publishes a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. Verify it with `scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`, as described in [`docs/releases/v0.1.0-rc.6-release-notes.md`](docs/releases/v0.1.0-rc.6-release-notes.md) and [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md). Pin Actions run [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665). Builders on any other platform should build from source.
 
 ## Limits you should understand
 
@@ -115,7 +115,7 @@ Read these before trusting Iroh Rooms with real work:
 - **Invite tickets are secrets**: treat tokens beginning with `roomtkt1` like passwords
 - **No native ticket-specific revocation**: Production Beta accepts the bounded leaked-ticket model in [`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md)
 - **Local audit only**: `audit.ndjson` is useful for incident reconstruction, not compliance-grade audit
-- **Release artifacts**: rc.1 through rc.5 have SHA-256 checksums and no project signature. Releases built by the signing workflow, starting with this candidate, add a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. No signed release has been published yet
+- **Release artifacts**: rc.1 through rc.5 have SHA-256 checksums and no project signature. `v0.1.0-rc.6` is signed: a build-provenance attestation per archive and a keyless signature over `SHA256SUMS`. Verify with `scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>` and pin run [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665)
 - **SDK publication is deferred**: the Rust SDK facade exists, but the crate remains `publish = false`
 
 The beta storage, invite, and audit decisions live in:

@@ -58,10 +58,10 @@ State these before install/run commands:
 - `audit.ndjson` is local best-effort audit, not remote, centrally retained,
   tamper-evident, or compliance-grade audit if ADR-0003 remains in force.
 - Binary artifacts for rc.1 through rc.5 are checksum-only
-  (WAIVER-PBETA-0004). Releases built by the signing workflow, starting with
-  the first release after rc.5, also publish a per-archive build-provenance
-  attestation and a keyless signature over SHA256SUMS. State below which of
-  those this candidate is. No signed release has been published yet.
+  (WAIVER-PBETA-0004, retired for v0.1.0-rc.6). `v0.1.0-rc.6` is the first
+  published signed release; verify it with `scripts/verify-release-artifacts.sh`
+  and pin run 43835416665. State below whether this candidate is signed the
+  same way, and name the workflow run a checker must pin.
 - SDK package publication status: <source-only publish=false / published>.
 - Rollback support: <without data restore / requires pre-upgrade backup /
   not supported>.

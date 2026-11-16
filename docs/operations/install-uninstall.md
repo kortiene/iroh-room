@@ -46,8 +46,15 @@ user-writable install directory.
 
 `v0.1.0-rc.1` through `v0.1.0-rc.5` publish a per-archive `.sha256` and nothing
 else. Those candidates are checksum-only
-([`WAIVER-PBETA-0004`](../releases/v0.1.0-rc.5-production-beta-signoff.md) is
-still in force). No signed release has been published yet.
+([`WAIVER-PBETA-0004`](../releases/v0.1.0-rc.5-production-beta-signoff.md)
+covered that gap and is retired for `v0.1.0-rc.6`; see
+[`v0.1.0-rc.6-production-beta-signoff.md`](../releases/v0.1.0-rc.6-production-beta-signoff.md)).
+Verify the signed release with the script below and pin Actions run
+[43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665):
+
+```bash
+scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>
+```
 
 Releases built by the signing workflow, starting with the first release after
 rc.5, publish the following assets for each of the four triples, plus the two

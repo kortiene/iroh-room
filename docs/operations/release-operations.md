@@ -420,8 +420,12 @@ Production Beta artifacts must be:
 
 The `release` workflow builds each triple on a native runner. rc.1 through rc.5
 attached the archive and its `.sha256` only. Those releases stay checksum-only;
-their records are not rewritten, and `WAIVER-PBETA-0004` stays in force until
-a signed release exists. No signed release has been published yet.
+their records are not rewritten. `WAIVER-PBETA-0004` is retired for
+`v0.1.0-rc.6`, the first published signed release. Verify it with
+`scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`
+and pin run
+[43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
+See `docs/releases/v0.1.0-rc.6-release-notes.md`.
 
 Releases built by the signing workflow, starting with the first release after
 rc.5, attach the archive, the `.sha256`, and `<archive>.sigstore.json` for each

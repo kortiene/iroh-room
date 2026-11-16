@@ -17,13 +17,15 @@ before v0.2 or any public beta expansion.
 
 ## Supported Versions
 
-Only the newest published release candidate receives security fixes.
+Security fixes target the supported row below. The newest published tag is
+`v0.1.0-rc.6`. It is signed, and it is not the supported build until its
+Production Beta sign-off is approved.
 
 | Version | Supported | Notes |
 | --- | --- | --- |
-| `v0.1.0-rc.5` | Yes | current published release; the last release-owner-approved build |
-| `v0.1.0-rc.6` | No | pending candidate; not yet supported until it is published and approved |
-| `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.5` (last approved), or `rc.6` once approved |
+| `v0.1.0-rc.5` | Yes | last release-owner-approved build. Supported until the rc.6 sign-off is approved |
+| `v0.1.0-rc.6` | No | published 2026-11-16 as a signed prerelease (release id 446819408). Production Beta sign-off is still pending, so it is not the supported build yet. Verify with `scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679` and pin run 43835416665 |
+| `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.5` (last approved) |
 | `v0.1.0-rc.1` | No | superseded |
 | source builds off `main` | Best effort | report anyway, and name the commit |
 
@@ -90,20 +92,28 @@ restate them will be closed with a pointer here — but a report showing one is
   ([`ADR-0002`](docs/decisions/ADR-0002-invite-revocation-bounded-ticket-risk.md))
 - **Persistent local audit.** `audit.ndjson` is retained locally and is not
   compliance-grade. ([`ADR-0003`](docs/decisions/ADR-0003-persistent-audit-posture.md))
-- **Release artifact signing.** `v0.1.0-rc.5` and rc.1 through rc.4 carry
-  SHA-256 checksums and no project signature
-  ([`WAIVER-PBETA-0004`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md)).
-  That waiver is still in force: no signed release has been published.
-  Releases built by the signing workflow, starting with the first release
-  after rc.5, publish a SLSA build-provenance attestation for each archive
-  (`<archive>.sigstore.json`, checked with `gh attestation verify`) and a
-  keyless cosign signature over `SHA256SUMS` (`SHA256SUMS.sigstore.json`,
-  checked with `cosign verify-blob`). Those two `.sigstore.json` files are
-  different bundles. The `SHA256SUMS` attestation bundle is not uploaded;
-  `gh attestation verify SHA256SUMS` reads it from GitHub. Verify a signed
-  release with
+- **Release artifact signing.** `v0.1.0-rc.1` through `v0.1.0-rc.5` carry
+  SHA-256 checksums and no project signature. That was
+  [`WAIVER-PBETA-0004`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md).
+  The waiver is retired for [`v0.1.0-rc.6`](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.6):
+  that release is signed. Verify it with
   [`scripts/verify-release-artifacts.sh`](scripts/verify-release-artifacts.sh)
-  and the steps in
+  `--commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`,
+  and pin Actions run
+  [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
+  Evidence:
+  [verification](https://github.com/kortiene/iroh-room/issues/248#issuecomment-6912690853)
+  and the
+  [publish record](https://github.com/kortiene/iroh-room/issues/248#issuecomment-6919904237).
+  An earlier run, 43791394134, signed without approval. Its draft was deleted.
+  Its attestations remain public with different digests.
+  The signed release publishes a SLSA build-provenance attestation for each
+  archive (`<archive>.sigstore.json`, checked with `gh attestation verify`)
+  and a keyless cosign signature over `SHA256SUMS`
+  (`SHA256SUMS.sigstore.json`, checked with `cosign verify-blob`). Those two
+  `.sigstore.json` files are different bundles. The `SHA256SUMS` attestation
+  bundle is not uploaded; `gh attestation verify SHA256SUMS` reads it from
+  GitHub. The install steps are in
   [`docs/operations/install-uninstall.md`](docs/operations/install-uninstall.md).
   rc.1 through rc.5 fail that script at the attestation step by design.
 - **Transport metadata is not private.** Payloads are encrypted in transit;
