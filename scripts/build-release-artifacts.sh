@@ -116,8 +116,9 @@ source: $(git config --get remote.origin.url || echo unknown)
 built_at_utc: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 binary: iroh-rooms
 
-This archive is checksummed by the adjacent .sha256 file. Production Beta
-artifacts are not project-signed unless the release notes explicitly say so.
+This archive is checksummed by the adjacent .sha256 file. This build script
+does not sign. Signing and provenance, if any, are published as separate
+assets on the GitHub release; verify with scripts/verify-release-artifacts.sh.
 EOF
 
 mkdir -p "$DIST_DIR"

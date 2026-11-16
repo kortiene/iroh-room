@@ -57,8 +57,11 @@ State these before install/run commands:
   `content-key-rotation.md` D8).
 - `audit.ndjson` is local best-effort audit, not remote, centrally retained,
   tamper-evident, or compliance-grade audit if ADR-0003 remains in force.
-- Binary artifacts are checksummed but not project-signed unless signing is
-  explicitly listed below.
+- Binary artifacts for rc.1 through rc.5 are checksum-only
+  (WAIVER-PBETA-0004). Releases built by the signing workflow, starting with
+  the first release after rc.5, also publish a per-archive build-provenance
+  attestation and a keyless signature over SHA256SUMS. State below which of
+  those this candidate is. No signed release has been published yet.
 - SDK package publication status: <source-only publish=false / published>.
 - Rollback support: <without data restore / requires pre-upgrade backup /
   not supported>.
@@ -95,21 +98,37 @@ production-readiness: <AUTOMATED PREFLIGHT PASS/FAIL>
 
 ## Artifacts And Checksums
 
-Artifacts were built with:
-
-```bash
-scripts/build-release-artifacts.sh --version <VERSION>
-```
+Published artifacts come from the `release` workflow at tag `v<VERSION>`, one
+native runner per triple. `scripts/build-release-artifacts.sh --version <VERSION>`
+is the same build run locally and only produces the rustc host triple; it does
+not sign anything.
 
 | Artifact | Platform | SHA-256 |
 | --- | --- | --- |
 | `iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz` | `<TRIPLE>` | `<SHA256>` |
 
-Project signing: <not signed / signed with ...>.
+A release built by the signing workflow also attaches, for each archive, the
+`.sha256` line and `<archive>.sigstore.json` (a GitHub build-provenance
+attestation bundle, SLSA, verified with `gh attestation verify`), plus
+`SHA256SUMS` and `SHA256SUMS.sigstore.json` (a cosign keyless signature bundle,
+verified with `cosign verify-blob`). Those two `.sigstore.json` files are
+different kinds of bundle. The `SHA256SUMS` attestation bundle is not
+uploaded; `gh attestation verify SHA256SUMS` reads it from GitHub.
+
+Project signing: <checksum-only, rc.5 and earlier / release built by the signing workflow, starting with the first release after rc.5>.
 
 ## Install
 
 See `docs/operations/install-uninstall.md`.
+
+For a release built by the signing workflow, verify before install:
+
+```bash
+scripts/verify-release-artifacts.sh v<VERSION> <TRIPLE>
+```
+
+rc.1 through rc.5 fail that script at the attestation step by design. On those
+candidates, check the per-archive checksum and then install.
 
 Minimum binary install:
 

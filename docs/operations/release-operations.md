@@ -63,26 +63,150 @@ scripts/production-readiness.sh
 `scripts/production-readiness.sh --offline-only` is allowed during iteration but
 cannot produce a production-ready verdict.
 
-Build release artifacts only after the gates pass. Pushing the release tag runs
-the `release` workflow, which builds and attaches every supported triple:
+Build release artifacts only after the gates pass. The published artifacts are
+the `release` workflow's, not a laptop build.
+`scripts/build-release-artifacts.sh --version <VERSION>` is that same build run
+locally, and it only ever produces the *rustc host triple*. Use it for local
+dry-runs and smoke tests. It writes a `.sha256` and does not sign. Use
+`--allow-dirty` only for local dry-runs, never for signed-off Production Beta
+artifacts.
+
+### Cutting a release
+
+`crates/iroh-rooms-cli` must already be version `<VERSION>` on the commit you
+tag. A non-dry run fails in `tag-guard`, before any build, unless `github.ref`
+is `refs/tags/v<VERSION>` and `<VERSION>` is that crate's version. A
+`workflow_dispatch` also fails unless the `tag` input equals `github.ref_name`.
+Dispatch on the tag. Dispatching `--ref main` records the wrong source and the
+guard rejects it.
 
 ```bash
+git tag v<VERSION> <COMMIT>
 git push origin v<VERSION>
 ```
 
-To (re)build artifacts for a tag that already exists — for example after fixing
-a release that shipped an incomplete artifact set:
+Pushing the tag starts the workflow (`on: push: tags: v*`). To run it again
+from the same tag, dispatch on that ref and pass the tag name:
 
 ```bash
-gh workflow run release.yml --ref main -f tag=v<VERSION>
+gh workflow run release.yml --ref v<VERSION> -f tag=v<VERSION>
 ```
 
-`scripts/build-release-artifacts.sh --version <VERSION>` is the same build run
-locally, but it only ever produces the *rustc host triple*. Use it for local
-dry-runs and smoke tests, not as the source of published artifacts: a release
-cut by hand ships only the platform its release owner happened to build on.
-Use `--allow-dirty` only for local dry-runs, never for signed-off Production
-Beta artifacts.
+Omit `dry_run`. `-f dry_run=true` skips `tag-guard`, signing, and every release
+write. A dry run builds archives and `SHA256SUMS` as workflow artifacts and
+does not create a GitHub release. It is not a practice release.
+
+The workflow runs one tag ref at a time (`concurrency: release-${{ github.ref }}`,
+`cancel-in-progress: false`). A second run waits. It does not cancel the first.
+
+### Approve the release environment
+
+`sign-and-publish` is the only job with `environment: release`, and the only
+job with `contents: write`, `id-token: write`, or `attestations: write`. GitHub
+pauses that job until a required reviewer approves the `release` environment
+deployment. Sekou is that reviewer. Nothing is attested, signed, or uploaded
+before the approval. Build jobs stay `contents: read` and have no `id-token`.
+
+### What the publish job does
+
+After approval the job, still before any release write:
+
+1. Re-verifies the four archives, each `.sha256` line, and `SHA256SUMS`, and
+   peels `refs/tags/v<VERSION>`. The tag must still peel to this run's
+   `GITHUB_SHA`. An annotated tag is peeled to its commit.
+2. Attests each archive and `SHA256SUMS` with `actions/attest` (SLSA build
+   provenance, one bundle per file).
+3. Keyless-signs `SHA256SUMS` with `cosign sign-blob --bundle SHA256SUMS.sigstore.json`.
+   There is no project-held signing key. The signer is this workflow's GitHub
+   OIDC identity at `refs/tags/v<VERSION>`.
+4. Self-verifies, and fails the job if any check fails:
+   - `gh attestation verify <archive>` online and again with
+     `--bundle <archive>.sigstore.json`, both with `--cert-identity`
+     `https://github.com/kortiene/iroh-room/.github/workflows/release.yml@refs/tags/v<VERSION>`,
+     `--source-ref refs/tags/v<VERSION>`, `--source-digest` set to `GITHUB_SHA`,
+     and `--deny-self-hosted-runners`.
+   - The same online and `--bundle` checks for `SHA256SUMS`. The `SHA256SUMS`
+     attestation bundle stays on the runner. It is not uploaded.
+   - `cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json` with that
+     same certificate identity, issuer
+     `https://token.actions.githubusercontent.com`, and
+     `--certificate-github-workflow-sha` set to `GITHUB_SHA`.
+
+`<archive>.sigstore.json` is the GitHub attestation bundle. `SHA256SUMS.sigstore.json`
+is the cosign signature bundle. They are not interchangeable.
+
+A failed self-verify leaves no draft. The attestations and the Rekor entries
+from `actions/attest` and `cosign sign-blob` are already public, and they stay
+public. Re-running does not erase them.
+
+On success the job creates a draft (`--draft --verify-tag`, and `--prerelease`
+when the version contains `-`) and uploads exactly these 14 files:
+
+- four `iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT12>.tar.gz`
+- four `<archive>.sha256`
+- four `<archive>.sigstore.json`
+- `SHA256SUMS`
+- `SHA256SUMS.sigstore.json`
+
+The workflow then checks the release is still a draft and that the asset names
+match that list. It never publishes the draft and it never passes `--clobber`.
+Immutable releases are on, so a published release cannot be overwritten.
+
+If a draft for the tag already exists and has any assets, the job refuses to
+upload (`draft <tag> already has N assets`). A re-run after a partial upload
+requires deleting that draft by hand first. Read the draft flag, and delete
+only when it is still `true`:
+
+```bash
+gh release view v<VERSION> --json isDraft
+gh release delete v<VERSION> --yes
+```
+
+Never pass `--cleanup-tag`. That flag deletes `refs/tags/v<VERSION>` along
+with the release, and the next run would no longer be on the tag ref
+`tag-guard` requires. Do not delete a release whose `isDraft` is `false`.
+The job also refuses to modify a published release. Immutable releases are on.
+
+### Before Sekou publishes the draft
+
+Drafts stay unpublished until Sekou publishes them. Before publishing:
+
+1. Peel `refs/tags/v<VERSION>` and compare that commit to the attestation's
+   source digest and to the run's `GITHUB_SHA`. Those three have to be the
+   same commit. The workflow peels the tag again immediately before upload;
+   this check is the release owner's, on the draft he is about to publish.
+
+   The `^{}` line is the peeled commit. A lightweight tag has no `^{}` line;
+   its single SHA is the commit. When both lines are present, the `^{}` line
+   wins:
+
+```bash
+git ls-remote origin 'refs/tags/v<VERSION>^{}' 'refs/tags/v<VERSION>'
+```
+
+   The source digest recorded in the attestation, from a downloaded archive
+   (GitHub CLI 2.68.0 or newer, `gh auth login`):
+
+```bash
+gh attestation verify <archive> \
+  --repo kortiene/iroh-room \
+  --cert-identity "https://github.com/kortiene/iroh-room/.github/workflows/release.yml@refs/tags/v<VERSION>" \
+  --source-ref "refs/tags/v<VERSION>" \
+  --source-digest "<GITHUB_SHA>" \
+  --deny-self-hosted-runners \
+  --format json \
+  --jq '.[].verificationResult.signature.certificate.sourceRepositoryDigest'
+```
+2. Download the draft assets (or point `--dir` at a directory that has them)
+   and run, for each supported triple:
+
+```bash
+scripts/verify-release-artifacts.sh --commit <GITHUB_SHA> v<VERSION> <TRIPLE>
+```
+
+Publish the draft only after both checks succeed. Publishing is a GitHub
+release action, outside this workflow. Immutable releases then reject a later
+overwrite of that release.
 
 ## Production Beta Sign-Off Template
 
@@ -105,7 +229,10 @@ Rust toolchain:
 - `scripts/release-readiness.sh`: <PASS/FAIL, paste `release-readiness: ...`>
 - `scripts/production-readiness.sh`: <PASS/FAIL, paste `production-readiness: ...`>
 - `release` workflow run for `v<VERSION>`:
-  <PASS/FAIL, paste run URL, then one artifact name + SHA-256 per supported triple>
+  <PASS/FAIL, paste run URL, then one artifact name + SHA-256 per supported triple.
+  For a release built by the signing workflow, also name each
+  `<archive>.sigstore.json` and `SHA256SUMS.sigstore.json`, and paste the
+  `scripts/verify-release-artifacts.sh` result.>
 
 ## Manual P0 Sign-Offs
 
@@ -118,6 +245,10 @@ Rust toolchain:
 - Compatibility and migration policy accepted: <YES/NO>
 - Backup and restore tested: <YES/NO>
 - Release artifacts versioned and checksummed: <YES/NO>
+- For a release built by the signing workflow (the first release after rc.5,
+  and later): `scripts/verify-release-artifacts.sh --commit <GITHUB_SHA>`
+  passed for every triple, and `refs/tags/v<VERSION>` still peels to that
+  SHA: <YES/NO / checksum-only candidate, WAIVER-PBETA-0004>
 - Install/uninstall/rollback instructions published:
   <YES/NO, docs/operations/install-uninstall.md>
 - Release notes include all known limitations before install/run steps: <YES/NO>
@@ -169,16 +300,24 @@ Production Beta artifacts must be:
   only supports triples the notes name with a checksum, so an unannounced
   artifact is an unsupported one.
 
-The `release` workflow builds and checksums each triple on a native runner and
-attaches both files to the tag's release. Verify a downloaded artifact with:
+The `release` workflow builds each triple on a native runner. rc.1 through rc.5
+attached the archive and its `.sha256` only. Those releases stay checksum-only;
+their records are not rewritten, and `WAIVER-PBETA-0004` stays in force until
+a signed release exists. No signed release has been published yet.
+
+Releases built by the signing workflow, starting with the first release after
+rc.5, attach the archive, the `.sha256`, and `<archive>.sigstore.json` for each
+triple, plus `SHA256SUMS` and `SHA256SUMS.sigstore.json`. Verify those with
+`scripts/verify-release-artifacts.sh`, or with the commands in
+`docs/operations/install-uninstall.md`. A checksum-only check is:
 
 ```bash
 shasum -a 256 -c <artifact>.sha256
 ```
 
-Production GA should add artifact signing. Production Beta can proceed with
-checksums only if the release notes say artifacts are checksummed but not
-cryptographically signed by the project.
+That checksum still matters. It does not check who built the archive. The
+attestation and the cosign signature do that, for releases the signing
+workflow built.
 
 ## Downstream Source Pins (Qualification Tags)
 
