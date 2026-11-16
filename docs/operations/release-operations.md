@@ -141,8 +141,8 @@ Environment protection is the gate. The job's first step only detects a
 missing approval. It calls
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` and fails unless
 one entry has `state` `approved`, names `RELEASE_ENVIRONMENT` (the same
-string as `environment:`), and has `user.login` `kortiene` with
-`user.type` `User` (`RELEASE_APPROVER`). GitHub stores that approval before the job's steps
+string as `environment:`), and has `user.login` `kortiene` (`RELEASE_APPROVER`) with
+`user.type` `User`. GitHub stores that approval before the job's steps
 start, so the check runs in the same job. It needs `actions: read`. It does
 not call the environments API. An environment with no required reviewer
 does not pause the job, and this list is empty, so the step fails before
@@ -167,26 +167,63 @@ gh api repos/kortiene/iroh-room/actions/runs/<run-id>/approvals \
 `gh api --jq` cannot take `--arg`, so the filter is a separate `jq -e`.
 Exit 0 means a matching approval exists. Any other exit means stop.
 
-Then compare that approval's time with this attempt's `sign-and-publish`
-start. The review object has its own `created_at` and `updated_at`. Those
-are the review times. Each nested environment object also has `created_at`
-and `updated_at`, and those are the environment resource's times, not the
-review. Use the review object's `created_at`.
+`/approvals` rows have `comment`, `environments`, `state`, and `user`.
+A row has no review timestamp. `created_at` and `updated_at` on a nested
+environment are that environment resource's times.
+
+A deployment status's `creator` is the run's actor. Approver identity still
+comes from the `/approvals` check above.
+
+Environment approvals carry over across re-run attempts. The job-id filter
+below is what ties this check to this attempt. It keeps statuses whose
+`log_url` ends in `/job/<job_id>` for this attempt's `sign-and-publish` job
+and drops statuses from earlier attempts.
+
+Set `run_id`, `attempt`, and `sha` for this attempt. `name` is the
+environment name read above. A non-zero exit means stop. The earliest
+`waiting` status for this job must be earlier than the first `queued` status
+created after that wait, and that `queued` status must be at or before the
+job's `started_at`.
 
 ```bash
-gh api repos/kortiene/iroh-room/actions/runs/<run-id>/approvals \
-  | jq -r --arg name "$name" '[.[] | select(.state=="approved" and .user.login=="kortiene" and .user.type=="User" and any(.environments[]?; .name==$name))] | max_by(.created_at) | .created_at'
-gh api repos/kortiene/iroh-room/actions/runs/<run-id>/attempts/<attempt>/jobs \
-  --jq '.jobs[] | select(.name=="sign-and-publish") | .started_at'
+: "${name:?}"
+: "${run_id:?}"
+: "${attempt:?}"
+: "${sha:?}"
+job_json="$(gh api "repos/kortiene/iroh-room/actions/runs/${run_id}/attempts/${attempt}/jobs")"
+job_id="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].id else error("expected one sign-and-publish job") end')"
+started_at="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].started_at else error("expected one sign-and-publish job") end')"
+statuses="$(
+  gh api "repos/kortiene/iroh-room/deployments?environment=${name}&sha=${sha}" \
+    | jq -r '.[].id' \
+    | while IFS= read -r dep_id; do
+        gh api "repos/kortiene/iroh-room/deployments/${dep_id}/statuses"
+      done \
+    | jq -s 'add // []'
+)"
+printf '%s\n' "$statuses" \
+  | jq -e --arg job "$job_id" --arg started "$started_at" '
+      [ .[] | select((.log_url // "") | endswith("/job/" + $job)) ] as $rows
+      | ($rows | map(select(.state=="waiting")) | sort_by(.created_at) | first // null) as $waiting
+      | if $waiting == null then false
+        else
+          ($rows
+            | map(select(
+                .state=="queued"
+                and ((.created_at | fromdateiso8601) > ($waiting.created_at | fromdateiso8601))
+              ))
+            | sort_by(.created_at)
+            | first // null) as $queued
+          | if $queued == null then false
+            else
+              (($waiting.created_at | fromdateiso8601) < ($queued.created_at | fromdateiso8601))
+              and (($queued.created_at | fromdateiso8601) <= ($started | fromdateiso8601))
+            end
+        end
+    '
 ```
 
-This is a manual comparison. The reviewer approves, then the runner starts,
-so `created_at` is earlier than `started_at` by the time that attempt waited
-for a runner after the review. There is no single field for that wait.
-Approvals from earlier attempts stay on the list. Stop unless this
-`created_at` is no earlier than this attempt's `started_at` minus that wait.
-An approval left over from a previous attempt is older than this attempt's
-start by the gap between attempts.
+A passing check prints `true`.
 
 ### What the publish job does
 
