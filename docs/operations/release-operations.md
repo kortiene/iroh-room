@@ -88,6 +88,7 @@ that token has `actions: read` and no administration scope.
 
 ```bash
 name="$(awk '/^  sign-and-publish:/{job=1; next} job && /^  [^ ]/{job=0} job && /^    environment: /{sub(/^    environment: /,""); sub(/[ \t]*#.*/,""); gsub(/^[ \t"\047]+|[ \t"\047]+$/,""); print; exit}' .github/workflows/release.yml)"
+: "${name:?}"
 gh api "repos/kortiene/iroh-room/environments/${name}" --jq '{protection_rules, deployment_branch_policy}'
 ```
 
@@ -140,8 +141,8 @@ Environment protection is the gate. The job's first step only detects a
 missing approval. It calls
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` and fails unless
 one entry has `state` `approved`, names `RELEASE_ENVIRONMENT` (the same
-string as `environment:`), and has `user.login` `kortiene`
-(`RELEASE_APPROVER`). GitHub stores that approval before the job's steps
+string as `environment:`), and has `user.login` `kortiene` with
+`user.type` `User` (`RELEASE_APPROVER`). GitHub stores that approval before the job's steps
 start, so the check runs in the same job. It needs `actions: read`. It does
 not call the environments API. An environment with no required reviewer
 does not pause the job, and this list is empty, so the step fails before
@@ -154,14 +155,38 @@ environment from an unprotected one with the same name.
 
 After the tag's `release` run, before publishing the draft, read the
 environment name from `sign-and-publish`'s `environment:` and then the
-approval record. Stop if the approvals command prints nothing. Stop unless
-a row has `state` `approved`, an environment equal to that name, and
-`user` `kortiene`.
+approval record. A non-zero exit from the `jq -e` command means stop.
 
 ```bash
 name="$(awk '/^  sign-and-publish:/{job=1; next} job && /^  [^ ]/{job=0} job && /^    environment: /{sub(/^    environment: /,""); sub(/[ \t]*#.*/,""); gsub(/^[ \t"\047]+|[ \t"\047]+$/,""); print; exit}' .github/workflows/release.yml)"
-gh api repos/kortiene/iroh-room/actions/runs/<id>/approvals --jq '.[] | {state, environments: [.environments[].name], user: .user.login}'
+: "${name:?}"
+gh api repos/kortiene/iroh-room/actions/runs/<run-id>/approvals \
+  | jq -e --arg name "$name" 'any(.[]; .state=="approved" and .user.login=="kortiene" and .user.type=="User" and any(.environments[]?; .name==$name))'
 ```
+
+`gh api --jq` cannot take `--arg`, so the filter is a separate `jq -e`.
+Exit 0 means a matching approval exists. Any other exit means stop.
+
+Then compare that approval's time with this attempt's `sign-and-publish`
+start. The review object has its own `created_at` and `updated_at`. Those
+are the review times. Each nested environment object also has `created_at`
+and `updated_at`, and those are the environment resource's times, not the
+review. Use the review object's `created_at`.
+
+```bash
+gh api repos/kortiene/iroh-room/actions/runs/<run-id>/approvals \
+  | jq -r --arg name "$name" '[.[] | select(.state=="approved" and .user.login=="kortiene" and .user.type=="User" and any(.environments[]?; .name==$name))] | max_by(.created_at) | .created_at'
+gh api repos/kortiene/iroh-room/actions/runs/<run-id>/attempts/<attempt>/jobs \
+  --jq '.jobs[] | select(.name=="sign-and-publish") | .started_at'
+```
+
+This is a manual comparison. The reviewer approves, then the runner starts,
+so `created_at` is earlier than `started_at` by the time that attempt waited
+for a runner after the review. There is no single field for that wait.
+Approvals from earlier attempts stay on the list. Stop unless this
+`created_at` is no earlier than this attempt's `started_at` minus that wait.
+An approval left over from a previous attempt is older than this attempt's
+start by the gap between attempts.
 
 ### What the publish job does
 
