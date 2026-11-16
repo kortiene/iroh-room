@@ -221,11 +221,18 @@ Current Beta evidence:
 - The published `v0.1.0-rc.5` artifacts, and rc.1 through rc.4, are
   checksum-only. `v0.1.0-rc.6` is signed (release id 446819408, published
   2026-11-16T09:42:41Z, immutable prerelease, 14 assets, approved run
-  43835416665). `WAIVER-PBETA-0004` is retired for that candidate in
+  43835416665). `WAIVER-PBETA-0004` is eligible for retirement for that
+  candidate; retired when the release owner approves
   `docs/releases/v0.1.0-rc.6-production-beta-signoff.md`. Verify rc.6 with
   `scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`
-  and pin run 43835416665. The rc.6 Production Beta sign-off is still pending
-  release-owner approval, so this gate's owner sign-off is not met for rc.6.
+  and pin run 43835416665 with
+  `jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId`,
+  which must print
+  `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+  An archive whose SHA-256 matches the rc.6 notes table is not an ungated
+  run 43791394134 byte; those digests do not overlap. The rc.6 Production
+  Beta sign-off is still pending release-owner approval, so this gate's
+  owner sign-off is not met for rc.6.
 - `.github/workflows/release.yml` on `main` is the signing workflow for
   releases built after rc.5. Its `sign-and-publish` job (the `release`
   environment) attests each archive and `SHA256SUMS` with `actions/attest`

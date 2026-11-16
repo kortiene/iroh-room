@@ -58,9 +58,15 @@ State these before install/run commands:
 - `audit.ndjson` is local best-effort audit, not remote, centrally retained,
   tamper-evident, or compliance-grade audit if ADR-0003 remains in force.
 - Binary artifacts for rc.1 through rc.5 are checksum-only
-  (WAIVER-PBETA-0004, retired for v0.1.0-rc.6). `v0.1.0-rc.6` is the first
-  published signed release; verify it with `scripts/verify-release-artifacts.sh`
-  and pin run 43835416665. State below whether this candidate is signed the
+  (WAIVER-PBETA-0004, eligible for retirement for v0.1.0-rc.6; retired when
+  the release owner approves that sign-off). `v0.1.0-rc.6` is the first
+  published signed release; verify it with `scripts/verify-release-artifacts.sh`.
+  Pin run 43835416665 with
+  `jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId`,
+  which must print
+  `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+  An archive whose SHA-256 matches the rc.6 notes table is not an ungated
+  run 43791394134 byte. State below whether this candidate is signed the
   same way, and name the workflow run a checker must pin.
 - SDK package publication status: <source-only publish=false / published>.
 - Rollback support: <without data restore / requires pre-upgrade backup /

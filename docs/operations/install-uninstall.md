@@ -47,14 +47,21 @@ user-writable install directory.
 `v0.1.0-rc.1` through `v0.1.0-rc.5` publish a per-archive `.sha256` and nothing
 else. Those candidates are checksum-only
 ([`WAIVER-PBETA-0004`](../releases/v0.1.0-rc.5-production-beta-signoff.md)
-covered that gap and is retired for `v0.1.0-rc.6`; see
+covered that gap and is eligible for retirement for `v0.1.0-rc.6`; retired
+when the release owner approves that sign-off. See
 [`v0.1.0-rc.6-production-beta-signoff.md`](../releases/v0.1.0-rc.6-production-beta-signoff.md)).
-Verify the signed release with the script below and pin Actions run
-[43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665):
+Verify the signed release with the script below. Pin Actions run
+[43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
+An archive whose SHA-256 matches the table in the rc.6 release notes is not
+an ungated run 43791394134 byte; those digests do not overlap.
 
 ```bash
 scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>
+jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId
 ```
+
+The `jq` line must print
+`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
 
 Releases built by the signing workflow, starting with the first release after
 rc.5, publish the following assets for each of the four triples, plus the two

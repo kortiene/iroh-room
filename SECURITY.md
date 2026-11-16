@@ -24,7 +24,7 @@ Production Beta sign-off is approved.
 | Version | Supported | Notes |
 | --- | --- | --- |
 | `v0.1.0-rc.5` | Yes | last release-owner-approved build. Supported until the rc.6 sign-off is approved |
-| `v0.1.0-rc.6` | No | published 2026-11-16 as a signed prerelease (release id 446819408). Production Beta sign-off is still pending, so it is not the supported build yet. Verify with `scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679` and pin run 43835416665 |
+| `v0.1.0-rc.6` | No | published 2026-11-16 as a signed prerelease (release id 446819408). Production Beta sign-off is still pending, so it is not the supported build yet. Verify with `scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679`. Pin run 43835416665 with `jq -r .dsseEnvelope.payload <archive>.sigstore.json \| base64 -d \| jq -r .predicate.runDetails.metadata.invocationId`, which must print `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`. An archive whose SHA-256 matches the rc.6 notes table is not an ungated run 43791394134 byte |
 | `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.5` (last approved) |
 | `v0.1.0-rc.1` | No | superseded |
 | source builds off `main` | Best effort | report anyway, and name the commit |
@@ -95,12 +95,23 @@ restate them will be closed with a pointer here — but a report showing one is
 - **Release artifact signing.** `v0.1.0-rc.1` through `v0.1.0-rc.5` carry
   SHA-256 checksums and no project signature. That was
   [`WAIVER-PBETA-0004`](docs/releases/v0.1.0-rc.5-production-beta-signoff.md).
-  The waiver is retired for [`v0.1.0-rc.6`](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.6):
-  that release is signed. Verify it with
+  The waiver is eligible for retirement for
+  [`v0.1.0-rc.6`](https://github.com/kortiene/iroh-room/releases/tag/v0.1.0-rc.6);
+  retired when the release owner approves that sign-off. That release is
+  signed. Verify it with
   [`scripts/verify-release-artifacts.sh`](scripts/verify-release-artifacts.sh)
-  `--commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`,
-  and pin Actions run
-  [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
+  `--commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`.
+  Pin Actions run
+  [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665):
+
+  ```bash
+  jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId
+  ```
+
+  That output must equal
+  `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+  An archive whose SHA-256 matches the table in the rc.6 release notes is not
+  an ungated run 43791394134 byte; those digests do not overlap.
   Evidence:
   [verification](https://github.com/kortiene/iroh-room/issues/248#issuecomment-6912690853)
   and the
