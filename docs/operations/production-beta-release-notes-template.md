@@ -65,6 +65,9 @@ State these before install/run commands:
   `jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId`,
   which must print
   `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+  This jq read only means something after `scripts/verify-release-artifacts.sh`
+  has verified that same bundle, because reading the payload alone does not
+  check its signature or provenance.
   An archive whose SHA-256 matches the rc.6 notes table is not an ungated
   run 43791394134 byte. State below whether this candidate is signed the
   same way, and name the workflow run a checker must pin.

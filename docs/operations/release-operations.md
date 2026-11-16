@@ -444,6 +444,9 @@ jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predica
 
 That output must equal
 `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+This jq read only means something after `scripts/verify-release-artifacts.sh`
+has verified that same bundle, because reading the payload alone does not check
+its signature or provenance.
 An archive whose SHA-256 matches the table in the rc.6 release notes is not
 an ungated run 43791394134 byte; those digests do not overlap. See
 `docs/releases/v0.1.0-rc.6-release-notes.md`.

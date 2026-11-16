@@ -62,6 +62,9 @@ jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predica
 
 The `jq` line must print
 `https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+This jq read only means something after `scripts/verify-release-artifacts.sh`
+has verified that same bundle, because reading the payload alone does not check
+its signature or provenance.
 
 Releases built by the signing workflow, starting with the first release after
 rc.5, publish the following assets for each of the four triples, plus the two
