@@ -88,6 +88,7 @@ that token has `actions: read` and no administration scope.
 
 ```bash
 name="$(awk '/^  sign-and-publish:/{job=1; next} job && /^  [^ ]/{job=0} job && /^    environment: /{sub(/^    environment: /,""); sub(/[ \t]*#.*/,""); gsub(/^[ \t"\047]+|[ \t"\047]+$/,""); print; exit}' .github/workflows/release.yml)"
+: "${name:?}"
 gh api "repos/kortiene/iroh-room/environments/${name}" --jq '{protection_rules, deployment_branch_policy}'
 ```
 
@@ -140,8 +141,8 @@ Environment protection is the gate. The job's first step only detects a
 missing approval. It calls
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` and fails unless
 one entry has `state` `approved`, names `RELEASE_ENVIRONMENT` (the same
-string as `environment:`), and has `user.login` `kortiene`
-(`RELEASE_APPROVER`). GitHub stores that approval before the job's steps
+string as `environment:`), and has `user.login` `kortiene` (`RELEASE_APPROVER`) with
+`user.type` `User`. GitHub stores that approval before the job's steps
 start, so the check runs in the same job. It needs `actions: read`. It does
 not call the environments API. An environment with no required reviewer
 does not pause the job, and this list is empty, so the step fails before
@@ -154,14 +155,75 @@ environment from an unprotected one with the same name.
 
 After the tag's `release` run, before publishing the draft, read the
 environment name from `sign-and-publish`'s `environment:` and then the
-approval record. Stop if the approvals command prints nothing. Stop unless
-a row has `state` `approved`, an environment equal to that name, and
-`user` `kortiene`.
+approval record. A non-zero exit from the `jq -e` command means stop.
 
 ```bash
 name="$(awk '/^  sign-and-publish:/{job=1; next} job && /^  [^ ]/{job=0} job && /^    environment: /{sub(/^    environment: /,""); sub(/[ \t]*#.*/,""); gsub(/^[ \t"\047]+|[ \t"\047]+$/,""); print; exit}' .github/workflows/release.yml)"
-gh api repos/kortiene/iroh-room/actions/runs/<id>/approvals --jq '.[] | {state, environments: [.environments[].name], user: .user.login}'
+: "${name:?}"
+gh api repos/kortiene/iroh-room/actions/runs/<run-id>/approvals \
+  | jq -e --arg name "$name" 'any(.[]; .state=="approved" and .user.login=="kortiene" and .user.type=="User" and any(.environments[]?; .name==$name))'
 ```
+
+`gh api --jq` cannot take `--arg`, so the filter is a separate `jq -e`.
+Exit 0 means a matching approval exists. Any other exit means stop.
+
+`/approvals` rows have `comment`, `environments`, `state`, and `user`.
+A row has no review timestamp. `created_at` and `updated_at` on a nested
+environment are that environment resource's times.
+
+A deployment status's `creator` is the run's actor. Approver identity still
+comes from the `/approvals` check above.
+
+Environment approvals carry over across re-run attempts. The job-id filter
+below is what ties this check to this attempt. It keeps statuses whose
+`log_url` ends in `/job/<job_id>` for this attempt's `sign-and-publish` job
+and drops statuses from earlier attempts.
+
+Set `run_id`, `attempt`, and `sha` for this attempt. `name` is the
+environment name read above. A non-zero exit means stop. The earliest
+`waiting` status for this job must be earlier than the first `queued` status
+created after that wait, and that `queued` status must be at or before the
+job's `started_at`.
+
+```bash
+: "${name:?}"
+: "${run_id:?}"
+: "${attempt:?}"
+: "${sha:?}"
+job_json="$(gh api "repos/kortiene/iroh-room/actions/runs/${run_id}/attempts/${attempt}/jobs")"
+job_id="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].id else error("expected one sign-and-publish job") end')"
+started_at="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].started_at else error("expected one sign-and-publish job") end')"
+statuses="$(
+  gh api "repos/kortiene/iroh-room/deployments?environment=${name}&sha=${sha}" \
+    | jq -r '.[].id' \
+    | while IFS= read -r dep_id; do
+        gh api "repos/kortiene/iroh-room/deployments/${dep_id}/statuses"
+      done \
+    | jq -s 'add // []'
+)"
+printf '%s\n' "$statuses" \
+  | jq -e --arg job "$job_id" --arg started "$started_at" '
+      [ .[] | select((.log_url // "") | endswith("/job/" + $job)) ] as $rows
+      | ($rows | map(select(.state=="waiting")) | sort_by(.created_at) | first // null) as $waiting
+      | if $waiting == null then false
+        else
+          ($rows
+            | map(select(
+                .state=="queued"
+                and ((.created_at | fromdateiso8601) > ($waiting.created_at | fromdateiso8601))
+              ))
+            | sort_by(.created_at)
+            | first // null) as $queued
+          | if $queued == null then false
+            else
+              (($waiting.created_at | fromdateiso8601) < ($queued.created_at | fromdateiso8601))
+              and (($queued.created_at | fromdateiso8601) <= ($started | fromdateiso8601))
+            end
+        end
+    '
+```
+
+A passing check prints `true`.
 
 ### What the publish job does
 

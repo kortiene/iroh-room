@@ -392,10 +392,10 @@ jobs:
     steps:
       # Environment protection is the gate. This step only detects a missing
       # approval: no row that is state approved, names RELEASE_ENVIRONMENT,
-      # and was made by RELEASE_APPROVER. GitHub writes that row before this
-      # job's steps start. A re-run attempt still needs a fresh GitHub
-      # approval, but the approvals list includes earlier attempts'
-      # approvals, so this step cannot prove the row belongs to
+      # and was made by RELEASE_APPROVER with user.type User. GitHub writes
+      # that row before this job's steps start. A re-run attempt still needs
+      # a fresh GitHub approval, but the approvals list includes earlier
+      # attempts' approvals, so this step cannot prove the row belongs to
       # GITHUB_RUN_ATTEMPT. It cannot tell a protected environment from an
       # unprotected one with the same name.
       - name: Require an approved environment review
@@ -414,7 +414,7 @@ jobs:
             exit 1
           fi
           approvals="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals")"
-          count="$(printf '%s\n' "$approvals" | jq --arg env "$RELEASE_ENVIRONMENT" --arg user "$RELEASE_APPROVER" '[.[] | select(.state == "approved" and any(.environments[]?; .name == $env) and .user.login == $user)] | length')"
+          count="$(printf '%s\n' "$approvals" | jq --arg env "$RELEASE_ENVIRONMENT" --arg user "$RELEASE_APPROVER" '[.[] | select(.state == "approved" and any(.environments[]?; .name == $env) and .user.login == $user and .user.type == "User")] | length')"
           if [[ "$count" -lt 1 ]]; then
             echo "::error::no approved review by ${RELEASE_APPROVER} covers environment ${RELEASE_ENVIRONMENT} on run ${GITHUB_RUN_ID}"
             echo "GITHUB_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT-}"
