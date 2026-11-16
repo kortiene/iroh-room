@@ -22,7 +22,7 @@ Only the newest published release candidate receives security fixes.
 | Version | Supported | Notes |
 | --- | --- | --- |
 | `v0.1.0-rc.6` | Yes | current candidate; release-owner approval is pending the signed practice run (`rc.5` remains the last release-owner-approved build until that approval) |
-| `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.6` |
+| `v0.1.0-rc.2` .. `v0.1.0-rc.4` | No | published, but their sign-offs were never completed; upgrade to `rc.5` (last approved), or `rc.6` once approved |
 | `v0.1.0-rc.1` | No | superseded |
 | source builds off `main` | Best effort | report anyway, and name the commit |
 
@@ -111,9 +111,12 @@ restate them will be closed with a pointer here — but a report showing one is
   plaintext, encrypted in transit only between admitted peers
   ([`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md)
   OD-1). The protocol and engine implement content-key rotation, but the
-  shipped CLI has no member-removal or rotation command and no way to turn on
-  encrypted writes, so CLI-operated rooms store and exchange room content in
-  plaintext form. End-to-end encryption is planned after GA (v0.2).
+  shipped CLI has no rotation command and no way to turn on encrypted writes.
+  `room remove` and `room leave` exist and do not rotate content keys: removed
+  members lose access to new messages, files and pipes once peers see the
+  removal; they keep what they already had. CLI-operated rooms store and
+  exchange room content in plaintext form. End-to-end encryption is planned
+  after GA (v0.2).
 
 The full inventory, including threats that are only partially mitigated, is in
 [`docs/security/threat-model.md`](docs/security/threat-model.md). Read it before

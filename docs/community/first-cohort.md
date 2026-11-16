@@ -94,7 +94,7 @@ Participant ask:
 Run the three named participant attempts. Do not announce broadly.
 
 Use only the three participant confirmations bound to the milestone #8
-activation record. `docs/community/outreach.md` is an rc.5-era ten-builder
+activation record. `docs/community/outreach.md` is an rc.6-era ten-builder
 script and is not an instruction source for this final cohort.
 
 Expected output:
