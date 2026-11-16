@@ -80,6 +80,34 @@ is `refs/tags/v<VERSION>` and `<VERSION>` is that crate's version. A
 Dispatch on the tag. Dispatching `--ref main` records the wrong source and the
 guard rejects it.
 
+Before `git tag` or `git push` of any `v*` tag, read the environment this
+workflow requests and stop unless that environment already requires
+`kortiene` and allows only `v*` tags. This endpoint is readable with
+ordinary repository access. `sign-and-publish`'s token does not call it:
+that token has `actions: read` and no administration scope.
+
+```bash
+name="$(awk '/^  sign-and-publish:/{job=1; next} job && /^  [^ ]/{job=0} job && /^    environment: /{sub(/^    environment: /,""); sub(/[ \t]*#.*/,""); gsub(/^[ \t"\047]+|[ \t"\047]+$/,""); print; exit}' .github/workflows/release.yml)"
+gh api "repos/kortiene/iroh-room/environments/${name}" --jq '{protection_rules, deployment_branch_policy}'
+```
+
+Stop unless that output shows both of these:
+
+- `protection_rules` contains `"type": "required_reviewers"` and a reviewer
+  `"login": "kortiene"`.
+- `deployment_branch_policy` is
+  `{"protected_branches": false, "custom_branch_policies": true}`.
+
+`deployment_branch_policy` does not list the allowed names. Stop unless the
+only deployment policy is the tag `v*`:
+
+```bash
+gh api "repos/kortiene/iroh-room/environments/${name}/deployment-branch-policies" --jq '.branch_policies[] | {name, type}'
+```
+
+`[]`, `"protection_rules": []`, or `"deployment_branch_policy": null` means
+stop. Do not push the tag.
+
 ```bash
 git tag v<VERSION> <COMMIT>
 git push origin v<VERSION>
@@ -102,10 +130,38 @@ The workflow runs one tag ref at a time (`concurrency: release-${{ github.ref }}
 ### Approve the release environment
 
 `sign-and-publish` is the only job with `environment: release`, and the only
-job with `contents: write`, `id-token: write`, or `attestations: write`. GitHub
-pauses that job until a required reviewer approves the `release` environment
-deployment. Sekou is that reviewer. Nothing is attested, signed, or uploaded
-before the approval. Build jobs stay `contents: read` and have no `id-token`.
+job with `contents: write`, `id-token: write`, `attestations: write`, or
+`actions: read`. GitHub pauses that job until a required reviewer approves
+the `release` environment deployment. Sekou is that reviewer. Nothing is
+attested, signed, or uploaded before the approval. Build jobs stay
+`contents: read` and have no `id-token`.
+
+Environment protection is the gate. The job's first step only detects a
+missing approval. It calls
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` and fails unless
+one entry has `state` `approved`, names `RELEASE_ENVIRONMENT` (the same
+string as `environment:`), and has `user.login` `kortiene`
+(`RELEASE_APPROVER`). GitHub stores that approval before the job's steps
+start, so the check runs in the same job. It needs `actions: read`. It does
+not call the environments API. An environment with no required reviewer
+does not pause the job, and this list is empty, so the step fails before
+attest or sign. A re-run attempt still needs a fresh GitHub approval, but
+the approvals list includes earlier attempts' approvals, so the step cannot
+prove the row belongs to that attempt. It cannot tell a protected
+environment from an unprotected one with the same name.
+
+### Confirm the approval record
+
+After the tag's `release` run, before publishing the draft, read the
+environment name from `sign-and-publish`'s `environment:` and then the
+approval record. Stop if the approvals command prints nothing. Stop unless
+a row has `state` `approved`, an environment equal to that name, and
+`user` `kortiene`.
+
+```bash
+name="$(awk '/^  sign-and-publish:/{job=1; next} job && /^  [^ ]/{job=0} job && /^    environment: /{sub(/^    environment: /,""); sub(/[ \t]*#.*/,""); gsub(/^[ \t"\047]+|[ \t"\047]+$/,""); print; exit}' .github/workflows/release.yml)"
+gh api repos/kortiene/iroh-room/actions/runs/<id>/approvals --jq '.[] | {state, environments: [.environments[].name], user: .user.login}'
+```
 
 ### What the publish job does
 

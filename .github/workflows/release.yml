@@ -11,7 +11,8 @@ name: release
 #
 # SHA256SUMS is written by `checksums`, which does not set `environment`.
 # `sign-and-publish` is the only job that sets `environment: release`, and the
-# only job with contents: write, id-token: write, or attestations: write.
+# only job with contents: write, id-token: write, attestations: write, or
+# actions: read.
 # Referencing an environment that does not exist creates it with no protection
 # rules, so `release` must already exist with a required reviewer before this
 # workflow is merged. A dry run skips
@@ -19,8 +20,10 @@ name: release
 # references that environment. Checksums stay on the other job so a dry run
 # still uploads SHA256SUMS without creating `release`.
 #
-# The job token on `sign-and-publish` is contents: write, id-token: write, and
-# attestations: write. Reading environment protection rules
+# The job token on `sign-and-publish` is contents: write, id-token: write,
+# attestations: write, and actions: read. actions: read is only for
+# GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals. Reading
+# environment protection rules
 # (GET /repos/{owner}/{repo}/environments/release) requires administration
 # read, so this workflow does not call that API: the call would 403 on every
 # real release.
@@ -62,8 +65,9 @@ on:
         default: false
 
 # Least privilege by default. sign-and-publish is the only job that sets
-# contents: write, id-token: write, and attestations: write. Every other job
-# keeps contents: read and does not set id-token. Unspecified scopes are none.
+# contents: write, id-token: write, attestations: write, and actions: read.
+# Every other job keeps contents: read and does not set id-token. Unspecified
+# scopes are none.
 permissions:
   contents: read
 
@@ -370,14 +374,55 @@ jobs:
     if: ${{ !cancelled() && needs.tag-guard.result == 'success' && needs.artifacts.result == 'success' && needs.checksums.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true) }}
     runs-on: ubuntu-24.04
     environment: release
+    # RELEASE_ENVIRONMENT must stay equal to `environment` above. Sekou
+    # decides that name. This job does not rename it. scripts/verify.sh
+    # fails if the two values differ.
+    env:
+      RELEASE_ENVIRONMENT: release
+      RELEASE_APPROVER: kortiene
     # artifact-metadata is omitted. actions/attest@v4.2.2 calls
     # createStorageRecord only when push-to-registry is true (src/attest.ts).
     # These subjects are files, and that input stays at its default false.
+    # actions: read is the approvals GET. It is not administration: read.
     permissions:
       contents: write
       id-token: write
       attestations: write
+      actions: read
     steps:
+      # Environment protection is the gate. This step only detects a missing
+      # approval: no row that is state approved, names RELEASE_ENVIRONMENT,
+      # and was made by RELEASE_APPROVER. GitHub writes that row before this
+      # job's steps start. A re-run attempt still needs a fresh GitHub
+      # approval, but the approvals list includes earlier attempts'
+      # approvals, so this step cannot prove the row belongs to
+      # GITHUB_RUN_ATTEMPT. It cannot tell a protected environment from an
+      # unprotected one with the same name.
+      - name: Require an approved environment review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          : "${GITHUB_REPOSITORY:?}"
+          : "${GITHUB_RUN_ID:?}"
+          if [[ -z "${RELEASE_ENVIRONMENT}" ]]; then
+            echo "::error::RELEASE_ENVIRONMENT is empty"
+            exit 1
+          fi
+          if [[ -z "${RELEASE_APPROVER}" ]]; then
+            echo "::error::RELEASE_APPROVER is empty"
+            exit 1
+          fi
+          approvals="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals")"
+          count="$(printf '%s\n' "$approvals" | jq --arg env "$RELEASE_ENVIRONMENT" --arg user "$RELEASE_APPROVER" '[.[] | select(.state == "approved" and any(.environments[]?; .name == $env) and .user.login == $user)] | length')"
+          if [[ "$count" -lt 1 ]]; then
+            echo "::error::no approved review by ${RELEASE_APPROVER} covers environment ${RELEASE_ENVIRONMENT} on run ${GITHUB_RUN_ID}"
+            echo "GITHUB_RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT-}"
+            printf '%s\n' "$approvals"
+            exit 1
+          fi
+          echo "approved review by ${RELEASE_APPROVER} covers environment ${RELEASE_ENVIRONMENT} (${count})"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
