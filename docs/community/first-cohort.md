@@ -5,7 +5,7 @@ Status: deferred; do not recruit or start until the RB-1 activation gate passes
 Duration: 30 days from milestone #8 activation
 
 Release target: the exact tagged roadmap-complete cohort candidate, not
-`v0.1.0-rc.5`
+`v0.1.0-rc.6`
 
 ## Activation Gate
 
@@ -94,7 +94,7 @@ Participant ask:
 Run the three named participant attempts. Do not announce broadly.
 
 Use only the three participant confirmations bound to the milestone #8
-activation record. `docs/community/outreach.md` is an rc.5-era ten-builder
+activation record. `docs/community/outreach.md` is an rc.6-era ten-builder
 script and is not an instruction source for this final cohort.
 
 Expected output:

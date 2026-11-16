@@ -7,6 +7,8 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+## 0.1.0-rc.6 - 2026-11-15
+
 - **CLI (`iroh-rooms` binary):** new `room remove <ROOM_ID> <MEMBER_ID>` (admin
   only; `insufficient_role`, exit 3, otherwise) and `room leave <ROOM_ID>`
   commands, built on the stable `iroh_rooms::room::build_member_removed` /
