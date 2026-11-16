@@ -185,7 +185,13 @@ environment name read above. A non-zero exit means stop. The earliest
 created after that wait, and that `queued` status must be at or before the
 job's `started_at`.
 
+Deployment and status lists are requested with `per_page=100` and
+`gh api --paginate`. Each page is its own JSON array. `jq -r '.[].id'`
+reads every deployment page, and `jq -s 'add // []'` flattens every status
+page, so a status that is not on the first page still reaches the job filter.
+
 ```bash
+set -euo pipefail
 : "${name:?}"
 : "${run_id:?}"
 : "${attempt:?}"
@@ -194,10 +200,10 @@ job_json="$(gh api "repos/kortiene/iroh-room/actions/runs/${run_id}/attempts/${a
 job_id="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].id else error("expected one sign-and-publish job") end')"
 started_at="$(printf '%s\n' "$job_json" | jq -er '[.jobs[] | select(.name=="sign-and-publish")] | if length==1 then .[0].started_at else error("expected one sign-and-publish job") end')"
 statuses="$(
-  gh api "repos/kortiene/iroh-room/deployments?environment=${name}&sha=${sha}" \
+  gh api --paginate "repos/kortiene/iroh-room/deployments?environment=${name}&sha=${sha}&per_page=100" \
     | jq -r '.[].id' \
     | while IFS= read -r dep_id; do
-        gh api "repos/kortiene/iroh-room/deployments/${dep_id}/statuses"
+        gh api --paginate "repos/kortiene/iroh-room/deployments/${dep_id}/statuses?per_page=100"
       done \
     | jq -s 'add // []'
 )"
