@@ -12,6 +12,11 @@ where feasible); the **experimental** tier may change on any release.
   `-wal`), and the
   refusal now includes a recovery hint to restore from backup or retry with
   the previous binary.
+- **CLI (`iroh-rooms` binary):** `room send` and the first `room leave` admit
+  peers from the live roster during their flush, the same way `room remove`
+  does. A member removed while that flush is running is not forwarded anything
+  accepted afterwards. `delivered` counts peers of the opening roster
+  connected at publish or after the flush. No SDK API change.
 
 ## 0.1.0-rc.6 - 2026-11-15
 

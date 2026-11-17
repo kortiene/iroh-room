@@ -9,10 +9,12 @@
 //!
 //! * `send` is **offline-first, online-best-effort** (D3): it builds + self-checks
 //!   the `message.text`, then — when the room has other active members — brings up
-//!   an ephemeral [`Node`], dials them, and lets the engine's `publish` persist and
-//!   fan the frame out to connected peers. The frame is **always** persisted
-//!   locally (the guaranteed core); live delivery is best-effort with no queue and
-//!   no guaranteed offline delivery (PRD §14).
+//!   a short-lived managed room session and lets the engine's `publish` persist and
+//!   fan the frame out. Admission for that flush is the live roster
+//!   ([`run_managed_push`]), the same session `room remove` uses, so a departure
+//!   folded during the flush is not admitted or forwarded afterwards. The frame is
+//!   **always** persisted locally (the guaranteed core); live delivery is
+//!   best-effort with no queue and no guaranteed offline delivery (PRD §14).
 //! * `tail` is the long-running receiver/session (D4): it brings up a [`Node`],
 //!   accepts inbound `message.text` frames (validated/deduped/persisted by the
 //!   landed engine), and renders the timeline in canonical `(lamport, event_id)`
@@ -67,27 +69,10 @@ pub const DEFAULT_SEND_TIMEOUT: &str = "5s";
 /// Poll interval for the `room tail` display loop (spec D6; ≈200 ms is negligible
 /// against a single `SQLite` reader, §8).
 const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Grace period after `publish` so the per-peer writer queues flush before the
-/// ephemeral `send` node tears down (spec §5 step 5 / R3).
-const FLUSH_GRACE: Duration = Duration::from_millis(300);
-
-/// Test-only override for the departure flush, in milliseconds. `0` keeps
-/// [`FLUSH_GRACE`]. The removal and leave-retry paths read it so a test can
-/// hold the node up long enough for a peer to send during that window.
-#[cfg(test)]
-pub(crate) static FLUSH_GRACE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn flush_grace() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = FLUSH_GRACE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    FLUSH_GRACE
-}
+/// Grace period after `publish` so the per-peer writer queues flush before a
+/// short-lived session tears down (spec §5 step 5 / R3). `room remove`,
+/// `room send`, the first `room leave`, and a leave retry all wait this long.
+pub(crate) const FLUSH_GRACE: Duration = Duration::from_millis(300);
 
 /// The result of a `room send`, for the caller to present.
 pub struct SendSummary {
@@ -124,6 +109,7 @@ pub async fn send(
     peers: &[String],
     timeout: Duration,
     loopback: bool,
+    flush: Duration,
 ) -> Result<SendSummary> {
     // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
     validate_body(body)?;
@@ -206,22 +192,26 @@ pub async fn send(
         0
     } else {
         // Best-effort live push: the engine's `publish` persists AND fans out.
+        // The flush uses live roster admission (`run_managed_push`), not a
+        // snapshot frozen at send time, so a removal folded while the node is
+        // still up is dropped before anything accepted afterwards is forwarded.
         let mode = net_mode(loopback);
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
-        let admission = build_admission(&snapshot);
-        // `Box::pin` keeps `run_push`'s future off this caller's stack — issue
-        // #141 grew `NetConfig` enough to trip clippy::large_futures here.
-        let delivered = match Box::pin(run_push(
+        let hints = addr_hints(&dial_set, &peer_addrs);
+        // `Box::pin` keeps `run_managed_push`'s future off this caller's stack —
+        // issue #141 grew `NetConfig` enough to trip clippy::large_futures here.
+        let delivered = match Box::pin(run_managed_push(
             home,
             store,
             room_id,
             secret_key,
             secret.device_seed(),
-            admission,
             dial_set,
+            hints,
             timeout,
             mode,
             wire_bytes,
+            flush,
         ))
         .await
         {
@@ -855,12 +845,17 @@ fn role_label(role: Role) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Live-push helper (the ephemeral `room send` node)
+// Live-push helpers
 // ---------------------------------------------------------------------------
 
-/// Bring up an ephemeral node over `store`, dial `dial_set`, wait briefly for at
-/// least one link, publish the frame (the engine persists + fans out), grant a
-/// short flush grace, and report how many peers were connected at publish time.
+/// Bring up an ephemeral node over `store` with a fixed allowlist, dial
+/// `dial_set`, wait briefly for at least one link, publish the frame (the
+/// engine persists + fans out), grant a short flush grace, and report how many
+/// peers were connected after the flush.
+///
+/// `room send` does not use this. Its flush goes through [`run_managed_push`]
+/// so admission tracks the live roster. Callers that still pass a fixed
+/// allowlist (`agent status`) keep this path.
 ///
 /// Consumes `store` (moved into the engine) and the wire `frame`.
 #[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
@@ -925,16 +920,21 @@ pub(crate) async fn run_push(
 
 /// Like [`run_push`], but the node is a managed room session.
 ///
+/// This is the flush for `room remove`, the first `room leave`, and `room send`.
 /// Admission is a live [`SnapshotAdmission`] the pump refreshes from the fold,
-/// and the [`PeerManager`] tears a departed device down as soon as the removal
-/// is published — routing is revoked before this function's flush sleep. The
-/// terminal removal is queued *before* that reconcile, so the removed device
-/// still learns it; anything accepted afterwards is not forwarded to it.
+/// and the [`PeerManager`] drops a device the fold has removed or that has left.
+/// Routing is revoked before this function's flush sleep. A `member.removed`
+/// addressed to that device is queued *before* the reconcile, so the removed
+/// device still learns it; anything accepted afterwards is not forwarded to it.
+/// A device that becomes active during the flush is dialed from the updated roster.
 ///
-/// `dial_set` is the pre-departure roster (the removed device included) plus
-/// any `--peer` address hints. The connected-peer count is the union of who
-/// was connected at publish time and who is still connected after the flush,
-/// so a device torn down after receiving its terminal removal still counts.
+/// `dial_set` is the opening roster — for `room remove`, the pre-removal roster,
+/// so the removed device is included. `addr_hints` is that roster plus every
+/// `--peer` address, so a device that is not active yet can still be dialed if
+/// the fold admits it before the flush ends. The connected-peer count is the
+/// union of who was connected at publish time and who is still connected after
+/// the flush, so a device torn down after receiving its terminal removal still
+/// counts. `flush` is how long to wait after publish before tearing the node down.
 ///
 /// # Errors
 /// Returns an error if the engine or node cannot start, the frame cannot be
@@ -948,9 +948,11 @@ pub(crate) async fn run_managed_push(
     secret_key: SecretKey,
     device_seed: [u8; 32],
     dial_set: Vec<EndpointAddr>,
+    addr_hints: Vec<EndpointAddr>,
     timeout: Duration,
     mode: NetMode,
     frame: Vec<u8>,
+    flush: Duration,
 ) -> Result<usize> {
     let engine = SyncEngine::open_with_local_device(
         store,
@@ -974,7 +976,7 @@ pub(crate) async fn run_managed_push(
         engine,
         cfg,
         DEFAULT_TICK,
-        dial_set.clone(),
+        addr_hints,
         admission_cell,
         None,
     )
@@ -990,9 +992,9 @@ pub(crate) async fn run_managed_push(
     let publish = node
         .publish(frame)
         .await
-        .context("could not publish the departure frame");
+        .context("could not publish the frame");
 
-    tokio::time::sleep(flush_grace()).await;
+    tokio::time::sleep(flush).await;
     reached.extend(connected_ids(&node, &ids));
     let shutdown = node.shutdown().await;
     publish?;
@@ -1054,6 +1056,7 @@ pub(crate) async fn run_sync(
     dial_set: Vec<EndpointAddr>,
     timeout: Duration,
     mode: NetMode,
+    flush: Duration,
 ) -> Result<SyncReport> {
     let engine = SyncEngine::open_with_local_device(
         store,
@@ -1085,7 +1088,7 @@ pub(crate) async fn run_sync(
     await_dial_outcome(&node, &ids, timeout).await;
     // A peer that accepted the link still needs a moment to pull the stored
     // departure. A refusal is already terminal by the time we get here.
-    tokio::time::sleep(flush_grace()).await;
+    tokio::time::sleep(flush).await;
     let report = classify_dial_outcome(&node, &ids);
     node.shutdown()
         .await
@@ -1224,8 +1227,9 @@ pub(crate) fn build_admission(snapshot: &MembershipSnapshot) -> AllowlistAdmissi
 /// The device **selection** (active-only, self-excluded, deduped) delegates to the
 /// net crate's [`PeerManager::desired_devices`] so there is a single implementation
 /// shared with the runtime peer manager (IR-0107 §11 step 1); this wrapper only maps
-/// each selected device to its `--peer`-hinted or bare address for the callers that
-/// still dial explicitly (`room send`, `pipe`).
+/// each selected device to its `--peer`-hinted or bare address. Callers either
+/// dial that set (`agent status`, `pipe`, a leave retry) or pass it as address
+/// hints to a managed flush (`room send`, `room remove`, the first `room leave`).
 pub(crate) fn build_dial_set(
     snapshot: &MembershipSnapshot,
     self_device: EndpointId,
@@ -1242,6 +1246,21 @@ pub(crate) fn build_dial_set(
                 .unwrap_or_else(|| EndpointAddr::new(id))
         })
         .collect()
+}
+
+/// Opening dial targets plus every `--peer` address, keyed by device.
+///
+/// [`build_dial_set`] drops a hinted device that is not active yet. Keeping
+/// that address here lets the managed session dial it if the fold admits the
+/// device during the flush. When both name the same device, the `--peer`
+/// address is kept and the dial-set address is not written over it.
+pub(crate) fn addr_hints(dial_set: &[EndpointAddr], peers: &[EndpointAddr]) -> Vec<EndpointAddr> {
+    let mut by_id: BTreeMap<EndpointId, EndpointAddr> =
+        peers.iter().map(|addr| (addr.id, addr.clone())).collect();
+    for addr in dial_set {
+        by_id.entry(addr.id).or_insert_with(|| addr.clone());
+    }
+    by_id.into_values().collect()
 }
 
 /// Convert a core [`DeviceKey`] (`device_id`) into an iroh [`EndpointId`]; they are
