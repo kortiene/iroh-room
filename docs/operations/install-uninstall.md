@@ -330,6 +330,18 @@ move-aside restore in [Rollback](#rollback) stay as written.
 `scripts/lifecycle-smoke.sh` `documented_backup()` copies that backup block
 and cites it.
 
+These commands need `pgrep` (to see whether `iroh-rooms` is running) and
+`sqlite3` (`PRAGMA integrity_check` and `PRAGMA wal_checkpoint`).
+
+Do the work in a directory outside the git checkout. `ASSET_DIR` and the
+backup tar are created in the working directory. The tar contains
+`identity.secret`. Inside the repository both would be untracked files.
+
+```bash
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/iroh-rooms-install.XXXXXX")"
+cd "$WORK"
+```
+
 ### Release triples
 
 | Triple | GitHub-hosted runner |
@@ -349,16 +361,19 @@ Artifact. Do not use another downloader.
 
 A signed release (`v0.1.0-rc.6` and later) is installed only through
 `scripts/verify-release-artifacts.sh`. That command needs GitHub CLI 2.68.0 or
-newer and cosign v3 or newer. If it exits non-zero, do not install.
+newer and cosign v3 or newer. If it exits non-zero, do not install. Without a
+`gh` login the verifier exits 3 and does not check attestations.
 
 `v0.1.0-rc.1` through `v0.1.0-rc.5` are checksum-only (the per-archive
-`.sha256`). `scripts/verify-release-artifacts.sh` exits 1 on those tags by
-design. That exit is not a pass and it is not permission to install. For those
-tags the gate is `sha256sum -c` on Linux, or `shasum -a 256 -c` on macOS. If
-that checksum command exits non-zero, do not install.
+`.sha256`). `scripts/verify-release-artifacts.sh` exits non-zero on those tags
+by design (exit 3 when `gh` is not logged in, and non-zero after that when
+the attestation is missing). That exit is not a pass and it is not permission
+to install. For those tags the gate is `sha256sum -c` on Linux, or
+`shasum -a 256 -c` on macOS. If that checksum command exits non-zero, do not
+install.
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-./assets}"
+ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
 mkdir -p "${PREFIX}/bin" "$ASSET_DIR"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
@@ -373,30 +388,34 @@ there is no verified archive left to install. Unpack
 
 Signed release (`v0.1.0-rc.6` and later). Install only when this exits 0:
 
+`<FULL_SHA>` is the commit `refs/tags/v<VERSION>` peels to.
+
 ```bash
-ASSET_DIR="${ASSET_DIR:-./assets}"
-scripts/verify-release-artifacts.sh --dir "$ASSET_DIR" "v<VERSION>" "<TRIPLE>" || exit 1
+ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
+scripts/verify-release-artifacts.sh --dir "$ASSET_DIR" --commit "<FULL_SHA>" \
+  "v<VERSION>" "<TRIPLE>" || exit 1
 ```
 
 Checksum-only (`v0.1.0-rc.1` through `v0.1.0-rc.5`). Do not use the verifier
-as the gate. It exits 1 on these tags by design, and that exit is not a pass.
-The `.sha256` names the archive with no directory, so the check runs inside
-`$ASSET_DIR`. Install only when it exits 0:
+as the gate. It exits non-zero on these tags by design, and that exit is not
+a pass. The `.sha256` names the archive with no directory, so the check runs
+inside `$ASSET_DIR`. Install only when it exits 0. The `|| exit 1` after the
+subshell stops the current shell, which closes an interactive shell:
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-./assets}"
+ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
 (
   cd "$ASSET_DIR" || exit 1
   sha256sum -c "${ARCHIVE}.sha256" || exit 1
   # macOS: shasum -a 256 -c "${ARCHIVE}.sha256" || exit 1
-)
+) || exit 1
 ```
 
 Unpack and install only after the gate above exits 0:
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-./assets}"
+ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
 mkdir -p "${PREFIX}/bin"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
@@ -416,7 +435,7 @@ that manifest's `commit` field and in the archive name (the 12-hex suffix).
 It does not appear in `--version`.
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-./assets}"
+ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
 inner="${ASSET_DIR}/${ARCHIVE%.tar.gz}"
@@ -431,9 +450,15 @@ the archive name's 12-hex suffix.
 
 ### Upgrade
 
-Confirm two things before the backup: no `iroh-rooms` process is running, and
-`rooms.db-wal` is not present. Then take the documented backup, the `umask 077`
-tar in Back Up Before Upgrade. Leave that block unchanged.
+Confirm no `iroh-rooms` process is running. A read-only open can leave a
+0-byte `rooms.db-wal`. `documented_backup` refuses while that file exists,
+including when it is empty. `scripts/lifecycle-smoke.sh` runs
+`PRAGMA wal_checkpoint(TRUNCATE)` first and still refuses if `rooms.db-wal`
+remains. Stop `iroh-rooms`, run that checkpoint, and take the backup only
+after the file is gone. If it is still there, do not back up and do not
+delete the file by hand. Run the backup from `$WORK`, not from the
+repository. Then take the documented backup, the `umask 077` tar in Back Up
+Before Upgrade. Leave that block unchanged.
 
 ```bash
 if pgrep -x iroh-rooms >/dev/null 2>&1; then
@@ -441,9 +466,9 @@ if pgrep -x iroh-rooms >/dev/null 2>&1; then
   exit 1
 fi
 data="${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}"
+sqlite3 "${data}/rooms.db" "PRAGMA wal_checkpoint(TRUNCATE);"
 if [[ -e "${data}/rooms.db-wal" ]]; then
-  printf '%s exists; refusing to back up a store with a live WAL\n' \
-    "${data}/rooms.db-wal" >&2
+  printf '%s still exists after checkpoint\n' "${data}/rooms.db-wal" >&2
   exit 1
 fi
 ```
@@ -487,18 +512,29 @@ mv "$tmp" "${PREFIX}/bin/iroh-rooms"
 ```
 
 **(b) The candidate raised `user_version`.** The older binary refuses the
-store. It exits 1 and prints:
+store and exits 1. stderr is:
 
 ```text
-store migration failed: database user_version N is newer than supported M
+error: could not open event store at <path>: store migration failed: database user_version N is newer than supported M
 ```
 
 `N` is the database `user_version` and `M` is the highest version that binary
-supports. Restore with the move-aside procedure in Rollback above: move the
-data directory to `$IROH_ROOMS_HOME.before-rollback`, then untar the
-pre-upgrade backup. Keep that move-aside restore for `v0.1.0-rc.1` through
-`v0.1.0-rc.6`. A refusal from those builds is not evidence that the store was
-left untouched.
+supports. A suffix `; restore from backup or retry with the previous binary`
+is pending: it is added once #409 lands, and it is not part of this message.
+
+Reinstall the prior binary with the rollback (a) commands so `PREFIX` is
+honored. Then use only the data-restore lines from the Rollback section
+above, which move the directory aside and untar the pre-upgrade backup:
+
+```bash
+mv "$IROH_ROOMS_HOME" "$IROH_ROOMS_HOME.before-rollback"
+tar -xzf <PRE_UPGRADE_BACKUP>.tar.gz -C "$(dirname "$IROH_ROOMS_HOME")"
+```
+
+The `rm` and `install` lines in that older block hard-code
+`$HOME/.local/bin`. Do not use them when `PREFIX` is custom. Keep the
+move-aside restore for `v0.1.0-rc.1` through `v0.1.0-rc.6`. A refusal from
+those builds is not evidence that the store was left untouched.
 
 ### Uninstall
 

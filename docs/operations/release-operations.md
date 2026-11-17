@@ -545,10 +545,16 @@ image as `ImageOS` and `ImageVersion` (stored on the record as `image_os` and
 
 The record's `class` field is self-asserted. The script sets it from the
 environment it sees, and it sets `evidence_grade` true only when `class` is
-`evidence`. A record counts as evidence only when it is the artifact downloaded
-from a dispatch of the lifecycle workflow on `main`, and its run id, run
-attempt, and head SHA match the GitHub API for that run. A self-asserted
-`class` of `evidence` is not enough on its own.
+`evidence`. A record counts as evidence only when all of these hold:
+
+- `class` is `evidence` and `evidence_grade` is true.
+- `triple` is one of the four release triples in the table above. A probe
+  cell does not count, including one from an ubuntu-22.04 runner.
+- It is the artifact downloaded from a dispatch of the lifecycle workflow on
+  `main`.
+- Its run id, run attempt, and head SHA match the GitHub API for that run.
+
+A self-asserted `class` of `evidence` is not enough on its own.
 
 ```bash
 gh api "repos/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>" \

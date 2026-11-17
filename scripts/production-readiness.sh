@@ -141,7 +141,64 @@ require_text ".github/ISSUE_TEMPLATE/bug_report.md" "full data-directory backups
 require_text "CONTRIBUTING.md" "Production Readiness" "contributing links production readiness"
 require_text "README.md" "Production Readiness" "readme links production readiness"
 require_file "scripts/lifecycle-smoke.sh"
-require_text "scripts/lifecycle-smoke.sh" "Written to the current working directory. The archive contains" "documented_backup mirrors the install backup block"
+# Every non-blank line of the bash fence under "## Back Up Before Upgrade"
+# must appear, unchanged, in documented_backup(). The function body is
+# indented two spaces past the fence, and the tar line ends with
+# " || return 1". Drop that indent and that suffix, then exact-match.
+require_documented_backup_mirror() {
+  local doc="docs/operations/install-uninstall.md"
+  local script="scripts/lifecycle-smoke.sh"
+  local label="documented_backup mirrors the install backup block"
+  local doc_file=""
+  local func_file=""
+  local line=""
+  local missing=""
+
+  doc_file="$(mktemp)"
+  func_file="$(mktemp)"
+
+  if [[ ! -f "$doc" || ! -f "$script" ]]; then
+    record "$label" "FAIL" "missing install doc or lifecycle-smoke.sh"
+    rm -f "$doc_file" "$func_file"
+    return 0
+  fi
+
+  awk '
+    $0 == "## Back Up Before Upgrade" { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^```bash$/ { in_fence = 1; next }
+    in_section && in_fence && /^```$/ { exit }
+    in_section && in_fence && $0 !~ /^[[:space:]]*$/ { print }
+  ' "$doc" >"$doc_file"
+
+  awk '
+    /^documented_backup\(\) \{/ { in_fn = 1; next }
+    in_fn && /^}/ { exit }
+    in_fn { print }
+  ' "$script" | sed -e 's/^  //' -e 's/ || return 1$//' >"$func_file"
+
+  if [[ ! -s "$doc_file" || ! -s "$func_file" ]]; then
+    record "$label" "FAIL" "backup block or documented_backup() body not found"
+    rm -f "$doc_file" "$func_file"
+    return 0
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if ! grep -Fxq -- "$line" "$func_file"; then
+      missing="$line"
+      break
+    fi
+  done <"$doc_file"
+
+  if [[ -n "$missing" ]]; then
+    record "$label" "FAIL" "missing line: ${missing}"
+  else
+    record "$label" "PASS" ""
+  fi
+  rm -f "$doc_file" "$func_file"
+  return 0
+}
+require_documented_backup_mirror
 
 RESULTS_MD="archive/spikes/spike-nat/results/results.md"
 if [[ -f "$RESULTS_MD" ]] && ! grep -Fq "pending manual two-host run" "$RESULTS_MD"; then
