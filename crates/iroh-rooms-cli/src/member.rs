@@ -50,7 +50,7 @@ use iroh_rooms_core::store::EventStore;
 use crate::error::{CodedResultExt, ErrorCode};
 use crate::identity;
 use crate::message::{
-    build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
+    addr_hints, build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
     run_managed_push, run_sync, select_heads, DB_FILE,
 };
 
@@ -115,6 +115,7 @@ pub async fn remove(
     peers: &[String],
     timeout: Duration,
     loopback: bool,
+    flush: Duration,
 ) -> Result<DepartureSummary> {
     // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
     let subject: IdentityKey = member_hex
@@ -182,6 +183,7 @@ pub async fn remove(
         &peer_addrs,
         timeout,
         loopback,
+        flush,
     )
     .await?;
     Ok(DepartureSummary {
@@ -219,6 +221,7 @@ pub async fn leave(
     peers: &[String],
     timeout: Duration,
     loopback: bool,
+    flush: Duration,
 ) -> Result<DepartureSummary> {
     validate_reason(reason)?;
     let peer_addrs = parse_peers(peers)?;
@@ -250,6 +253,7 @@ pub async fn leave(
             &peer_addrs,
             timeout,
             loopback,
+            flush,
         )
         .await;
     }
@@ -275,6 +279,7 @@ pub async fn leave(
         &peer_addrs,
         timeout,
         loopback,
+        flush,
     )
     .await?;
     Ok(DepartureSummary {
@@ -311,6 +316,7 @@ async fn redeliver_pending_leave(
     peer_addrs: &[EndpointAddr],
     timeout: Duration,
     loopback: bool,
+    flush: Duration,
 ) -> Result<DepartureSummary> {
     let Some(pending) = pending_self_leave(&store, room_id, caller)? else {
         crate::bail_coded!(
@@ -354,6 +360,7 @@ async fn redeliver_pending_leave(
             dial_set,
             timeout,
             net_mode(loopback),
+            flush,
         ))
         .await
         {
@@ -505,6 +512,7 @@ async fn persist_and_push(
     peer_addrs: &[EndpointAddr],
     timeout: Duration,
     loopback: bool,
+    flush: Duration,
 ) -> Result<(EventId, usize, usize)> {
     let ctx = ValidationContext::for_room(*room_id);
     let validated = validate_wire_bytes(&wire_bytes, &ctx)
@@ -543,6 +551,7 @@ async fn persist_and_push(
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
         let mode = net_mode(loopback);
         let device_seed = secret.device_seed();
+        let hints = addr_hints(&dial_set, peer_addrs);
         let pushed = Box::pin(run_managed_push(
             home,
             store,
@@ -550,9 +559,11 @@ async fn persist_and_push(
             secret_key,
             device_seed,
             dial_set,
+            hints,
             timeout,
             mode,
             wire_bytes,
+            flush,
         ))
         .await;
         let delivered = match pushed {
@@ -775,7 +786,9 @@ mod live {
     use iroh_rooms::events::build_message_text;
     use iroh_rooms::experimental::session::{EndpointId, SecretKey};
     use iroh_rooms::identity::DeviceBinding;
-    use iroh_rooms::room::{build_member_joined, build_member_removed, RoomInviteTicket};
+    use iroh_rooms::room::{
+        build_member_joined, build_member_left, build_member_removed, RoomInviteTicket,
+    };
     use iroh_rooms_core::event::content::EventType;
     use iroh_rooms_core::event::ids::{EventId, RoomId};
     use iroh_rooms_core::event::keys::IdentityKey;
@@ -955,16 +968,15 @@ mod live {
         })
     }
 
-    fn hold_flush_open() {
-        message::FLUSH_GRACE_OVERRIDE_MS.store(4_000, std::sync::atomic::Ordering::Relaxed);
-    }
+    /// Long enough for a peer to publish during the flush. Passed into the
+    /// command; tests do not share a process-wide override.
+    const OPEN_FLUSH: Duration = Duration::from_secs(4);
 
     /// A third member sends after the removal is folded, while the admin's push
     /// node is still in its flush window. The removed device gets the terminal
     /// removal and not that send.
     #[tokio::test]
     async fn removal_flush_does_not_forward_a_third_members_send() {
-        hold_flush_open();
         let (alice, members, room) = joined_room(&["Bob", "Carol"]);
         let (bob, carol) = (&members[0], &members[1]);
         let admit: [&Party; 3] = [&alice, bob, carol];
@@ -986,6 +998,7 @@ mod live {
             &peers,
             Duration::from_secs(5),
             true,
+            OPEN_FLUSH,
         ));
         let mut message_id = None;
         let summary = loop {
@@ -1046,7 +1059,6 @@ mod live {
     /// A fixed allowlist for the whole flush still forwards that message. Live
     /// roster admission, the same path as `room remove`, does not.
     async fn flush_does_not_forward_after_a_folded_removal(command: FlushCommand) {
-        hold_flush_open();
         let (alice, members, room) = joined_room(&["Bob", "Carol"]);
         let (bob, carol) = (&members[0], &members[1]);
         let admit: [&Party; 3] = [&alice, bob, carol];
@@ -1083,6 +1095,7 @@ mod live {
                         &peers,
                         Duration::from_secs(5),
                         true,
+                        OPEN_FLUSH,
                     )
                     .await
                     .expect("room send");
@@ -1095,6 +1108,7 @@ mod live {
                         &peers,
                         Duration::from_secs(5),
                         true,
+                        OPEN_FLUSH,
                     )
                     .await
                     .expect("room leave");
@@ -1127,7 +1141,8 @@ mod live {
             panic!("{label}: the flush ended before Alice folded a removal into it")
         });
         let follow_id = follow_id.expect("follow-up is published with the removal");
-        assert_flush_stopped_forwarding(label, carol, &bob_node, removal_id, follow_id).await;
+        assert_flush_stopped_forwarding(label, "removal", carol, &bob_node, removal_id, follow_id)
+            .await;
 
         alice_node.shutdown().await.expect("shutdown alice");
         bob_node.shutdown().await.expect("shutdown bob");
@@ -1137,29 +1152,33 @@ mod live {
     /// removal and must not hold the message she accepted after folding it.
     async fn assert_flush_stopped_forwarding(
         label: &str,
+        departed: &str,
         carol: &Party,
         bob_node: &Node,
-        removal_id: EventId,
+        departure_id: EventId,
         follow_id: EventId,
     ) {
         // Give a buggy forward time to land in Bob's store before asserting.
         tokio::time::sleep(Duration::from_millis(400)).await;
         let carol_db = carol.home.path().join(DB_FILE);
         assert!(
-            store_has(&carol_db, removal_id),
-            "{label}: the flushing node must fold the removal during the flush"
+            store_has(&carol_db, departure_id),
+            "{label}: the flushing node must fold the {departed} during the flush"
         );
         assert!(
             store_has(&carol_db, follow_id),
-            "{label}: the flushing node must accept the message published after the removal"
+            "{label}: the flushing node must accept the message published after the {departed}"
         );
         assert!(
             !bob_node.store_contains(follow_id).await.expect("bob read"),
-            "{label}: a message accepted during the flush after a removal is folded must not be forwarded to the removed device"
+            "{label}: a message accepted during the flush after a {departed} is folded must not be forwarded to the departed device"
         );
         assert!(
-            bob_node.store_contains(removal_id).await.expect("bob read"),
-            "{label}: the removed device still receives the removal folded during the flush"
+            bob_node
+                .store_contains(departure_id)
+                .await
+                .expect("bob read"),
+            "{label}: the departed device still receives the {departed} folded during the flush"
         );
     }
 
@@ -1175,6 +1194,192 @@ mod live {
     #[tokio::test]
     async fn leave_flush_does_not_forward_after_a_folded_removal() {
         flush_does_not_forward_after_a_folded_removal(FlushCommand::Leave).await;
+    }
+
+    /// Bob leaves himself while Carol is flushing. A message Carol accepts
+    /// after that `member.left` must not be forwarded to Bob.
+    async fn flush_does_not_forward_after_a_third_party_leave(command: FlushCommand) {
+        let (alice, members, room) = joined_room(&["Bob", "Carol"]);
+        let (bob, carol) = (&members[0], &members[1]);
+        let admit: [&Party; 3] = [&alice, bob, carol];
+        let alice_node = spawn_listener(&alice, room, &admit).await;
+        let bob_node = spawn_listener(bob, room, &admit).await;
+        let peers = vec![
+            render_endpoint_addr(&alice_node.endpoint_addr().expect("alice addr")),
+            render_endpoint_addr(&bob_node.endpoint_addr().expect("bob addr")),
+        ];
+        let alice_keys = SecretKeys::load(alice.home.path()).expect("alice keys");
+        let bob_keys = SecretKeys::load(bob.home.path()).expect("bob keys");
+        let mut alice_events = alice_node.room_events();
+        let mut bob_events = bob_node.room_events();
+        let trigger = match command {
+            FlushCommand::Send => EventType::MessageText,
+            FlushCommand::Leave => EventType::MemberLeft,
+        };
+        let label = match command {
+            FlushCommand::Send => "room send",
+            FlushCommand::Leave => "room leave",
+        };
+        let mut leave_id = None;
+        let mut follow_id = None;
+        {
+            let mut flush_fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = ()> + Send + '_>,
+            > = match command {
+                FlushCommand::Send => Box::pin(async {
+                    message::send(
+                        carol.home.path(),
+                        &room,
+                        "opening-flush",
+                        None,
+                        None,
+                        &peers,
+                        Duration::from_secs(5),
+                        true,
+                        OPEN_FLUSH,
+                    )
+                    .await
+                    .expect("room send");
+                }),
+                FlushCommand::Leave => Box::pin(async {
+                    leave(
+                        carol.home.path(),
+                        &room,
+                        None,
+                        &peers,
+                        Duration::from_secs(5),
+                        true,
+                        OPEN_FLUSH,
+                    )
+                    .await
+                    .expect("room leave");
+                }),
+            };
+            loop {
+                tokio::select! {
+                    () = &mut flush_fut => break,
+                    recv = bob_events.recv() => {
+                        if leave_id.is_some() {
+                            continue;
+                        }
+                        let Some(event) = accepted_room_event(recv) else { continue };
+                        if event.event_type != trigger {
+                            continue;
+                        }
+                        leave_id = Some(publish_leave(&bob_node, &bob_keys, room).await);
+                    }
+                    recv = alice_events.recv() => {
+                        if follow_id.is_some() {
+                            continue;
+                        }
+                        let Some(event) = accepted_room_event(recv) else { continue };
+                        if Some(event.event_id) != leave_id {
+                            continue;
+                        }
+                        follow_id = Some(
+                            publish_text(&alice_node, &alice_keys, room, "after-leave").await,
+                        );
+                    }
+                }
+            }
+        }
+        let leave_id = leave_id.unwrap_or_else(|| {
+            panic!("{label}: the flush ended before Bob's member.left was published")
+        });
+        let follow_id = follow_id.unwrap_or_else(|| {
+            panic!("{label}: the flush ended before the post-leave message was published")
+        });
+        assert_flush_stopped_forwarding(label, "leave", carol, &bob_node, leave_id, follow_id)
+            .await;
+        alice_node.shutdown().await.expect("shutdown alice");
+        bob_node.shutdown().await.expect("shutdown bob");
+    }
+
+    /// A third member's `member.left`, folded during `room send`, is not
+    /// followed by a forward of a later message to that device.
+    #[tokio::test]
+    async fn send_flush_does_not_forward_after_a_third_party_leave() {
+        flush_does_not_forward_after_a_third_party_leave(FlushCommand::Send).await;
+    }
+
+    /// Same window as [`send_flush_does_not_forward_after_a_third_party_leave`],
+    /// during the first `room leave`.
+    #[tokio::test]
+    async fn leave_flush_does_not_forward_after_a_third_party_leave() {
+        flush_does_not_forward_after_a_third_party_leave(FlushCommand::Leave).await;
+    }
+
+    /// Carol is only invited when Alice starts `room send`. Bob publishes
+    /// Carol's join during the flush. Alice was given Carol's address as
+    /// `--peer`, so the managed session dials her and she receives the send.
+    #[tokio::test]
+    async fn send_flush_dials_a_member_who_joins_during_the_flush() {
+        let (alice, members, room) = joined_room(&["Bob"]);
+        let bob = &members[0];
+        let carol = party("Carol");
+        let ticket = invite_only(&alice, &carol, &room);
+        replicate(&alice, bob, &room);
+        replicate(&alice, &carol, &room);
+        let admit: [&Party; 3] = [&alice, bob, &carol];
+        let bob_node = spawn_listener(bob, room, &admit).await;
+        let carol_node = spawn_listener(&carol, room, &admit).await;
+        let peers = vec![
+            render_endpoint_addr(&bob_node.endpoint_addr().expect("bob addr")),
+            render_endpoint_addr(&carol_node.endpoint_addr().expect("carol addr")),
+        ];
+        let carol_keys = SecretKeys::load(carol.home.path()).expect("carol keys");
+        let mut bob_events = bob_node.room_events();
+        let mut opening = None;
+        let mut join_id = None;
+        {
+            let mut send_fut = Box::pin(async {
+                message::send(
+                    alice.home.path(),
+                    &room,
+                    "opening-flush",
+                    None,
+                    None,
+                    &peers,
+                    Duration::from_secs(5),
+                    true,
+                    OPEN_FLUSH,
+                )
+                .await
+                .expect("room send");
+            });
+            loop {
+                tokio::select! {
+                    () = &mut send_fut => break,
+                    recv = bob_events.recv() => {
+                        if opening.is_some() {
+                            continue;
+                        }
+                        let Some(event) = accepted_room_event(recv) else { continue };
+                        if event.event_type != EventType::MessageText {
+                            continue;
+                        }
+                        opening = Some(event.event_id);
+                        join_id = Some(publish_join(&bob_node, &carol_keys, room, &ticket).await);
+                    }
+                }
+            }
+        }
+        let opening = opening.expect("bob must see the send during the flush");
+        let join_id = join_id.expect("the join is published with the send");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            store_has(&alice.home.path().join(DB_FILE), join_id),
+            "the sender must fold the join during the flush"
+        );
+        assert!(
+            carol_node
+                .store_contains(opening)
+                .await
+                .expect("carol read"),
+            "a member who became active during the flush must be dialed and receive the send"
+        );
+        bob_node.shutdown().await.expect("shutdown bob");
+        carol_node.shutdown().await.expect("shutdown carol");
     }
 
     async fn publish_during_flush(
@@ -1242,6 +1447,54 @@ mod live {
         publish_wire(node, room, wire.to_bytes()).await
     }
 
+    async fn publish_leave(node: &Node, keys: &SecretKeys, room: RoomId) -> EventId {
+        let heads = node.heads().await.expect("heads");
+        let wire = build_member_left(
+            &keys.identity,
+            &keys.device,
+            &room,
+            None,
+            &heads,
+            crate::clock::now_ms(),
+        );
+        publish_wire(node, room, wire.to_bytes()).await
+    }
+
+    async fn publish_join(
+        node: &Node,
+        joiner: &SecretKeys,
+        room: RoomId,
+        ticket: &RoomInviteTicket,
+    ) -> EventId {
+        let heads = node.heads().await.expect("heads");
+        let binding = DeviceBinding::create(&room, &joiner.identity, joiner.device.device_key());
+        let wire = build_member_joined(
+            &joiner.identity,
+            &joiner.device,
+            &room,
+            &ticket.invite_id,
+            &ticket.capability_secret,
+            &ticket.role,
+            binding,
+            None,
+            &heads,
+            crate::clock::now_ms(),
+        );
+        publish_wire(node, room, wire.to_bytes()).await
+    }
+
+    fn invite_only(admin: &Party, member: &Party, room: &RoomId) -> RoomInviteTicket {
+        let summary = crate::invite::invite(
+            admin.home.path(),
+            room,
+            &member.identity.to_string(),
+            "member",
+            None,
+        )
+        .expect("invite");
+        RoomInviteTicket::from_str(&summary.ticket).expect("ticket")
+    }
+
     async fn publish_text(node: &Node, keys: &SecretKeys, room: RoomId, body: &str) -> EventId {
         let heads = node.heads().await.expect("heads");
         let wire = build_message_text(
@@ -1285,7 +1538,6 @@ mod live {
     /// `room leave` delivers that same `member.left` and does not author another.
     #[tokio::test]
     async fn leave_redelivers_exactly_one_member_left_when_peers_return() {
-        hold_flush_open();
         let (alice, members, room) = joined_room(&["Bob"]);
         let bob = &members[0];
 
@@ -1296,6 +1548,7 @@ mod live {
             &[],
             Duration::from_millis(300),
             true,
+            OPEN_FLUSH,
         )
         .await
         .expect("leave while peers are offline");
@@ -1313,6 +1566,7 @@ mod live {
             &peers,
             Duration::from_secs(5),
             true,
+            OPEN_FLUSH,
         )
         .await
         .expect("leave retries the stored departure");
@@ -1347,7 +1601,6 @@ mod live {
     /// offline, and must not suggest another leave.
     #[tokio::test]
     async fn leave_retry_reports_live_admission_peer_who_folded_the_leave_as_refused() {
-        message::FLUSH_GRACE_OVERRIDE_MS.store(300, std::sync::atomic::Ordering::Relaxed);
         let (alice, members, room) = joined_room(&["Bob"]);
         let bob = &members[0];
         let first = leave(
@@ -1357,6 +1610,7 @@ mod live {
             &[],
             Duration::from_millis(300),
             true,
+            message::FLUSH_GRACE,
         )
         .await
         .expect("leave while alice is offline");
@@ -1372,6 +1626,7 @@ mod live {
             &peers,
             Duration::from_secs(8),
             true,
+            message::FLUSH_GRACE,
         )
         .await
         .expect("retry against a peer who already folded the leave");

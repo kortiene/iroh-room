@@ -69,27 +69,10 @@ pub const DEFAULT_SEND_TIMEOUT: &str = "5s";
 /// Poll interval for the `room tail` display loop (spec D6; ≈200 ms is negligible
 /// against a single `SQLite` reader, §8).
 const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Grace period after `publish` so the per-peer writer queues flush before the
-/// ephemeral `send` node tears down (spec §5 step 5 / R3).
-const FLUSH_GRACE: Duration = Duration::from_millis(300);
-
-/// Test-only override for the departure flush, in milliseconds. `0` keeps
-/// [`FLUSH_GRACE`]. The removal and leave-retry paths read it so a test can
-/// hold the node up long enough for a peer to send during that window.
-#[cfg(test)]
-pub(crate) static FLUSH_GRACE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn flush_grace() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = FLUSH_GRACE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    FLUSH_GRACE
-}
+/// Grace period after `publish` so the per-peer writer queues flush before a
+/// short-lived session tears down (spec §5 step 5 / R3). `room remove`,
+/// `room send`, the first `room leave`, and a leave retry all wait this long.
+pub(crate) const FLUSH_GRACE: Duration = Duration::from_millis(300);
 
 /// The result of a `room send`, for the caller to present.
 pub struct SendSummary {
@@ -126,6 +109,7 @@ pub async fn send(
     peers: &[String],
     timeout: Duration,
     loopback: bool,
+    flush: Duration,
 ) -> Result<SendSummary> {
     // ---- Pre-IO argument validation (a bad invocation writes nothing). ----
     validate_body(body)?;
@@ -213,6 +197,7 @@ pub async fn send(
         // still up is dropped before anything accepted afterwards is forwarded.
         let mode = net_mode(loopback);
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
+        let hints = addr_hints(&dial_set, &peer_addrs);
         // `Box::pin` keeps `run_managed_push`'s future off this caller's stack —
         // issue #141 grew `NetConfig` enough to trip clippy::large_futures here.
         let delivered = match Box::pin(run_managed_push(
@@ -222,9 +207,11 @@ pub async fn send(
             secret_key,
             secret.device_seed(),
             dial_set,
+            hints,
             timeout,
             mode,
             wire_bytes,
+            flush,
         ))
         .await
         {
@@ -942,10 +929,12 @@ pub(crate) async fn run_push(
 /// A device that becomes active during the flush is dialed from the updated roster.
 ///
 /// `dial_set` is the opening roster — for `room remove`, the pre-removal roster,
-/// so the removed device is included — plus any `--peer` address hints. The
-/// connected-peer count is the union of who was connected at publish time and
-/// who is still connected after the flush, so a device torn down after receiving
-/// its terminal removal still counts.
+/// so the removed device is included. `addr_hints` is that roster plus every
+/// `--peer` address, so a device that is not active yet can still be dialed if
+/// the fold admits it before the flush ends. The connected-peer count is the
+/// union of who was connected at publish time and who is still connected after
+/// the flush, so a device torn down after receiving its terminal removal still
+/// counts. `flush` is how long to wait after publish before tearing the node down.
 ///
 /// # Errors
 /// Returns an error if the engine or node cannot start, the frame cannot be
@@ -959,9 +948,11 @@ pub(crate) async fn run_managed_push(
     secret_key: SecretKey,
     device_seed: [u8; 32],
     dial_set: Vec<EndpointAddr>,
+    addr_hints: Vec<EndpointAddr>,
     timeout: Duration,
     mode: NetMode,
     frame: Vec<u8>,
+    flush: Duration,
 ) -> Result<usize> {
     let engine = SyncEngine::open_with_local_device(
         store,
@@ -985,7 +976,7 @@ pub(crate) async fn run_managed_push(
         engine,
         cfg,
         DEFAULT_TICK,
-        dial_set.clone(),
+        addr_hints,
         admission_cell,
         None,
     )
@@ -1003,7 +994,7 @@ pub(crate) async fn run_managed_push(
         .await
         .context("could not publish the frame");
 
-    tokio::time::sleep(flush_grace()).await;
+    tokio::time::sleep(flush).await;
     reached.extend(connected_ids(&node, &ids));
     let shutdown = node.shutdown().await;
     publish?;
@@ -1065,6 +1056,7 @@ pub(crate) async fn run_sync(
     dial_set: Vec<EndpointAddr>,
     timeout: Duration,
     mode: NetMode,
+    flush: Duration,
 ) -> Result<SyncReport> {
     let engine = SyncEngine::open_with_local_device(
         store,
@@ -1096,7 +1088,7 @@ pub(crate) async fn run_sync(
     await_dial_outcome(&node, &ids, timeout).await;
     // A peer that accepted the link still needs a moment to pull the stored
     // departure. A refusal is already terminal by the time we get here.
-    tokio::time::sleep(flush_grace()).await;
+    tokio::time::sleep(flush).await;
     let report = classify_dial_outcome(&node, &ids);
     node.shutdown()
         .await
@@ -1254,6 +1246,21 @@ pub(crate) fn build_dial_set(
                 .unwrap_or_else(|| EndpointAddr::new(id))
         })
         .collect()
+}
+
+/// Opening dial targets plus every `--peer` address, keyed by device.
+///
+/// [`build_dial_set`] drops a hinted device that is not active yet. Keeping
+/// that address here lets the managed session dial it if the fold admits the
+/// device during the flush. A dial-set address wins when both name the same
+/// device.
+pub(crate) fn addr_hints(dial_set: &[EndpointAddr], peers: &[EndpointAddr]) -> Vec<EndpointAddr> {
+    let mut by_id: BTreeMap<EndpointId, EndpointAddr> =
+        peers.iter().map(|addr| (addr.id, addr.clone())).collect();
+    for addr in dial_set {
+        by_id.entry(addr.id).or_insert_with(|| addr.clone());
+    }
+    by_id.into_values().collect()
 }
 
 /// Convert a core [`DeviceKey`] (`device_id`) into an iroh [`EndpointId`]; they are
