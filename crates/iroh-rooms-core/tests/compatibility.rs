@@ -497,6 +497,37 @@ fn seed_rc6_fixture(conn: &Connection) -> Vec<FixtureRecord> {
     records
 }
 
+/// Read the store's own `lamport` / `admin_seq` columns and match them to
+/// [`RC6_DERIVED_CACHE`]. Call this after [`EventStore::rebuild`]: the pairs
+/// come from the rebuilt rows, not from [`insert_fixture_rows`].
+fn assert_rebuilt_store_matches_rc6_derived_cache(store: &EventStore, records: &[FixtureRecord]) {
+    let tail = store
+        .room_tail(&rc6_room_id(), fixture_limit(records.len()))
+        .expect("read rc.6 tail after rebuild");
+    let got: Vec<_> = RC6_DERIVED_CACHE
+        .iter()
+        .map(|(label, _, _)| {
+            let record = records
+                .iter()
+                .find(|candidate| candidate.label == *label)
+                .unwrap_or_else(|| panic!("rc.6 fixture missing {label}"));
+            let stored = tail
+                .iter()
+                .find(|row| row.event_id == record.validated.event_id)
+                .unwrap_or_else(|| panic!("{label} missing from the rebuilt store"));
+            ((*label).to_owned(), stored.lamport, stored.admin_seq)
+        })
+        .collect();
+    let expected: Vec<_> = RC6_DERIVED_CACHE
+        .iter()
+        .map(|(label, lamport, admin_seq)| ((*label).to_owned(), Some(*lamport), Some(*admin_seq)))
+        .collect();
+    assert_eq!(
+        got, expected,
+        "rebuilt store lamport/admin_seq must match the rc.6 derived cache"
+    );
+}
+
 fn validated_events(records: &[FixtureRecord]) -> Vec<ValidatedEvent> {
     records
         .iter()
@@ -979,6 +1010,7 @@ fn rc6_sqlite_fixture_opens_under_current_schema_without_migration() {
                 .len(),
             records.len()
         );
+        assert_rebuilt_store_matches_rc6_derived_cache(&store, &records);
     }
 
     let conn = Connection::open(&db_path).expect("reopen rc.6 db");

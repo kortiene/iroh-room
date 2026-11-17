@@ -20,9 +20,12 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const RC6_EVENTS: &str = include_str!("../../iroh-rooms-core/tests/fixtures/rc6/events.txt");
+const RC6_STORE_SCHEMA: &str =
+    include_str!("../../iroh-rooms-core/tests/fixtures/rc6/store_rc6_schema.sql");
 
-/// `schema::USER_VERSION` of the binary under test. The downgrade case stamps
-/// one past this value.
+/// Mirrors `schema::USER_VERSION` in `iroh-rooms-core` (currently 2). The
+/// downgrade test compares the opened store to this constant and fails loudly
+/// if `USER_VERSION` is bumped without updating it.
 const SUPPORTED_USER_VERSION: i64 = 2;
 
 fn cmd(home: &TempDir) -> Command {
@@ -93,15 +96,42 @@ fn rc6_validated_events(room: RoomId) -> Vec<ValidatedEvent> {
     events
 }
 
+fn read_user_version(db_path: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(db_path).expect("open rooms.db");
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read user_version")
+}
+
 fn seed_rc6_store(home: &Path) {
+    let db_path = home.join("rooms.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("create rc.6 schema db");
+        conn.execute_batch(RC6_STORE_SCHEMA)
+            .expect("apply harvested rc.6 schema");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version after schema");
+        assert_eq!(
+            version, SUPPORTED_USER_VERSION,
+            "store_rc6_schema.sql must stamp user_version 2"
+        );
+    }
+
     let room: RoomId = rc6_room_id().parse().expect("rc.6 room id parses");
     let events = rc6_validated_events(room);
-    let mut store = EventStore::open(&home.join("rooms.db")).expect("open seed store");
+    // The schema is already v2, so this open is a no-op migration.
+    let mut store = EventStore::open(&db_path).expect("open rc.6-shaped store");
     let stats = store
         .insert_all(&events)
         .expect("insert rc.6 fixture events");
     assert_eq!(stats.inserted, events.len() as u64);
     assert_eq!(stats.duplicate, 0);
+    drop(store);
+    assert_eq!(
+        read_user_version(&db_path),
+        SUPPORTED_USER_VERSION,
+        "opening the rc.6 schema must leave user_version at 2"
+    );
 }
 
 fn tail_offline(home: &TempDir, room_id: &str) -> String {
@@ -227,6 +257,11 @@ fn rc6_old_room_tail_matches_after_new_identity_creates_a_room() {
             "the new room must not contain harvested event {event_id}"
         );
     }
+    assert_eq!(
+        read_user_version(&home.path().join("rooms.db")),
+        SUPPORTED_USER_VERSION,
+        "CLI use of the rc.6 store must leave user_version at 2"
+    );
 }
 
 /// A checkpointed WAL store with `user_version = USER_VERSION + 1` is refused.
@@ -284,18 +319,15 @@ fn identity_secret_version_mismatch_fails_loudly() {
         .success();
     bump_identity_secret_version(home.path(), 99);
 
-    let output = cmd(&home)
+    cmd(&home)
         .args(["room", "create", "Should Not Persist"])
-        .output()
-        .expect("spawn room create");
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "unsupported identity.secret version",
+        ));
     assert!(
-        output.status.code().is_some_and(|code| code != 0),
-        "identity.secret version mismatch must exit non-zero, got {:?}",
-        output.status.code()
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unsupported identity.secret version"),
-        "version mismatch must fail with a clear error: {stderr}"
+        !home.path().join("rooms.db").exists(),
+        "a rejected identity load must not create rooms.db"
     );
 }
