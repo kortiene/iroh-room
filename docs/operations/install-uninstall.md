@@ -337,7 +337,14 @@ Do the work in a directory outside the git checkout. `ASSET_DIR` and the
 backup tar are created in the working directory. The tar contains
 `identity.secret`. Inside the repository both would be untracked files.
 
+Record the checkout before `cd`. After that, `scripts/verify-release-artifacts.sh`
+is not in the working directory. Later blocks use
+`${WORK:?set WORK first (see above)}` and, when they call a repository
+script, `${REPO:?set REPO first (see above)}`. An unset value stops the
+shell, including an interactive one.
+
 ```bash
+REPO="$(git rev-parse --show-toplevel)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/iroh-rooms-install.XXXXXX")"
 cd "$WORK"
 ```
@@ -373,7 +380,7 @@ to install. For those tags the gate is `sha256sum -c` on Linux, or
 install.
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
+ASSET_DIR="${ASSET_DIR:-${WORK:?set WORK first (see above)}/assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
 mkdir -p "${PREFIX}/bin" "$ASSET_DIR"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
@@ -391,8 +398,9 @@ Signed release (`v0.1.0-rc.6` and later). Install only when this exits 0:
 `<FULL_SHA>` is the commit `refs/tags/v<VERSION>` peels to.
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
-scripts/verify-release-artifacts.sh --dir "$ASSET_DIR" --commit "<FULL_SHA>" \
+REPO="${REPO:?set REPO first (see above)}"
+ASSET_DIR="${ASSET_DIR:-${WORK:?set WORK first (see above)}/assets}"
+"$REPO/scripts/verify-release-artifacts.sh" --dir "$ASSET_DIR" --commit "<FULL_SHA>" \
   "v<VERSION>" "<TRIPLE>" || exit 1
 ```
 
@@ -403,7 +411,7 @@ inside `$ASSET_DIR`. Install only when it exits 0. The `|| exit 1` after the
 subshell stops the current shell, which closes an interactive shell:
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
+ASSET_DIR="${ASSET_DIR:-${WORK:?set WORK first (see above)}/assets}"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
 (
   cd "$ASSET_DIR" || exit 1
@@ -415,7 +423,7 @@ ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
 Unpack and install only after the gate above exits 0:
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
+ASSET_DIR="${ASSET_DIR:-${WORK:?set WORK first (see above)}/assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
 mkdir -p "${PREFIX}/bin"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
@@ -435,7 +443,7 @@ that manifest's `commit` field and in the archive name (the 12-hex suffix).
 It does not appear in `--version`.
 
 ```bash
-ASSET_DIR="${ASSET_DIR:-$WORK/assets}"
+ASSET_DIR="${ASSET_DIR:-${WORK:?set WORK first (see above)}/assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
 inner="${ASSET_DIR}/${ARCHIVE%.tar.gz}"
@@ -456,7 +464,8 @@ including when it is empty. `scripts/lifecycle-smoke.sh` runs
 `PRAGMA wal_checkpoint(TRUNCATE)` first and still refuses if `rooms.db-wal`
 remains. Stop `iroh-rooms`, run that checkpoint, and take the backup only
 after the file is gone. If it is still there, do not back up and do not
-delete the file by hand. Run the backup from `$WORK`, not from the
+delete the file by hand. If `rooms.db` is missing, stop: `sqlite3` would
+otherwise create an empty database. Run the backup from `$WORK`, not from the
 repository. Then take the documented backup, the `umask 077` tar in Back Up
 Before Upgrade. Leave that block unchanged.
 
@@ -466,6 +475,7 @@ if pgrep -x iroh-rooms >/dev/null 2>&1; then
   exit 1
 fi
 data="${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}"
+[[ -f "${data}/rooms.db" ]] || exit 1
 sqlite3 "${data}/rooms.db" "PRAGMA wal_checkpoint(TRUNCATE);"
 if [[ -e "${data}/rooms.db-wal" ]]; then
   printf '%s still exists after checkpoint\n' "${data}/rooms.db-wal" >&2
@@ -512,18 +522,20 @@ mv "$tmp" "${PREFIX}/bin/iroh-rooms"
 ```
 
 **(b) The candidate raised `user_version`.** The older binary refuses the
-store and exits 1. stderr contains `error: could not open event store at <path>: …`
-and the refusal from `crates/iroh-rooms-core/src/store/schema.rs`:
+store and exits 1. stderr contains `error: could not open event store at <path>: store migration failed: `.
+
+`v0.1.0-rc.1` through `v0.1.0-rc.6` have no suffix. `N` is the database
+`user_version` and `M` is the highest version that binary supports:
 
 ```text
-database user_version {current} is newer than supported {USER_VERSION}; restore from backup or retry with the previous binary
+error: could not open event store at <path>: store migration failed: database user_version N is newer than supported M
 ```
 
-`{current}` is the database `user_version`. `{USER_VERSION}` is the highest
-version that binary supports. The full line contains
+Builds that contain #409 (`7c20e93` on `main`, and later) append
+`; restore from backup or retry with the previous binary`. They also exit 1:
 
 ```text
-error: could not open event store at <path>: store migration failed: database user_version {current} is newer than supported {USER_VERSION}; restore from backup or retry with the previous binary
+error: could not open event store at <path>: store migration failed: database user_version N is newer than supported M; restore from backup or retry with the previous binary
 ```
 
 Reinstall the prior binary with the rollback (a) commands so `PREFIX` is
@@ -556,7 +568,8 @@ either file does not change the data directory.
 ### Automated lifecycle check
 
 ```bash
-scripts/lifecycle-smoke.sh <prior-tag> <candidate-tag> <triple>
+REPO="${REPO:?set REPO first (see above)}"
+"$REPO/scripts/lifecycle-smoke.sh" <prior-tag> <candidate-tag> <triple>
 ```
 
 `<triple>` is one of the four release triples. The script exits 0 only when

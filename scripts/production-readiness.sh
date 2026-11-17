@@ -134,6 +134,8 @@ require_text "crates/iroh-rooms-core/tests/fixtures/v1/store_v1_schema.sql" "PRA
 require_text "scripts/build-release-artifacts.sh" "shasum -a 256" "release artifact script writes SHA-256 checksums"
 require_text "docs/operations/release-operations.md" "scripts/build-release-artifacts.sh --version <VERSION>" "release ops documents artifact build command"
 require_text "docs/operations/install-uninstall.md" "Rollback requires" "install docs include rollback procedure"
+# The single quotes are the grep needle, not a shell expansion.
+# shellcheck disable=SC2016
 require_text "docs/operations/install-uninstall.md" 'rm -f "$HOME/.local/bin/iroh-rooms"' "install docs include uninstall command"
 require_text "docs/operations/production-beta-release-notes-template.md" "Known Limitations" "release notes template surfaces limitations"
 require_text "docs/operations/production-beta-release-notes-template.md" "Artifacts And Checksums" "release notes template includes checksums"
@@ -141,18 +143,17 @@ require_text ".github/ISSUE_TEMPLATE/bug_report.md" "full data-directory backups
 require_text "CONTRIBUTING.md" "Production Readiness" "contributing links production readiness"
 require_text "README.md" "Production Readiness" "readme links production readiness"
 require_file "scripts/lifecycle-smoke.sh"
-# Every non-blank line of the bash fence under "## Back Up Before Upgrade"
-# must appear, unchanged, in documented_backup(). The function body is
-# indented two spaces past the fence, and the tar line ends with
-# " || return 1". Drop that indent and that suffix, then exact-match.
+# The fence under "## Back Up Before Upgrade" and the documented_backup()
+# span must be the same lines, in order. The span starts at the
+# install-uninstall.md cite comment and runs through the line ending in
+# "|| return 1". Drop the function's two-space indent and a trailing
+# " || return 1" before the comparison.
 require_documented_backup_mirror() {
   local doc="docs/operations/install-uninstall.md"
   local script="scripts/lifecycle-smoke.sh"
   local label="documented_backup mirrors the install backup block"
   local doc_file=""
   local func_file=""
-  local line=""
-  local missing=""
 
   doc_file="$(mktemp)"
   func_file="$(mktemp)"
@@ -174,7 +175,12 @@ require_documented_backup_mirror() {
   awk '
     /^documented_backup\(\) \{/ { in_fn = 1; next }
     in_fn && /^}/ { exit }
-    in_fn { print }
+    in_fn && !span && index($0, "docs/operations/install-uninstall.md:252-260") {
+      span = 1
+      next
+    }
+    span { print }
+    span && /\|\| return 1$/ { exit }
   ' "$script" | sed -e 's/^  //' -e 's/ || return 1$//' >"$func_file"
 
   if [[ ! -s "$doc_file" || ! -s "$func_file" ]]; then
@@ -183,15 +189,8 @@ require_documented_backup_mirror() {
     return 0
   fi
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if ! grep -Fxq -- "$line" "$func_file"; then
-      missing="$line"
-      break
-    fi
-  done <"$doc_file"
-
-  if [[ -n "$missing" ]]; then
-    record "$label" "FAIL" "missing line: ${missing}"
+  if ! diff -q "$doc_file" "$func_file" >/dev/null; then
+    record "$label" "FAIL" "backup block and documented_backup() differ"
   else
     record "$label" "PASS" ""
   fi
