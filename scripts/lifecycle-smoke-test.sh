@@ -21,6 +21,9 @@ if [[ ! -x "$SCRIPT" ]]; then
   fail "lifecycle-smoke.sh is not executable"
 fi
 
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/lifecycle-test.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+
 refusal_out=""
 refusal_code=0
 refusal_out="$(GITHUB_ACTIONS=true "$SCRIPT" v0.1.0-rc.5 v0.1.0-rc.6 x86_64-unknown-linux-gnu --candidate-binary /no/such/binary 2>&1)" || refusal_code=$?
@@ -33,22 +36,20 @@ fi
 ok "refuses --candidate-binary on GitHub Actions (exit ${refusal_code})"
 
 same_code=0
-"$SCRIPT" v0.1.0-rc.6 v0.1.0-rc.6 x86_64-unknown-linux-gnu >/tmp/lifecycle-same.out 2>/tmp/lifecycle-same.err || same_code=$?
+"$SCRIPT" v0.1.0-rc.6 v0.1.0-rc.6 x86_64-unknown-linux-gnu >"${tmp}/same.out" 2>"${tmp}/same.err" || same_code=$?
 if [[ "$same_code" -eq 0 ]]; then
   fail "identical tags were accepted"
 fi
-if ! grep -F -q 'must differ' /tmp/lifecycle-same.err; then
+if ! grep -F -q 'must differ' "${tmp}/same.err"; then
   fail "identical-tag error missing"
 fi
-rm -f /tmp/lifecycle-same.out /tmp/lifecycle-same.err
 ok "rejects identical tags (exit ${same_code})"
 
 bad_code=0
-"$SCRIPT" not-a-tag v0.1.0-rc.6 x86_64-unknown-linux-gnu >/dev/null 2>/tmp/lifecycle-bad.err || bad_code=$?
+"$SCRIPT" not-a-tag v0.1.0-rc.6 x86_64-unknown-linux-gnu >/dev/null 2>"${tmp}/bad.err" || bad_code=$?
 if [[ "$bad_code" -eq 0 ]]; then
   fail "bad tag was accepted"
 fi
-rm -f /tmp/lifecycle-bad.err
 ok "rejects a bad tag (exit ${bad_code})"
 
 # shellcheck disable=SC1090,SC1091
@@ -122,8 +123,6 @@ if ! grep -F -q 'tar -C "$(dirname "$IROH_ROOMS_HOME")"' "$SCRIPT"; then
 fi
 ok "runbook citations"
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/lifecycle-test.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
 data="${tmp}/home/.local/share/iroh-rooms-beta"
 mkdir -p "$data"
 printf 'marker\n' >"${data}/marker.txt"
@@ -413,5 +412,70 @@ if ! grep -F -q "trap 'exit 129' HUP" "$SCRIPT"; then
   fail "missing HUP trap"
 fi
 ok "signal traps exit 130, 143, and 129"
+
+sumfile="${tmp}/named.sha256"
+printf 'abc  example.tar.gz\n' >"$sumfile"
+assert_sha256_names_archive "$sumfile" "example.tar.gz" || fail "sha256 name match"
+printf 'abc  other.tar.gz\n' >"$sumfile"
+if assert_sha256_names_archive "$sumfile" "example.tar.gz"; then
+  fail "sha256 name mismatch was accepted"
+fi
+ok "sha256 file names the archive"
+
+USER_VERSION_BEFORE=2
+USER_VERSION_AFTER=2
+note_user_version || fail "equal user_version"
+if [[ "$MIGRATED" != "false" ]]; then
+  fail "equal versions recorded migrated=${MIGRATED}"
+fi
+USER_VERSION_AFTER=3
+note_user_version || fail "newer user_version"
+if [[ "$MIGRATED" != "true" ]]; then
+  fail "newer version recorded migrated=${MIGRATED}"
+fi
+USER_VERSION_AFTER=1
+if note_user_version; then
+  fail "older user_version was accepted"
+fi
+ok "user_version migration flag"
+
+saved_path="$PATH"
+prefix="${tmp}/uninstall-prefix"
+mkdir -p "${prefix}/bin" "${tmp}/other-bin"
+printf '#!/bin/sh\n' >"${prefix}/bin/iroh-rooms"
+printf '#!/bin/sh\n' >"${tmp}/other-bin/iroh-rooms"
+chmod 755 "${prefix}/bin/iroh-rooms" "${tmp}/other-bin/iroh-rooms"
+uhome="${tmp}/uninstall-home"
+mkdir -p "$uhome"
+printf '{}\n' >"${uhome}/identity.json"
+printf 'db\n' >"${uhome}/rooms.db"
+PREFIX="$prefix"
+IROH_ROOMS_HOME="$uhome"
+PATH="${prefix}/bin:${tmp}/other-bin:${saved_path}"
+hash -r
+uninstall_impl || fail "uninstall rejected another iroh-rooms on PATH"
+if [[ -e "${prefix}/bin/iroh-rooms" ]]; then
+  fail "temp binary still exists"
+fi
+found="$(command -v iroh-rooms || true)"
+case "$found" in
+  "${prefix}/"*) fail "command -v still under PREFIX (${found})" ;;
+esac
+PATH="$saved_path"
+hash -r
+ok "uninstall ignores an iroh-rooms outside PREFIX"
+
+SIMULATED=secret_key
+RESULT=PASS
+OUT_DIR="${tmp}/secret-key"
+mkdir -p "$OUT_DIR"
+if write_record; then
+  fail "secret_key was accepted"
+fi
+SIMULATED=seed
+if write_record; then
+  fail "seed was accepted"
+fi
+ok "secret scan rejects secret_key and seed"
 
 printf 'ok lifecycle-smoke-test\n'

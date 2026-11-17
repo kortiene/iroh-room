@@ -104,6 +104,7 @@ GLIBC_METHOD=""
 LDD_VERSION=""
 USER_VERSION_BEFORE=""
 USER_VERSION_AFTER=""
+MIGRATED=""
 SIMULATED=""
 DATA_DIRS=""
 GH_VERSION=""
@@ -217,6 +218,22 @@ sha256_file() {
     sha256sum "$file" | awk '{ print $1 }'
   else
     shasum -a 256 "$file" | awk '{ print $1 }'
+  fi
+}
+
+assert_sha256_names_archive() {
+  local sumfile="$1"
+  local archive="$2"
+  local line="" name=""
+  if [[ ! -f "$sumfile" ]]; then
+    printf 'error: missing %s\n' "$sumfile" >&2
+    return 1
+  fi
+  line="$(awk 'NR==1 { sub(/\r$/, ""); print; exit }' "$sumfile")"
+  name="${line#*  }"
+  if [[ "$name" == "$line" || "$name" != "$archive" ]]; then
+    printf 'error: %s does not name %s\n' "$(basename "$sumfile")" "$archive" >&2
+    return 1
   fi
 }
 
@@ -563,6 +580,7 @@ verify_published() {
   download_assets "$tag" "$dest" || return 1
   archive="$(pick_archive "$dest" "$tag")" || return 1
   sum="$(sha256_file "${dest}/${archive}")" || return 1
+  assert_sha256_names_archive "${dest}/${archive}.sha256" "$archive" || return 1
   if is_checksum_only_tag "$tag"; then
     if [[ ! -f "${dest}/${archive}.sha256" ]]; then
       printf 'error: missing %s.sha256\n' "$archive" >&2
@@ -599,7 +617,7 @@ verify_candidate_impl() {
     CANDIDATE_VERSION_MATCH="n/a"
     return 0
   fi
-    verify_published "candidate" "$CANDIDATE_TAG" || return 1
+  verify_published "candidate" "$CANDIDATE_TAG" || return 1
 }
 
 verify_prior_impl() {
@@ -905,6 +923,64 @@ cmp_snapshot() {
   return 1
 }
 
+note_user_version() {
+  if [[ ! "$USER_VERSION_BEFORE" =~ ^[0-9]+$ || ! "$USER_VERSION_AFTER" =~ ^[0-9]+$ ]]; then
+    printf 'error: user_version before [%s] after [%s]\n' "$USER_VERSION_BEFORE" "$USER_VERSION_AFTER" >&2
+    return 1
+  fi
+  if [[ "$USER_VERSION_AFTER" -lt "$USER_VERSION_BEFORE" ]]; then
+    printf 'error: user_version %s is older than %s\n' "$USER_VERSION_AFTER" "$USER_VERSION_BEFORE" >&2
+    return 1
+  fi
+  if [[ "$USER_VERSION_AFTER" -eq "$USER_VERSION_BEFORE" ]]; then
+    MIGRATED=false
+  else
+    MIGRATED=true
+  fi
+}
+
+platform_default_dir() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "${HOME}/Library/Application Support/iroh-rooms"
+      ;;
+    Linux)
+      printf '%s\n' "${XDG_DATA_HOME}/iroh-rooms"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+show_platform_default_after_upgrade() {
+  local expected="" phys_home="" phys_expected=""
+  expected="$(platform_default_dir)" || return 1
+  if [[ ! -d "$expected" ]]; then
+    printf 'error: platform-default data dir is missing after upgrade\n' >&2
+    return 1
+  fi
+  phys_home="$(physical_dir "$HOME")" || return 1
+  phys_expected="$(physical_dir "$expected")" || return 1
+  case "$phys_expected" in
+    "$phys_home"/*) ;;
+    *)
+      printf 'error: refusing identity show outside the temp HOME (%s)\n' "$phys_expected" >&2
+      return 1
+      ;;
+  esac
+  env -u IROH_ROOMS_HOME "${PREFIX}/bin/iroh-rooms" identity show \
+    >"${WORK}/platform-default-upgrade.out" 2>"${WORK}/platform-default-upgrade.err" || {
+    printf 'error: candidate identity show on the platform-default dir failed\n' >&2
+    cat "${WORK}/platform-default-upgrade.err" >&2
+    return 1
+  }
+  if ! grep -F -q 'lifecycle-platform-default' "${WORK}/platform-default-upgrade.out"; then
+    printf 'error: platform-default identity show did not read the temp HOME identity\n' >&2
+    return 1
+  fi
+}
+
 require_integrity_ok() {
   local db="$1"
   local integrity=""
@@ -947,10 +1023,8 @@ upgrade_impl() {
   require_integrity_ok "${IROH_ROOMS_HOME}/rooms.db" || return 1
   USER_VERSION_AFTER="$(sqlite_scalar "${IROH_ROOMS_HOME}/rooms.db" "PRAGMA user_version;")"
   USER_VERSION_AFTER="${USER_VERSION_AFTER//$'\r'/}"
-  if [[ ! "$USER_VERSION_AFTER" =~ ^[0-9]+$ ]]; then
-    printf 'error: could not read user_version after upgrade\n' >&2
-    return 1
-  fi
+  note_user_version || return 1
+  show_platform_default_after_upgrade || return 1
 }
 
 write_after_upgrade_impl() {
@@ -1066,12 +1140,18 @@ uninstall_impl() {
   local before="" after="" found=""
   before="$(sha256_file "$db")" || return 1
   rm -f "${PREFIX}/bin/iroh-rooms" || return 1
-  hash -r
-  found="$(command -v iroh-rooms || true)"
-  if [[ -n "$found" ]]; then
-    printf 'error: command -v iroh-rooms still resolves to %s after uninstall\n' "$found" >&2
+  if [[ -e "${PREFIX}/bin/iroh-rooms" ]]; then
+    printf 'error: %s still exists after uninstall\n' "${PREFIX}/bin/iroh-rooms" >&2
     return 1
   fi
+  hash -r
+  found="$(command -v iroh-rooms || true)"
+  case "$found" in
+    "${PREFIX}/"*)
+      printf 'error: command -v iroh-rooms still resolves under %s (%s)\n' "$PREFIX" "$found" >&2
+      return 1
+      ;;
+  esac
   if [[ ! -d "$IROH_ROOMS_HOME" || ! -f "${IROH_ROOMS_HOME}/identity.json" || ! -f "$db" ]]; then
     printf 'error: uninstall removed or damaged the data directory\n' >&2
     return 1
@@ -1283,6 +1363,11 @@ if before is not None:
     data["user_version_before"] = before
 if after is not None:
     data["user_version_after"] = after
+migrated = env("LS_MIGRATED")
+if migrated == "true":
+    data["migrated"] = True
+elif migrated == "false":
+    data["migrated"] = False
 simulated = env("LS_SIMULATED")
 if simulated:
     data["simulated"] = simulated
@@ -1396,6 +1481,8 @@ if "user_version_before" in rendered:
     lines.append("- user_version_before: `%s`" % rendered["user_version_before"])
 if "user_version_after" in rendered:
     lines.append("- user_version_after: `%s`" % rendered["user_version_after"])
+if "migrated" in rendered:
+    lines.append("- migrated: `%s`" % rendered["migrated"])
 if "simulated" in rendered:
     lines.append("- simulated: `%s`" % rendered["simulated"])
 if rendered.get("data_dirs_covered"):
@@ -1421,7 +1508,7 @@ lines.append("")
 markdown = "\n".join(lines)
 
 blob = open(json_path, encoding="utf-8").read() + markdown
-for needle in ("identity_secret", "device_secret", "roomtkt1"):
+for needle in ("identity_secret", "device_secret", "roomtkt1", "secret_key", "seed"):
     if needle in blob:
         os.remove(json_path)
         sys.stderr.write("refusing to write a record that contains secret material\n")
@@ -1505,8 +1592,8 @@ tool_versions() {
   else
     COSIGN_VERSION="not installed"
   fi
-  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    RUNNER_HOSTED="github"
+  if [[ -n "${RUNNER_ENVIRONMENT:-}" ]]; then
+    RUNNER_HOSTED="${RUNNER_ENVIRONMENT}"
   else
     RUNNER_HOSTED="local"
   fi
