@@ -109,6 +109,13 @@ gh api "repos/kortiene/iroh-room/environments/${name}/deployment-branch-policies
 `[]`, `"protection_rules": []`, or `"deployment_branch_policy": null` means
 stop. Do not push the tag.
 
+The repository ruleset `release-tags` (id 27471194, added 2026-11-17)
+restricts creating, updating, deleting and force-pushing `refs/tags/v*`.
+Only accounts on the bypass list (repository admin, currently kortiene) can
+push `v*` tags. The publish job still peels `refs/tags/v<VERSION>` to this
+run's `GITHUB_SHA` before any release write. That publish-time peel check
+stays as defence in depth.
+
 ```bash
 git tag v<VERSION> <COMMIT>
 git push origin v<VERSION>
