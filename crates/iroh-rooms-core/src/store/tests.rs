@@ -592,6 +592,77 @@ fn refused_open_of_delete_journal_future_user_version_leaves_header_unchanged() 
     assert_refused_open_leaves_file_unchanged(&path);
 }
 
+/// `user_version + 1` committed with `wal_autocheckpoint = 0` and the writer
+/// still open, so the new version lives only in `-wal`. Copy `rooms.db` and
+/// `-wal`, then refuse the copy. Both files stay byte-identical.
+#[test]
+fn refused_open_of_uncheckpointed_wal_future_user_version_leaves_db_and_wal_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    drop(EventStore::open(&path).expect("create wal store"));
+
+    let writer = Connection::open(&path).expect("hold the writer");
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0_i64)
+        .expect("disable autocheckpoint");
+    writer
+        .pragma_update(None, "user_version", super::schema::USER_VERSION + 1)
+        .expect("commit a newer user_version into the wal");
+    let wal = wal_sidecar(&path);
+    assert!(
+        wal.is_file(),
+        "the uncheckpointed wal must exist while the writer is held"
+    );
+
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_db = copy_dir.path().join("rooms.db");
+    let copy_wal = wal_sidecar(&copy_db);
+    std::fs::copy(&path, &copy_db).expect("copy rooms.db");
+    std::fs::copy(&wal, &copy_wal).expect("copy -wal");
+
+    let main = std::fs::read(&copy_db).expect("read copied rooms.db");
+    let on_disk_version = i64::from(u32::from_be_bytes(
+        main[60..64].try_into().expect("user_version bytes"),
+    ));
+    assert_eq!(
+        on_disk_version,
+        super::schema::USER_VERSION,
+        "setup must leave the newer user_version only in the uncheckpointed wal"
+    );
+    assert!(
+        std::fs::metadata(&copy_wal).expect("wal metadata").len() > 32,
+        "the copied wal must contain a committed frame"
+    );
+
+    let before_db = sha256_hex(&main);
+    let before_wal = sha256_hex(&std::fs::read(&copy_wal).expect("read copied wal"));
+
+    let msg = open_err(&copy_db).to_string();
+    assert_newer_user_version_prefix(&msg);
+    assert_recovery_hint(&msg);
+
+    let after_db = sha256_hex(&std::fs::read(&copy_db).expect("read rooms.db after refusal"));
+    let after_wal = sha256_hex(&std::fs::read(&copy_wal).expect("read -wal after refusal"));
+    assert_eq!(
+        after_db, before_db,
+        "refused open must not rewrite rooms.db when user_version is only in the wal"
+    );
+    assert_eq!(
+        after_wal, before_wal,
+        "refused open must not rewrite or remove the uncheckpointed -wal"
+    );
+
+    // Keep the writer alive until the copy has been refused. Dropping it
+    // checkpoints the original, which is not the file under test.
+    drop(writer);
+}
+
+fn wal_sidecar(db_path: &Path) -> std::path::PathBuf {
+    let mut name = db_path.file_name().expect("db file name").to_os_string();
+    name.push("-wal");
+    db_path.with_file_name(name)
+}
+
 /// `chmod` the data directory and the database read-only. Root ignores mode
 /// bits, so the refusal would not be distinguished from a successful write.
 #[cfg(unix)]
@@ -600,6 +671,10 @@ fn refused_open_on_readonly_dir_reports_newer_user_version() {
     use std::os::unix::fs::PermissionsExt;
 
     if unix_euid_is_root() {
+        assert!(
+            std::env::var("CI").ok().as_deref() != Some("true"),
+            "refused_open_on_readonly_dir_reports_newer_user_version: uid is 0 and CI=true; refusing to skip"
+        );
         eprintln!(
             "skipping refused_open_on_readonly_dir_reports_newer_user_version: running as root"
         );

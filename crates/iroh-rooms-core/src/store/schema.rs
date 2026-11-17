@@ -205,17 +205,21 @@ pub(crate) fn refuse_newer_user_version(conn: &Connection) -> Result<(), StoreEr
     Ok(())
 }
 
-/// Read `user_version` from `path` without altering the file, and refuse a
-/// newer store. A missing or empty path is left for the caller to create.
+/// Read `user_version` from `path` and refuse a newer store.
 ///
-/// The probe is a read-only `immutable=1` open, so it does not change
-/// `journal_mode`, does not rewrite header bytes 18–19, and still works when
-/// the data directory cannot be written. That keeps a read-only refusal on
-/// the version error instead of a failed WAL pragma.
+/// A plain `mode=ro` open runs first so a version that exists only in an
+/// uncheckpointed `-wal` is visible. `immutable=1` is the fallback when that
+/// open cannot proceed, including a read-only directory whose query fails
+/// because `-shm` cannot be created. The probe does not rewrite the main
+/// file or `-wal`; it may create `-shm`.
+///
+/// An open or query failure is inconclusive and returns `Ok`: the read-write
+/// open repeats the check with checkpoint-on-close disabled. A missing or
+/// empty path is left for the caller to create.
 ///
 /// # Errors
-/// [`StoreError::Migration`] when the on-disk `user_version` is newer than
-/// this binary. [`StoreError::Sqlite`] when an existing database cannot be read.
+/// [`StoreError::Migration`] when the probe reads a `user_version` newer than
+/// this binary.
 pub(crate) fn refuse_newer_user_version_at(path: &Path) -> Result<(), StoreError> {
     if !path.is_file() {
         return Ok(());
@@ -226,7 +230,9 @@ pub(crate) fn refuse_newer_user_version_at(path: &Path) -> Result<(), StoreError
         // Let the real open report a path that disappeared or cannot be stat'd.
         Err(_) => return Ok(()),
     }
-    let current = read_user_version_without_writing(path)?;
+    let Some(current) = read_user_version_without_writing(path) else {
+        return Ok(());
+    };
     if current > USER_VERSION {
         return Err(StoreError::Migration(newer_user_version_message(current)));
     }
@@ -242,30 +248,40 @@ fn newer_user_version_message(current: i64) -> String {
     )
 }
 
-/// `PRAGMA user_version` via an open that cannot rewrite the database.
-fn read_user_version_without_writing(path: &Path) -> Result<i64, StoreError> {
-    // A plain read-only open still does not set `journal_mode`. Used when the
-    // URI probe cannot parse the path.
-    let conn = if let Ok(conn) = open_immutable_readonly(path) {
-        conn
-    } else {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        Connection::open_with_flags(path, flags)?
-    };
-    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+/// `PRAGMA user_version` without rewriting the main file or `-wal`.
+///
+/// `mode=ro` first: it applies the `-wal`, so an uncheckpointed version is
+/// visible, and it may create `-shm`. A read-only directory often accepts the
+/// open and then fails the query, because `-shm` cannot be created; that is
+/// treated like an open failure and falls back to `immutable=1`, which reads
+/// the main-file header and does not create `-shm`. `None` means the probe
+/// was inconclusive (both opens failed, or the immutable query failed), not
+/// that the version is 0.
+fn read_user_version_without_writing(path: &Path) -> Option<i64> {
+    if let Ok(conn) = open_readonly(path, "mode=ro") {
+        if let Some(version) = query_user_version(&conn) {
+            return Some(version);
+        }
+    }
+    query_user_version(&open_readonly(path, "mode=ro&immutable=1").ok()?)
 }
 
-fn open_immutable_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
-    let uri = sqlite_immutable_uri(path);
+fn query_user_version(conn: &Connection) -> Option<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok()
+}
+
+fn open_readonly(path: &Path, query: &str) -> Result<Connection, rusqlite::Error> {
+    let uri = sqlite_file_uri(path, query);
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     Connection::open_with_flags(uri, flags)
 }
 
-/// `file://` URI with `mode=ro&immutable=1`. SQLite then reads the header and
-/// does not create a journal, a WAL, or a shared-memory file.
-fn sqlite_immutable_uri(path: &Path) -> String {
+/// `file://` URI. `mode=ro` reads the WAL. `immutable=1` reads the main file
+/// only and does not create a journal, a WAL, or a shared-memory file.
+fn sqlite_file_uri(path: &Path, query: &str) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -292,7 +308,8 @@ fn sqlite_immutable_uri(path: &Path) -> String {
             }
         }
     }
-    uri.push_str("?mode=ro&immutable=1");
+    uri.push('?');
+    uri.push_str(query);
     uri
 }
 
