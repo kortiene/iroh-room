@@ -140,6 +140,8 @@ require_text "docs/operations/production-beta-release-notes-template.md" "Artifa
 require_text ".github/ISSUE_TEMPLATE/bug_report.md" "full data-directory backups" "bug template blocks raw local backups"
 require_text "CONTRIBUTING.md" "Production Readiness" "contributing links production readiness"
 require_text "README.md" "Production Readiness" "readme links production readiness"
+require_file "scripts/lifecycle-smoke.sh"
+require_text "scripts/lifecycle-smoke.sh" "Written to the current working directory. The archive contains" "documented_backup mirrors the install backup block"
 
 RESULTS_MD="archive/spikes/spike-nat/results/results.md"
 if [[ -f "$RESULTS_MD" ]] && ! grep -Fq "pending manual two-host run" "$RESULTS_MD"; then

@@ -177,6 +177,9 @@ Production Beta candidate, the release owner must preserve a database fixture
 created by the immediately previous candidate or explicitly disclose why upgrade
 continuity is not claimed.
 
+The rc.6 continuity fixture at `crates/iroh-rooms-core/tests/fixtures/rc6/`
+(from #408) covers prior-candidate data continuity.
+
 Each fixture should assert:
 
 - Bytes still decode.

@@ -319,3 +319,198 @@ iroh-rooms identity show
 
 If rollback fails after a schema migration, stop using the data directory and
 restore the backup again with the previous binary.
+
+## Per-Platform Install, Upgrade, Rollback, And Uninstall
+
+These steps are the operator procedure for the four release triples.
+Verification flags, asset names, and the signer identity are in
+[Install From Binary Artifact](#install-from-binary-artifact) above. The
+backup block in [Back Up Before Upgrade](#back-up-before-upgrade) and the
+move-aside restore in [Rollback](#rollback) stay as written.
+`scripts/lifecycle-smoke.sh` `documented_backup()` copies that backup block
+and cites it.
+
+### Release triples
+
+| Triple | GitHub-hosted runner |
+| --- | --- |
+| `x86_64-apple-darwin` | `macos-15-intel` |
+| `aarch64-apple-darwin` | `macos-15` |
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
+
+`<TRIPLE>` in the commands below is one of those four. Download and install
+only the archive whose name contains that triple.
+
+### Install
+
+Download with `curl` or `gh` only, using the commands in Install From Binary
+Artifact. Do not use another downloader.
+
+A signed release (`v0.1.0-rc.6` and later) is installed only through
+`scripts/verify-release-artifacts.sh`. That command needs GitHub CLI 2.68.0 or
+newer and cosign v3 or newer. If it exits non-zero, do not install.
+
+`v0.1.0-rc.1` through `v0.1.0-rc.5` are checksum-only (the per-archive
+`.sha256`). `scripts/verify-release-artifacts.sh` exits 1 on those tags by
+design. That exit is not a pass and it is not permission to install. For those
+tags the gate is `sha256sum -c` on Linux, or `shasum -a 256 -c` on macOS. If
+that checksum command exits non-zero, do not install.
+
+```bash
+PREFIX="${PREFIX:-$HOME/.local}"
+mkdir -p "${PREFIX}/bin"
+ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
+```
+
+Download `$ARCHIVE` and its check assets with `curl` or `gh` only. Those
+commands are in Install From Binary Artifact. `--dir` below is that download
+directory. Leaving `--dir` off makes `scripts/verify-release-artifacts.sh`
+download with `gh release download`, which is still `gh`.
+
+Signed release (`v0.1.0-rc.6` and later). Install only when this exits 0:
+
+```bash
+scripts/verify-release-artifacts.sh --dir ./assets "v<VERSION>" "<TRIPLE>" || exit 1
+```
+
+Checksum-only (`v0.1.0-rc.1` through `v0.1.0-rc.5`). Do not use the verifier
+as the gate. It exits 1 on these tags by design, and that exit is not a pass.
+Install only when the checksum exits 0:
+
+```bash
+sha256sum -c "${ARCHIVE}.sha256" || exit 1
+# macOS: shasum -a 256 -c "${ARCHIVE}.sha256" || exit 1
+```
+
+Unpack and install only after the gate above exits 0:
+
+```bash
+tar -xzf "$ARCHIVE"
+inner="${ARCHIVE%.tar.gz}"
+tmp="${PREFIX}/bin/iroh-rooms.tmp.$$"
+install -m 0755 "${inner}/iroh-rooms" "$tmp"
+mv "$tmp" "${PREFIX}/bin/iroh-rooms"
+```
+
+The default directory is `$HOME/.local/bin`. Set `PREFIX` to override that
+prefix. The binary is always installed at `$PREFIX/bin/iroh-rooms`.
+
+`--version` must print `iroh-rooms` and the `version` field from
+`RELEASE-MANIFEST.txt` in the unpacked archive. The commit appears only in
+that manifest's `commit` field and in the archive name (the 12-hex suffix).
+It does not appear in `--version`.
+
+```bash
+awk -F ': ' '$1 == "version" { print "iroh-rooms " $2; exit }' \
+  "${inner}/RELEASE-MANIFEST.txt"
+"${PREFIX}/bin/iroh-rooms" --version
+awk -F ': ' '$1 == "commit" { print $2; exit }' "${inner}/RELEASE-MANIFEST.txt"
+```
+
+The first two lines must be the same string. The `commit` value must equal
+the archive name's 12-hex suffix.
+
+### Upgrade
+
+Confirm two things before the backup: no `iroh-rooms` process is running, and
+`rooms.db-wal` is not present. Then take the documented backup, the `umask 077`
+tar in Back Up Before Upgrade. Leave that block unchanged.
+
+```bash
+if pgrep -x iroh-rooms >/dev/null 2>&1; then
+  printf 'stop iroh-rooms before the backup\n' >&2
+  exit 1
+fi
+data="${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}"
+if [[ -e "${data}/rooms.db-wal" ]]; then
+  printf '%s exists; refusing to back up a store with a live WAL\n' \
+    "${data}/rooms.db-wal" >&2
+  exit 1
+fi
+```
+
+Keep the binary you are replacing:
+
+```bash
+mv "${PREFIX}/bin/iroh-rooms" "${PREFIX}/bin/iroh-rooms.prev"
+```
+
+Install the candidate with the Install steps above (temporary name, then
+`mv`). Then run:
+
+```bash
+"${PREFIX}/bin/iroh-rooms" identity show
+"${PREFIX}/bin/iroh-rooms" room members "<ROOM_ID>"
+"${PREFIX}/bin/iroh-rooms" room tail --offline "<ROOM_ID>"
+sqlite3 "${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}/rooms.db" \
+  'PRAGMA integrity_check;'
+```
+
+`identity show`, `room members`, and `room tail --offline` must still read the
+room from before the upgrade. `PRAGMA integrity_check` must print `ok`.
+
+### Rollback
+
+**(a) Same `user_version`.** `v0.1.0-rc.5` and `v0.1.0-rc.6` have the same
+`user_version` today. Reinstall the prior binary from `iroh-rooms.prev`. Do
+not restore the data directory.
+
+```bash
+tmp="${PREFIX}/bin/iroh-rooms.tmp.$$"
+install -m 0755 "${PREFIX}/bin/iroh-rooms.prev" "$tmp"
+mv "$tmp" "${PREFIX}/bin/iroh-rooms"
+"${PREFIX}/bin/iroh-rooms" --version
+```
+
+**(b) The candidate raised `user_version`.** The older binary refuses the
+store. It exits 1 and prints:
+
+```text
+store migration failed: database user_version N is newer than supported M
+```
+
+`N` is the database `user_version` and `M` is the highest version that binary
+supports. Restore with the move-aside procedure in Rollback above: move the
+data directory to `$IROH_ROOMS_HOME.before-rollback`, then untar the
+pre-upgrade backup. Keep that move-aside restore for `v0.1.0-rc.1` through
+`v0.1.0-rc.6`. A refusal from those builds is not evidence that the store was
+left untouched.
+
+### Uninstall
+
+Remove the binary. The data directory is left in place unless you remove it
+with Remove Local Data.
+
+```bash
+rm -f "${PREFIX}/bin/iroh-rooms"
+```
+
+`iroh-rooms.prev`, when it is still on disk, is a second binary. Removing
+either file does not change the data directory.
+
+### Automated lifecycle check
+
+```bash
+scripts/lifecycle-smoke.sh <prior-tag> <candidate-tag> <triple>
+```
+
+`<triple>` is one of the four release triples. The script exits 0 only when
+every step passes. It writes `lifecycle-<triple>.json` and renders
+`lifecycle-<triple>.md` from that JSON. The record's `evidence_grade` is true
+only when `class` is `evidence`, and false for every other class.
+
+| `class` | When the script assigns it |
+| --- | --- |
+| `evidence` | All of `GITHUB_ACTIONS=true`, `GITHUB_REF=refs/heads/main`, `GITHUB_EVENT_NAME=workflow_dispatch`, `RUNNER_ENVIRONMENT=github-hosted`, `GITHUB_REPOSITORY=kortiene/iroh-room`, and `GITHUB_WORKFLOW_REF=kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main`, with neither `--candidate-binary` nor `--probe`. |
+| `probe` | Any other GitHub Actions run, including an evidence-shaped run lowered by `--probe`. |
+| `unreleased` | `--candidate-binary` is set. The script refuses that flag and exits 2 when `GITHUB_ACTIONS=true`. |
+| `local` | A published-asset run outside GitHub Actions. |
+
+`--probe` can only lower the class. It never raises `local` or `unreleased`.
+
+local / probe / unreleased: developer or diagnostic run; not GA evidence for #265, #293 or #347
+
+The workflow file named by that `GITHUB_WORKFLOW_REF` is planned and is not in
+this repository yet. See Lifecycle evidence in
+`docs/operations/release-operations.md` for what counts as evidence.
