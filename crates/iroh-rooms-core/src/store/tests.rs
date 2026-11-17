@@ -2,6 +2,7 @@
 //! Criteria (the broader integration suite lives in `tests/` per the test phase).
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -451,6 +452,355 @@ fn migration_rejects_future_schema_version() {
         matches!(err, super::StoreError::Migration(_)),
         "expected Migration error, got {err:?}"
     );
+}
+
+// ── issue #405: a newer user_version is refused before WAL pragmas ───────────
+//
+// `apply_pragmas` sets `journal_mode = WAL`, which rewrites header bytes 18-19.
+// That write must not run when the open is refused. The non-WAL case is the one
+// current main fails: bytes 18-19 move from 1/1 to 2/2.
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn header_bytes_18_19(bytes: &[u8]) -> [u8; 2] {
+    assert!(
+        bytes.len() >= 20,
+        "sqlite database header is shorter than 20 bytes"
+    );
+    [bytes[18], bytes[19]]
+}
+
+/// The CLI regex is a prefix match: the pinned text, then anything (the hint).
+fn assert_newer_user_version_prefix(msg: &str) {
+    let marker = "store migration failed: database user_version ";
+    let Some(rest) = msg.split_once(marker).map(|(_, rest)| rest) else {
+        panic!("missing pinned prefix in: {msg}");
+    };
+    let Some((version, rest)) = rest.split_once(" is newer than supported ") else {
+        panic!("missing pinned prefix in: {msg}");
+    };
+    assert!(
+        !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
+        "user_version is not an integer in: {msg}"
+    );
+    let supported: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    assert!(
+        !supported.is_empty(),
+        "supported version is not an integer in: {msg}"
+    );
+}
+
+fn assert_recovery_hint(msg: &str) {
+    assert!(
+        msg.contains("restore from backup") && msg.contains("previous binary"),
+        "refusal must tell the user to restore from backup or retry with the previous binary, got {msg}"
+    );
+}
+
+fn open_err(path: &Path) -> super::StoreError {
+    match EventStore::open(path) {
+        Ok(_) => panic!("newer user_version must be refused"),
+        Err(err) => err,
+    }
+}
+
+/// A real WAL store (the format `EventStore::open` writes) with `user_version + 1`
+/// checkpointed into the main database file.
+fn stamp_wal_future_version(path: &Path) {
+    drop(EventStore::open(path).expect("create wal store"));
+    let conn = Connection::open(path).expect("reopen wal store");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read journal_mode");
+    assert_eq!(mode.to_ascii_lowercase(), "wal", "setup store must be WAL");
+    conn.pragma_update(None, "user_version", super::schema::USER_VERSION + 1)
+        .expect("stamp a newer user_version");
+    let checkpoint: (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("checkpoint the WAL");
+    assert_eq!(checkpoint.0, 0, "wal checkpoint must not report busy");
+    drop(conn);
+    let bytes = std::fs::read(path).expect("read checkpointed rooms.db");
+    assert_eq!(
+        header_bytes_18_19(&bytes),
+        [2, 2],
+        "WAL stores write version/read version 2"
+    );
+}
+
+/// Rollback-journal store (`journal_mode = DELETE`): header bytes 18-19 are 1/1.
+fn stamp_delete_journal_future_version(path: &Path) {
+    let conn = Connection::open(path).expect("create delete-journal store");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("set journal_mode = DELETE");
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    conn.pragma_update(None, "user_version", super::schema::USER_VERSION + 1)
+        .expect("stamp a newer user_version");
+    drop(conn);
+    let bytes = std::fs::read(path).expect("read delete-journal store");
+    assert_eq!(
+        header_bytes_18_19(&bytes),
+        [1, 1],
+        "DELETE journal stores write version/read version 1"
+    );
+}
+
+fn assert_refused_open_leaves_file_unchanged(path: &Path) {
+    let before = std::fs::read(path).expect("read store before refused open");
+    let before_header = header_bytes_18_19(&before);
+    let before_hash = sha256_hex(&before);
+
+    let err = open_err(path);
+    let msg = err.to_string();
+    assert_newer_user_version_prefix(&msg);
+
+    let after = std::fs::read(path).expect("read store after refused open");
+    let after_header = header_bytes_18_19(&after);
+    let after_hash = sha256_hex(&after);
+    assert_eq!(
+        after_header, before_header,
+        "refused open rewrote header bytes 18-19 from {before_header:?} to {after_header:?} \
+         (sha256 before {before_hash} after {after_hash})"
+    );
+    assert_eq!(
+        after_hash, before_hash,
+        "rooms.db sha256 must be unchanged after the refused open \
+         (header before {before_header:?} after {after_header:?})"
+    );
+    assert_recovery_hint(&msg);
+}
+
+#[test]
+fn refused_open_of_wal_future_user_version_leaves_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    stamp_wal_future_version(&path);
+    assert_refused_open_leaves_file_unchanged(&path);
+}
+
+#[test]
+fn refused_open_of_delete_journal_future_user_version_leaves_header_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    stamp_delete_journal_future_version(&path);
+    assert_refused_open_leaves_file_unchanged(&path);
+}
+
+/// `user_version + 1` committed with `wal_autocheckpoint = 0` and the writer
+/// still open, so the new version lives only in `-wal`. The returned writer
+/// must stay alive until the copy has been examined: dropping it checkpoints
+/// the original, not the copy.
+struct HeldWalCopy {
+    _src: tempfile::TempDir,
+    writer: Connection,
+    _copy: tempfile::TempDir,
+    copy_db: std::path::PathBuf,
+    copy_wal: std::path::PathBuf,
+}
+
+fn held_uncheckpointed_future_wal() -> HeldWalCopy {
+    let src = tempfile::tempdir().unwrap();
+    let path = src.path().join("rooms.db");
+    drop(EventStore::open(&path).expect("create wal store"));
+
+    let writer = Connection::open(&path).expect("hold the writer");
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0_i64)
+        .expect("disable autocheckpoint");
+    writer
+        .pragma_update(None, "user_version", super::schema::USER_VERSION + 1)
+        .expect("commit a newer user_version into the wal");
+    let wal = wal_sidecar(&path);
+    assert!(
+        wal.is_file(),
+        "the uncheckpointed wal must exist while the writer is held"
+    );
+
+    let copy = tempfile::tempdir().unwrap();
+    let copy_db = copy.path().join("rooms.db");
+    let copy_wal = wal_sidecar(&copy_db);
+    std::fs::copy(&path, &copy_db).expect("copy rooms.db");
+    std::fs::copy(&wal, &copy_wal).expect("copy -wal");
+
+    let main = std::fs::read(&copy_db).expect("read copied rooms.db");
+    let on_disk_version = i64::from(u32::from_be_bytes(
+        main[60..64].try_into().expect("user_version bytes"),
+    ));
+    assert_eq!(
+        on_disk_version,
+        super::schema::USER_VERSION,
+        "setup must leave the newer user_version only in the uncheckpointed wal"
+    );
+    assert!(
+        std::fs::metadata(&copy_wal).expect("wal metadata").len() > 32,
+        "the copied wal must contain a committed frame"
+    );
+
+    HeldWalCopy {
+        _src: src,
+        writer,
+        _copy: copy,
+        copy_db,
+        copy_wal,
+    }
+}
+
+fn assert_db_and_wal_unchanged(copy_db: &Path, copy_wal: &Path, before_db: &str, before_wal: &str) {
+    let after_db = std::fs::read(copy_db).ok().map(|bytes| sha256_hex(&bytes));
+    let after_wal = std::fs::read(copy_wal).ok().map(|bytes| sha256_hex(&bytes));
+    assert_eq!(
+        (after_db.as_deref(), after_wal.as_deref()),
+        (Some(before_db), Some(before_wal)),
+        "refused open must not rewrite rooms.db or rewrite or remove the uncheckpointed -wal"
+    );
+}
+
+/// `user_version + 1` committed with `wal_autocheckpoint = 0` and the writer
+/// still open, so the new version lives only in `-wal`. Copy `rooms.db` and
+/// `-wal`, then refuse the copy. Both files stay byte-identical.
+#[test]
+fn refused_open_of_uncheckpointed_wal_future_user_version_leaves_db_and_wal_unchanged() {
+    let held = held_uncheckpointed_future_wal();
+    let before_db = sha256_hex(&std::fs::read(&held.copy_db).expect("read copied rooms.db"));
+    let before_wal = sha256_hex(&std::fs::read(&held.copy_wal).expect("read copied wal"));
+
+    let msg = open_err(&held.copy_db).to_string();
+    assert_newer_user_version_prefix(&msg);
+    assert_recovery_hint(&msg);
+    assert_db_and_wal_unchanged(&held.copy_db, &held.copy_wal, &before_db, &before_wal);
+    drop(held.writer);
+}
+
+/// The `mode=ro` probe is not on this path. A read-write connection opened on
+/// the copy goes straight through `from_connection_with`, so only
+/// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` stops the refusal from checkpointing.
+#[test]
+fn refused_from_connection_with_uncheckpointed_wal_leaves_db_and_wal_unchanged() {
+    let held = held_uncheckpointed_future_wal();
+    let before_db = sha256_hex(&std::fs::read(&held.copy_db).expect("read copied rooms.db"));
+    let before_wal = sha256_hex(&std::fs::read(&held.copy_wal).expect("read copied wal"));
+
+    let conn = Connection::open(&held.copy_db).expect("read-write open of the copy");
+    let Err(err) = EventStore::from_connection_with(conn, &super::StoreOptions::default()) else {
+        panic!("newer user_version must be refused");
+    };
+    let msg = err.to_string();
+    assert_newer_user_version_prefix(&msg);
+    assert_recovery_hint(&msg);
+    drop(err);
+    assert_db_and_wal_unchanged(&held.copy_db, &held.copy_wal, &before_db, &before_wal);
+    drop(held.writer);
+
+    let fresh = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&fresh.path().join("rooms.db")).expect("normal open");
+    let checkpoint_on_close_disabled = store
+        .conn
+        .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+        .expect("read NO_CKPT_ON_CLOSE");
+    assert!(
+        !checkpoint_on_close_disabled,
+        "a successful open must leave checkpoint-on-close enabled"
+    );
+}
+
+fn wal_sidecar(db_path: &Path) -> std::path::PathBuf {
+    let mut name = db_path.file_name().expect("db file name").to_os_string();
+    name.push("-wal");
+    db_path.with_file_name(name)
+}
+
+/// `chmod` the data directory and the database read-only. Root ignores mode
+/// bits, so the refusal would not be distinguished from a successful write.
+#[cfg(unix)]
+#[test]
+fn refused_open_on_readonly_dir_reports_newer_user_version() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unix_euid_is_root() {
+        assert!(
+            std::env::var("CI").ok().as_deref() != Some("true"),
+            "refused_open_on_readonly_dir_reports_newer_user_version: uid is 0 and CI=true; refusing to skip"
+        );
+        eprintln!(
+            "skipping refused_open_on_readonly_dir_reports_newer_user_version: running as root"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    stamp_wal_future_version(&path);
+
+    let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    let _restore = RestoreModes {
+        dir: dir.path().to_path_buf(),
+        dir_mode,
+        file: path.clone(),
+        file_mode,
+    };
+    set_unix_mode(&path, 0o444);
+    set_unix_mode(dir.path(), 0o555);
+
+    let before = std::fs::read(&path).expect("read store before refused open");
+    let err = open_err(&path);
+    let msg = err.to_string();
+    assert_newer_user_version_prefix(&msg);
+    assert!(
+        !msg.to_ascii_lowercase().contains("readonly"),
+        "a read-only data dir must surface the version refusal, not a readonly write error, got {msg}"
+    );
+    assert_recovery_hint(&msg);
+    let after = std::fs::read(&path).expect("read store after refused open");
+    assert_eq!(
+        sha256_hex(&after),
+        sha256_hex(&before),
+        "refused open on a read-only data dir must not modify rooms.db"
+    );
+    assert_eq!(header_bytes_18_19(&after), header_bytes_18_19(&before));
+}
+
+#[cfg(unix)]
+fn unix_euid_is_root() -> bool {
+    match std::process::Command::new("id").arg("-u").output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim() == "0"
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+struct RestoreModes {
+    dir: std::path::PathBuf,
+    dir_mode: u32,
+    file: std::path::PathBuf,
+    file_mode: u32,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreModes {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let file_perms = std::fs::Permissions::from_mode(self.file_mode);
+        let _ = std::fs::set_permissions(&self.file, file_perms);
+        let dir_perms = std::fs::Permissions::from_mode(self.dir_mode);
+        let _ = std::fs::set_permissions(&self.dir, dir_perms);
+    }
 }
 
 // All point/existence queries on an empty store return empty / None / false.

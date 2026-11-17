@@ -308,6 +308,85 @@ fn wal_store_newer_user_version_is_refused_without_changing_rooms_db() {
     );
 }
 
+fn header_bytes_18_19(path: &Path) -> [u8; 2] {
+    let bytes = std::fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    assert!(
+        bytes.len() >= 20,
+        "sqlite header truncated in {}",
+        path.display()
+    );
+    [bytes[18], bytes[19]]
+}
+
+/// Rollback journal (`journal_mode = DELETE`): header bytes 18-19 are 1/1,
+/// then `user_version` is one past what this binary supports.
+fn stamp_future_user_version_delete_journal(db_path: &Path) {
+    let conn = rusqlite::Connection::open(db_path).expect("open rooms.db");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("switch to DELETE journal");
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    conn.pragma_update(None, "user_version", SUPPORTED_USER_VERSION + 1)
+        .expect("stamp a newer user_version");
+    drop(conn);
+    assert_eq!(
+        header_bytes_18_19(db_path),
+        [1, 1],
+        "DELETE journal stores write version/read version 1"
+    );
+}
+
+/// A non-WAL store with `user_version = USER_VERSION + 1` is refused.
+/// `rooms.db`'s sha256 and header bytes 18-19 stay unchanged. On current main
+/// those bytes move from 1/1 to 2/2 because WAL pragmas run before the check.
+#[test]
+fn delete_journal_store_newer_user_version_is_refused_without_rewriting_header() {
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["identity", "create", "--name", "Downgrade Probe"])
+        .assert()
+        .success();
+    let created = cmd(&home)
+        .args(["room", "create", "Downgrade Probe Room"])
+        .output()
+        .expect("spawn room create");
+    assert!(
+        created.status.success(),
+        "setup room create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let room_id = extract_field(&String::from_utf8_lossy(&created.stdout), "room_id")
+        .expect("setup room_id")
+        .to_owned();
+
+    let db_path = home.path().join("rooms.db");
+    stamp_future_user_version_delete_journal(&db_path);
+    let before = sha256_file(&db_path);
+    let before_header = header_bytes_18_19(&db_path);
+
+    cmd(&home)
+        .args(["room", "tail", &room_id, "--offline"])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::is_match(
+                "store migration failed: database user_version [0-9]+ is newer than supported [0-9]+",
+            )
+            .expect("prefix regex compiles"),
+        );
+
+    assert_eq!(
+        sha256_file(&db_path),
+        before,
+        "rooms.db sha256 must be unchanged after the refused open"
+    );
+    assert_eq!(
+        header_bytes_18_19(&db_path),
+        before_header,
+        "header bytes 18-19 must stay {before_header:?} after the refused open"
+    );
+}
+
 /// `identity.secret` `version` other than the version this binary writes fails
 /// the next command that loads the secret.
 #[test]
