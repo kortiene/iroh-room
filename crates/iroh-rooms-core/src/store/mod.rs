@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use iroh_rooms_crypto::RoomKey;
@@ -134,6 +135,10 @@ impl EventStore {
     /// [`StoreOptions`] (a 5000ms `busy_timeout`), applying pragmas and the
     /// idempotent schema migration.
     ///
+    /// A database whose `user_version` is newer than this binary is refused
+    /// before those pragmas run. The refusal does not rewrite the main file
+    /// or `-wal`; it may create `-shm` and an empty `-wal`.
+    ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened, or
     /// [`StoreError::Migration`] if it carries a newer unknown schema version.
@@ -146,6 +151,13 @@ impl EventStore {
     /// # Errors
     /// As [`EventStore::open`].
     pub fn open_with(path: &Path, opts: &StoreOptions) -> Result<Self, StoreError> {
+        // Before the read-write open. `Connection::open` uses
+        // `SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE`, which fails on a
+        // read-only data dir with "attempt to write a readonly database" and
+        // would hide this refusal. `mode=ro` sees an uncheckpointed `-wal`;
+        // a probe failure is inconclusive and the check below is the backstop.
+        // The probe does not rewrite the main file or `-wal`; it may create `-shm` and an empty `-wal`.
+        schema::refuse_newer_user_version_at(path)?;
         let conn = Connection::open(path)?;
         Self::from_connection_with(conn, opts)
     }
@@ -169,6 +181,17 @@ impl EventStore {
     }
 
     fn from_connection_with(conn: Connection, opts: &StoreOptions) -> Result<Self, StoreError> {
+        // `apply_pragmas` sets `journal_mode = WAL`, which rewrites header
+        // bytes 18–19. Refuse a newer `user_version` before that write.
+        //
+        // A newer version may exist only in an uncheckpointed `-wal`. The
+        // read-only probe can miss it; this read-write connection then sees
+        // it. Checkpoint-on-close must stay off for that refusal: dropping
+        // the connection would otherwise rewrite the main file and delete
+        // `-wal`. It is turned back on only after the version is supported.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        schema::refuse_newer_user_version(&conn)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
         schema::apply_pragmas(&conn)?;
         // Unconditional: rusqlite pre-installs a 5000ms busy_timeout on open, so a
         // conditional `if let Some(d) = ...` would leave that default in place and
@@ -192,7 +215,7 @@ impl EventStore {
     /// transaction-level `SQLITE_BUSY` burst against a batched accepted-event
     /// commit (issue #143). One fault decrements by one regardless of whether
     /// the call is a single-event insert or a batch (spec §6 / D6).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sync"))]
     pub(crate) fn fail_next_inserts(&mut self, n: u32) {
         self.fail_next_inserts = n;
     }

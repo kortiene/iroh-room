@@ -80,6 +80,8 @@ iroh-rooms-crypto = { path = "../iroh-rooms-crypto" }
 [dev-dependencies]
 # Temporary directory / file creation for file-backed store e2e tests.
 tempfile = "3"
+# SHA-256 of `rooms.db` before and after a refused open (issue #405).
+sha2 = "0.11"
 # Property-based robustness/round-trip tests for the strict CBOR reader (risk
 # R1, IR-0002 follow-up). Dev-only so validate-only consumers stay lean.
 proptest = "1"

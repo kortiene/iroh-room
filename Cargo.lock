@@ -2010,6 +2010,7 @@ dependencies = [
  "iroh-rooms-crypto",
  "proptest",
  "rusqlite",
+ "sha2",
  "tempfile",
  "zeroize",
 ]
