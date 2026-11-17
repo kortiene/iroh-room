@@ -358,36 +358,50 @@ tags the gate is `sha256sum -c` on Linux, or `shasum -a 256 -c` on macOS. If
 that checksum command exits non-zero, do not install.
 
 ```bash
+ASSET_DIR="${ASSET_DIR:-./assets}"
 PREFIX="${PREFIX:-$HOME/.local}"
-mkdir -p "${PREFIX}/bin"
+mkdir -p "${PREFIX}/bin" "$ASSET_DIR"
 ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
 ```
 
-Download `$ARCHIVE` and its check assets with `curl` or `gh` only. Those
-commands are in Install From Binary Artifact. `--dir` below is that download
-directory. Leaving `--dir` off makes `scripts/verify-release-artifacts.sh`
-download with `gh release download`, which is still `gh`.
+Download `$ARCHIVE` and its check assets into `$ASSET_DIR` with `curl` or `gh`
+only. Those commands are in Install From Binary Artifact. Pass that same
+directory as `--dir`. The verifier reads the files there. Omit `--dir` and it
+downloads into a temporary directory, then deletes that directory on exit, so
+there is no verified archive left to install. Unpack
+`${ASSET_DIR}/${ARCHIVE}`, the archive the gate just checked.
 
 Signed release (`v0.1.0-rc.6` and later). Install only when this exits 0:
 
 ```bash
-scripts/verify-release-artifacts.sh --dir ./assets "v<VERSION>" "<TRIPLE>" || exit 1
+ASSET_DIR="${ASSET_DIR:-./assets}"
+scripts/verify-release-artifacts.sh --dir "$ASSET_DIR" "v<VERSION>" "<TRIPLE>" || exit 1
 ```
 
 Checksum-only (`v0.1.0-rc.1` through `v0.1.0-rc.5`). Do not use the verifier
 as the gate. It exits 1 on these tags by design, and that exit is not a pass.
-Install only when the checksum exits 0:
+The `.sha256` names the archive with no directory, so the check runs inside
+`$ASSET_DIR`. Install only when it exits 0:
 
 ```bash
-sha256sum -c "${ARCHIVE}.sha256" || exit 1
-# macOS: shasum -a 256 -c "${ARCHIVE}.sha256" || exit 1
+ASSET_DIR="${ASSET_DIR:-./assets}"
+ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
+(
+  cd "$ASSET_DIR" || exit 1
+  sha256sum -c "${ARCHIVE}.sha256" || exit 1
+  # macOS: shasum -a 256 -c "${ARCHIVE}.sha256" || exit 1
+)
 ```
 
 Unpack and install only after the gate above exits 0:
 
 ```bash
-tar -xzf "$ARCHIVE"
-inner="${ARCHIVE%.tar.gz}"
+ASSET_DIR="${ASSET_DIR:-./assets}"
+PREFIX="${PREFIX:-$HOME/.local}"
+mkdir -p "${PREFIX}/bin"
+ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
+tar -xzf "${ASSET_DIR}/${ARCHIVE}" -C "$ASSET_DIR"
+inner="${ASSET_DIR}/${ARCHIVE%.tar.gz}"
 tmp="${PREFIX}/bin/iroh-rooms.tmp.$$"
 install -m 0755 "${inner}/iroh-rooms" "$tmp"
 mv "$tmp" "${PREFIX}/bin/iroh-rooms"
@@ -402,6 +416,10 @@ that manifest's `commit` field and in the archive name (the 12-hex suffix).
 It does not appear in `--version`.
 
 ```bash
+ASSET_DIR="${ASSET_DIR:-./assets}"
+PREFIX="${PREFIX:-$HOME/.local}"
+ARCHIVE="iroh-rooms-<VERSION>-<TRIPLE>-<COMMIT>.tar.gz"
+inner="${ASSET_DIR}/${ARCHIVE%.tar.gz}"
 awk -F ': ' '$1 == "version" { print "iroh-rooms " $2; exit }' \
   "${inner}/RELEASE-MANIFEST.txt"
 "${PREFIX}/bin/iroh-rooms" --version
@@ -430,9 +448,12 @@ if [[ -e "${data}/rooms.db-wal" ]]; then
 fi
 ```
 
-Keep the binary you are replacing:
+Keep the binary you are replacing. Each maintenance command sets `PREFIX`
+when it is unset, which is `$HOME/.local`. A custom install must export the
+same `PREFIX` used at install time.
 
 ```bash
+PREFIX="${PREFIX:-$HOME/.local}"
 mv "${PREFIX}/bin/iroh-rooms" "${PREFIX}/bin/iroh-rooms.prev"
 ```
 
@@ -440,6 +461,7 @@ Install the candidate with the Install steps above (temporary name, then
 `mv`). Then run:
 
 ```bash
+PREFIX="${PREFIX:-$HOME/.local}"
 "${PREFIX}/bin/iroh-rooms" identity show
 "${PREFIX}/bin/iroh-rooms" room members "<ROOM_ID>"
 "${PREFIX}/bin/iroh-rooms" room tail --offline "<ROOM_ID>"
@@ -457,6 +479,7 @@ room from before the upgrade. `PRAGMA integrity_check` must print `ok`.
 not restore the data directory.
 
 ```bash
+PREFIX="${PREFIX:-$HOME/.local}"
 tmp="${PREFIX}/bin/iroh-rooms.tmp.$$"
 install -m 0755 "${PREFIX}/bin/iroh-rooms.prev" "$tmp"
 mv "$tmp" "${PREFIX}/bin/iroh-rooms"
@@ -483,6 +506,7 @@ Remove the binary. The data directory is left in place unless you remove it
 with Remove Local Data.
 
 ```bash
+PREFIX="${PREFIX:-$HOME/.local}"
 rm -f "${PREFIX}/bin/iroh-rooms"
 ```
 
