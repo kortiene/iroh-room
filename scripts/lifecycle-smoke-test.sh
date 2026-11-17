@@ -187,7 +187,15 @@ CANDIDATE_VERSION_EXPECTED="iroh-rooms 0.1.0-rc.6"
 CANDIDATE_VERSION_ACTUAL="iroh-rooms 0.1.0-rc.6"
 CANDIDATE_VERSION_MATCH=true
 record_archive prior "$PRIOR_TAG" "iroh-rooms-0.1.0-rc.5-${TRIPLE}-dc6833cc4690.tar.gz" "abc" checksum-only
-record_step_line verify_prior 0 "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" "2026-11-17T14:00:02-0500" "2026-11-17T19:00:02Z" "$attempts"
+: >"$STEPS_JSONL"
+step_name=""
+for step_name in \
+  verify_candidate verify_prior install_prior create_data backup \
+  upgrade write_after_upgrade rollback_a rollback_b uninstall; do
+  record_step_line "$step_name" 0 \
+    "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+    "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+done
 write_record
 record="${OUT_DIR}/lifecycle-${TRIPLE}.md"
 json="${OUT_DIR}/lifecycle-${TRIPLE}.json"
@@ -212,5 +220,153 @@ if [[ -f "$json" ]]; then
   fail "secret scan left the JSON in place"
 fi
 ok "secret scan refuses a tainted record"
+
+: >"$STEPS_JSONL"
+record_step_line verify_candidate 0 \
+  "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+  "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+record_step_line verify_prior 0 \
+  "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+  "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+RESULT=PASS
+SIMULATED="store stamped USER_VERSION+1"
+partial_out="${tmp}/partial"
+mkdir -p "$partial_out"
+OUT_DIR="$partial_out"
+if write_record; then
+  fail "PASS with 2 steps was accepted"
+fi
+partial_json="${partial_out}/lifecycle-${TRIPLE}.json"
+if [[ ! -f "$partial_json" ]]; then
+  fail "rejected PASS did not leave a record"
+fi
+partial_result="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"])' "$partial_json")"
+if [[ "$partial_result" == "PASS" ]]; then
+  fail "incomplete record result is still PASS"
+fi
+if [[ "$partial_result" != "FAIL (record)" ]]; then
+  fail "incomplete record result is ${partial_result}"
+fi
+ok "PASS requires exactly 10 successful steps"
+
+if (
+  # shellcheck disable=SC1090,SC1091
+  source "$SCRIPT"
+  set +e
+  OUT_DIR="${tmp}/interrupted"
+  mkdir -p "$OUT_DIR"
+  TRIPLE=x86_64-unknown-linux-gnu
+  PRIOR_TAG=v0.1.0-rc.5
+  CANDIDATE_TAG=v0.1.0-rc.6
+  LIFECYCLE_STARTED=1
+  RESULT=""
+  FAILED_STEP=""
+  WORK=""
+  STEPS_JSONL="${OUT_DIR}/steps.jsonl"
+  ARCHIVES_JSONL="${OUT_DIR}/archives.jsonl"
+  : >"$STEPS_JSONL"
+  : >"$ARCHIVES_JSONL"
+  record_step_line verify_candidate 0 \
+    "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+    "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+  record_step_line verify_prior 0 \
+    "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+    "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+  (exit 143)
+  on_exit
+); then
+  fail "interrupted exit was reported as success"
+else
+  int_code=$?
+fi
+if [[ "$int_code" -ne 143 ]]; then
+  fail "interrupted exit code is ${int_code}, expected 143"
+fi
+int_json="${tmp}/interrupted/lifecycle-x86_64-unknown-linux-gnu.json"
+int_result="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"])' "$int_json")"
+if [[ "$int_result" == "PASS" ]]; then
+  fail "SIGTERM-style exit recorded PASS"
+fi
+if [[ "$int_result" != "FAIL (interrupted)" ]]; then
+  fail "interrupted result is ${int_result}"
+fi
+ok "on_exit records FAIL (interrupted) and exits 143"
+
+if (
+  # shellcheck disable=SC1090,SC1091
+  source "$SCRIPT"
+  set +e
+  OUT_DIR="${tmp}/unexpected"
+  mkdir -p "$OUT_DIR"
+  TRIPLE=x86_64-unknown-linux-gnu
+  PRIOR_TAG=v0.1.0-rc.5
+  CANDIDATE_TAG=v0.1.0-rc.6
+  LIFECYCLE_STARTED=1
+  RESULT=""
+  FAILED_STEP=""
+  WORK=""
+  STEPS_JSONL="${OUT_DIR}/steps.jsonl"
+  ARCHIVES_JSONL="${OUT_DIR}/archives.jsonl"
+  : >"$STEPS_JSONL"
+  : >"$ARCHIVES_JSONL"
+  true
+  on_exit
+); then
+  unexpected_code=0
+else
+  unexpected_code=$?
+fi
+unexpected_result="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"])' "${tmp}/unexpected/lifecycle-x86_64-unknown-linux-gnu.json")"
+if [[ "$unexpected_result" == "PASS" ]]; then
+  fail "on_exit invented PASS from exit 0"
+fi
+if [[ "$unexpected_result" != "FAIL (unexpected)" ]]; then
+  fail "empty RESULT with exit 0 recorded ${unexpected_result}"
+fi
+if [[ "$unexpected_code" -ne 0 ]]; then
+  fail "successful record write changed exit ${unexpected_code}"
+fi
+ok "on_exit does not invent PASS"
+
+if (
+  # shellcheck disable=SC1090,SC1091
+  source "$SCRIPT"
+  set +e
+  OUT_DIR="${tmp}/write-fail/nested"
+  mkdir -p "${tmp}/write-fail"
+  : >"${tmp}/write-fail-block"
+  OUT_DIR="${tmp}/write-fail-block/out"
+  TRIPLE=x86_64-unknown-linux-gnu
+  PRIOR_TAG=v0.1.0-rc.5
+  CANDIDATE_TAG=v0.1.0-rc.6
+  LIFECYCLE_STARTED=1
+  RESULT=PASS
+  WORK=""
+  STEPS_JSONL="${tmp}/write-fail-steps.jsonl"
+  ARCHIVES_JSONL="${tmp}/write-fail-archives.jsonl"
+  : >"$STEPS_JSONL"
+  : >"$ARCHIVES_JSONL"
+  true
+  on_exit
+); then
+  fail "failed record write kept exit 0"
+else
+  write_fail_code=$?
+fi
+if [[ "$write_fail_code" -eq 0 ]]; then
+  fail "failed record write exited 0"
+fi
+ok "failed record write turns exit 0 into ${write_fail_code}"
+
+if ! grep -F -q "trap 'exit 130' INT" "$SCRIPT"; then
+  fail "missing INT trap"
+fi
+if ! grep -F -q "trap 'exit 143' TERM" "$SCRIPT"; then
+  fail "missing TERM trap"
+fi
+if ! grep -F -q "trap 'exit 129' HUP" "$SCRIPT"; then
+  fail "missing HUP trap"
+fi
+ok "signal traps exit 130, 143, and 129"
 
 printf 'ok lifecycle-smoke-test\n'

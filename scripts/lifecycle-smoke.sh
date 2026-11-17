@@ -1242,6 +1242,14 @@ dirs = [part for part in env("LS_DATA_DIRS").split(",") if part]
 if dirs:
     data["data_dirs_covered"] = dirs
 
+reject_pass = False
+if data["result"] == "PASS":
+    steps = data["steps"]
+    complete = len(steps) == 10 and all(step.get("exit_code") == 0 for step in steps)
+    if not complete:
+        data["result"] = "FAIL (record)"
+        reject_pass = True
+
 with open(json_path, "w", encoding="utf-8") as handle:
     json.dump(data, handle, indent=2)
     handle.write("\n")
@@ -1356,22 +1364,35 @@ for needle in ("identity_secret", "device_secret", "roomtkt1"):
 
 with open(md_path, "w", encoding="utf-8") as handle:
     handle.write(markdown)
+if reject_pass:
+    sys.stderr.write("refusing PASS without exactly 10 successful steps\n")
+    sys.exit(1)
 PY
 }
 
 on_exit() {
   local code=$?
   trap - EXIT
+  # Only main sets PASS. A signal or any other exit leaves a failure record.
   if [[ -z "${RESULT:-}" ]]; then
+    case "$code" in
+      129 | 130 | 143)
+        RESULT="FAIL (interrupted)"
+        ;;
+      *)
+        if [[ -n "${FAILED_STEP:-}" ]]; then
+          RESULT="FAIL (${FAILED_STEP})"
+        else
+          RESULT="FAIL (unexpected)"
+        fi
+        ;;
+    esac
+  fi
+  if ! write_record; then
     if [[ "$code" -eq 0 ]]; then
-      RESULT="PASS"
-    elif [[ -n "${FAILED_STEP:-}" ]]; then
-      RESULT="FAIL (${FAILED_STEP})"
-    else
-      RESULT="FAIL (unexpected)"
+      code=1
     fi
   fi
-  write_record || true
   remove_work || true
   exit "$code"
 }
@@ -1520,6 +1541,9 @@ main() {
   prepare_home
   tool_versions
   LIFECYCLE_STARTED=1
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   trap on_exit EXIT
   if [[ -n "$CANDIDATE_BINARY" ]]; then
     candidate_mode="once"
