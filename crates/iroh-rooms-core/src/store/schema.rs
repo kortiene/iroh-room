@@ -211,7 +211,7 @@ pub(crate) fn refuse_newer_user_version(conn: &Connection) -> Result<(), StoreEr
 /// uncheckpointed `-wal` is visible. `immutable=1` is the fallback when that
 /// open cannot proceed, including a read-only directory whose query fails
 /// because `-shm` cannot be created. The probe does not rewrite the main
-/// file or `-wal`; it may create `-shm`.
+/// file or `-wal`; it may create `-shm` and an empty `-wal`.
 ///
 /// An open or query failure is inconclusive and returns `Ok`: the read-write
 /// open repeats the check with checkpoint-on-close disabled. A missing or
@@ -251,7 +251,7 @@ fn newer_user_version_message(current: i64) -> String {
 /// `PRAGMA user_version` without rewriting the main file or `-wal`.
 ///
 /// `mode=ro` first: it applies the `-wal`, so an uncheckpointed version is
-/// visible, and it may create `-shm`. A read-only directory often accepts the
+/// visible, and it may create `-shm` and an empty `-wal`. A read-only directory often accepts the
 /// open and then fails the query, because `-shm` cannot be created; that is
 /// treated like an open failure and falls back to `immutable=1`, which reads
 /// the main-file header and does not create `-shm`. `None` means the probe

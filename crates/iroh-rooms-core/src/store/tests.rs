@@ -593,12 +593,20 @@ fn refused_open_of_delete_journal_future_user_version_leaves_header_unchanged() 
 }
 
 /// `user_version + 1` committed with `wal_autocheckpoint = 0` and the writer
-/// still open, so the new version lives only in `-wal`. Copy `rooms.db` and
-/// `-wal`, then refuse the copy. Both files stay byte-identical.
-#[test]
-fn refused_open_of_uncheckpointed_wal_future_user_version_leaves_db_and_wal_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("rooms.db");
+/// still open, so the new version lives only in `-wal`. The returned writer
+/// must stay alive until the copy has been examined: dropping it checkpoints
+/// the original, not the copy.
+struct HeldWalCopy {
+    _src: tempfile::TempDir,
+    writer: Connection,
+    _copy: tempfile::TempDir,
+    copy_db: std::path::PathBuf,
+    copy_wal: std::path::PathBuf,
+}
+
+fn held_uncheckpointed_future_wal() -> HeldWalCopy {
+    let src = tempfile::tempdir().unwrap();
+    let path = src.path().join("rooms.db");
     drop(EventStore::open(&path).expect("create wal store"));
 
     let writer = Connection::open(&path).expect("hold the writer");
@@ -614,8 +622,8 @@ fn refused_open_of_uncheckpointed_wal_future_user_version_leaves_db_and_wal_unch
         "the uncheckpointed wal must exist while the writer is held"
     );
 
-    let copy_dir = tempfile::tempdir().unwrap();
-    let copy_db = copy_dir.path().join("rooms.db");
+    let copy = tempfile::tempdir().unwrap();
+    let copy_db = copy.path().join("rooms.db");
     let copy_wal = wal_sidecar(&copy_db);
     std::fs::copy(&path, &copy_db).expect("copy rooms.db");
     std::fs::copy(&wal, &copy_wal).expect("copy -wal");
@@ -634,27 +642,71 @@ fn refused_open_of_uncheckpointed_wal_future_user_version_leaves_db_and_wal_unch
         "the copied wal must contain a committed frame"
     );
 
-    let before_db = sha256_hex(&main);
-    let before_wal = sha256_hex(&std::fs::read(&copy_wal).expect("read copied wal"));
+    HeldWalCopy {
+        _src: src,
+        writer,
+        _copy: copy,
+        copy_db,
+        copy_wal,
+    }
+}
 
-    let msg = open_err(&copy_db).to_string();
+fn assert_db_and_wal_unchanged(copy_db: &Path, copy_wal: &Path, before_db: &str, before_wal: &str) {
+    let after_db = std::fs::read(copy_db).ok().map(|bytes| sha256_hex(&bytes));
+    let after_wal = std::fs::read(copy_wal).ok().map(|bytes| sha256_hex(&bytes));
+    assert_eq!(
+        (after_db.as_deref(), after_wal.as_deref()),
+        (Some(before_db), Some(before_wal)),
+        "refused open must not rewrite rooms.db or rewrite or remove the uncheckpointed -wal"
+    );
+}
+
+/// `user_version + 1` committed with `wal_autocheckpoint = 0` and the writer
+/// still open, so the new version lives only in `-wal`. Copy `rooms.db` and
+/// `-wal`, then refuse the copy. Both files stay byte-identical.
+#[test]
+fn refused_open_of_uncheckpointed_wal_future_user_version_leaves_db_and_wal_unchanged() {
+    let held = held_uncheckpointed_future_wal();
+    let before_db = sha256_hex(&std::fs::read(&held.copy_db).expect("read copied rooms.db"));
+    let before_wal = sha256_hex(&std::fs::read(&held.copy_wal).expect("read copied wal"));
+
+    let msg = open_err(&held.copy_db).to_string();
     assert_newer_user_version_prefix(&msg);
     assert_recovery_hint(&msg);
+    assert_db_and_wal_unchanged(&held.copy_db, &held.copy_wal, &before_db, &before_wal);
+    drop(held.writer);
+}
 
-    let after_db = sha256_hex(&std::fs::read(&copy_db).expect("read rooms.db after refusal"));
-    let after_wal = sha256_hex(&std::fs::read(&copy_wal).expect("read -wal after refusal"));
-    assert_eq!(
-        after_db, before_db,
-        "refused open must not rewrite rooms.db when user_version is only in the wal"
-    );
-    assert_eq!(
-        after_wal, before_wal,
-        "refused open must not rewrite or remove the uncheckpointed -wal"
-    );
+/// The `mode=ro` probe is not on this path. A read-write connection opened on
+/// the copy goes straight through `from_connection_with`, so only
+/// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` stops the refusal from checkpointing.
+#[test]
+fn refused_from_connection_with_uncheckpointed_wal_leaves_db_and_wal_unchanged() {
+    let held = held_uncheckpointed_future_wal();
+    let before_db = sha256_hex(&std::fs::read(&held.copy_db).expect("read copied rooms.db"));
+    let before_wal = sha256_hex(&std::fs::read(&held.copy_wal).expect("read copied wal"));
 
-    // Keep the writer alive until the copy has been refused. Dropping it
-    // checkpoints the original, which is not the file under test.
-    drop(writer);
+    let conn = Connection::open(&held.copy_db).expect("read-write open of the copy");
+    let Err(err) = EventStore::from_connection_with(conn, &super::StoreOptions::default()) else {
+        panic!("newer user_version must be refused");
+    };
+    let msg = err.to_string();
+    assert_newer_user_version_prefix(&msg);
+    assert_recovery_hint(&msg);
+    drop(err);
+    assert_db_and_wal_unchanged(&held.copy_db, &held.copy_wal, &before_db, &before_wal);
+    drop(held.writer);
+
+    let fresh = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&fresh.path().join("rooms.db")).expect("normal open");
+    let checkpoint_on_close_disabled = store
+        .conn
+        .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+        .expect("read NO_CKPT_ON_CLOSE");
+    assert!(
+        !checkpoint_on_close_disabled,
+        "a successful open must leave checkpoint-on-close enabled"
+    );
 }
 
 fn wal_sidecar(db_path: &Path) -> std::path::PathBuf {

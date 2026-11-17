@@ -137,7 +137,7 @@ impl EventStore {
     ///
     /// A database whose `user_version` is newer than this binary is refused
     /// before those pragmas run. The refusal does not rewrite the main file
-    /// or `-wal`; it may create `-shm`.
+    /// or `-wal`; it may create `-shm` and an empty `-wal`.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened, or
@@ -156,7 +156,7 @@ impl EventStore {
         // read-only data dir with "attempt to write a readonly database" and
         // would hide this refusal. `mode=ro` sees an uncheckpointed `-wal`;
         // a probe failure is inconclusive and the check below is the backstop.
-        // The probe does not rewrite the main file or `-wal`; it may create `-shm`.
+        // The probe does not rewrite the main file or `-wal`; it may create `-shm` and an empty `-wal`.
         schema::refuse_newer_user_version_at(path)?;
         let conn = Connection::open(path)?;
         Self::from_connection_with(conn, opts)
