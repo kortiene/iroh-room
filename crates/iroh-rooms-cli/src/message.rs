@@ -1252,8 +1252,8 @@ pub(crate) fn build_dial_set(
 ///
 /// [`build_dial_set`] drops a hinted device that is not active yet. Keeping
 /// that address here lets the managed session dial it if the fold admits the
-/// device during the flush. A dial-set address wins when both name the same
-/// device.
+/// device during the flush. When both name the same device, the `--peer`
+/// address is kept and the dial-set address is not written over it.
 pub(crate) fn addr_hints(dial_set: &[EndpointAddr], peers: &[EndpointAddr]) -> Vec<EndpointAddr> {
     let mut by_id: BTreeMap<EndpointId, EndpointAddr> =
         peers.iter().map(|addr| (addr.id, addr.clone())).collect();
