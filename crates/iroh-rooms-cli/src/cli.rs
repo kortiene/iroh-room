@@ -688,6 +688,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                 &peers,
                 timeout,
                 loopback,
+                message::FLUSH_GRACE,
             ))?;
             message::print_send(&summary);
         }
@@ -709,6 +710,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                 &peers,
                 timeout,
                 loopback,
+                crate::message::FLUSH_GRACE,
             ))?;
             crate::member::print_departure(&summary);
         }
@@ -728,6 +730,7 @@ fn dispatch_room(home: &std::path::Path, action: RoomAction) -> Result<()> {
                 &peers,
                 timeout,
                 loopback,
+                crate::message::FLUSH_GRACE,
             ))?;
             crate::member::print_departure(&summary);
         }

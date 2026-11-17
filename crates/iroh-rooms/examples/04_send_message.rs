@@ -3,8 +3,9 @@
 //!
 //! Requires: `--features experimental`. Compile-only in CI — running it needs
 //! a second, already-running peer to publish to; substitute `PEER_ENDPOINT`.
-//! This is a trimmed illustration of `crates/iroh-rooms-cli/src/message.rs`'s
-//! `run_push`.
+//! This is a trimmed illustration of a fixed-allowlist push. The CLI `room send`
+//! uses a managed session (`run_managed_push`) whose admission follows the live
+//! roster; this example keeps `Node::spawn` so it stays a short SDK sketch.
 //!
 //! The library emits `tracing` events but installs no subscriber (this repo's
 //! "CLI has no tracing subscriber" note applies to the SDK too) — call
@@ -56,9 +57,9 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("could not open sync engine: {e}"))?;
     let secret_key = SecretKey::from_bytes(&sender_device.to_seed());
 
-    // Every peer we have not folded as `Active` yet is rejected by default;
-    // a real `room send` builds this from the local membership snapshot
-    // (`AllowlistAdmission::from_snapshot`-equivalent — see `room.rs`).
+    // Every peer we have not folded as `Active` yet is rejected by default.
+    // The CLI `room send` does not use this fixed allowlist: its flush reads
+    // the live roster. This sketch keeps an empty `AllowlistAdmission`.
     let admission = AllowlistAdmission::new();
 
     let node = Node::spawn(
