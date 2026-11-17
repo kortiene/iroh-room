@@ -58,8 +58,8 @@ State these before install/run commands:
 - `audit.ndjson` is local best-effort audit, not remote, centrally retained,
   tamper-evident, or compliance-grade audit if ADR-0003 remains in force.
 - Binary artifacts for rc.1 through rc.5 are checksum-only
-  (WAIVER-PBETA-0004, eligible for retirement for v0.1.0-rc.6; retired when
-  the release owner approves that sign-off). `v0.1.0-rc.6` is the first
+  (WAIVER-PBETA-0004, retired for v0.1.0-rc.6 when the release owner approved
+  that sign-off on 2026-11-16). `v0.1.0-rc.6` is the first
   published signed release; verify it with `scripts/verify-release-artifacts.sh`.
   Pin run 43835416665 with
   `jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId`,

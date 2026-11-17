@@ -2,7 +2,7 @@
 
 Iroh Rooms is a local-first collaboration runtime for small trusted groups. It lets people and agents create a private room, exchange signed messages, share verified files, expose a loopback-only live TCP pipe, and keep the room state on their own machines instead of a central application server.
 
-The newest published release is `v0.1.0-rc.6`, a signed prerelease. The last release-owner-approved controlled Production Beta is `v0.1.0-rc.5`. That approved build is ready for narrow, supervised use in private CLI-first rooms. rc.6 is published and signed; its Production Beta sign-off is still pending. Neither build is a general public launch, hosted chat service, compliance product, or polished GUI app.
+The newest published release is `v0.1.0-rc.6`, a signed prerelease. The release owner approved it as the controlled Production Beta on 2026-11-16. That approved build is ready for narrow, supervised use in private CLI-first rooms. It is not a general public launch, hosted chat service, compliance product, or polished GUI app.
 
 The external builder cohort is deferred until every cohort-blocking `PRE` row
 in the approved [`RB-1 roadmap baseline`](ROADMAP.md) is complete, every
