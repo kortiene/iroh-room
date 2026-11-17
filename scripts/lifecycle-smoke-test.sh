@@ -57,24 +57,42 @@ source "$SCRIPT"
 if [[ "$(class_of "")" != "local" ]]; then
   fail "plain local class"
 fi
-# Read by class_of in the sourced script.
-# shellcheck disable=SC2034
-GITHUB_ACTIONS=true
-# shellcheck disable=SC2034
-GITHUB_REF=refs/heads/main
-if [[ "$(class_of "")" != "evidence" ]]; then
-  fail "evidence class"
+PROBE=1
+if [[ "$(class_of "")" != "local" ]]; then
+  fail "--probe raised a local run"
 fi
-# shellcheck disable=SC2034
+PROBE=0
+GITHUB_ACTIONS=true
+GITHUB_REF=refs/heads/main
+if [[ "$(class_of "")" != "probe" ]]; then
+  fail "partial Actions context was not probe"
+fi
+GITHUB_EVENT_NAME=workflow_dispatch
+RUNNER_ENVIRONMENT=github-hosted
+GITHUB_REPOSITORY=kortiene/iroh-room
+GITHUB_WORKFLOW_REF="kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main"
+if [[ "$(class_of "")" != "evidence" ]]; then
+  fail "full dispatch context was not evidence"
+fi
+PROBE=1
+if [[ "$(class_of "")" != "probe" ]]; then
+  fail "--probe did not lower evidence"
+fi
+PROBE=0
+if [[ "$(class_of "/tmp/local-binary")" != "unreleased" ]]; then
+  fail "candidate binary was not unreleased"
+fi
 GITHUB_REF=refs/pull/1/merge
 if [[ "$(class_of "")" != "probe" ]]; then
-  fail "probe class"
-fi
-if [[ "$(class_of "/tmp/local-binary")" != "unreleased" ]]; then
-  fail "unreleased class"
+  fail "non-main Actions ref was not probe"
 fi
 unset GITHUB_ACTIONS
 unset GITHUB_REF
+unset GITHUB_EVENT_NAME
+unset RUNNER_ENVIRONMENT
+unset GITHUB_REPOSITORY
+unset GITHUB_WORKFLOW_REF
+PROBE=0
 ok "class rule"
 
 tag_ok "v0.1.0-rc.5" || fail "rc tag"
@@ -210,6 +228,33 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$json" || fail "reco
 if grep -E -q 'identity_secret|device_secret|roomtkt1' "$json" "$record"; then
   fail "record contains secret-shaped text"
 fi
+if ! grep -F -q 'local / probe / unreleased: developer or diagnostic run; not GA evidence for #265, #293 or #347' "$record"; then
+  fail "class rule sentence missing from the record"
+fi
+grade="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["evidence_grade"])' "$json")"
+if [[ "$grade" != "False" ]]; then
+  fail "local evidence_grade is ${grade}"
+fi
+evidence_out="${tmp}/evidence"
+mkdir -p "$evidence_out"
+OUT_DIR="$evidence_out"
+GITHUB_ACTIONS=true
+GITHUB_REF=refs/heads/main
+GITHUB_EVENT_NAME=workflow_dispatch
+RUNNER_ENVIRONMENT=github-hosted
+GITHUB_REPOSITORY=kortiene/iroh-room
+GITHUB_WORKFLOW_REF="kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main"
+PROBE=0
+CANDIDATE_BINARY=""
+RESULT=PASS
+write_record
+evidence_pair="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["class"]); print(d["evidence_grade"]); print(d["github_workflow_ref"])' "${evidence_out}/lifecycle-${TRIPLE}.json")"
+if [[ "$evidence_pair" != "$(printf 'evidence\nTrue\nkortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main')" ]]; then
+  fail "evidence record was: ${evidence_pair}"
+fi
+unset GITHUB_ACTIONS GITHUB_REF GITHUB_EVENT_NAME RUNNER_ENVIRONMENT GITHUB_REPOSITORY GITHUB_WORKFLOW_REF
+PROBE=0
+OUT_DIR="${tmp}/out"
 ok "record renders PASS from JSON"
 
 SIMULATED="identity_secret"

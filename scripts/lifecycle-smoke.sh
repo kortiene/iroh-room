@@ -23,14 +23,20 @@ set -euo pipefail
 #
 # --candidate-binary PATH is local dev mode. The record class is unreleased.
 # The flag is refused (exit 2) when GITHUB_ACTIONS=true.
+# --probe can only lower the class. It never raises local or unreleased.
 #
 # Class rule:
-#   unreleased  --candidate-binary is set. Local dev only. Refused when
-#               GITHUB_ACTIONS=true.
-#   evidence    GitHub Actions and GITHUB_REF=refs/heads/main, without
-#               --candidate-binary.
-#   probe       any other GitHub Actions run.
+#   evidence    all of: GITHUB_ACTIONS=true, GITHUB_REF=refs/heads/main,
+#               GITHUB_EVENT_NAME=workflow_dispatch,
+#               RUNNER_ENVIRONMENT=github-hosted,
+#               GITHUB_REPOSITORY=kortiene/iroh-room,
+#               GITHUB_WORKFLOW_REF=kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main,
+#               and neither --candidate-binary nor --probe.
+#   probe       any other GitHub Actions run, including evidence lowered by --probe.
+#   unreleased  --candidate-binary is set. Refused when GITHUB_ACTIONS=true.
 #   local       a published-asset run outside GitHub Actions.
+#   local / probe / unreleased: developer or diagnostic run; not GA evidence
+#               for #265, #293 or #347.
 #
 # The temp HOME is mktemp -d "${TMPDIR:-/tmp}/lifecycle.XXXXXX", then pwd -P
 # (macOS /var vs /private/var). On Linux, XDG_DATA_HOME is set explicitly.
@@ -53,12 +59,14 @@ REPO="kortiene/iroh-room"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERIFIER="${ROOT}/scripts/verify-release-artifacts.sh"
 
-CLASS_RULE="unreleased: --candidate-binary is set (local dev only; refused when GITHUB_ACTIONS=true). evidence: GitHub Actions and GITHUB_REF is refs/heads/main, without --candidate-binary. probe: any other GitHub Actions run. local: a published-asset run outside GitHub Actions."
+EVIDENCE_WORKFLOW_REF="kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main"
+CLASS_RULE="evidence requires GITHUB_ACTIONS=true, GITHUB_REF=refs/heads/main, GITHUB_EVENT_NAME=workflow_dispatch, RUNNER_ENVIRONMENT=github-hosted, GITHUB_REPOSITORY=kortiene/iroh-room, and GITHUB_WORKFLOW_REF=${EVIDENCE_WORKFLOW_REF}, with neither --candidate-binary nor --probe. --probe can only lower evidence to probe. local / probe / unreleased: developer or diagnostic run; not GA evidence for #265, #293 or #347."
 
 PRIOR_TAG=""
 CANDIDATE_TAG=""
 TRIPLE=""
 CANDIDATE_BINARY=""
+PROBE=0
 OUT_DIR=""
 WORK=""
 REAL_HOME=""
@@ -108,7 +116,7 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/lifecycle-smoke.sh <prior-tag> <candidate-tag> <triple> \
-    [--candidate-binary PATH] [--out DIR]
+    [--candidate-binary PATH] [--probe] [--out DIR]
 
 Run an install, upgrade, rollback, and uninstall smoke against two published
 tags, and write lifecycle-<triple>.json plus a markdown record rendered from
@@ -122,14 +130,17 @@ that JSON.
 Options:
   --candidate-binary PATH   Install this local binary as the candidate.
                             Class is unreleased. Refused when GITHUB_ACTIONS=true.
+  --probe                   Lower evidence to probe. Does not raise any class.
   --out DIR                 Directory for the JSON and markdown records.
                             Default: the current directory.
   -h, --help                Show this help.
 
-Class rule: unreleased when --candidate-binary is set (local dev only; refused
-on GitHub Actions); evidence only on GitHub Actions with GITHUB_REF=refs/heads/main
-and no --candidate-binary; probe for any other GitHub Actions run; local for a
-published-asset run outside GitHub Actions.
+Class rule: evidence only when GITHUB_ACTIONS=true, GITHUB_REF=refs/heads/main,
+GITHUB_EVENT_NAME=workflow_dispatch, RUNNER_ENVIRONMENT=github-hosted,
+GITHUB_REPOSITORY=kortiene/iroh-room, and GITHUB_WORKFLOW_REF names
+lifecycle.yml on refs/heads/main, with neither --candidate-binary nor --probe.
+Any other GitHub Actions run is probe. local / probe / unreleased: developer
+or diagnostic run; not GA evidence for #265, #293 or #347.
 
 v0.1.0-rc.1 through v0.1.0-rc.5 are verified checksum-only (.sha256). rc.6 and
 later are verified with scripts/verify-release-artifacts.sh. Exit 0 only when
@@ -144,21 +155,33 @@ die() {
   exit "$code"
 }
 
+evidence_ready() {
+  [[ -z "${1:-}" ]] || return 1
+  [[ "${PROBE:-0}" == "0" ]] || return 1
+  [[ "${GITHUB_ACTIONS:-}" == "true" ]] || return 1
+  [[ "${GITHUB_REF:-}" == "refs/heads/main" ]] || return 1
+  [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]] || return 1
+  [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]] || return 1
+  [[ "${GITHUB_REPOSITORY:-}" == "kortiene/iroh-room" ]] || return 1
+  [[ "${GITHUB_WORKFLOW_REF:-}" == "$EVIDENCE_WORKFLOW_REF" ]] || return 1
+  return 0
+}
+
 class_of() {
   local candidate_binary="${1:-}"
   if [[ -n "$candidate_binary" ]]; then
     printf '%s\n' "unreleased"
     return 0
   fi
-  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    if [[ "${GITHUB_REF:-}" == "refs/heads/main" ]]; then
-      printf '%s\n' "evidence"
-    else
-      printf '%s\n' "probe"
-    fi
+  if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
+    printf '%s\n' "local"
     return 0
   fi
-  printf '%s\n' "local"
+  if evidence_ready ""; then
+    printf '%s\n' "evidence"
+    return 0
+  fi
+  printf '%s\n' "probe"
 }
 
 tag_ok() {
@@ -1079,9 +1102,13 @@ remove_work() {
 }
 
 write_record() {
-  local json_path="" md_path=""
+  local json_path="" md_path="" run_url="" attempt=""
   if [[ "$LIFECYCLE_STARTED" -ne 1 || -z "$OUT_DIR" ]]; then
     return 0
+  fi
+  if [[ -n "${GITHUB_RUN_ID:-}" && -n "${GITHUB_REPOSITORY:-}" ]]; then
+    attempt="${GITHUB_RUN_ATTEMPT:-1}"
+    run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${attempt}"
   fi
   mkdir -p "$OUT_DIR"
   json_path="${OUT_DIR}/lifecycle-${TRIPLE}.json"
@@ -1124,6 +1151,14 @@ write_record() {
   LS_CANDIDATE_VERSION_EXPECTED="$CANDIDATE_VERSION_EXPECTED" \
   LS_CANDIDATE_VERSION_ACTUAL="$CANDIDATE_VERSION_ACTUAL" \
   LS_CANDIDATE_VERSION_MATCH="$CANDIDATE_VERSION_MATCH" \
+  LS_MIGRATED="${MIGRATED:-}" \
+  LS_GITHUB_ACTIONS="${GITHUB_ACTIONS:-}" \
+  LS_GITHUB_REF="${GITHUB_REF:-}" \
+  LS_GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}" \
+  LS_RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT:-}" \
+  LS_GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}" \
+  LS_GITHUB_WORKFLOW_REF="${GITHUB_WORKFLOW_REF:-}" \
+  LS_GITHUB_RUN_URL="$run_url" \
   python3 - "$json_path" "$md_path" "$STEPS_JSONL" "$ARCHIVES_JSONL" <<'PY'
 import json
 import os
@@ -1209,6 +1244,19 @@ data = {
     "result": env("LS_RESULT") or "FAIL (unexpected)",
 }
 
+def present(name):
+    value = env(name)
+    return value if value else None
+
+data["github_actions"] = present("LS_GITHUB_ACTIONS")
+data["github_ref"] = present("LS_GITHUB_REF")
+data["github_event_name"] = present("LS_GITHUB_EVENT_NAME")
+data["runner_environment"] = present("LS_RUNNER_ENVIRONMENT")
+data["github_repository"] = present("LS_GITHUB_REPOSITORY")
+data["github_workflow_ref"] = present("LS_GITHUB_WORKFLOW_REF")
+data["github_run_url"] = present("LS_GITHUB_RUN_URL")
+data["evidence_grade"] = data.get("class") == "evidence"
+
 for src, dst in (
     ("GITHUB_RUN_ID", "github_run_id"),
     ("GITHUB_RUN_ATTEMPT", "github_run_attempt"),
@@ -1276,6 +1324,7 @@ lines.append("")
 lines.append("- prior: `%s`" % rendered.get("prior_tag", ""))
 lines.append("- candidate: `%s`" % rendered.get("candidate_tag", ""))
 lines.append("- class: `%s`" % rendered.get("class", ""))
+lines.append("- evidence_grade: `%s`" % rendered.get("evidence_grade"))
 lines.append("- schema_version: `%s`" % rendered.get("schema_version", ""))
 lines.append("")
 lines.append(rendered.get("class_rule", ""))
@@ -1283,9 +1332,25 @@ lines.append("")
 lines.append("## Runner")
 lines.append("")
 lines.append("- runner_hosted: `%s`" % rendered.get("runner_hosted", ""))
-for key in ("github_run_id", "github_run_attempt", "github_sha", "github_ref", "image_os", "image_version"):
+for key in (
+    "github_actions",
+    "github_ref",
+    "github_event_name",
+    "runner_environment",
+    "github_repository",
+    "github_workflow_ref",
+    "github_run_url",
+    "github_run_id",
+    "github_run_attempt",
+    "github_sha",
+    "image_os",
+    "image_version",
+):
     if key in rendered:
-        lines.append("- %s: `%s`" % (key, rendered[key]))
+        shown = rendered[key]
+        if shown is None:
+            shown = ""
+        lines.append("- %s: `%s`" % (key, shown))
 lines.append("- gh_version: `%s`" % rendered.get("gh_version", ""))
 lines.append("- cosign_version: `%s`" % rendered.get("cosign_version", ""))
 lines.append("")
@@ -1456,6 +1521,10 @@ parse_args() {
         fi
         CANDIDATE_BINARY="$2"
         shift 2
+        ;;
+      --probe)
+        PROBE=1
+        shift
         ;;
       --out)
         if [[ $# -lt 2 ]]; then
