@@ -43,6 +43,27 @@ const RC3_DERIVED_CACHE: [(&str, u64, u64); 5] = [
     ("E_INVITE_BOB", 4, 4),
 ];
 
+/// Previous-candidate (v0.1.0-rc.6) data-continuity fixture.
+///
+/// These bytes were written by the *published* rc.6 binary driving the
+/// documented CLI flow, not regenerated from fixed seeds, so there is
+/// deliberately no `*_matches_regenerated_source` oracle for them: the rc.6
+/// keys were random and the fixture file is the only artifact.
+const RC6_EVENTS_FIXTURE: &str = include_str!("fixtures/rc6/events.txt");
+const RC6_STORE_SCHEMA: &str = include_str!("fixtures/rc6/store_rc6_schema.sql");
+const RC6_EVENTS_PATH: &str = "fixtures/rc6/events.txt";
+
+/// `(label, lamport, admin_seq)` exactly as the rc.6 binary recorded them in its
+/// own `rooms.db` derived cache. The current store must re-derive these values
+/// unchanged, otherwise an rc.6 upgrade would silently reorder history.
+const RC6_DERIVED_CACHE: [(&str, u64, u64); 5] = [
+    ("E_CREATE", 0, 0),
+    ("E_MESSAGE_1", 1, 1),
+    ("E_MESSAGE_2", 2, 2),
+    ("E_MESSAGE_3", 3, 3),
+    ("E_INVITE_BOB", 4, 4),
+];
+
 const T0: u64 = 1_750_000_000_000;
 const ROOM_NONCE: [u8; 16] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
@@ -440,6 +461,73 @@ fn rc3_admin_id(records: &[FixtureRecord]) -> IdentityKey {
     genesis.validated.event.sender_id
 }
 
+fn rc6_room_id() -> RoomId {
+    fixture_header_room_id(RC6_EVENTS_FIXTURE, RC6_EVENTS_PATH)
+}
+
+fn decode_rc6_fixture_records() -> Vec<FixtureRecord> {
+    decode_fixture_records_from(RC6_EVENTS_FIXTURE, RC6_EVENTS_PATH, rc6_room_id())
+}
+
+/// The rc.6 room's single immutable admin: the genesis `room.created` signer.
+fn rc6_admin_id(records: &[FixtureRecord]) -> IdentityKey {
+    let genesis = records
+        .iter()
+        .find(|record| record.validated.event.event_type == EventType::RoomCreated)
+        .expect("rc.6 fixture must contain room.created");
+    genesis.validated.event.sender_id
+}
+
+/// Apply the harvested rc.6 schema and seed its events. The derived
+/// `(lamport, admin_seq)` cache is checked against the pairs the rc.6 binary
+/// recorded, not against a source-level regeneration.
+fn seed_rc6_fixture(conn: &Connection) -> Vec<FixtureRecord> {
+    let records = decode_rc6_fixture_records();
+    conn.execute_batch(RC6_STORE_SCHEMA)
+        .expect("apply rc.6 schema");
+    let derived = insert_fixture_rows(conn, &records, rc6_admin_id(&records));
+    let expected: Vec<_> = RC6_DERIVED_CACHE
+        .iter()
+        .map(|(label, lamport, admin_seq)| ((*label).to_owned(), Some(*lamport), Some(*admin_seq)))
+        .collect();
+    assert_eq!(
+        derived, expected,
+        "current code must re-derive rc.6's recorded (lamport, admin_seq) cache"
+    );
+    records
+}
+
+/// Read the store's own `lamport` / `admin_seq` columns and match them to
+/// [`RC6_DERIVED_CACHE`]. Call this after [`EventStore::rebuild`]: the pairs
+/// come from the rebuilt rows, not from [`insert_fixture_rows`].
+fn assert_rebuilt_store_matches_rc6_derived_cache(store: &EventStore, records: &[FixtureRecord]) {
+    let tail = store
+        .room_tail(&rc6_room_id(), fixture_limit(records.len()))
+        .expect("read rc.6 tail after rebuild");
+    let got: Vec<_> = RC6_DERIVED_CACHE
+        .iter()
+        .map(|(label, _, _)| {
+            let record = records
+                .iter()
+                .find(|candidate| candidate.label == *label)
+                .unwrap_or_else(|| panic!("rc.6 fixture missing {label}"));
+            let stored = tail
+                .iter()
+                .find(|row| row.event_id == record.validated.event_id)
+                .unwrap_or_else(|| panic!("{label} missing from the rebuilt store"));
+            ((*label).to_owned(), stored.lamport, stored.admin_seq)
+        })
+        .collect();
+    let expected: Vec<_> = RC6_DERIVED_CACHE
+        .iter()
+        .map(|(label, lamport, admin_seq)| ((*label).to_owned(), Some(*lamport), Some(*admin_seq)))
+        .collect();
+    assert_eq!(
+        got, expected,
+        "rebuilt store lamport/admin_seq must match the rc.6 derived cache"
+    );
+}
+
 fn validated_events(records: &[FixtureRecord]) -> Vec<ValidatedEvent> {
     records
         .iter()
@@ -788,6 +876,223 @@ fn rc3_sqlite_fixture_opens_under_current_schema_without_migration() {
 }
 
 #[test]
+fn rc6_wire_fixture_decodes_validates_and_folds_current_snapshot() {
+    let records = decode_rc6_fixture_records();
+    let labels_and_types: Vec<_> = records
+        .iter()
+        .map(|record| (record.label.as_str(), record.event_type.as_str()))
+        .collect();
+    assert_eq!(
+        labels_and_types,
+        [
+            ("E_CREATE", "room.created"),
+            ("E_MESSAGE_1", "message.text"),
+            ("E_MESSAGE_2", "message.text"),
+            ("E_MESSAGE_3", "message.text"),
+            ("E_INVITE_BOB", "member.invited"),
+        ]
+    );
+
+    let admin = rc6_admin_id(&records);
+    let membership = RoomMembership::from_events(rc6_room_id(), validated_events(&records));
+    let snapshot = membership.snapshot();
+    assert_eq!(snapshot.status(&admin), Some(Status::Active));
+    assert_eq!(snapshot.role(&admin), Some(Role::Admin));
+    assert_eq!(
+        snapshot.active_members().count(),
+        1,
+        "rc.6 fixture room has exactly one active member (the admin)"
+    );
+
+    // The invitee never redeemed the ticket, so rc.6 history must still project
+    // as Invited under the current membership fold — not Active, not dropped.
+    let invited = records
+        .iter()
+        .find(|record| record.label == "E_INVITE_BOB")
+        .and_then(|record| match &record.validated.event.content {
+            Content::MemberInvited(content) => Some(content.invitee_key),
+            _ => None,
+        })
+        .expect("rc.6 fixture must contain member.invited");
+    assert_ne!(invited, admin, "the invitee is not the admin");
+    assert_eq!(snapshot.status(&invited), Some(Status::Invited));
+    assert_eq!(snapshot.role(&invited), Some(Role::Member));
+}
+
+#[test]
+fn rc6_wire_fixture_imports_into_current_store_byte_for_byte() {
+    let records = decode_rc6_fixture_records();
+    let mut store = EventStore::open_in_memory().expect("open in-memory store");
+    let stats = store
+        .insert_all(&validated_events(&records))
+        .expect("insert rc.6 fixture");
+    assert_eq!(stats.inserted, records.len() as u64);
+    assert_eq!(stats.duplicate, 0);
+    assert_eq!(
+        store.count(&rc6_room_id()).expect("count room"),
+        records.len() as u64
+    );
+
+    for record in &records {
+        let stored = store
+            .get(&record.validated.event_id)
+            .expect("store get")
+            .unwrap_or_else(|| panic!("missing stored event {}", record.label));
+        assert_eq!(stored.event_id.to_named_string(), record.event_id);
+        assert_eq!(stored.event_type.as_str(), record.event_type);
+        assert_eq!(stored.wire.to_bytes(), record.wire);
+    }
+
+    for (ty, expected) in [
+        (EventType::RoomCreated, 1),
+        (EventType::MessageText, 3),
+        (EventType::MemberInvited, 1),
+    ] {
+        assert_eq!(
+            store
+                .by_type(&rc6_room_id(), ty)
+                .unwrap_or_else(|err| panic!("by_type({}) failed: {err}", ty.as_str()))
+                .len(),
+            expected,
+            "{} count must remain compatible",
+            ty.as_str()
+        );
+    }
+
+    let tail = store
+        .room_tail(&rc6_room_id(), fixture_limit(records.len()))
+        .expect("room tail");
+    assert_eq!(tail.len(), records.len());
+}
+
+#[test]
+fn rc6_sqlite_fixture_opens_under_current_schema_without_migration() {
+    let records = decode_rc6_fixture_records();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("iroh-rooms-rc6-fixture.sqlite");
+
+    {
+        let conn = Connection::open(&db_path).expect("open rc.6 db");
+        let seeded = seed_rc6_fixture(&conn);
+        assert_eq!(seeded.len(), records.len());
+
+        // rc.6 already shipped schema v2, including the empty room_keys table.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read rc.6 user_version");
+        assert_eq!(version, 2, "rc.6 stores are already schema v2");
+        assert_eq!(
+            count_v2_tables(&conn),
+            5,
+            "rc.6 fixture must start WITH the v2 sync-cache tables"
+        );
+        assert_table_exists_empty(&conn, "room_keys");
+    }
+
+    {
+        let mut store = EventStore::open(&db_path).expect("open rc.6 fixture under current schema");
+        assert_eq!(
+            store.count(&rc6_room_id()).expect("count rc.6 room"),
+            records.len() as u64
+        );
+        assert_eq!(
+            store
+                .room_tail(&rc6_room_id(), fixture_limit(records.len()))
+                .expect("rc.6 room tail")
+                .len(),
+            records.len()
+        );
+        store.rebuild().expect("rebuild rc.6 fixture");
+        assert_eq!(
+            store
+                .room_tail(&rc6_room_id(), fixture_limit(records.len()))
+                .expect("rebuilt rc.6 room tail")
+                .len(),
+            records.len()
+        );
+        assert_rebuilt_store_matches_rc6_derived_cache(&store, &records);
+    }
+
+    let conn = Connection::open(&db_path).expect("reopen rc.6 db");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read rc.6 user_version after open");
+    assert_eq!(
+        version, 2,
+        "opening rc.6 data must not bump user_version (no-op open)"
+    );
+    for table in [
+        "sync_state",
+        "sync_backfill_tokens",
+        "sync_parked",
+        "sync_parked_missing",
+        "trust_decisions",
+        "room_keys",
+    ] {
+        assert_table_exists_empty(&conn, table);
+    }
+    assert_fixture_wires_preserved(&conn, &records);
+}
+
+#[test]
+fn rc6_signed_wire_bytes_and_event_ids_survive_open_fold_and_reopen() {
+    let records = decode_rc6_fixture_records();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("iroh-rooms-rc6-reopen.sqlite");
+
+    let before = {
+        let conn = Connection::open(&db_path).expect("open rc.6 db");
+        seed_rc6_fixture(&conn);
+        event_id_and_wire_rows(&conn)
+    };
+    assert_rows_match_rc6_fixture(&before, &records);
+
+    {
+        let mut store = EventStore::open(&db_path).expect("open rc.6 fixture");
+        let tail = store
+            .room_tail(&rc6_room_id(), fixture_limit(records.len()))
+            .expect("rc.6 room tail");
+        let ctx = ValidationContext::for_room(rc6_room_id());
+        let validated: Vec<_> = tail
+            .iter()
+            .map(|stored| {
+                validate_wire_bytes(&stored.wire.to_bytes(), &ctx)
+                    .unwrap_or_else(|err| panic!("stored rc.6 event failed re-validation: {err:?}"))
+            })
+            .collect();
+        let snapshot = RoomMembership::from_events(rc6_room_id(), validated).snapshot();
+        assert_eq!(
+            snapshot.role(&rc6_admin_id(&records)),
+            Some(Role::Admin),
+            "folding the opened rc.6 log must keep the harvested admin"
+        );
+        store.rebuild().expect("rebuild rc.6 fixture");
+    }
+
+    let after_fold = {
+        let conn = Connection::open(&db_path).expect("reopen after fold");
+        event_id_and_wire_rows(&conn)
+    };
+    assert_eq!(
+        after_fold, before,
+        "open and fold must leave signed wire bytes and event ids unchanged"
+    );
+
+    {
+        let _store = EventStore::open(&db_path).expect("reopen rc.6 fixture");
+    }
+
+    let after_reopen = {
+        let conn = Connection::open(&db_path).expect("reopen after second open");
+        event_id_and_wire_rows(&conn)
+    };
+    assert_eq!(
+        after_reopen, before,
+        "reopen must leave signed wire bytes and event ids unchanged"
+    );
+}
+
+#[test]
 #[ignore = "fixture regeneration utility; run explicitly with --ignored --nocapture"]
 fn zzz_harvest_v1_fixture() {
     println!("# Iroh Rooms v1 compatibility event fixture");
@@ -947,6 +1252,29 @@ fn assert_table_exists_empty(conn: &Connection, table: &str) {
         })
         .unwrap_or_else(|err| panic!("count {table}: {err}"));
     assert_eq!(count, 0, "{table} must start empty after migration");
+}
+
+fn event_id_and_wire_rows(conn: &Connection) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut stmt = conn
+        .prepare("SELECT event_id, wire FROM events ORDER BY lamport, event_id")
+        .expect("prepare event id/wire snapshot");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query event id/wire snapshot")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read event id/wire snapshot")
+}
+
+fn assert_rows_match_rc6_fixture(rows: &[(Vec<u8>, Vec<u8>)], records: &[FixtureRecord]) {
+    assert_eq!(rows.len(), records.len());
+    for (row, record) in rows.iter().zip(records) {
+        assert_eq!(
+            &row.0[..],
+            &record.validated.event_id.as_bytes()[..],
+            "{} event id changed",
+            record.label
+        );
+        assert_eq!(&row.1, &record.wire, "{} wire changed", record.label);
+    }
 }
 
 fn assert_fixture_wires_preserved(conn: &Connection, records: &[FixtureRecord]) {

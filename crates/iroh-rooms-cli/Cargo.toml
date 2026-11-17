@@ -114,3 +114,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net",
 # Hex encoding/decoding used by the file_cli.rs hash-verification test. Already
 # a resolved crate in Cargo.lock (used by core and net).
 hex = "0.4"
+# Stamp a future `user_version` and checkpoint a CLI-created WAL store in the
+# downgrade-refusal test. Same bundled pin the core `store` feature uses.
+rusqlite = { version = "0.42", features = ["bundled"] }
+# SHA-256 of `rooms.db` before and after a refused open. Already in Cargo.lock.
+sha2 = "0.11"
