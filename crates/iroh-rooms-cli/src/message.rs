@@ -9,10 +9,12 @@
 //!
 //! * `send` is **offline-first, online-best-effort** (D3): it builds + self-checks
 //!   the `message.text`, then — when the room has other active members — brings up
-//!   an ephemeral [`Node`], dials them, and lets the engine's `publish` persist and
-//!   fan the frame out to connected peers. The frame is **always** persisted
-//!   locally (the guaranteed core); live delivery is best-effort with no queue and
-//!   no guaranteed offline delivery (PRD §14).
+//!   a short-lived managed room session and lets the engine's `publish` persist and
+//!   fan the frame out. Admission for that flush is the live roster
+//!   ([`run_managed_push`]), the same session `room remove` uses, so a departure
+//!   folded during the flush is not admitted or forwarded afterwards. The frame is
+//!   **always** persisted locally (the guaranteed core); live delivery is
+//!   best-effort with no queue and no guaranteed offline delivery (PRD §14).
 //! * `tail` is the long-running receiver/session (D4): it brings up a [`Node`],
 //!   accepts inbound `message.text` frames (validated/deduped/persisted by the
 //!   landed engine), and renders the timeline in canonical `(lamport, event_id)`
@@ -206,18 +208,19 @@ pub async fn send(
         0
     } else {
         // Best-effort live push: the engine's `publish` persists AND fans out.
+        // The flush uses live roster admission (`run_managed_push`), not a
+        // snapshot frozen at send time, so a removal folded while the node is
+        // still up is dropped before anything accepted afterwards is forwarded.
         let mode = net_mode(loopback);
         let secret_key = SecretKey::from_bytes(&secret.device.to_seed());
-        let admission = build_admission(&snapshot);
-        // `Box::pin` keeps `run_push`'s future off this caller's stack — issue
-        // #141 grew `NetConfig` enough to trip clippy::large_futures here.
-        let delivered = match Box::pin(run_push(
+        // `Box::pin` keeps `run_managed_push`'s future off this caller's stack —
+        // issue #141 grew `NetConfig` enough to trip clippy::large_futures here.
+        let delivered = match Box::pin(run_managed_push(
             home,
             store,
             room_id,
             secret_key,
             secret.device_seed(),
-            admission,
             dial_set,
             timeout,
             mode,
@@ -855,12 +858,17 @@ fn role_label(role: Role) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Live-push helper (the ephemeral `room send` node)
+// Live-push helpers
 // ---------------------------------------------------------------------------
 
-/// Bring up an ephemeral node over `store`, dial `dial_set`, wait briefly for at
-/// least one link, publish the frame (the engine persists + fans out), grant a
-/// short flush grace, and report how many peers were connected at publish time.
+/// Bring up an ephemeral node over `store` with a fixed allowlist, dial
+/// `dial_set`, wait briefly for at least one link, publish the frame (the
+/// engine persists + fans out), grant a short flush grace, and report how many
+/// peers were connected after the flush.
+///
+/// `room send` does not use this. Its flush goes through [`run_managed_push`]
+/// so admission tracks the live roster. Callers that still pass a fixed
+/// allowlist (`agent status`) keep this path.
 ///
 /// Consumes `store` (moved into the engine) and the wire `frame`.
 #[allow(clippy::too_many_arguments)] // distinct carrier inputs; grouping them buys nothing
@@ -925,16 +933,19 @@ pub(crate) async fn run_push(
 
 /// Like [`run_push`], but the node is a managed room session.
 ///
+/// This is the flush for `room remove`, the first `room leave`, and `room send`.
 /// Admission is a live [`SnapshotAdmission`] the pump refreshes from the fold,
-/// and the [`PeerManager`] tears a departed device down as soon as the removal
-/// is published — routing is revoked before this function's flush sleep. The
-/// terminal removal is queued *before* that reconcile, so the removed device
-/// still learns it; anything accepted afterwards is not forwarded to it.
+/// and the [`PeerManager`] drops a device the fold has removed or that has left.
+/// Routing is revoked before this function's flush sleep. A `member.removed`
+/// addressed to that device is queued *before* the reconcile, so the removed
+/// device still learns it; anything accepted afterwards is not forwarded to it.
+/// A device that becomes active during the flush is dialed from the updated roster.
 ///
-/// `dial_set` is the pre-departure roster (the removed device included) plus
-/// any `--peer` address hints. The connected-peer count is the union of who
-/// was connected at publish time and who is still connected after the flush,
-/// so a device torn down after receiving its terminal removal still counts.
+/// `dial_set` is the opening roster — for `room remove`, the pre-removal roster,
+/// so the removed device is included — plus any `--peer` address hints. The
+/// connected-peer count is the union of who was connected at publish time and
+/// who is still connected after the flush, so a device torn down after receiving
+/// its terminal removal still counts.
 ///
 /// # Errors
 /// Returns an error if the engine or node cannot start, the frame cannot be
@@ -990,7 +1001,7 @@ pub(crate) async fn run_managed_push(
     let publish = node
         .publish(frame)
         .await
-        .context("could not publish the departure frame");
+        .context("could not publish the frame");
 
     tokio::time::sleep(flush_grace()).await;
     reached.extend(connected_ids(&node, &ids));
@@ -1224,8 +1235,9 @@ pub(crate) fn build_admission(snapshot: &MembershipSnapshot) -> AllowlistAdmissi
 /// The device **selection** (active-only, self-excluded, deduped) delegates to the
 /// net crate's [`PeerManager::desired_devices`] so there is a single implementation
 /// shared with the runtime peer manager (IR-0107 §11 step 1); this wrapper only maps
-/// each selected device to its `--peer`-hinted or bare address for the callers that
-/// still dial explicitly (`room send`, `pipe`).
+/// each selected device to its `--peer`-hinted or bare address. Callers either
+/// dial that set (`agent status`, `pipe`, a leave retry) or pass it as address
+/// hints to a managed flush (`room send`, `room remove`, the first `room leave`).
 pub(crate) fn build_dial_set(
     snapshot: &MembershipSnapshot,
     self_device: EndpointId,
