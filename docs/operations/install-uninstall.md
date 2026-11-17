@@ -512,15 +512,19 @@ mv "$tmp" "${PREFIX}/bin/iroh-rooms"
 ```
 
 **(b) The candidate raised `user_version`.** The older binary refuses the
-store and exits 1. stderr is:
+store and exits 1. stderr contains `error: could not open event store at <path>: …`
+and the refusal from `crates/iroh-rooms-core/src/store/schema.rs`:
 
 ```text
-error: could not open event store at <path>: store migration failed: database user_version N is newer than supported M
+database user_version {current} is newer than supported {USER_VERSION}; restore from backup or retry with the previous binary
 ```
 
-`N` is the database `user_version` and `M` is the highest version that binary
-supports. A suffix `; restore from backup or retry with the previous binary`
-is pending: it is added once #409 lands, and it is not part of this message.
+`{current}` is the database `user_version`. `{USER_VERSION}` is the highest
+version that binary supports. The full line contains
+
+```text
+error: could not open event store at <path>: store migration failed: database user_version {current} is newer than supported {USER_VERSION}; restore from backup or retry with the previous binary
+```
 
 Reinstall the prior binary with the rollback (a) commands so `PREFIX` is
 honored. Then use only the data-restore lines from the Rollback section
