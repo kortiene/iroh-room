@@ -1409,7 +1409,7 @@ lines.append("")
 lines.append("- prior: `%s`" % rendered.get("prior_tag", ""))
 lines.append("- candidate: `%s`" % rendered.get("candidate_tag", ""))
 lines.append("- class: `%s`" % rendered.get("class", ""))
-lines.append("- evidence_grade: `%s`" % rendered.get("evidence_grade"))
+lines.append("- evidence_grade: `%s`" % ("true" if rendered.get("evidence_grade") else "false"))
 lines.append("- schema_version: `%s`" % rendered.get("schema_version", ""))
 lines.append("")
 lines.append(rendered.get("class_rule", ""))
@@ -1482,7 +1482,7 @@ if "user_version_before" in rendered:
 if "user_version_after" in rendered:
     lines.append("- user_version_after: `%s`" % rendered["user_version_after"])
 if "migrated" in rendered:
-    lines.append("- migrated: `%s`" % rendered["migrated"])
+    lines.append("- migrated: `%s`" % ("true" if rendered["migrated"] else "false"))
 if "simulated" in rendered:
     lines.append("- simulated: `%s`" % rendered["simulated"])
 if rendered.get("data_dirs_covered"):
