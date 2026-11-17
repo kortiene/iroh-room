@@ -134,6 +134,9 @@ impl EventStore {
     /// [`StoreOptions`] (a 5000ms `busy_timeout`), applying pragmas and the
     /// idempotent schema migration.
     ///
+    /// A database whose `user_version` is newer than this binary is refused
+    /// before those pragmas run, so the refused open does not change the file.
+    ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened, or
     /// [`StoreError::Migration`] if it carries a newer unknown schema version.
@@ -146,6 +149,11 @@ impl EventStore {
     /// # Errors
     /// As [`EventStore::open`].
     pub fn open_with(path: &Path, opts: &StoreOptions) -> Result<Self, StoreError> {
+        // Before the read-write open. `Connection::open` uses
+        // `SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE`, which fails on a
+        // read-only data dir with "attempt to write a readonly database" and
+        // would hide this refusal. The probe does not change journal mode.
+        schema::refuse_newer_user_version_at(path)?;
         let conn = Connection::open(path)?;
         Self::from_connection_with(conn, opts)
     }
@@ -169,6 +177,10 @@ impl EventStore {
     }
 
     fn from_connection_with(conn: Connection, opts: &StoreOptions) -> Result<Self, StoreError> {
+        // `apply_pragmas` sets `journal_mode = WAL`, which rewrites header
+        // bytes 18–19. Refuse a newer `user_version` before that write. The
+        // pragma read does not itself change journal mode.
+        schema::refuse_newer_user_version(&conn)?;
         schema::apply_pragmas(&conn)?;
         // Unconditional: rusqlite pre-installs a 5000ms busy_timeout on open, so a
         // conditional `if let Some(d) = ...` would leave that default in place and

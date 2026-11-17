@@ -7,6 +7,10 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- Refusing to open a store whose `user_version` is newer than this binary no
+  longer modifies that store, and the refusal now includes a recovery hint to
+  restore from backup or retry with the previous binary.
+
 ## 0.1.0-rc.6 - 2026-11-15
 
 - **CLI (`iroh-rooms` binary):** new `room remove <ROOM_ID> <MEMBER_ID>` (admin

@@ -2,6 +2,7 @@
 //! Criteria (the broader integration suite lives in `tests/` per the test phase).
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -451,6 +452,228 @@ fn migration_rejects_future_schema_version() {
         matches!(err, super::StoreError::Migration(_)),
         "expected Migration error, got {err:?}"
     );
+}
+
+// ── issue #405: a newer user_version is refused before WAL pragmas ───────────
+//
+// `apply_pragmas` sets `journal_mode = WAL`, which rewrites header bytes 18-19.
+// That write must not run when the open is refused. The non-WAL case is the one
+// current main fails: bytes 18-19 move from 1/1 to 2/2.
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn header_bytes_18_19(bytes: &[u8]) -> [u8; 2] {
+    assert!(
+        bytes.len() >= 20,
+        "sqlite database header is shorter than 20 bytes"
+    );
+    [bytes[18], bytes[19]]
+}
+
+/// The CLI regex is a prefix match: the pinned text, then anything (the hint).
+fn assert_newer_user_version_prefix(msg: &str) {
+    let marker = "store migration failed: database user_version ";
+    let Some(rest) = msg.split_once(marker).map(|(_, rest)| rest) else {
+        panic!("missing pinned prefix in: {msg}");
+    };
+    let Some((version, rest)) = rest.split_once(" is newer than supported ") else {
+        panic!("missing pinned prefix in: {msg}");
+    };
+    assert!(
+        !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
+        "user_version is not an integer in: {msg}"
+    );
+    let supported: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    assert!(
+        !supported.is_empty(),
+        "supported version is not an integer in: {msg}"
+    );
+}
+
+fn assert_recovery_hint(msg: &str) {
+    assert!(
+        msg.contains("restore from backup") && msg.contains("previous binary"),
+        "refusal must tell the user to restore from backup or retry with the previous binary, got {msg}"
+    );
+}
+
+fn open_err(path: &Path) -> super::StoreError {
+    match EventStore::open(path) {
+        Ok(_) => panic!("newer user_version must be refused"),
+        Err(err) => err,
+    }
+}
+
+/// A real WAL store (the format `EventStore::open` writes) with `user_version + 1`
+/// checkpointed into the main database file.
+fn stamp_wal_future_version(path: &Path) {
+    drop(EventStore::open(path).expect("create wal store"));
+    let conn = Connection::open(path).expect("reopen wal store");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read journal_mode");
+    assert_eq!(mode.to_ascii_lowercase(), "wal", "setup store must be WAL");
+    conn.pragma_update(None, "user_version", super::schema::USER_VERSION + 1)
+        .expect("stamp a newer user_version");
+    let checkpoint: (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("checkpoint the WAL");
+    assert_eq!(checkpoint.0, 0, "wal checkpoint must not report busy");
+    drop(conn);
+    let bytes = std::fs::read(path).expect("read checkpointed rooms.db");
+    assert_eq!(
+        header_bytes_18_19(&bytes),
+        [2, 2],
+        "WAL stores write version/read version 2"
+    );
+}
+
+/// Rollback-journal store (`journal_mode = DELETE`): header bytes 18-19 are 1/1.
+fn stamp_delete_journal_future_version(path: &Path) {
+    let conn = Connection::open(path).expect("create delete-journal store");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("set journal_mode = DELETE");
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    conn.pragma_update(None, "user_version", super::schema::USER_VERSION + 1)
+        .expect("stamp a newer user_version");
+    drop(conn);
+    let bytes = std::fs::read(path).expect("read delete-journal store");
+    assert_eq!(
+        header_bytes_18_19(&bytes),
+        [1, 1],
+        "DELETE journal stores write version/read version 1"
+    );
+}
+
+fn assert_refused_open_leaves_file_unchanged(path: &Path) {
+    let before = std::fs::read(path).expect("read store before refused open");
+    let before_header = header_bytes_18_19(&before);
+    let before_hash = sha256_hex(&before);
+
+    let err = open_err(path);
+    let msg = err.to_string();
+    assert_newer_user_version_prefix(&msg);
+
+    let after = std::fs::read(path).expect("read store after refused open");
+    let after_header = header_bytes_18_19(&after);
+    let after_hash = sha256_hex(&after);
+    assert_eq!(
+        after_header, before_header,
+        "refused open rewrote header bytes 18-19 from {before_header:?} to {after_header:?} \
+         (sha256 before {before_hash} after {after_hash})"
+    );
+    assert_eq!(
+        after_hash, before_hash,
+        "rooms.db sha256 must be unchanged after the refused open \
+         (header before {before_header:?} after {after_header:?})"
+    );
+    assert_recovery_hint(&msg);
+}
+
+#[test]
+fn refused_open_of_wal_future_user_version_leaves_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    stamp_wal_future_version(&path);
+    assert_refused_open_leaves_file_unchanged(&path);
+}
+
+#[test]
+fn refused_open_of_delete_journal_future_user_version_leaves_header_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    stamp_delete_journal_future_version(&path);
+    assert_refused_open_leaves_file_unchanged(&path);
+}
+
+/// `chmod` the data directory and the database read-only. Root ignores mode
+/// bits, so the refusal would not be distinguished from a successful write.
+#[cfg(unix)]
+#[test]
+fn refused_open_on_readonly_dir_reports_newer_user_version() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unix_euid_is_root() {
+        eprintln!(
+            "skipping refused_open_on_readonly_dir_reports_newer_user_version: running as root"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.db");
+    stamp_wal_future_version(&path);
+
+    let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    let _restore = RestoreModes {
+        dir: dir.path().to_path_buf(),
+        dir_mode,
+        file: path.clone(),
+        file_mode,
+    };
+    set_unix_mode(&path, 0o444);
+    set_unix_mode(dir.path(), 0o555);
+
+    let before = std::fs::read(&path).expect("read store before refused open");
+    let err = open_err(&path);
+    let msg = err.to_string();
+    assert_newer_user_version_prefix(&msg);
+    assert!(
+        !msg.to_ascii_lowercase().contains("readonly"),
+        "a read-only data dir must surface the version refusal, not a readonly write error, got {msg}"
+    );
+    assert_recovery_hint(&msg);
+    let after = std::fs::read(&path).expect("read store after refused open");
+    assert_eq!(
+        sha256_hex(&after),
+        sha256_hex(&before),
+        "refused open on a read-only data dir must not modify rooms.db"
+    );
+    assert_eq!(header_bytes_18_19(&after), header_bytes_18_19(&before));
+}
+
+#[cfg(unix)]
+fn unix_euid_is_root() -> bool {
+    match std::process::Command::new("id").arg("-u").output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim() == "0"
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+struct RestoreModes {
+    dir: std::path::PathBuf,
+    dir_mode: u32,
+    file: std::path::PathBuf,
+    file_mode: u32,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreModes {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let file_perms = std::fs::Permissions::from_mode(self.file_mode);
+        let _ = std::fs::set_permissions(&self.file, file_perms);
+        let dir_perms = std::fs::Permissions::from_mode(self.dir_mode);
+        let _ = std::fs::set_permissions(&self.dir, dir_perms);
+    }
 }
 
 // All point/existence queries on an empty store return empty / None / false.

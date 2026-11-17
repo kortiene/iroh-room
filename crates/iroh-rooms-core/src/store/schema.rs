@@ -19,7 +19,9 @@
 //! new tables are created empty, and the five tables remain droppable caches
 //! re-derivable from `events` + reconnect (spec D1/D7).
 
-use rusqlite::Connection;
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags};
 
 use super::error::StoreError;
 
@@ -179,14 +181,131 @@ pub(crate) fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
 /// [`StoreError::Migration`] if an existing database carries a newer, unknown
 /// `user_version`; [`StoreError::Sqlite`] on any DDL failure.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), StoreError> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if current > USER_VERSION {
-        return Err(StoreError::Migration(format!(
-            "database user_version {current} is newer than supported {USER_VERSION}"
-        )));
-    }
+    refuse_newer_user_version(conn)?;
     conn.execute_batch(DDL)?;
     // `?` binding is not allowed in PRAGMA; USER_VERSION is a trusted constant.
     conn.pragma_update(None, "user_version", USER_VERSION)?;
     Ok(())
+}
+
+/// Refuse a store whose `user_version` is newer than [`USER_VERSION`].
+///
+/// The read is `PRAGMA user_version` only: it does not change `journal_mode`
+/// and does not rewrite header bytes 18–19. Callers must run this before
+/// [`apply_pragmas`].
+///
+/// # Errors
+/// [`StoreError::Migration`] when `user_version` is newer than this binary.
+/// [`StoreError::Sqlite`] when the pragma cannot be read.
+pub(crate) fn refuse_newer_user_version(conn: &Connection) -> Result<(), StoreError> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > USER_VERSION {
+        return Err(StoreError::Migration(newer_user_version_message(current)));
+    }
+    Ok(())
+}
+
+/// Read `user_version` from `path` without altering the file, and refuse a
+/// newer store. A missing or empty path is left for the caller to create.
+///
+/// The probe is a read-only `immutable=1` open, so it does not change
+/// `journal_mode`, does not rewrite header bytes 18–19, and still works when
+/// the data directory cannot be written. That keeps a read-only refusal on
+/// the version error instead of a failed WAL pragma.
+///
+/// # Errors
+/// [`StoreError::Migration`] when the on-disk `user_version` is newer than
+/// this binary. [`StoreError::Sqlite`] when an existing database cannot be read.
+pub(crate) fn refuse_newer_user_version_at(path: &Path) -> Result<(), StoreError> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() == 0 => return Ok(()),
+        Ok(_) => {}
+        // Let the real open report a path that disappeared or cannot be stat'd.
+        Err(_) => return Ok(()),
+    }
+    let current = read_user_version_without_writing(path)?;
+    if current > USER_VERSION {
+        return Err(StoreError::Migration(newer_user_version_message(current)));
+    }
+    Ok(())
+}
+
+/// Pinned prefix, then the recovery hint from `docs/compatibility.md`
+/// (restore from backup, or retry with the previous binary).
+fn newer_user_version_message(current: i64) -> String {
+    format!(
+        "database user_version {current} is newer than supported {USER_VERSION}; \
+         restore from backup or retry with the previous binary"
+    )
+}
+
+/// `PRAGMA user_version` via an open that cannot rewrite the database.
+fn read_user_version_without_writing(path: &Path) -> Result<i64, StoreError> {
+    // A plain read-only open still does not set `journal_mode`. Used when the
+    // URI probe cannot parse the path.
+    let conn = if let Ok(conn) = open_immutable_readonly(path) {
+        conn
+    } else {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        Connection::open_with_flags(path, flags)?
+    };
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+fn open_immutable_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let uri = sqlite_immutable_uri(path);
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    Connection::open_with_flags(uri, flags)
+}
+
+/// `file://` URI with `mode=ro&immutable=1`. SQLite then reads the header and
+/// does not create a journal, a WAL, or a shared-memory file.
+fn sqlite_immutable_uri(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    // `file://` + `/abs/path` is `file:///abs/path` (empty authority).
+    let mut uri = String::from("file://");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        for &byte in absolute.as_os_str().as_bytes() {
+            push_uri_byte(&mut uri, byte);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // `file:///C:/...` — one more slash so the drive letter is not a host.
+        uri.push('/');
+        for byte in absolute.to_string_lossy().bytes() {
+            if byte == b'\\' {
+                push_uri_byte(&mut uri, b'/');
+            } else {
+                push_uri_byte(&mut uri, byte);
+            }
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
+}
+
+fn push_uri_byte(uri: &mut String, byte: u8) {
+    match byte {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+            uri.push(char::from(byte));
+        }
+        _ => {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
 }
