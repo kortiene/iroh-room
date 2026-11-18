@@ -1075,6 +1075,38 @@ restore_documented() {
   run_rooms "${WORK}/restored-identity.out" "${WORK}/restored-identity.err" identity show || return 1
 }
 
+# Accept the prior binary's newer-store refusal. The exit status is coupled to
+# the rendered form. Exactly one of these pairs is accepted:
+#   (i)  exit 1 and an uncoded
+#        `error: could not open event store at ... is newer than supported ...`
+#        line (rc.1-rc.6, and the #409 recovery-hint form)
+#   (ii) exit 4, an `error[store_version_unsupported]:` line, and a `next:` line
+# Any other combination fails, including exit 1 with the coded prefix, exit 4
+# without `next:`, and exit 4 uncoded. The migration message regex is required
+# for both pairs. There is no tag table.
+accept_newer_store_refusal() {
+  local code="$1"
+  local stderr_path="$2"
+  if ! grep -E -q 'store migration failed: database user_version [0-9]+ is newer than supported [0-9]+' "$stderr_path"; then
+    printf 'error: stderr did not match the store migration refusal\n' >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+  if [[ "$code" -eq 1 ]] \
+    && grep -E -q 'error: could not open event store at .+ is newer than supported ' "$stderr_path" \
+    && ! grep -F -q 'error[store_version_unsupported]:' "$stderr_path"; then
+    return 0
+  fi
+  if [[ "$code" -eq 4 ]] \
+    && grep -F -q 'error[store_version_unsupported]:' "$stderr_path" \
+    && grep -E -q '^next:' "$stderr_path"; then
+    return 0
+  fi
+  printf 'error: newer-store refusal exit %s does not match its stderr form\n' "$code" >&2
+  cat "$stderr_path" >&2
+  return 1
+}
+
 rollback_b_impl() {
   local db="${IROH_ROOMS_HOME}/rooms.db"
   local current="" next="" mode="" hash_before="" hash_after="" code=0
@@ -1106,17 +1138,7 @@ rollback_b_impl() {
   code=0
   "${PREFIX}/bin/iroh-rooms" room tail --offline "$ROOM_ID" \
     >"${WORK}/rollback-b.stdout" 2>"${WORK}/rollback-b.stderr" || code=$?
-  if [[ "$code" -ne 1 ]]; then
-    printf 'error: prior binary room tail --offline exited %s, expected 1\n' "$code" >&2
-    cat "${WORK}/rollback-b.stderr" >&2
-    return 1
-  fi
-  if ! grep -E -q 'store migration failed: database user_version [0-9]+ is newer than supported [0-9]+' \
-    "${WORK}/rollback-b.stderr"; then
-    printf 'error: stderr did not match the store migration refusal\n' >&2
-    cat "${WORK}/rollback-b.stderr" >&2
-    return 1
-  fi
+  accept_newer_store_refusal "$code" "${WORK}/rollback-b.stderr" || return 1
   hash_after="$(sha256_file "$db")" || return 1
   if [[ "$hash_before" != "$hash_after" ]]; then
     printf 'error: rooms.db sha256 changed across the refused open\n' >&2

@@ -16,12 +16,15 @@
 //! `anyhow`'s `.context(...)` ergonomics. [`main`](crate::main) walks the
 //! resulting error chain via [`code_of`] and renders the pinned
 //! `error[<code>]: <message>` contract with the matching category exit code
-//! (§5.2/§5.3 of the spec); an error nobody attached a code to still renders as
+//! (§5.2/§5.3 of the spec). An attached [`CliError`] wins. With none, a
+//! [`StoreError::NewerSchema`] in the chain is `store_version_unsupported`.
+//! Any other error nobody attached a code to still renders as
 //! `error: <message>` and exits `1` — a code-adoption gap, not a crash.
 
 use std::fmt;
 
 use iroh_rooms_core::event::RejectReason;
+use iroh_rooms_core::store::StoreError;
 use iroh_rooms_core::ticket::TicketError;
 use iroh_rooms_net::OfflineReason;
 
@@ -72,6 +75,10 @@ pub enum ErrorCode {
     /// an availability or authorization one (spec IR-0205 §5.4).
     HashMismatch,
 
+    /// The on-disk store `user_version` is newer than this binary supports.
+    /// Distinct from a protocol `unknown_schema_version` reject.
+    StoreVersionUnsupported,
+
     /// `--room-id`/positional room id argument does not parse (`blake3:<hex>`).
     InvalidRoomId,
     /// An option value is malformed (`--timeout`, `--role`, `--format`,
@@ -107,6 +114,7 @@ impl ErrorCode {
             Self::NoDiscoveryHint => "no_discovery_hint",
             Self::BlobUnavailable => "blob_unavailable",
             Self::HashMismatch => "hash_mismatch",
+            Self::StoreVersionUnsupported => "store_version_unsupported",
             Self::InvalidRoomId => "invalid_room_id",
             Self::InvalidArgument => "invalid_argument",
             Self::NoSuchFile => "no_such_file",
@@ -132,7 +140,7 @@ impl ErrorCode {
             | Self::RoomNotFound
             | Self::NoDiscoveryHint => ErrorCategory::Usage,
             Self::WrongIdentity | Self::PeerUnauthorized => ErrorCategory::Auth,
-            Self::HashMismatch => ErrorCategory::Integrity,
+            Self::HashMismatch | Self::StoreVersionUnsupported => ErrorCategory::Integrity,
             Self::Reject(reason) => reject_category(reason),
             Self::Ticket(_) => ErrorCategory::Ticket,
             Self::NoAdminReachable
@@ -205,6 +213,10 @@ impl ErrorCode {
             Self::HashMismatch => Some(
                 "do not trust this file; the reference or a provider may be corrupt — \
                  ask for a fresh `file share`",
+            ),
+            Self::StoreVersionUnsupported => Some(
+                "restore the pre-upgrade backup, or retry with the previous binary \
+                 (see docs/compatibility.md#migration-failure-policy)",
             ),
             Self::Ticket(_) => Some(
                 "check the whole ticket was copied (no truncation/whitespace); if it persists, \
@@ -377,19 +389,35 @@ macro_rules! bail_coded {
     };
 }
 
-/// Walk `err`'s cause chain for the outermost [`CliError`] and return its code.
-/// `None` means no layer attached a code — the long-tail, uncoded case (spec §5.2).
+/// Walk `err`'s cause chain for a stable [`ErrorCode`].
+///
+/// An outermost [`CliError`] wins, including when a [`StoreError`] sits further
+/// down the chain. Otherwise the whole chain is walked with
+/// [`downcast_ref`](std::error::Error::downcast_ref) and
+/// [`StoreError::NewerSchema`] maps to [`ErrorCode::StoreVersionUnsupported`].
+/// No message text is consulted. `None` means no layer attached a code and the
+/// chain is not a newer-store refusal — the long-tail, uncoded case (spec §5.2).
 #[must_use]
 pub fn code_of(err: &anyhow::Error) -> Option<ErrorCode> {
-    err.chain()
+    if let Some(cli_err) = err
+        .chain()
         .find_map(|cause| cause.downcast_ref::<CliError>())
-        .map(|cli_err| cli_err.code.clone())
+    {
+        return Some(cli_err.code.clone());
+    }
+    for cause in err.chain() {
+        if let Some(StoreError::NewerSchema { .. }) = cause.downcast_ref::<StoreError>() {
+            return Some(ErrorCode::StoreVersionUnsupported);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{CliError, CodedResultExt, ErrorCategory, ErrorCode};
     use iroh_rooms_core::event::RejectReason;
+    use iroh_rooms_core::store::StoreError;
     use iroh_rooms_core::ticket::TicketError;
     use iroh_rooms_net::OfflineReason;
 
@@ -423,6 +451,10 @@ mod tests {
         assert_eq!(ErrorCode::NoDiscoveryHint.code(), "no_discovery_hint");
         assert_eq!(ErrorCode::BlobUnavailable.code(), "blob_unavailable");
         assert_eq!(ErrorCode::HashMismatch.code(), "hash_mismatch");
+        assert_eq!(
+            ErrorCode::StoreVersionUnsupported.code(),
+            "store_version_unsupported"
+        );
         assert_eq!(ErrorCode::InvalidRoomId.code(), "invalid_room_id");
         assert_eq!(ErrorCode::InvalidArgument.code(), "invalid_argument");
         assert_eq!(ErrorCode::NoSuchFile.code(), "no_such_file");
@@ -690,6 +722,7 @@ mod tests {
             ErrorCode::WrongIdentity,
             ErrorCode::BlobUnavailable,
             ErrorCode::HashMismatch,
+            ErrorCode::StoreVersionUnsupported,
             ErrorCode::Ticket(TicketError::BadChecksum),
         ] {
             let action = code.next_action();
@@ -767,6 +800,7 @@ mod tests {
             ErrorCode::WrongIdentity,
             ErrorCode::BlobUnavailable,
             ErrorCode::HashMismatch,
+            ErrorCode::StoreVersionUnsupported,
             ErrorCode::Ticket(TicketError::BadChecksum),
         ];
         for code in all_codes {
@@ -782,5 +816,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn store_version_unsupported_is_integrity_exit_4_with_a_pinned_next_action() {
+        assert_eq!(
+            ErrorCode::StoreVersionUnsupported.code(),
+            "store_version_unsupported"
+        );
+        assert_eq!(
+            ErrorCode::StoreVersionUnsupported.category(),
+            ErrorCategory::Integrity
+        );
+        assert_eq!(ErrorCode::StoreVersionUnsupported.exit_code(), 4);
+        assert_eq!(
+            ErrorCode::StoreVersionUnsupported.next_action(),
+            Some(
+                "restore the pre-upgrade backup, or retry with the previous binary \
+                 (see docs/compatibility.md#migration-failure-policy)"
+            )
+        );
+    }
+
+    #[test]
+    fn code_of_maps_newer_schema_and_ignores_other_store_errors() {
+        let newer = anyhow::Error::new(StoreError::NewerSchema {
+            found: 3,
+            supported: 2,
+        });
+        assert_eq!(
+            super::code_of(&newer),
+            Some(ErrorCode::StoreVersionUnsupported)
+        );
+
+        // Same words as the newer-store sentence, but a different variant. The
+        // mapping is the type, not the text.
+        let other = anyhow::Error::new(StoreError::Migration(
+            "database user_version 3 is newer than supported 2; \
+             restore from backup or retry with the previous binary"
+                .into(),
+        ));
+        assert_eq!(super::code_of(&other), None);
+    }
+
+    #[test]
+    fn an_attached_cli_error_wins_over_newer_schema() {
+        let result: Result<(), StoreError> = Err(StoreError::NewerSchema {
+            found: 3,
+            supported: 2,
+        });
+        let err = result.coded(ErrorCode::Internal).unwrap_err();
+        assert_eq!(super::code_of(&err), Some(ErrorCode::Internal));
+    }
+
+    /// `room create` wraps `EventStore::open` in `.with_context` (`room.rs`).
+    /// The code has to come from that real chain, not a hand-built error.
+    #[test]
+    fn code_of_maps_a_real_newer_store_open_wrapped_like_room_create() {
+        use anyhow::Context as _;
+        use iroh_rooms_core::store::EventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rooms.db");
+        EventStore::open(&path).expect("create a current store");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("reopen rooms.db");
+            let current: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read user_version");
+            conn.pragma_update(None, "user_version", current + 1)
+                .expect("stamp a newer user_version");
+        }
+        let opened = EventStore::open(&path)
+            .with_context(|| format!("could not open event store at {}", path.display()));
+        let Err(err) = opened else {
+            panic!("a newer store must be refused");
+        };
+        assert_eq!(
+            super::code_of(&err),
+            Some(ErrorCode::StoreVersionUnsupported)
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.starts_with("could not open event store at "),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("store migration failed: database user_version ")
+                && rendered.contains(" is newer than supported ")
+                && rendered.contains("restore from backup or retry with the previous binary"),
+            "{rendered}"
+        );
     }
 }

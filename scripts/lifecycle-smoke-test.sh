@@ -478,4 +478,36 @@ if write_record; then
 fi
 ok "secret scan rejects secret_key and seed"
 
+refusal_dir="${tmp}/refusal-forms"
+mkdir -p "$refusal_dir"
+printf '%s\n' 'error: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2' \
+  >"${refusal_dir}/rc.stderr"
+accept_newer_store_refusal 1 "${refusal_dir}/rc.stderr" || fail "rc.1-rc.6 form was refused"
+printf '%s\n' 'error: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2; restore from backup or retry with the previous binary' \
+  >"${refusal_dir}/hint.stderr"
+accept_newer_store_refusal 1 "${refusal_dir}/hint.stderr" || fail "#409 form was refused"
+printf '%s\n' \
+  'error[store_version_unsupported]: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2; restore from backup or retry with the previous binary' \
+  'next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)' \
+  >"${refusal_dir}/coded.stderr"
+accept_newer_store_refusal 4 "${refusal_dir}/coded.stderr" || fail "coded form was refused"
+printf '%s\n' \
+  'error[store_version_unsupported]: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2; restore from backup or retry with the previous binary' \
+  >"${refusal_dir}/coded-exit1.stderr"
+if accept_newer_store_refusal 1 "${refusal_dir}/coded-exit1.stderr"; then
+  fail "exit 1 with the coded prefix was accepted"
+fi
+printf '%s\n' \
+  'error[store_version_unsupported]: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2; restore from backup or retry with the previous binary' \
+  >"${refusal_dir}/no-next.stderr"
+if accept_newer_store_refusal 4 "${refusal_dir}/no-next.stderr"; then
+  fail "exit 4 without next: was accepted"
+fi
+printf '%s\n' 'error: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2' \
+  >"${refusal_dir}/uncoded-exit4.stderr"
+if accept_newer_store_refusal 4 "${refusal_dir}/uncoded-exit4.stderr"; then
+  fail "exit 4 uncoded was accepted"
+fi
+ok "newer-store refusal pairs"
+
 printf 'ok lifecycle-smoke-test\n'

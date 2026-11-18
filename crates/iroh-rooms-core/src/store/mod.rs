@@ -141,7 +141,7 @@ impl EventStore {
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the file cannot be opened, or
-    /// [`StoreError::Migration`] if it carries a newer unknown schema version.
+    /// [`StoreError::NewerSchema`] if it carries a newer unknown schema version.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_with(path, &StoreOptions::default())
     }

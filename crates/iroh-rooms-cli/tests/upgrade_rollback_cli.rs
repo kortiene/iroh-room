@@ -293,7 +293,13 @@ fn wal_store_newer_user_version_is_refused_without_changing_rooms_db() {
     cmd(&home)
         .args(["room", "tail", &room_id, "--offline"])
         .assert()
-        .code(1)
+        .code(4)
+        .stderr(predicate::str::starts_with(
+            "error[store_version_unsupported]:",
+        ))
+        .stderr(predicate::str::contains(
+            "next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)",
+        ))
         .stderr(
             predicate::str::is_match(
                 "store migration failed: database user_version [0-9]+ is newer than supported [0-9]+",
@@ -367,7 +373,13 @@ fn delete_journal_store_newer_user_version_is_refused_without_rewriting_header()
     cmd(&home)
         .args(["room", "tail", &room_id, "--offline"])
         .assert()
-        .code(1)
+        .code(4)
+        .stderr(predicate::str::starts_with(
+            "error[store_version_unsupported]:",
+        ))
+        .stderr(predicate::str::contains(
+            "next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)",
+        ))
         .stderr(
             predicate::str::is_match(
                 "store migration failed: database user_version [0-9]+ is newer than supported [0-9]+",

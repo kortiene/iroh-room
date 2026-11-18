@@ -27,8 +27,15 @@ pub enum StoreError {
     /// re-derivation did not equal the row's `event_id` key, a derived column was
     /// out of range, or a stored enum/string was unrecognized (spec §9).
     Integrity(String),
-    /// Schema migration failed (e.g. an unsupported existing `user_version`).
+    /// Schema migration failed for a reason other than a newer `user_version`.
     Migration(String),
+    /// The on-disk `user_version` is newer than this binary supports.
+    NewerSchema {
+        /// The `user_version` read from the database.
+        found: i64,
+        /// The highest `user_version` this binary can open.
+        supported: i64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -38,6 +45,11 @@ impl fmt::Display for StoreError {
             Self::Decode(r) => write!(f, "stored event failed to decode (corruption): {r}"),
             Self::Integrity(msg) => write!(f, "store integrity violation: {msg}"),
             Self::Migration(msg) => write!(f, "store migration failed: {msg}"),
+            Self::NewerSchema { found, supported } => write!(
+                f,
+                "store migration failed: database user_version {found} is newer than supported {supported}; \
+                 restore from backup or retry with the previous binary"
+            ),
         }
     }
 }
@@ -47,7 +59,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Sqlite(e) => Some(e),
             Self::Decode(r) => Some(r),
-            Self::Integrity(_) | Self::Migration(_) => None,
+            Self::Integrity(_) | Self::Migration(_) | Self::NewerSchema { .. } => None,
         }
     }
 }

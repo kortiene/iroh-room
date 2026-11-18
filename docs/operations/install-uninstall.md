@@ -538,6 +538,14 @@ Builds that contain #409 (`7c20e93` on `main`, and later) append
 error: could not open event store at <path>: store migration failed: database user_version N is newer than supported M; restore from backup or retry with the previous binary
 ```
 
+Builds that contain #406, and later, use a stable code and a `next:` line.
+They exit 4:
+
+```text
+error[store_version_unsupported]: could not open event store at <path>: store migration failed: database user_version N is newer than supported M; restore from backup or retry with the previous binary
+next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)
+```
+
 Reinstall the prior binary with the rollback (a) commands so `PREFIX` is
 honored. Then use only the data-restore lines from the Rollback section
 above, which move the directory aside and untar the pre-upgrade backup:

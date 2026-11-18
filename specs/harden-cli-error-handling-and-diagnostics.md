@@ -291,6 +291,7 @@ impl ErrorCode {
             Self::WrongIdentity    => Some("ask the admin to re-issue the invite for your identity id (`identity show`)"),
             Self::BlobUnavailable  => Some("ask a peer that holds the file to run `room tail <ROOM_ID>`, then retry `file fetch`"),
             Self::HashMismatch     => Some("do not trust this file; the reference or a provider may be corrupt — ask for a fresh `file share`"),
+            Self::StoreVersionUnsupported => Some("restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)"),
             Self::Ticket(_)        => Some("check the whole ticket was copied (no truncation/whitespace); if it persists, ask the admin for a fresh `room invite`"),
             Self::Reject(r)        => reject_next_action(*r), // see below
             Self::InvalidArgument | Self::Internal => None,   // context is in the message

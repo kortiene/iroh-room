@@ -8,6 +8,9 @@ where feasible); the **experimental** tier may change on any release.
 ## Unreleased
 
 - Refusing to open a store whose `user_version` is newer than this binary
+  now exits 4 and uses the `store_version_unsupported` code. That refusal
+  previously exited 1.
+- Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the
   refusal now includes a recovery hint to restore from backup or retry with

@@ -178,7 +178,7 @@ pub(crate) fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
 /// Create the schema if absent and stamp `user_version`, idempotently.
 ///
 /// # Errors
-/// [`StoreError::Migration`] if an existing database carries a newer, unknown
+/// [`StoreError::NewerSchema`] if an existing database carries a newer
 /// `user_version`; [`StoreError::Sqlite`] on any DDL failure.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), StoreError> {
     refuse_newer_user_version(conn)?;
@@ -195,12 +195,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StoreError> {
 /// [`apply_pragmas`].
 ///
 /// # Errors
-/// [`StoreError::Migration`] when `user_version` is newer than this binary.
+/// [`StoreError::NewerSchema`] when `user_version` is newer than this binary.
 /// [`StoreError::Sqlite`] when the pragma cannot be read.
 pub(crate) fn refuse_newer_user_version(conn: &Connection) -> Result<(), StoreError> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > USER_VERSION {
-        return Err(StoreError::Migration(newer_user_version_message(current)));
+        return Err(StoreError::NewerSchema {
+            found: current,
+            supported: USER_VERSION,
+        });
     }
     Ok(())
 }
@@ -218,7 +221,7 @@ pub(crate) fn refuse_newer_user_version(conn: &Connection) -> Result<(), StoreEr
 /// empty path is left for the caller to create.
 ///
 /// # Errors
-/// [`StoreError::Migration`] when the probe reads a `user_version` newer than
+/// [`StoreError::NewerSchema`] when the probe reads a `user_version` newer than
 /// this binary.
 pub(crate) fn refuse_newer_user_version_at(path: &Path) -> Result<(), StoreError> {
     if !path.is_file() {
@@ -234,18 +237,12 @@ pub(crate) fn refuse_newer_user_version_at(path: &Path) -> Result<(), StoreError
         return Ok(());
     };
     if current > USER_VERSION {
-        return Err(StoreError::Migration(newer_user_version_message(current)));
+        return Err(StoreError::NewerSchema {
+            found: current,
+            supported: USER_VERSION,
+        });
     }
     Ok(())
-}
-
-/// Pinned prefix, then the recovery hint from `docs/compatibility.md`
-/// (restore from backup, or retry with the previous binary).
-fn newer_user_version_message(current: i64) -> String {
-    format!(
-        "database user_version {current} is newer than supported {USER_VERSION}; \
-         restore from backup or retry with the previous binary"
-    )
 }
 
 /// `PRAGMA user_version` without rewriting the main file or `-wal`.

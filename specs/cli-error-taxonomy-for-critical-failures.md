@@ -283,6 +283,9 @@ pub enum ErrorCode {
     IdentityNotFound,    // secrets not present (run `identity create`)
     RoomNotFound,        // room id not in the local log
 
+    /// The on-disk store `user_version` is newer than this binary supports.
+    StoreVersionUnsupported,
+
     /// Catch-all for an unexpected internal failure (should be rare; a bug signal).
     Internal,
 }
@@ -309,6 +312,7 @@ impl ErrorCode {
             Self::FileTooLarge       => "file_too_large",
             Self::IdentityNotFound   => "identity_not_found",
             Self::RoomNotFound       => "room_not_found",
+            Self::StoreVersionUnsupported => "store_version_unsupported",
             Self::Internal           => "internal",
         }
     }
@@ -380,9 +384,11 @@ stable script contract; the string code is the fine-grained one). Aligned with
 | `1` | `Internal` | unexpected / uncoded internal error | `internal`, any uncoded |
 | `2` | `Usage` | bad input / environment (clap-aligned) | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
 | `3` | `Auth` | authorization / capability denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `wrong_identity`, `peer_unauthorized` |
-| `4` | `Integrity` | crypto / structural rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch` |
+| `4` | `Integrity` | crypto / structural / version rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `store_version_unsupported` |
 | `5` | `Ticket` | ticket decode failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
 | `6` | `Connectivity` | reachability / availability | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
+
+`store_version_unsupported` is exit 4 by analogy with `unknown_schema_version`: both refuse a version this binary does not understand, rather than reporting an internal failure.
 
 The **string code is authoritative** for fine-grained branching; the exit code is the
 coarse contract for `if ! iroh-rooms …; then case $? in …`. Both are pinned by tests.
