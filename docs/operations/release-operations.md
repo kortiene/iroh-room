@@ -548,6 +548,7 @@ environment it sees, and it sets `evidence_grade` true only when `class` is
 `evidence`. A record counts as evidence only when all of these hold:
 
 - `class` is `evidence` and `evidence_grade` is true.
+- `result` is `PASS`.
 - `triple` is one of the four release triples in the table above. A probe
   cell does not count, including one from an ubuntu-22.04 runner.
 - It is the artifact downloaded from a dispatch of the lifecycle workflow on

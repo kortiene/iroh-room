@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# SC2016: the uninstall require_text needle is a single-quoted grep string.
-# The directive stays above the first command so the Rollback and uninstall
-# require_text lines stay adjacent.
-# shellcheck disable=SC2016
 set -euo pipefail
 
 # Automated preflight for the Production Readiness Plan.
@@ -138,6 +134,8 @@ require_text "crates/iroh-rooms-core/tests/fixtures/v1/store_v1_schema.sql" "PRA
 require_text "scripts/build-release-artifacts.sh" "shasum -a 256" "release artifact script writes SHA-256 checksums"
 require_text "docs/operations/release-operations.md" "scripts/build-release-artifacts.sh --version <VERSION>" "release ops documents artifact build command"
 require_text "docs/operations/install-uninstall.md" "Rollback requires" "install docs include rollback procedure"
+# The single quotes are the grep needle, not a shell expansion.
+# shellcheck disable=SC2016
 require_text "docs/operations/install-uninstall.md" 'rm -f "$HOME/.local/bin/iroh-rooms"' "install docs include uninstall command"
 require_text "docs/operations/production-beta-release-notes-template.md" "Known Limitations" "release notes template surfaces limitations"
 require_text "docs/operations/production-beta-release-notes-template.md" "Artifacts And Checksums" "release notes template includes checksums"

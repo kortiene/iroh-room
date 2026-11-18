@@ -82,6 +82,12 @@ GITHUB_WORKFLOW_REF="kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/hea
 if [[ "$(class_of "")" != "evidence" ]]; then
   fail "full dispatch context was not evidence"
 fi
+saved_workflow_ref="$GITHUB_WORKFLOW_REF"
+GITHUB_WORKFLOW_REF="kortiene/iroh-room/.github/workflows/verify.yml@refs/heads/main"
+if [[ "$(class_of "")" != "probe" ]]; then
+  fail "other workflow on main was not probe"
+fi
+GITHUB_WORKFLOW_REF="$saved_workflow_ref"
 PROBE=1
 if [[ "$(class_of "")" != "probe" ]]; then
   fail "--probe did not lower evidence"
@@ -374,10 +380,51 @@ fi
 if [[ "$unexpected_result" != "FAIL (unexpected)" ]]; then
   fail "empty RESULT with exit 0 recorded ${unexpected_result}"
 fi
-if [[ "$unexpected_code" -ne 0 ]]; then
-  fail "successful record write changed exit ${unexpected_code}"
+if [[ "$unexpected_code" -eq 0 ]]; then
+  fail "empty RESULT with exit 0 stayed 0"
 fi
-ok "on_exit does not invent PASS"
+ok "on_exit turns empty RESULT and exit 0 into ${unexpected_code}"
+
+if (
+  # shellcheck disable=SC1090,SC1091
+  source "$SCRIPT"
+  set +e
+  OUT_DIR="${tmp}/pass-exit"
+  mkdir -p "$OUT_DIR"
+  TRIPLE=x86_64-unknown-linux-gnu
+  PRIOR_TAG=v0.1.0-rc.5
+  CANDIDATE_TAG=v0.1.0-rc.6
+  LIFECYCLE_STARTED=1
+  RESULT=PASS
+  FAILED_STEP=""
+  WORK=""
+  STEPS_JSONL="${OUT_DIR}/steps.jsonl"
+  ARCHIVES_JSONL="${OUT_DIR}/archives.jsonl"
+  : >"$STEPS_JSONL"
+  : >"$ARCHIVES_JSONL"
+  step_name=""
+  for step_name in \
+    verify_candidate verify_prior install_prior create_data backup \
+    upgrade write_after_upgrade rollback_a rollback_b uninstall; do
+    record_step_line "$step_name" 0 \
+      "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+      "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+  done
+  true
+  on_exit
+); then
+  pass_code=0
+else
+  pass_code=$?
+fi
+if [[ "$pass_code" -ne 0 ]]; then
+  fail "PASS record write exited ${pass_code}"
+fi
+pass_result="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"])' "${tmp}/pass-exit/lifecycle-x86_64-unknown-linux-gnu.json")"
+if [[ "$pass_result" != "PASS" ]]; then
+  fail "PASS record result is ${pass_result}"
+fi
+ok "on_exit keeps exit 0 when the PASS record write succeeds"
 
 if (
   # shellcheck disable=SC1090,SC1091

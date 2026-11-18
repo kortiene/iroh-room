@@ -38,10 +38,12 @@ on:
         type: string
 
 permissions:
-  contents: read
-  attestations: read
+  contents: read # checkout and gh release download
+  attestations: read # gh attestation verify
 
-# One pair of tags at a time. A second dispatch waits.
+# One pair of tags at a time. The in-progress run keeps going.
+# A second dispatch waits. A third dispatch for the same pair cancels
+# the queued second one.
 concurrency:
   group: lifecycle-${{ inputs.prior_tag }}-${{ inputs.candidate_tag }}
   cancel-in-progress: false
@@ -53,8 +55,8 @@ jobs:
     timeout-minutes: 30
     continue-on-error: ${{ matrix.probe }}
     permissions:
-      contents: read
-      attestations: read
+      contents: read # checkout and gh release download
+      attestations: read # gh attestation verify
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +83,7 @@ jobs:
       PRIOR_TAG: ${{ inputs.prior_tag }}
       CANDIDATE_TAG: ${{ inputs.candidate_tag }}
       TRIPLE: ${{ matrix.triple }}
-      PROBE: ${{ matrix.probe }}
+      MATRIX_PROBE: ${{ matrix.probe }}
     steps:
       - name: Validate tags
         shell: bash
@@ -91,7 +93,9 @@ jobs:
           check_tag() {
             local label="$1"
             local value="$2"
-            if printf '%s\n' "$value" | grep -Eq "$tag_re"; then
+            # Match the whole value. A line-oriented check would accept a
+            # newline-separated extra line.
+            if [[ "$value" =~ $tag_re ]]; then
               return 0
             fi
             printf 'error: %s must match %s (got %s)\n' "$label" "$tag_re" "$value" >&2
@@ -135,7 +139,7 @@ jobs:
             smoke_bash=bash
           fi
           set +e
-          if [[ "$PROBE" == "true" ]]; then
+          if [[ "$MATRIX_PROBE" == "true" ]]; then
             "$smoke_bash" scripts/lifecycle-smoke.sh \
               "$PRIOR_TAG" "$CANDIDATE_TAG" "$TRIPLE" --probe --out "$PWD"
           else
@@ -146,8 +150,9 @@ jobs:
           json="lifecycle-${TRIPLE}.json"
           md="lifecycle-${TRIPLE}.md"
           class=""
+          result=""
           if [[ -f "$json" ]]; then
-            class="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["class"])' "$json")"
+            class="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("class", ""))' "$json")"
             py_code=$?
             if [[ "$py_code" -ne 0 ]]; then
               printf 'error: could not read class from %s\n' "$json" >&2
@@ -156,7 +161,17 @@ jobs:
                 smoke_code=1
               fi
             else
-              printf 'recorded github_ref=%s class=%s\n' "${GITHUB_REF-}" "$class"
+              result="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("result", ""))' "$json")"
+              py_code=$?
+              if [[ "$py_code" -ne 0 ]]; then
+                printf 'error: could not read result from %s\n' "$json" >&2
+                result=""
+                if [[ "$smoke_code" -eq 0 ]]; then
+                  smoke_code=1
+                fi
+              else
+                printf 'recorded github_ref=%s class=%s result=%s\n' "${GITHUB_REF-}" "$class" "$result"
+              fi
             fi
           fi
           if [[ ! -f "$json" || ! -f "$md" ]]; then
@@ -164,14 +179,23 @@ jobs:
             if [[ "$smoke_code" -eq 0 ]]; then
               smoke_code=1
             fi
-          elif [[ -n "$class" ]]; then
-            expect=evidence
-            if [[ "$PROBE" == "true" || "${GITHUB_REF-}" != "refs/heads/main" ]]; then
-              expect=probe
+          else
+            if [[ -n "$class" ]]; then
+              expect=evidence
+              if [[ "$MATRIX_PROBE" == "true" || "${GITHUB_REF-}" != "refs/heads/main" ]]; then
+                expect=probe
+              fi
+              if [[ "$class" != "$expect" ]]; then
+                printf 'error: ref %s matrix_probe=%s recorded class %s, expected %s\n' \
+                  "${GITHUB_REF-}" "$MATRIX_PROBE" "$class" "$expect" >&2
+                if [[ "$smoke_code" -eq 0 ]]; then
+                  smoke_code=1
+                fi
+              fi
             fi
-            if [[ "$class" != "$expect" ]]; then
-              printf 'error: ref %s probe=%s recorded class %s, expected %s\n' \
-                "${GITHUB_REF-}" "$PROBE" "$class" "$expect" >&2
+            # Every cell, including probe cells. Probe jobs stay continue-on-error.
+            if [[ "$result" != "PASS" ]]; then
+              printf 'error: result is %s, expected PASS\n' "$result" >&2
               if [[ "$smoke_code" -eq 0 ]]; then
                 smoke_code=1
               fi
