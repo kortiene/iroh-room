@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local checks for scripts/lifecycle-smoke.sh. Bash 3.2 compatible.
-# Not part of scripts/verify.sh.
+# Invoked from scripts/verify.sh.
 # SC2034: assignments below are inputs to functions defined in the sourced script.
 # shellcheck disable=SC2034
 set -euo pipefail
@@ -390,6 +390,14 @@ if (
   ARCHIVES_JSONL="${tmp}/write-fail-archives.jsonl"
   : >"$STEPS_JSONL"
   : >"$ARCHIVES_JSONL"
+  step_name=""
+  for step_name in \
+    verify_candidate verify_prior install_prior create_data backup \
+    upgrade write_after_upgrade rollback_a rollback_b uninstall; do
+    record_step_line "$step_name" 0 \
+      "2026-11-17T14:00:00-0500" "2026-11-17T19:00:00Z" \
+      "2026-11-17T14:00:01-0500" "2026-11-17T19:00:01Z" "[]"
+  done
   true
   on_exit
 ); then
@@ -400,6 +408,12 @@ fi
 if [[ "$write_fail_code" -eq 0 ]]; then
   fail "failed record write exited 0"
 fi
+python3 -c '
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+if len(rows) != 10 or any(row.get("exit_code") != 0 for row in rows):
+    sys.exit(1)
+' "${tmp}/write-fail-steps.jsonl" || fail "write-failure setup was not 10 successful steps"
 ok "failed record write turns exit 0 into ${write_fail_code}"
 
 if ! grep -F -q "trap 'exit 130' INT" "$SCRIPT"; then
