@@ -55,6 +55,13 @@ ok "rejects a bad tag (exit ${bad_code})"
 # shellcheck disable=SC1090,SC1091
 source "$SCRIPT"
 
+# verify.sh runs under GitHub Actions, which exports these. Without a clear
+# baseline, class_of sees probe, or evidence when the dispatch context matches.
+unset GITHUB_ACTIONS GITHUB_REF GITHUB_EVENT_NAME RUNNER_ENVIRONMENT \
+  GITHUB_REPOSITORY GITHUB_WORKFLOW_REF
+PROBE=0
+CANDIDATE_BINARY=""
+
 if [[ "$(class_of "")" != "local" ]]; then
   fail "plain local class"
 fi
