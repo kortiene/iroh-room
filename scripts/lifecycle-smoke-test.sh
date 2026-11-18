@@ -508,6 +508,30 @@ printf '%s\n' 'error: could not open event store at /tmp/rooms.db: store migrati
 if accept_newer_store_refusal 4 "${refusal_dir}/uncoded-exit4.stderr"; then
   fail "exit 4 uncoded was accepted"
 fi
+# The full coded line plus next: is accepted only at exit 4. The same stderr
+# at any other status must be rejected, including exit 1.
+printf '%s\n' \
+  'error[store_version_unsupported]: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2; restore from backup or retry with the previous binary' \
+  'next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)' \
+  >"${refusal_dir}/coded-next.stderr"
+if accept_newer_store_refusal 1 "${refusal_dir}/coded-next.stderr"; then
+  fail "exit 1 with the coded line and next: was accepted"
+fi
+if accept_newer_store_refusal 0 "${refusal_dir}/coded-next.stderr"; then
+  fail "exit 0 with the coded line and next: was accepted"
+fi
+if accept_newer_store_refusal 2 "${refusal_dir}/coded-next.stderr"; then
+  fail "exit 2 with the coded line and next: was accepted"
+fi
+# Uncoded error: line plus a coded line. The uncoded grep matches, so only
+# the coded-prefix exclusion can reject exit 1.
+printf '%s\n' \
+  'error: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2' \
+  'error[store_version_unsupported]: could not open event store at /tmp/rooms.db: store migration failed: database user_version 3 is newer than supported 2; restore from backup or retry with the previous binary' \
+  >"${refusal_dir}/uncoded-and-coded-exit1.stderr"
+if accept_newer_store_refusal 1 "${refusal_dir}/uncoded-and-coded-exit1.stderr"; then
+  fail "exit 1 with an uncoded error: line and a coded line was accepted"
+fi
 ok "newer-store refusal pairs"
 
 printf 'ok lifecycle-smoke-test\n'

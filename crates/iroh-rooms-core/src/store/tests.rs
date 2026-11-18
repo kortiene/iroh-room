@@ -584,6 +584,17 @@ fn assert_refused_open_leaves_file_unchanged(path: &Path) {
     let err = open_err(path);
     let msg = err.to_string();
     assert_newer_user_version_prefix(&msg);
+    // Checkpointed stores are refused by the path probe
+    // (`refuse_newer_user_version_at`), before the read-write open.
+    assert!(
+        matches!(
+            err,
+            super::StoreError::NewerSchema { found, supported }
+                if found == super::schema::USER_VERSION + 1
+                    && supported == super::schema::USER_VERSION
+        ),
+        "expected NewerSchema from the path probe, got {err:?}"
+    );
 
     let after = std::fs::read(path).expect("read store after refused open");
     let after_header = header_bytes_18_19(&after);

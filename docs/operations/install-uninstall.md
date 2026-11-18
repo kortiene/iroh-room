@@ -521,8 +521,9 @@ mv "$tmp" "${PREFIX}/bin/iroh-rooms"
 "${PREFIX}/bin/iroh-rooms" --version
 ```
 
-**(b) The candidate raised `user_version`.** The older binary refuses the
-store and exits 1. stderr contains `error: could not open event store at <path>: store migration failed: `.
+**(b) The candidate raised `user_version`.** Prior releases exit 1 with one
+of the two uncoded forms. Builds that contain #406, and later, exit 4 with
+the coded form plus a `next:` line. Uncoded stderr contains `error: could not open event store at <path>: store migration failed: `.
 
 `v0.1.0-rc.1` through `v0.1.0-rc.6` have no suffix. `N` is the database
 `user_version` and `M` is the highest version that binary supports:
