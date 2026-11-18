@@ -134,12 +134,70 @@ require_text "crates/iroh-rooms-core/tests/fixtures/v1/store_v1_schema.sql" "PRA
 require_text "scripts/build-release-artifacts.sh" "shasum -a 256" "release artifact script writes SHA-256 checksums"
 require_text "docs/operations/release-operations.md" "scripts/build-release-artifacts.sh --version <VERSION>" "release ops documents artifact build command"
 require_text "docs/operations/install-uninstall.md" "Rollback requires" "install docs include rollback procedure"
+# The single quotes are the grep needle, not a shell expansion.
+# shellcheck disable=SC2016
 require_text "docs/operations/install-uninstall.md" 'rm -f "$HOME/.local/bin/iroh-rooms"' "install docs include uninstall command"
 require_text "docs/operations/production-beta-release-notes-template.md" "Known Limitations" "release notes template surfaces limitations"
 require_text "docs/operations/production-beta-release-notes-template.md" "Artifacts And Checksums" "release notes template includes checksums"
 require_text ".github/ISSUE_TEMPLATE/bug_report.md" "full data-directory backups" "bug template blocks raw local backups"
 require_text "CONTRIBUTING.md" "Production Readiness" "contributing links production readiness"
 require_text "README.md" "Production Readiness" "readme links production readiness"
+require_file "scripts/lifecycle-smoke.sh"
+# The fence under "## Back Up Before Upgrade" and the documented_backup()
+# span must be the same lines, in order. The span starts at the
+# install-uninstall.md cite comment and runs through the line ending in
+# "|| return 1". Drop the function's two-space indent and a trailing
+# " || return 1" before the comparison.
+require_documented_backup_mirror() {
+  local doc="docs/operations/install-uninstall.md"
+  local script="scripts/lifecycle-smoke.sh"
+  local label="documented_backup mirrors the install backup block"
+  local doc_file=""
+  local func_file=""
+
+  doc_file="$(mktemp)"
+  func_file="$(mktemp)"
+
+  if [[ ! -f "$doc" || ! -f "$script" ]]; then
+    record "$label" "FAIL" "missing install doc or lifecycle-smoke.sh"
+    rm -f "$doc_file" "$func_file"
+    return 0
+  fi
+
+  awk '
+    $0 == "## Back Up Before Upgrade" { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^```bash$/ { in_fence = 1; next }
+    in_section && in_fence && /^```$/ { exit }
+    in_section && in_fence && $0 !~ /^[[:space:]]*$/ { print }
+  ' "$doc" >"$doc_file"
+
+  awk '
+    /^documented_backup\(\) \{/ { in_fn = 1; next }
+    in_fn && /^}/ { exit }
+    in_fn && !span && index($0, "docs/operations/install-uninstall.md:252-260") {
+      span = 1
+      next
+    }
+    span { print }
+    span && /\|\| return 1$/ { exit }
+  ' "$script" | sed -e 's/^  //' -e 's/ || return 1$//' >"$func_file"
+
+  if [[ ! -s "$doc_file" || ! -s "$func_file" ]]; then
+    record "$label" "FAIL" "backup block or documented_backup() body not found"
+    rm -f "$doc_file" "$func_file"
+    return 0
+  fi
+
+  if ! diff -q "$doc_file" "$func_file" >/dev/null; then
+    record "$label" "FAIL" "backup block and documented_backup() differ"
+  else
+    record "$label" "PASS" ""
+  fi
+  rm -f "$doc_file" "$func_file"
+  return 0
+}
+require_documented_backup_mirror
 
 RESULTS_MD="archive/spikes/spike-nat/results/results.md"
 if [[ -f "$RESULTS_MD" ]] && ! grep -Fq "pending manual two-host run" "$RESULTS_MD"; then
