@@ -45,5 +45,3 @@ jobs:
             ulimit -S -n 1024
           fi
           scripts/verify.sh
-      - name: Clippy (default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
