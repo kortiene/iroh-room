@@ -272,12 +272,8 @@ fn experimental_sync_paths_resolve() {
     assert!(!name_of::<sync::Outgoing>().is_empty());
     assert!(!name_of::<sync::Window>().is_empty());
     assert!(!name_of::<sync::PeerId>().is_empty());
-    assert!(!name_of::<sync::KeyHistoryChunk>().is_empty());
     // `WireBytes` is a type alias (`Vec<u8>`); it still resolves through the façade.
     assert!(!name_of::<sync::WireBytes>().is_empty());
-    const {
-        assert!(sync::MAX_FRAME_BYTES > 0);
-    }
 
     // `SyncConfig` is a plain value type — constructing its default is offline.
     assert!(!format!("{:?}", sync::SyncConfig::default()).is_empty());
@@ -364,11 +360,8 @@ fn pipe_runtime_helpers_are_pure() {
 #[test]
 fn rotation_builder_is_experimental() {
     assert!(!name_of::<rotation::DistributionError>().is_empty());
-    assert!(!name_of::<rotation::SealError>().is_empty());
-    assert!(!name_of::<rotation::UnreadableReason>().is_empty());
+    assert!(!name_of::<rotation::EncryptedContent>().is_empty());
+    assert!(!name_of::<rotation::MemberKeyDistribution>().is_empty());
+    assert!(!name_of::<rotation::WrappedKeyEntry>().is_empty());
     assert!(!std::any::type_name_of_val(&rotation::build_member_removed_with_rotation).is_empty());
-    assert!(!std::any::type_name_of_val(&rotation::build_content_encrypted).is_empty());
-    assert!(!std::any::type_name_of_val(&rotation::open_encrypted_content).is_empty());
-    assert!(!std::any::type_name_of_val(&rotation::build_key_distribution_content).is_empty());
-    assert!(!std::any::type_name_of_val(&rotation::build_member_key_distribution).is_empty());
 }

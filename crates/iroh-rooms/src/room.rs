@@ -47,8 +47,7 @@ pub use iroh_rooms_core::event::{
     build_room_created,
 };
 pub use iroh_rooms_core::membership::{
-    active_member_warning_crossed, blob_serve_allowed, pipe_connect_allowed, AncestorView,
-    BlobDecision, DenyReason, Ingest, Member, MembershipSnapshot, PipeDecision, Role,
-    RoomMembership, Status, ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS,
+    blob_serve_allowed, pipe_connect_allowed, AncestorView, BlobDecision, DenyReason, Ingest,
+    Member, MembershipSnapshot, PipeDecision, Role, RoomMembership, Status,
 };
 pub use iroh_rooms_core::ticket::{RoomInviteTicket, TicketError};

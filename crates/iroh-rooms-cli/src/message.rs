@@ -730,8 +730,8 @@ fn print_members_status(
 /// `room members --status` (issue #144). Kept as a pure formatter so unit tests
 /// do not need to capture stdout; the `slot`/`slots` pluralization is the only
 /// piece of natural-language variance. `max` is taken from the caller (the
-/// snapshot's `active_member_limit()`, which returns [`MAX_ACTIVE_MEMBERS`]) so
-/// the helper stays trivially testable without constructing a snapshot.
+/// snapshot's `active_member_limit()`) so the helper stays trivially testable
+/// without constructing a snapshot.
 fn active_capacity_line(active: usize, max: usize) -> String {
     let remaining = max.saturating_sub(active);
     let slot = if remaining == 1 { "slot" } else { "slots" };

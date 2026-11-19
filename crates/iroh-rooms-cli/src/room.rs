@@ -605,7 +605,8 @@ mod tests {
     };
     use crate::identity;
     use iroh_rooms::events::EventId;
-    use iroh_rooms::events::{AgentStatus, Content, EncryptedContent, EventType, MessageText};
+    use iroh_rooms::events::{AgentStatus, Content, EventType, MessageText};
+    use iroh_rooms::experimental::rotation::EncryptedContent;
     use iroh_rooms::files::FileShared;
     use iroh_rooms::files::HashRef;
     use iroh_rooms::identity::DeviceBinding;

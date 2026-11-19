@@ -14,18 +14,67 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn manifest_toml() -> String {
-    let path = crate_root().join("Cargo.toml");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("CLI Cargo.toml must exist at {}", path.display()))
+const INTERNAL_PACKAGES: &[&str] = &["iroh-rooms-core", "iroh-rooms-net"];
+
+/// Package names of every dependency `cargo metadata` reports for `manifest`,
+/// including dev-dependencies and renames (`rc = { package = "iroh-rooms-core" }`).
+/// `name` is the package, not the manifest key.
+fn dependency_package_names(manifest: &Path) -> Vec<String> {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("cargo metadata failed to start: {err}"));
+    assert!(
+        output.status.success(),
+        "cargo metadata failed for {}: {}",
+        manifest.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata must be JSON");
+    let manifest_canon = manifest
+        .canonicalize()
+        .unwrap_or_else(|err| panic!("canonicalize {}: {err}", manifest.display()));
+    let package = meta["packages"]
+        .as_array()
+        .expect("packages array")
+        .iter()
+        .find(|pkg| {
+            let path = pkg["manifest_path"].as_str().expect("manifest_path");
+            Path::new(path)
+                .canonicalize()
+                .is_ok_and(|canon| canon == manifest_canon)
+        })
+        .unwrap_or_else(|| panic!("metadata has no package for {}", manifest.display()));
+    package["dependencies"]
+        .as_array()
+        .expect("dependencies array")
+        .iter()
+        .map(|dep| dep["name"].as_str().expect("dependency name").to_owned())
+        .collect()
 }
 
-fn declares_internal_key(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-    trimmed.starts_with("iroh-rooms-core") || trimmed.starts_with("iroh-rooms-net")
+fn internal_dependencies(manifest: &Path) -> Vec<String> {
+    dependency_package_names(manifest)
+        .into_iter()
+        .filter(|name| INTERNAL_PACKAGES.contains(&name.as_str()))
+        .collect()
+}
+
+fn write_dodge_manifest(dir: &Path, body: &str) -> PathBuf {
+    std::fs::create_dir_all(dir.join("src")).expect("temp crate src");
+    std::fs::write(dir.join("src/lib.rs"), "").expect("temp lib");
+    let manifest = dir.join("Cargo.toml");
+    std::fs::write(&manifest, body).expect("temp manifest");
+    manifest
 }
 
 fn names_internal_crate(line: &str) -> bool {
@@ -53,17 +102,52 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn cli_manifest_has_no_direct_internal_dependency() {
-    let toml = manifest_toml();
-    let offending: Vec<&str> = toml
-        .lines()
-        .filter(|line| declares_internal_key(line))
-        .map(str::trim)
-        .collect();
+    let offending = internal_dependencies(&crate_root().join("Cargo.toml"));
     assert!(
         offending.is_empty(),
         "the CLI manifest must not depend on the internal protocol crates directly. \
          Found: {offending:?}"
     );
+}
+
+#[test]
+fn renamed_core_dependency_is_rejected() {
+    let dir = std::env::temp_dir().join(format!(
+        "iroh-rooms-dep-dodge-rename-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let core = crate_root().join("../iroh-rooms-core");
+    let manifest = write_dodge_manifest(
+        &dir,
+        &format!(
+            "[package]\nname = \"dodge-rename\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nrc = {{ package = \"iroh-rooms-core\", path = \"{}\" }}\n",
+            core.display()
+        ),
+    );
+    let found = internal_dependencies(&manifest);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(found, vec!["iroh-rooms-core".to_owned()]);
+}
+
+#[test]
+fn dev_dependency_table_key_is_rejected() {
+    let dir =
+        std::env::temp_dir().join(format!("iroh-rooms-dep-dodge-table-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let net = crate_root().join("../iroh-rooms-net");
+    let manifest = write_dodge_manifest(
+        &dir,
+        &format!(
+            "[package]\nname = \"dodge-table\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [dev-dependencies.iroh-rooms-net]\npath = \"{}\"\n",
+            net.display()
+        ),
+    );
+    let found = internal_dependencies(&manifest);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(found, vec!["iroh-rooms-net".to_owned()]);
 }
 
 #[test]

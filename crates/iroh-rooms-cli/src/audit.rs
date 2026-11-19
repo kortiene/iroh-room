@@ -31,7 +31,6 @@ use iroh_rooms::experimental::session::EndpointId;
 use iroh_rooms::experimental::session::{AuditSink, BlobDenyCause, RejectCause};
 use iroh_rooms::identity::IdentityKey;
 use iroh_rooms::room::RoomId;
-use iroh_rooms::room::ACTIVE_MEMBER_WARNING_THRESHOLD;
 use serde_json::{json, Value};
 
 use crate::clock;
@@ -322,7 +321,10 @@ impl AuditSink for LocalAudit {
                 "active": active,
                 "max": max,
                 "remaining": remaining,
-                "threshold": ACTIVE_MEMBER_WARNING_THRESHOLD,
+                // One below the hard cap the caller passes as `max`
+                // (`MembershipSnapshot::active_member_limit()`). The cap
+                // constant itself is not on the façade: `large_rooms` changes it.
+                "threshold": max.saturating_sub(1),
             }),
         );
         self.stderr

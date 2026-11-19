@@ -7,16 +7,15 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
-- **SDK façade (additive).** Re-export the stable content payloads the CLI
-  already matches (`RoomCreated`, membership payloads, `MessageText`,
-  `AgentStatus`, `EncryptedContent`, `MemberKeyDistribution`,
-  `WrappedKeyEntry`), the active-member cap
-  (`MAX_ACTIVE_MEMBERS`, `ACTIVE_MEMBER_WARNING_THRESHOLD`,
-  `active_member_warning_crossed`), `experimental::session::PathType`,
-  `experimental::pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS`,
-  `experimental::sync::{KeyHistoryChunk, MAX_FRAME_BYTES}`, and the
-  content-encryption builders next to the existing rotation builder under
-  `experimental::rotation`. No existing path was renamed or removed.
+- **SDK façade (additive, CLI-named only).** Stable re-exports:
+  `room::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}`
+  and `events::{MessageText, AgentStatus}`. Experimental re-exports:
+  `session::PathType`, `pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS`, and
+  `rotation::{EncryptedContent, MemberKeyDistribution, WrappedKeyEntry}`.
+  `build_member_removed_with_rotation` was already experimental. The
+  feature-dependent member-cap constants and the encryption builders the CLI
+  does not name are not on the façade. No existing public path was renamed
+  or removed.
 - **CLI:** production code and integration tests import `iroh-rooms` only.
   The binary no longer declares a direct dependency on `iroh-rooms-core` or
   `iroh-rooms-net`.

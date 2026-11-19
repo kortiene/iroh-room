@@ -50,9 +50,9 @@ implemented, so there is nothing further to re-export.
 | RB-SEC-007 | `room::Role` (`Admin`, `Member`, `Agent`) only. No separate agent trust-level type. |
 | RB-SEC-008 | Per-pipe allowlists: `pipes::build_pipe_opened` and `room::pipe_connect_allowed`. No room-level pipe-policy object. |
 | RB-SEC-009 | None. `experimental::blob::BlobStore` stores blobs; it does not encrypt them at rest. |
-| RB-SEC-011 | Experimental only: `experimental::rotation::{build_content_encrypted, open_encrypted_content, SealError, UnreadableReason}` and `events::EncryptedContent`. Not the v0.1 GA shipping configuration (plaintext content, encrypted in transit only). The CLI does not call these builders. |
-| RB-SEC-012 | `experimental::sync::SyncMessage::{WantKeyHistory, KeyHistory}` and `experimental::sync::KeyHistoryChunk`. No CLI paging command. |
-| RB-SEC-013 | `events::MemberKeyDistribution` and `events::WrappedKeyEntry` (the payload shape). No new provenance-id type. |
+| RB-SEC-011 | The CLI display test names `experimental::rotation::EncryptedContent`. The seal/open builders (`build_content_encrypted`, `open_encrypted_content`, `SealError`, `UnreadableReason`) stay in core: the CLI does not name them. v0.1 GA ships plaintext content, encrypted in transit only. |
+| RB-SEC-012 | `experimental::sync::SyncMessage` includes `WantKeyHistory` and `KeyHistory`. `KeyHistoryChunk` is not re-exported; the CLI does not name it. No CLI paging command. |
+| RB-SEC-013 | `experimental::rotation::{MemberKeyDistribution, WrappedKeyEntry}` (the payload shape the CLI can match). No new provenance-id type. The CLI does not construct these structs. |
 | RB-SEC-014 | None beyond the sync engine. No poison-state SDK type. |
 | RB-SEC-015 | None. No blocklist or moderation product type. |
 | RB-SEC-016 | `experimental::session::AuditSink` (and `TracingAudit`). No retention/rotation API. The CLI's `audit.ndjson` writer is CLI-local. |
@@ -99,7 +99,7 @@ expression is `RB-PRD3-001..007`. Their deliverables (`agent.artifact.shared`,
 | `event::ids::EventId` | `events::EventId` |
 | `event::ids::HashRef` | `files::HashRef` and `events::HashRef` |
 | `event::content::{Content, EventType, capability_hash}` | `events::{Content, EventType, capability_hash}` |
-| `event::content::{MessageText, AgentStatus, EncryptedContent, MemberKeyDistribution, WrappedKeyEntry}` | `events::` of the same names |
+| `event::content::{MessageText, AgentStatus}` | `events::{MessageText, AgentStatus}` |
 | `event::content::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}` | `room::` of the same names |
 | `event::content::FileShared` | `files::FileShared` |
 | `event::content::{PipeOpened, PipeClosed}` | `pipes::{PipeOpened, PipeClosed}` |
@@ -114,24 +114,28 @@ expression is `RB-PRD3-001..007`. Their deliverables (`agent.artifact.shared`,
 | `event::{build_room_created, build_member_invited, build_member_joined, build_member_left, build_member_removed}` | `room::` of the same names |
 | `event::constants::*` | `events::constants::*` |
 | `PROTOCOL_VERSION` | `events::PROTOCOL_VERSION` |
-| `membership::{RoomMembership, MembershipSnapshot, Member, Ingest, AncestorView, Role, Status, BlobDecision, PipeDecision, DenyReason, blob_serve_allowed, pipe_connect_allowed, MAX_ACTIVE_MEMBERS, ACTIVE_MEMBER_WARNING_THRESHOLD, active_member_warning_crossed}` | `room::` of the same names |
+| `membership::{RoomMembership, MembershipSnapshot, Member, Ingest, AncestorView, Role, Status, BlobDecision, PipeDecision, DenyReason, blob_serve_allowed, pipe_connect_allowed}` | `room::` of the same names |
 | `ticket::{RoomInviteTicket, TicketError}` | `room::` of the same names |
 
-`ACTIVE_MEMBER_WARNING_THRESHOLD` and `active_member_warning_crossed` used to
-be core-only. The CLI's audit warning and `iroh-rooms-net` both use them, so
-they are re-exported from `room`.
+`MAX_ACTIVE_MEMBERS`, `ACTIVE_MEMBER_WARNING_THRESHOLD`, and
+`active_member_warning_crossed` are not re-exported. The cap is 5 without
+`large_rooms` and 40 with it, so a stable constant would lie. The CLI reads
+`MembershipSnapshot::active_member_limit()` and derives the near-cap warning
+as one below that limit. `iroh-rooms-net` still calls the core function
+internally.
 
 ## Experimental symbols
 
 | Net or core symbol | Façade path |
 |---|---|
 | `store::{EventStore, StoredEvent, InsertOutcome, InsertStats, ParkedRow, StoreError, StoreOptions, SyncStateRow, TrustRow}` | `experimental::store::` |
-| `sync::{SyncConfig, SyncEngine, SyncMessage, SyncError, SyncTransport, Completeness, Severity, TrustDecision, SyncCounters, SyncDigest, KeyHistoryChunk, MAX_FRAME_BYTES, ...}` | `experimental::sync::` |
+| `sync::{SyncConfig, SyncEngine, SyncMessage, SyncError, SyncTransport, Completeness, Severity, TrustDecision, SyncCounters, SyncDigest, ...}` | `experimental::sync::` |
 | `net` session/admission/transport types the CLI names, including `Node`, `NetConfig`, `PathType`, `BootstrapProof`, `AuditSink` | `experimental::session::` |
 | `iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey}` | `experimental::session::` (and `EndpointId` again on `blob` and `pipe_runtime`) |
 | `net::{BlobStore, BlobError, BlobImport, BlobAclView, FetchOutcome}` | `experimental::blob::` |
 | `net` pipe runtime, including `is_loopback_target` and `PIPE_MAX_CONCURRENT_FORWARDS` | `experimental::pipe_runtime::` |
-| `event::{build_member_removed_with_rotation, build_content_encrypted, open_encrypted_content, build_key_distribution_content, build_member_key_distribution, DistributionError, SealError, UnreadableReason}` | `experimental::rotation::` |
+| `event::content::{EncryptedContent, MemberKeyDistribution, WrappedKeyEntry}` | `experimental::rotation::` of the same names |
+| `event::{build_member_removed_with_rotation, DistributionError}` | `experimental::rotation::` |
 
 `PathType` is the classification `Node::peer_paths` returns. The CLI's
 diagnostics block matches it. `classify_remote_info` is not re-exported: its
@@ -144,6 +148,9 @@ argument is `iroh::endpoint::RemoteInfo`, and the CLI does not call it.
 
 These stay public on the internal crate. They were not removed.
 
+- `MAX_ACTIVE_MEMBERS`, `ACTIVE_MEMBER_WARNING_THRESHOLD`, and `active_member_warning_crossed`. The CLI uses `MembershipSnapshot::active_member_limit()` instead. Net still calls the core function.
+- Encryption builders the CLI does not name: `build_content_encrypted`, `open_encrypted_content`, `build_key_distribution_content`, `build_member_key_distribution`, `SealError`, `UnreadableReason`.
+- `sync::message::KeyHistoryChunk` and `sync::MAX_FRAME_BYTES`. `SyncMessage` is re-exported; the CLI does not name the chunk type or the frame cap.
 - `event::cbor` — raw deterministic CBOR. Consumers use `WireEvent` and `validate_wire_bytes`.
 - `sync::sim` — in-memory test harness.
 - Gossip-only net items (`GOSSIP_ALPN`, `GOSSIP_BOOTSTRAP_SEEDS`) and the `gossip_overlay` feature. The shipping CLI and the façade's `experimental` feature keep full-mesh and the cap of 5.
