@@ -1,7 +1,8 @@
 //! Regression guard for RB-SDK-001: the reference CLI consumer names protocol
 //! and network types only through the `iroh_rooms` façade.
 //!
-//! `iroh-rooms-core` and `iroh-rooms-net` stay implementation crates. A direct
+//! `iroh-rooms-core`, `iroh-rooms-net`, `iroh-rooms-crypto`, and
+//! `iroh-rooms-v2-core` stay implementation crates. A direct
 //! `use` or path in the CLI would compile, and would silently put the SDK
 //! coverage claim back to the partial migration this guard exists to keep
 //! closed. `tests/no_direct_iroh_dep.rs` is the sibling guard for the bare
@@ -14,7 +15,12 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-const INTERNAL_PACKAGES: &[&str] = &["iroh-rooms-core", "iroh-rooms-net"];
+const INTERNAL_PACKAGES: &[&str] = &[
+    "iroh-rooms-core",
+    "iroh-rooms-crypto",
+    "iroh-rooms-net",
+    "iroh-rooms-v2-core",
+];
 
 /// Package names of every dependency `cargo metadata` reports for `manifest`,
 /// including dev-dependencies and renames (`rc = { package = "iroh-rooms-core" }`).
@@ -78,7 +84,10 @@ fn write_dodge_manifest(dir: &Path, body: &str) -> PathBuf {
 }
 
 fn names_internal_crate(line: &str) -> bool {
-    line.contains("iroh_rooms_core") || line.contains("iroh_rooms_net")
+    line.contains("iroh_rooms_core")
+        || line.contains("iroh_rooms_crypto")
+        || line.contains("iroh_rooms_net")
+        || line.contains("iroh_rooms_v2_core")
 }
 
 fn rust_files_under(dir: &Path) -> Vec<PathBuf> {

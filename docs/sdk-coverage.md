@@ -52,7 +52,7 @@ implemented, so there is nothing further to re-export.
 | RB-SEC-009 | None. `experimental::blob::BlobStore` stores blobs; it does not encrypt them at rest. |
 | RB-SEC-011 | The CLI display test names `experimental::rotation::EncryptedContent`. The seal/open builders (`build_content_encrypted`, `open_encrypted_content`, `SealError`, `UnreadableReason`) stay in core: the CLI does not name them. v0.1 GA ships plaintext content, encrypted in transit only. |
 | RB-SEC-012 | `experimental::sync::SyncMessage` includes `WantKeyHistory` and `KeyHistory`. `KeyHistoryChunk` is not re-exported; the CLI does not name it. No CLI paging command. |
-| RB-SEC-013 | `experimental::rotation::{MemberKeyDistribution, WrappedKeyEntry}` (the payload shape the CLI can match). No new provenance-id type. The CLI does not construct these structs. |
+| RB-SEC-013 | The CLI matches the `Content::MemberKeyDistribution` variant and never names the `MemberKeyDistribution` or `WrappedKeyEntry` types. Those payload types are re-exported at `experimental::rotation` for a façade consumer. No new provenance-id type. |
 | RB-SEC-014 | None beyond the sync engine. No poison-state SDK type. |
 | RB-SEC-015 | None. No blocklist or moderation product type. |
 | RB-SEC-016 | `experimental::session::AuditSink` (and `TracingAudit`). No retention/rotation API. The CLI's `audit.ndjson` writer is CLI-local. |
