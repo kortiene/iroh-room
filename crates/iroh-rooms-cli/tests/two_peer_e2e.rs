@@ -1576,7 +1576,10 @@ fn admin_removal_reaches_member_and_withholds_new_messages() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("removed:"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("removed-not-a-real-marker:"),
+        "stdout: {stdout}"
+    );
     assert_eq!(
         extract_field(&stdout, "delivered"),
         Some("1 connected peer(s)"),
