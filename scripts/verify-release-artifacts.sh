@@ -11,11 +11,23 @@ set -euo pipefail
 # verifies before it creates a draft.
 #
 # Usage:
-#   scripts/verify-release-artifacts.sh [--dir DIR] [--commit SHA] [--offline] <tag> <triple>
+#   scripts/verify-release-artifacts.sh [--dir DIR] [--commit SHA]
+#     [--expected-run RUN_ID ATTEMPT] [--offline] <tag> <triple>
 #
 # Environment (a flag overrides the matching variable):
 #   IROH_ROOMS_RELEASE_DIR      use this directory instead of downloading
 #   IROH_ROOMS_RELEASE_COMMIT   full 40-hex commit the caller expects
+#
+# Run pin, for every tag except v0.1.0-rc.1 through v0.1.0-rc.5. After
+# gh attestation verify and cosign verify-blob have succeeded, each verified
+# provenance bundle's .predicate.runDetails.metadata.invocationId must equal
+# https://github.com/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>
+# with no normalization. The run id and attempt come from
+# scripts/release-run-pins.txt (one line: "<tag> <run_id> <attempt>"), unless
+# --expected-run is set. That flag overrides only the pin lookup. It does not
+# skip a check. The pin is not read from the GitHub release. rc.1 through
+# rc.5 do not consult the pin file. --offline still exits 1 without checking
+# the pin. python3 decodes the DSSE payload.
 #
 # <tag> is v<VER>, for example v0.1.0-rc.6.
 # <triple> is one of x86_64-apple-darwin, aarch64-apple-darwin,
@@ -54,8 +66,8 @@ set -euo pipefail
 # "PARTIAL: online checks skipped". It never exits 0.
 #
 # Exit codes:
-#   0  checksums, attestations, and the cosign signature all passed
-#   1  download, checksum, attestation, signature, or commit mismatch failed,
+#   0  checksums, attestations, the cosign signature, and the run pin all passed
+#   1  download, checksum, attestation, signature, commit, or run pin failed,
 #      or --offline stopped after the local checks
 #   2  usage error
 #   3  a required tool is missing, gh is not authenticated, or gh is too old
@@ -66,10 +78,11 @@ ISSUER="https://token.actions.githubusercontent.com"
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/verify-release-artifacts.sh [--dir DIR] [--commit SHA] [--offline] <tag> <triple>
+  scripts/verify-release-artifacts.sh [--dir DIR] [--commit SHA] [--expected-run RUN_ID ATTEMPT] [--offline] <tag> <triple>
 
 Verify one Iroh Rooms release archive: the per-archive SHA-256, the GitHub
-build-provenance attestation, and the keyless cosign signature over SHA256SUMS.
+build-provenance attestation, the keyless cosign signature over SHA256SUMS,
+and, for a signed release, the Actions run pin.
 
   <tag>     Release tag, for example v0.1.0-rc.6
   <triple>  x86_64-apple-darwin, aarch64-apple-darwin,
@@ -84,10 +97,25 @@ Options:
                   must equal the peeled commit, and the archive name's 12-hex
                   suffix must equal the first 12 hex of that commit.
                   IROH_ROOMS_RELEASE_COMMIT is the same switch.
-  --offline       Skip online checks (tag peel, gh attestation lookup, cosign).
-                  Prints "PARTIAL: online checks skipped" and exits 1.
-                  This is not a successful verification.
+  --expected-run RUN_ID ATTEMPT
+                  Require invocationId
+                  https://github.com/kortiene/iroh-room/actions/runs/RUN_ID/attempts/ATTEMPT
+                  Overrides scripts/release-run-pins.txt. Does not skip any
+                  check. For a pre-publish run, before that file has a line.
+  --offline       Skip online checks (tag peel, gh attestation lookup, cosign,
+                  and the run pin). Prints "PARTIAL: online checks skipped"
+                  and exits 1. This is not a successful verification.
   -h, --help      Show this help.
+
+Signed releases (every tag except v0.1.0-rc.1 through v0.1.0-rc.5) need one
+line in scripts/release-run-pins.txt, next to this script:
+
+  <tag> <run_id> <attempt>
+
+A missing pin, a malformed line, or a duplicate tag fails the script. After
+gh attestation verify and cosign verify-blob succeed, the script decodes each
+verified provenance bundle and requires .predicate.runDetails.metadata.invocationId
+to equal that URL exactly. rc.1 through rc.5 do not read the pin file.
 
 Two different .sigstore.json files are published with a signed release:
   <archive>.sigstore.json   GitHub attestation bundle (gh attestation verify --bundle)
@@ -100,8 +128,9 @@ cosign v3 or newer. v0.1.0-rc.1 through v0.1.0-rc.5 have checksums and no
 attestation. After authentication, this script fails on those tags at the
 attestation step by design.
 
-Exit codes: 0 passed, 1 verification failed (including --offline), 2 usage,
-3 gh missing, too old, or not authenticated, or cosign missing/too old.
+Exit codes: 0 passed, 1 verification failed (including the run pin and
+--offline), 2 usage, 3 gh missing, too old, or not authenticated, cosign
+missing/too old, or python3 missing when a run pin is required.
 EOF
 }
 
@@ -297,14 +326,18 @@ resolve_tag_commit() {
   fi
 }
 
-# $1 subject, $2 bundle path or empty. Exits on failure.
+# $1 subject, $2 bundle path or empty, $3 label for the run pin.
+# Keeps the verified bundle JSON. Does not read invocationId here.
+# Exits on failure.
 run_attest() {
   local subject="$1"
   local bundle="${2:-}"
-  local attest_log
+  local label="$3"
+  local attest_log attest_err
   attest_log="$(mktemp)"
+  attest_err="$(mktemp)"
   if [[ -n "$bundle" ]]; then
-    printf 'running: gh attestation verify %q --bundle %q --repo %q --cert-identity %q --source-ref %q --source-digest %q --deny-self-hosted-runners\n' \
+    printf 'running: gh attestation verify %q --bundle %q --repo %q --cert-identity %q --source-ref %q --source-digest %q --deny-self-hosted-runners --format json\n' \
       "$subject" "$bundle" "$REPO" "$identity" "$source_ref" "$resolved_commit"
     if gh attestation verify "$subject" \
       --bundle "$bundle" \
@@ -312,26 +345,32 @@ run_attest() {
       --cert-identity "$identity" \
       --source-ref "$source_ref" \
       --source-digest "$resolved_commit" \
-      --deny-self-hosted-runners >"$attest_log" 2>&1; then
-      cat "$attest_log"
-      rm -f "$attest_log"
+      --deny-self-hosted-runners \
+      --format json >"$attest_log" 2>"$attest_err"; then
+      remember_attestation "$label" "$attest_log"
+      rm -f "$attest_log" "$attest_err"
+      echo "attestation signature ok for ${subject}"
       return 0
     fi
   else
-    printf 'running: gh attestation verify %q --repo %q --cert-identity %q --source-ref %q --source-digest %q --deny-self-hosted-runners\n' \
+    printf 'running: gh attestation verify %q --repo %q --cert-identity %q --source-ref %q --source-digest %q --deny-self-hosted-runners --format json\n' \
       "$subject" "$REPO" "$identity" "$source_ref" "$resolved_commit"
     if gh attestation verify "$subject" \
       --repo "$REPO" \
       --cert-identity "$identity" \
       --source-ref "$source_ref" \
       --source-digest "$resolved_commit" \
-      --deny-self-hosted-runners >"$attest_log" 2>&1; then
-      cat "$attest_log"
-      rm -f "$attest_log"
+      --deny-self-hosted-runners \
+      --format json >"$attest_log" 2>"$attest_err"; then
+      remember_attestation "$label" "$attest_log"
+      rm -f "$attest_log" "$attest_err"
+      echo "attestation signature ok for ${subject}"
       return 0
     fi
   fi
+  cat "$attest_err" >&2
   cat "$attest_log" >&2
+  rm -f "$attest_err"
   attest_failed "$subject" "$attest_log"
 }
 
@@ -340,9 +379,221 @@ finish_offline() {
   exit 1
 }
 
+set_expected_url() {
+  expected_url="https://github.com/${REPO}/actions/runs/${expected_run_id}/attempts/${expected_attempt}"
+}
+
+load_pin_file() {
+  local line lineno=0
+  local ptag prid pattempt
+  local found_id="" found_attempt=""
+  local seen_tags=""
+  if [[ ! -f "$pin_file" ]]; then
+    die 1 "no run pin for ${tag}: ${pin_file} is missing"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    line="${line%$'\r'}"
+    if [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    if [[ ! "$line" =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]]; then
+      die 1 "malformed run pin line ${lineno} in ${pin_file}"
+    fi
+    ptag="${BASH_REMATCH[1]}"
+    prid="${BASH_REMATCH[2]}"
+    pattempt="${BASH_REMATCH[3]}"
+    if [[ ! "$ptag" =~ ^v[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+      die 1 "malformed run pin line ${lineno} in ${pin_file}"
+    fi
+    if [[ ! "$prid" =~ ^[1-9][0-9]*$ || ! "$pattempt" =~ ^[1-9][0-9]*$ ]]; then
+      die 1 "malformed run pin line ${lineno} in ${pin_file}"
+    fi
+    case " ${seen_tags} " in
+      *" ${ptag} "*)
+        die 1 "duplicate run pin for ${ptag} in ${pin_file}"
+        ;;
+    esac
+    seen_tags="${seen_tags} ${ptag}"
+    if [[ "$ptag" == "$tag" ]]; then
+      found_id="$prid"
+      found_attempt="$pattempt"
+    fi
+  done <"$pin_file"
+  if [[ -z "$found_id" ]]; then
+    die 1 "no run pin for ${tag} in ${pin_file}"
+  fi
+  expected_run_id="$found_id"
+  expected_attempt="$found_attempt"
+  set_expected_url
+}
+
+require_expected_run() {
+  if [[ "$expected_run_set" -eq 1 ]]; then
+    set_expected_url
+    echo "expected run pin ${expected_url} (--expected-run)"
+    return
+  fi
+  load_pin_file
+  echo "expected run pin ${expected_url}"
+}
+
+read_invocation_ids() {
+  local kind="$1"
+  local path="$2"
+  python3 - "$kind" "$path" <<'PY'
+import base64
+import json
+import sys
+
+kind, path = sys.argv[1], sys.argv[2]
+
+
+def fail(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(1)
+
+
+def invocation_from_bundle(bundle, where):
+    if not isinstance(bundle, dict):
+        fail(where + ": bundle is not a JSON object")
+    envelope = bundle.get("dsseEnvelope")
+    if not isinstance(envelope, dict):
+        fail(where + ": bundle has no dsseEnvelope")
+    payload = envelope.get("payload")
+    if payload is None:
+        fail(where + ": missing dsse payload")
+    if not isinstance(payload, str):
+        fail(where + ": dsse payload is not a string")
+    if payload == "":
+        fail(where + ": empty dsse payload")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except Exception:
+        fail(where + ": dsse payload is not base64")
+    try:
+        statement = json.loads(raw.decode("utf-8"))
+    except Exception:
+        fail(where + ": dsse payload is not JSON")
+    if not isinstance(statement, dict):
+        fail(where + ": dsse payload is not a JSON object")
+    predicate = statement.get("predicate")
+    run_details = predicate.get("runDetails") if isinstance(predicate, dict) else None
+    metadata = run_details.get("metadata") if isinstance(run_details, dict) else None
+    if not isinstance(metadata, dict) or "invocationId" not in metadata:
+        fail(where + ": missing invocationId")
+    invocation = metadata.get("invocationId")
+    if not isinstance(invocation, str) or invocation == "":
+        fail(where + ": missing invocationId")
+    if "\n" in invocation or "\r" in invocation:
+        fail(where + ": invocationId is not a single line")
+    return invocation
+
+
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    fail("attestation JSON is not JSON")
+
+if kind == "bundle":
+    sys.stdout.write(invocation_from_bundle(data, "bundle") + "\n")
+elif kind == "gh":
+    if not isinstance(data, list) or len(data) == 0:
+        fail("no verified attestations")
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            fail("verified attestation %d is not an object" % index)
+        attestation = item.get("attestation")
+        if not isinstance(attestation, dict):
+            fail("verified attestation %d has no attestation" % index)
+        bundle = attestation.get("bundle")
+        invocation = invocation_from_bundle(bundle, "verified attestation %d" % index)
+        sys.stdout.write(invocation + "\n")
+else:
+    fail("unknown bundle kind")
+PY
+}
+
+require_invocation_ids() {
+  local label="$1"
+  local kind="$2"
+  local path="$3"
+  local err ids id id_file
+  err="$(mktemp)"
+  if ! ids="$(read_invocation_ids "$kind" "$path" 2>"$err")"; then
+    local msg
+    msg="$(cat "$err")"
+    rm -f "$err"
+    die 1 "run pin: ${label}: ${msg}"
+  fi
+  rm -f "$err"
+  if [[ -z "$ids" ]]; then
+    die 1 "run pin: ${label}: missing invocationId"
+  fi
+  id_file="$(mktemp)"
+  printf '%s\n' "$ids" >"$id_file"
+  while IFS= read -r id; do
+    if [[ -z "$id" ]]; then
+      rm -f "$id_file"
+      die 1 "run pin: ${label}: missing invocationId"
+    fi
+    # Exact match. The attempts/<n> suffix is part of the pin.
+    if [[ "$id" != "$expected_url" ]]; then
+      rm -f "$id_file"
+      die 1 "run pin mismatch for ${label}: invocationId [${id}] does not equal [${expected_url}]"
+    fi
+  done <"$id_file"
+  rm -f "$id_file"
+}
+
+remember_attestation() {
+  local label="$1"
+  local src="$2"
+  local dest
+  if [[ -z "$attest_dir" ]]; then
+    attest_dir="$(mktemp -d)"
+    : >"${attest_dir}/manifest"
+  fi
+  attest_seq=$((attest_seq + 1))
+  dest="${attest_dir}/${attest_seq}.json"
+  cp "$src" "$dest"
+  printf '%s\t%s\n' "$label" "$dest" >>"${attest_dir}/manifest"
+}
+
+# Payloads are read only after gh attestation verify and cosign have passed.
+# SHA256SUMS.sigstore.json is the cosign message signature. It has no DSSE
+# payload and no invocationId. The SHA256SUMS run pin is the provenance
+# bundle gh attestation verify returned for SHA256SUMS.
+check_verified_run_pins() {
+  local label path
+  if [[ -z "$expected_url" ]]; then
+    die 1 "no run pin for ${tag}"
+  fi
+  if [[ -z "$attest_dir" || ! -f "${attest_dir}/manifest" ]]; then
+    die 1 "run pin: no verified attestations to read"
+  fi
+  while IFS="$(printf '\t')" read -r label path; do
+    if [[ -z "${label:-}" ]]; then
+      continue
+    fi
+    require_invocation_ids "$label" gh "$path"
+  done <"${attest_dir}/manifest"
+  require_invocation_ids "archive bundle ${archive}.sigstore.json" bundle "${archive}.sigstore.json"
+  echo "run pin ok ${expected_url}"
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pin_file="${script_dir}/release-run-pins.txt"
 dir="${IROH_ROOMS_RELEASE_DIR:-}"
 given_commit="${IROH_ROOMS_RELEASE_COMMIT:-}"
 offline=0
+expected_run_set=0
+expected_run_id=""
+expected_attempt=""
+expected_url=""
+attest_dir=""
+attest_seq=0
 asset_names=""
 archive=""
 resolved_commit=""
@@ -352,6 +603,9 @@ workdir=""
 cleanup() {
   if [[ "$owned_workdir" -eq 1 && -n "$workdir" ]]; then
     rm -rf "$workdir"
+  fi
+  if [[ -n "$attest_dir" ]]; then
+    rm -rf "$attest_dir"
   fi
 }
 trap cleanup EXIT
@@ -367,6 +621,16 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die 2 "--commit requires a full 40-hex SHA"
       given_commit="$2"
       shift 2
+      ;;
+    --expected-run)
+      [[ $# -ge 3 ]] || die 2 "--expected-run requires <run_id> <attempt>"
+      expected_run_id="$2"
+      expected_attempt="$3"
+      if [[ ! "$expected_run_id" =~ ^[1-9][0-9]*$ || ! "$expected_attempt" =~ ^[1-9][0-9]*$ ]]; then
+        die 2 "--expected-run requires a numeric run id and an attempt starting at 1"
+      fi
+      expected_run_set=1
+      shift 3
       ;;
     --offline)
       offline=1
@@ -412,6 +676,15 @@ esac
 
 if [[ -n "$given_commit" && ! "$given_commit" =~ ^[0-9a-f]{40}$ ]]; then
   die 2 "--commit must be the full 40-hex source digest (the workflow's GITHUB_SHA)"
+fi
+
+# rc.1 through rc.5 keep the checksum-only path and do not read the pin file.
+# --offline never reaches the provenance bundles, so it does not check the pin.
+if [[ "$offline" -eq 0 ]] && ! is_checksum_only_tag; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    die 3 "python3 is required to check the release run pin"
+  fi
+  require_expected_run
 fi
 
 if [[ "$offline" -eq 0 ]]; then
@@ -514,16 +787,17 @@ verified with gh attestation verify.
 SHA256SUMS.sigstore.json is a cosign keyless signature bundle, verified with
 cosign verify-blob. The SHA256SUMS attestation bundle is not a release asset;
 gh attestation verify SHA256SUMS reads that attestation from GitHub.
+The run pin is checked only after those verifications succeed.
 EOF
 
 echo "verifying build provenance for ${archive}"
-run_attest "$archive"
+run_attest "$archive" "" "archive attestation"
 
 if [[ ! -s "${archive}.sigstore.json" ]]; then
   die 1 "missing ${archive}.sigstore.json (the GitHub attestation bundle for this archive)"
 fi
 echo "verifying ${archive} against ${archive}.sigstore.json"
-run_attest "$archive" "${archive}.sigstore.json"
+run_attest "$archive" "${archive}.sigstore.json" "archive bundle"
 
 if [[ ! -f SHA256SUMS ]]; then
   die 1 "SHA256SUMS is missing. Releases built by the signing workflow publish it next to the archives."
@@ -548,7 +822,7 @@ else
 fi
 
 echo "verifying build provenance for SHA256SUMS"
-run_attest "SHA256SUMS"
+run_attest "SHA256SUMS" "" "SHA256SUMS attestation"
 
 if [[ ! -s SHA256SUMS.sigstore.json ]]; then
   die 1 "missing SHA256SUMS.sigstore.json (the cosign keyless signature bundle, not an attestation bundle)"
@@ -579,4 +853,6 @@ if ! cosign verify-blob SHA256SUMS \
   die 1 "cosign verify-blob failed for SHA256SUMS"
 fi
 
-echo "verified ${tag} ${triple}: checksum, archive attestation, SHA256SUMS attestation, cosign signature (source commit ${resolved_commit})"
+check_verified_run_pins
+
+echo "verified ${tag} ${triple}: checksum, archive attestation, SHA256SUMS attestation, cosign signature, run pin ${expected_url} (source commit ${resolved_commit})"

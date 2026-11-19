@@ -31,3 +31,6 @@ cargo test -p iroh-rooms-crypto --doc
 # Local lifecycle-smoke harness. The networked install is lifecycle-smoke.sh
 # itself and is not run here.
 scripts/lifecycle-smoke-test.sh
+
+# Release run-pin harness. No network. The published-asset check is not run here.
+scripts/verify-release-artifacts-test.sh
