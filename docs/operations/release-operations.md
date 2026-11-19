@@ -347,11 +347,12 @@ gh attestation verify <archive> \
    `<attempt>` are the `sign-and-publish` run. The script reads that file from
    the checkout that contains it. GitHub releases do not record the producing
    run, so the file is the only source. Do not put the pin in
-   `docs/releases/`. Before that line is on the checkout you are using, pass
-   the same values as `--expected-run <run_id> <attempt>`. The flag overrides
-   only the pin lookup.
+   `docs/releases/`. If this tag is not in the file yet, a draft check may pass
+   `--expected-run <run_id> <attempt>`. If the tag is already pinned, that
+   flag must equal the line. It does not replace a pin.
 3. Download the draft assets (or point `--dir` at a directory that has them)
-   and run, for each supported triple:
+   and run, for each supported triple. Run the script from current `main`;
+   a checkout of the tag itself has no pin for that tag.
 
 ```bash
 scripts/verify-release-artifacts.sh --commit <GITHUB_SHA> v<VERSION> <TRIPLE>

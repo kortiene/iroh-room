@@ -23,11 +23,15 @@ set -euo pipefail
 # provenance bundle's .predicate.runDetails.metadata.invocationId must equal
 # https://github.com/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>
 # with no normalization. The run id and attempt come from
-# scripts/release-run-pins.txt (one line: "<tag> <run_id> <attempt>"), unless
-# --expected-run is set. That flag overrides only the pin lookup. It does not
-# skip a check. The pin is not read from the GitHub release. rc.1 through
-# rc.5 do not consult the pin file. --offline still exits 1 without checking
-# the pin. python3 decodes the DSSE payload.
+# scripts/release-run-pins.txt (one line: "<tag> <run_id> <attempt>").
+# --expected-run is allowed only when that file has no line for the tag
+# (a draft, before the pin is committed). If the tag is already pinned, the
+# flag must equal that line or the script exits 1. It never replaces a pin
+# and it does not skip a check. The pin is not read from the GitHub release.
+# rc.1 through rc.5 do not consult the pin file. --offline still exits 1
+# without checking the pin. python3 decodes the DSSE payload. Run the script
+# from a checkout of current main: a checkout of the tag itself has no pin
+# for that tag.
 #
 # <tag> is v<VER>, for example v0.1.0-rc.6.
 # <triple> is one of x86_64-apple-darwin, aarch64-apple-darwin,
@@ -100,8 +104,9 @@ Options:
   --expected-run RUN_ID ATTEMPT
                   Require invocationId
                   https://github.com/kortiene/iroh-room/actions/runs/RUN_ID/attempts/ATTEMPT
-                  Overrides scripts/release-run-pins.txt. Does not skip any
-                  check. For a pre-publish run, before that file has a line.
+                  Allowed only when scripts/release-run-pins.txt has no line
+                  for this tag. If the tag is already pinned, RUN_ID and
+                  ATTEMPT must equal that line. Does not skip any check.
   --offline       Skip online checks (tag peel, gh attestation lookup, cosign,
                   and the run pin). Prints "PARTIAL: online checks skipped"
                   and exits 1. This is not a successful verification.
@@ -112,7 +117,9 @@ line in scripts/release-run-pins.txt, next to this script:
 
   <tag> <run_id> <attempt>
 
-A missing pin, a malformed line, or a duplicate tag fails the script. After
+A missing pin, a malformed line, or a duplicate tag fails the script.
+--expected-run supplies the run only when this tag has no line. If the tag
+is already pinned, the flag must equal that line or the script exits 1. After
 gh attestation verify and cosign verify-blob succeed, the script decodes each
 verified provenance bundle and requires .predicate.runDetails.metadata.invocationId
 to equal that URL exactly. rc.1 through rc.5 do not read the pin file.
@@ -383,13 +390,18 @@ set_expected_url() {
   expected_url="https://github.com/${REPO}/actions/runs/${expected_run_id}/attempts/${expected_attempt}"
 }
 
-load_pin_file() {
+# Parses scripts/release-run-pins.txt. Sets pin_present, and pin_run_id /
+# pin_attempt when this tag has a line. A missing file means the tag is
+# unpinned. A malformed line or a duplicate tag still fails closed.
+read_pin_file() {
   local line lineno=0
   local ptag prid pattempt
-  local found_id="" found_attempt=""
   local seen_tags=""
+  pin_present=0
+  pin_run_id=""
+  pin_attempt=""
   if [[ ! -f "$pin_file" ]]; then
-    die 1 "no run pin for ${tag}: ${pin_file} is missing"
+    return 0
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
@@ -416,26 +428,38 @@ load_pin_file() {
     esac
     seen_tags="${seen_tags} ${ptag}"
     if [[ "$ptag" == "$tag" ]]; then
-      found_id="$prid"
-      found_attempt="$pattempt"
+      pin_present=1
+      pin_run_id="$prid"
+      pin_attempt="$pattempt"
     fi
   done <"$pin_file"
-  if [[ -z "$found_id" ]]; then
-    die 1 "no run pin for ${tag} in ${pin_file}"
-  fi
-  expected_run_id="$found_id"
-  expected_attempt="$found_attempt"
-  set_expected_url
 }
 
 require_expected_run() {
-  if [[ "$expected_run_set" -eq 1 ]]; then
+  read_pin_file
+  operator_supplied=0
+  if [[ "$pin_present" -eq 1 ]]; then
+    if [[ "$expected_run_set" -eq 1 ]]; then
+      if [[ "$expected_run_id" != "$pin_run_id" || "$expected_attempt" != "$pin_attempt" ]]; then
+        die 1 "--expected-run ${expected_run_id} ${expected_attempt} does not equal the pin for ${tag} (${pin_run_id} ${pin_attempt}) in ${pin_file}"
+      fi
+    fi
+    expected_run_id="$pin_run_id"
+    expected_attempt="$pin_attempt"
     set_expected_url
-    echo "expected run pin ${expected_url} (--expected-run)"
+    echo "expected run pin ${expected_url}"
     return
   fi
-  load_pin_file
-  echo "expected run pin ${expected_url}"
+  if [[ "$expected_run_set" -eq 1 ]]; then
+    operator_supplied=1
+    set_expected_url
+    echo "expected run pin ${expected_url} (--expected-run; tag is not in ${pin_file})"
+    return
+  fi
+  if [[ ! -f "$pin_file" ]]; then
+    die 1 "no run pin for ${tag}: ${pin_file} is missing"
+  fi
+  die 1 "no run pin for ${tag} in ${pin_file}"
 }
 
 read_invocation_ids() {
@@ -592,6 +616,10 @@ expected_run_set=0
 expected_run_id=""
 expected_attempt=""
 expected_url=""
+operator_supplied=0
+pin_present=0
+pin_run_id=""
+pin_attempt=""
 attest_dir=""
 attest_seq=0
 asset_names=""
@@ -856,3 +884,6 @@ fi
 check_verified_run_pins
 
 echo "verified ${tag} ${triple}: checksum, archive attestation, SHA256SUMS attestation, cosign signature, run pin ${expected_url} (source commit ${resolved_commit})"
+if [[ "$operator_supplied" -eq 1 ]]; then
+  echo "run pin: operator-supplied (not in release-run-pins.txt)"
+fi

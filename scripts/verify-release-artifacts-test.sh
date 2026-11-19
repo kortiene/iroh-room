@@ -120,11 +120,16 @@ if [[ "${1:-}" == "attestation" && "${2:-}" == "verify" ]]; then
   else
     src="${FIXTURE_ONLINE_ARCHIVE_BUNDLE:?}"
   fi
-  python3 - "$subject" "$src" <<'PY'
-import base64, hashlib, json, sys
-subject, bundle_path = sys.argv[1], sys.argv[2]
+  online=0
+  if [[ -z "$bundle" ]]; then
+    online=1
+  fi
+  python3 - "$subject" "$src" "$online" <<'PY'
+import base64, copy, hashlib, json, os, sys
+subject, bundle_path, online = sys.argv[1], sys.argv[2], sys.argv[3]
 bundle = json.load(open(bundle_path, encoding="utf-8"))
 digest = None
+statement = None
 try:
     payload = bundle["dsseEnvelope"]["payload"]
     if isinstance(payload, str) and payload != "":
@@ -139,6 +144,14 @@ if isinstance(digest, str):
         sys.stderr.write("subject digest mismatch\n")
         sys.exit(1)
 out = [{"attestation": {"bundle": bundle}, "verificationResult": {"statement": {}}}]
+second = os.environ.get("FIXTURE_SECOND_INVOCATION", "")
+if online == "1" and second and isinstance(statement, dict):
+    other = copy.deepcopy(bundle)
+    statement["predicate"]["runDetails"]["metadata"]["invocationId"] = second
+    other["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(statement).encode("utf-8")
+    ).decode("ascii")
+    out.append({"attestation": {"bundle": other}, "verificationResult": {"statement": {}}})
 json.dump(out, sys.stdout)
 sys.stdout.write("\n")
 PY
@@ -335,7 +348,13 @@ fi
 
 prepare_case "override" "v0.1.0-rc.6" "v0.1.0-rc.6 11111111111 1" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0-rc.6" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
-assert_ok "expected-run overrides a conflicting pin file" "$GOOD_URL"
+assert_fail "expected-run conflicting with a pinned tag is rejected" "does not equal the pin"
+assert_absent "expected-run conflicting with a pinned tag is rejected" "run pin: operator-supplied"
+
+prepare_case "flag-matches-pin" "v0.1.0-rc.6" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
+run_case "v0.1.0-rc.6" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
+assert_ok "expected-run that equals the pin passes" "$GOOD_URL"
+assert_absent "expected-run that equals the pin passes" "run pin: operator-supplied"
 
 prepare_case "bad-run" "v0.1.0-rc.6" "$PIN_LINE" "$BAD_RUN_URL" "$BAD_RUN_URL" ok ok
 run_case "v0.1.0-rc.6"
@@ -410,5 +429,60 @@ assert_fail "rc.5 skips the run pin" "v0.1.0-rc.1 through v0.1.0-rc.5"
 assert_absent "rc.5 skips the run pin" "malformed run pin"
 assert_absent "rc.5 skips the run pin" "no run pin"
 assert_absent "rc.5 skips the run pin" "run pin mismatch"
+
+prepare_case "stable" "v0.1.0" "# no pin" "$GOOD_URL" "$GOOD_URL" ok ok
+run_case "v0.1.0"
+assert_fail "v0.1.0 with no pin is rejected" "no run pin"
+
+prepare_case "rc10" "v0.1.0-rc.10" "# no pin" "$GOOD_URL" "$GOOD_URL" ok ok
+run_case "v0.1.0-rc.10"
+assert_fail "v0.1.0-rc.10 with no pin is rejected" "no run pin"
+
+assert_usage() {
+  local label="$1"
+  local needle="$2"
+  shift 2
+  local out="" code=0
+  set +e
+  out="$("$SRC" "$@" 2>&1)"
+  code=$?
+  set -e
+  if [[ "$code" -eq 0 ]]; then
+    fail "${label}: expected a non-zero exit, got 0. output: ${out}"
+  fi
+  if ! printf '%s\n' "$out" | grep -F -q -- "$needle"; then
+    fail "${label}: missing [${needle}] in output: ${out}"
+  fi
+  ok "${label} (exit ${code})"
+}
+
+assert_usage "expected-run 0 is rejected" "attempt starting at 1" \
+  --expected-run 0 1 v0.1.0 "$TRIPLE"
+assert_usage "expected-run abc is rejected" "attempt starting at 1" \
+  --expected-run abc 1 v0.1.0 "$TRIPLE"
+assert_usage "expected-run attempt 0 is rejected" "attempt starting at 1" \
+  --expected-run "$GOOD_RUN" 0 v0.1.0 "$TRIPLE"
+assert_usage "expected-run without an attempt is rejected" "requires <run_id> <attempt>" \
+  --expected-run "$GOOD_RUN"
+
+export FIXTURE_SECOND_INVOCATION="$BAD_RUN_URL"
+prepare_case "two-online" "v0.1.0-rc.6" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
+run_case "v0.1.0-rc.6"
+unset FIXTURE_SECOND_INVOCATION
+assert_fail "online result with one non-matching attestation is rejected" "43791394134"
+assert_absent "online result with one non-matching attestation is rejected" "verified v0.1.0-rc.6"
+
+prepare_case "operator" "v0.1.0" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
+run_case "v0.1.0" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
+assert_ok "operator-supplied pin for an unpinned tag passes" "$GOOD_URL"
+operator_line="run pin: operator-supplied (not in release-run-pins.txt)"
+if ! printf '%s\n' "$CASE_OUT" | grep -F -q -- "$operator_line"; then
+  fail "operator-supplied pin did not print the required line: ${CASE_OUT}"
+fi
+last_line="$(printf '%s\n' "$CASE_OUT" | sed '/^$/d' | tail -n 1)"
+if [[ "$last_line" != "$operator_line" ]]; then
+  fail "operator-supplied final line was [${last_line}]"
+fi
+ok "operator-supplied final line"
 
 printf 'ok verify-release-artifacts-test\n'

@@ -132,8 +132,11 @@ v3.1.4. If `cosign` is missing or older after the `gh` checks have passed, the
 script exits 3 and says the signature was not checked. For every tag except
 `v0.1.0-rc.1` through `v0.1.0-rc.5`, the script then checks the run pin in
 `scripts/release-run-pins.txt` (one line, `<tag> <run_id> <attempt>`, next to
-the script). `--expected-run <RUN_ID> <ATTEMPT>` overrides that lookup and
-does not skip a check. Exit 0 means the checksum, both archive attestation
+the script). Run the script from current `main`; a checkout of the tag
+itself has no pin for that tag. `--expected-run <RUN_ID> <ATTEMPT>` is only
+for a tag that is not in the pin file yet. If the tag is already pinned, the
+flag must equal that line. It does not replace a pin and it does not skip a
+check. Exit 0 means the checksum, both archive attestation
 checks, the online `SHA256SUMS` attestation, `cosign verify-blob`, and the
 run pin all passed. The pin is `.predicate.runDetails.metadata.invocationId`
 on each verified provenance bundle, exactly
