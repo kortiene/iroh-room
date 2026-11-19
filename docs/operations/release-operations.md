@@ -540,6 +540,55 @@ If rollback is not supported:
 - Require users to back up before upgrade.
 - Explain how to restore the backup.
 
+## Lifecycle evidence
+
+Install, upgrade, rollback, and uninstall evidence comes from GitHub-hosted
+runners for all four release triples. That is a release-owner decision. Each
+triple uses the same GitHub-hosted runner image the release workflow builds on:
+
+| Triple | GitHub-hosted runner |
+| --- | --- |
+| `x86_64-apple-darwin` | `macos-15-intel` |
+| `aarch64-apple-darwin` | `macos-15` |
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
+
+The operator procedure is `docs/operations/install-uninstall.md`. Every record
+must disclose that the runner is GitHub-hosted, and must disclose the runner
+image as `ImageOS` and `ImageVersion` (stored on the record as `image_os` and
+`image_version`).
+
+The record's `class` field is self-asserted. The script sets it from the
+environment it sees, and it sets `evidence_grade` true only when `class` is
+`evidence`. A record counts as evidence only when all of these hold:
+
+- `class` is `evidence` and `evidence_grade` is true.
+- `result` is `PASS`.
+- `triple` is one of the four release triples in the table above. A probe
+  cell does not count, including one from an ubuntu-22.04 runner.
+- It is the artifact downloaded from a dispatch of the lifecycle workflow on
+  `main`.
+- Its run id, run attempt, and head SHA match the GitHub API for that run.
+
+A self-asserted `class` of `evidence` is not enough on its own.
+
+```bash
+gh api "repos/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>" \
+  --jq '{id, run_attempt, head_sha, event, head_branch, path}'
+```
+
+`id`, `run_attempt`, and `head_sha` must equal the record's `github_run_id`,
+`github_run_attempt`, and `github_sha`. `event` must be `workflow_dispatch`,
+`head_branch` must be `main`, and `path` must be
+`.github/workflows/lifecycle.yml`.
+
+Priors in `v0.1.0-rc.1` through `v0.1.0-rc.5` are recorded
+`prior_verification: checksum-only`. They are never signature-verified.
+
+`.github/workflows/lifecycle.yml` is in the repository. It is
+`workflow_dispatch` only. It has not been dispatched on `main`. No
+evidence-class lifecycle record exists.
+
 ## Security Reporting
 
 Production Beta must provide a private or controlled security report path.

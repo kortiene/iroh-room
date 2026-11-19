@@ -27,3 +27,7 @@ cargo build -p iroh-rooms --examples
 # (#191 step 2 acceptance: doctests green); only `--doc` exercises it, and
 # the `--all-targets` workspace run above skips doctests entirely.
 cargo test -p iroh-rooms-crypto --doc
+
+# Local lifecycle-smoke harness. The networked install is lifecycle-smoke.sh
+# itself and is not run here.
+scripts/lifecycle-smoke-test.sh

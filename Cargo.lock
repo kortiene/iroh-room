@@ -1989,8 +1989,10 @@ dependencies = [
  "iroh-rooms-core",
  "iroh-rooms-net",
  "predicates",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "zeroize",
@@ -2008,6 +2010,7 @@ dependencies = [
  "iroh-rooms-crypto",
  "proptest",
  "rusqlite",
+ "sha2",
  "tempfile",
  "zeroize",
 ]
