@@ -4,6 +4,8 @@ version = "0.1.0-rc.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
+description = "Iroh Rooms command-line client. Release archives ship the binary; this package is not published to crates.io."
 # Not inherited: this crate links the iroh 1.0 stack, which sets a higher real
 # floor than the workspace (pure-crate) value. See the MSRV note below.
 rust-version = "1.91"
@@ -31,7 +33,7 @@ workspace = true
 # invite` persist and fold the log, while `room send`/`room tail` drive a live
 # `SyncEngine` through `iroh-rooms-net` (spec IR-0105 D2). The membership fold is
 # always compiled (no feature).
-iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
+iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-rc.6", features = ["sync"] }
 # The shipping QUIC event-transport carrier (IR-0005): `room send` and
 # `room tail` bring up a `Node` over it to push/receive `message.text` frames.
 # `gossip_overlay` is deliberately NOT enabled here. It pulls in
@@ -47,13 +49,13 @@ iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
 # fail-closed wedge, which permanently wedges a room with no recovery path.
 # Until both are closed, the shipped CLI keeps the full-mesh topology and the
 # cap of 5. The overlay stays compiled and tested under `--all-features`.
-iroh-rooms-net = { path = "../iroh-rooms-net" }
+iroh-rooms-net = { path = "../iroh-rooms-net", version = "0.1.0-rc.6" }
 # The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
 # (spec AC2). The offline authoring path imports stable items through here
 # instead of `iroh-rooms-core` directly; `experimental` is enabled so the
 # façade's re-exports stay a strict superset of what the CLI already needs
 # (see `docs/sdk-coverage.md`).
-iroh-rooms = { path = "../iroh-rooms", features = ["experimental"] }
+iroh-rooms = { path = "../iroh-rooms", version = "0.1.0-rc.6", features = ["experimental"] }
 # Async runtime for the two online commands (`room send`, `room tail`). The offline
 # commands stay synchronous; each online command enters a scoped runtime (D2).
 # `signal` powers `room tail`'s Ctrl-C shutdown.
@@ -105,7 +107,7 @@ predicates = "3"
 serde_json = "1"
 # Decode the `roomtkt1…` ticket token in CLI e2e tests that cross the
 # CLI-output → ticket-codec boundary (AC2/AC4 from the invite-ticket spec).
-iroh-rooms-core = { path = "../iroh-rooms-core", features = ["store"] }
+iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-rc.6", features = ["store"] }
 # The two-peer integration suite (`tests/two_peer_e2e.rs`, IR-0109) runs an
 # in-test loopback TCP echo target + client for the pipe tier. tokio is already a
 # normal dependency of this crate, so this adds no new resolution — only the

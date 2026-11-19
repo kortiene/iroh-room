@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Not published: depends on the path-only, publish = false `iroh-rooms-crypto`
-# crate (whose dalek deps are pinned to `-rc` versions), so `cargo publish`
-# cannot resolve it. Mirrors the `iroh-rooms-net` / facade posture.
-publish = false
+description = "Deterministic Iroh Rooms event protocol: signing, validation, membership, tickets, and optional store and sync."
+readme = "README.md"
+keywords = ["p2p", "protocol", "cryptography"]
+# Published with the SDK closure. See `docs/sdk-publish.md`. The version stays
+# a pre-release while `ed25519-dalek` is pinned to a `-rc` release.
 
 [lib]
 path = "src/lib.rs"
@@ -75,7 +76,7 @@ rusqlite = { version = "0.42", features = ["bundled"], optional = true }
 # with it and the engine's epoch key store holds its zeroizing `RoomKey`s. The
 # dependency edge is one-way (crypto imports nothing from core), so the crypto
 # crate's `banned_dependencies` purity tripwire is unaffected.
-iroh-rooms-crypto = { path = "../iroh-rooms-crypto" }
+iroh-rooms-crypto = { path = "../iroh-rooms-crypto", version = "0.1.0-rc.6" }
 
 [dev-dependencies]
 # Temporary directory / file creation for file-backed store e2e tests.

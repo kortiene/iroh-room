@@ -8,8 +8,11 @@ version = "0.1.0-rc.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false            # developer preview; crates.io release is a follow-up (spec OQ3)
-description = "Iroh Rooms Rust SDK: a curated, stability-tiered façade over iroh-rooms-core/-net"
+description = "Iroh Rooms Rust SDK: a curated, stability-tiered façade over iroh-rooms-core and iroh-rooms-net."
+readme = "README.md"
+keywords = ["p2p", "sdk", "iroh"]
+# Published SDK entry point. See `docs/sdk-publish.md`. The version stays a
+# pre-release while the dalek pin below the closure is a `-rc` release.
 # MSRV is feature-dependent, so this declares the floor of the DEFAULT (stable,
 # pure) tier and documents the rest. Default features resolve to rustc 1.87 (the
 # RustCrypto/dalek stack behind `iroh-rooms-core`, incl. `ctutils` >= 0.4.4). `experimental` / `full` /
@@ -45,9 +48,9 @@ full = ["experimental"]
 
 [dependencies]
 # Stable tier: pure protocol only, no `store`/`sync` feature.
-iroh-rooms-core = { path = "../iroh-rooms-core" }
+iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-rc.6" }
 # Experimental tier only.
-iroh-rooms-net = { path = "../iroh-rooms-net", optional = true }
+iroh-rooms-net = { path = "../iroh-rooms-net", version = "0.1.0-rc.6", optional = true }
 # Re-exported verbatim from `experimental::{session, blob, pipe_runtime}`
 # (issue #87): `EndpointAddr`/`EndpointId`/`SecretKey`/`Endpoint` are the
 # transport identities the online `Node` API names. Same-type re-export — this

@@ -1,17 +1,16 @@
 [package]
 name = "iroh-rooms-crypto"
-version = "0.1.0"
+version = "0.1.0-rc.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Pure SUITE_V1 content-key primitives (issue #191, spec
-# `content-key-rotation.md` D3/D3a, §7 step 2). Lands as unused, isolated
-# infrastructure like `iroh-rooms-v2-core` did: never published, no consumer
-# wiring in this phase. The rotation lifecycle / wire schema / net / CLI wire
-# to it through separate, later issues (§7 steps 3–6).
-publish = false
-description = "Pure SUITE_V1 content-key crypto for #191: Ed25519→X25519 conversion, HKDF-SHA-256 wrap KDF, AES-256-GCM key wrap and content AEAD. No network, no store, no async."
+description = "SUITE_V1 content-key primitives: Ed25519 to X25519, HKDF-SHA-256 wrap, and AES-256-GCM."
+readme = "README.md"
+keywords = ["cryptography", "aes-gcm", "x25519", "hkdf"]
+# Pre-release on purpose: this crate depends on `ed25519-dalek` `3.0.0-rc.0`.
+# crates.io rejects a non-pre-release that depends on a pre-release. Publish
+# order is documented in `docs/sdk-publish.md`.
 
 [lib]
 path = "src/lib.rs"
