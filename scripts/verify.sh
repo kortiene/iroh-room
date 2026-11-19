@@ -7,6 +7,10 @@ scripts/check-release-environment.sh
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Shipping config: default features, gossip_overlay off. The --all-features
+# run above compiles the gossip-only helpers, so it does not catch dead code
+# on the default build. A failure here fails the required verify check.
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets --all-features
 
 # `cargo test --all-targets` does not run doctests; the SDK façade's stable
