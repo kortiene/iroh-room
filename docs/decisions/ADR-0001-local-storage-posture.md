@@ -3,6 +3,13 @@
 Status: Accepted for Phase 2.5 Production Beta  
 Date: 2026-07-07  
 Owners: Release owner, security reviewer
+Amended: 2026-11-19, GA acceptances (roadmap amendment RB-1.6). Plaintext at
+rest carries into v0.1 GA as a disclosed limitation, per the v0.1 GA P1 note
+in [ROADMAP.md](../../ROADMAP.md): at-rest encryption (`RB-SEC-004` / #266 and
+`RB-SEC-009` / #294) carries into GA as a disclosed ADR-0001 limitation. The
+"Production GA remains blocked unless…" condition below is not rewritten;
+this acceptance is option 2 of that condition. Citable record:
+<https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384>.
 
 ## Context
 
