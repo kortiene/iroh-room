@@ -548,6 +548,7 @@ environment it sees, and it sets `evidence_grade` true only when `class` is
 `evidence`. A record counts as evidence only when all of these hold:
 
 - `class` is `evidence` and `evidence_grade` is true.
+- `result` is `PASS`.
 - `triple` is one of the four release triples in the table above. A probe
   cell does not count, including one from an ubuntu-22.04 runner.
 - It is the artifact downloaded from a dispatch of the lifecycle workflow on
@@ -569,9 +570,9 @@ gh api "repos/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>" \
 Priors in `v0.1.0-rc.1` through `v0.1.0-rc.5` are recorded
 `prior_verification: checksum-only`. They are never signature-verified.
 
-The dispatch workflow is planned. The planned file is
-`.github/workflows/lifecycle.yml`, dispatched on `main`. That file is not in
-this repository; it lands in a later PR.
+`.github/workflows/lifecycle.yml` is in the repository. It is
+`workflow_dispatch` only. It has not been dispatched on `main`. No
+evidence-class lifecycle record exists.
 
 ## Security Reporting
 

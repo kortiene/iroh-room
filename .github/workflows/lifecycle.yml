@@ -1,0 +1,219 @@
+name: lifecycle
+
+# Dispatch-only install, upgrade, rollback, and uninstall smoke.
+#
+# An evidence-class run is workflow_dispatch on refs/heads/main, on a
+# GitHub-hosted runner, for kortiene/iroh-room, with
+# GITHUB_WORKFLOW_REF=kortiene/iroh-room/.github/workflows/lifecycle.yml@refs/heads/main.
+# scripts/lifecycle-smoke.sh reads those values from the runner. This
+# workflow does not overwrite them and does not pass --candidate-binary.
+# The four release cells pass no --probe. The two ubuntu-22.04 cells pass
+# --probe, so their class is probe, and continue-on-error is true there.
+#
+# Any ref other than refs/heads/main is class probe. The ref is printed and
+# stored on the record. A probe class on that ref is not an extra failure.
+#
+# Published release assets only. The smoke script downloads them through
+# scripts/verify-release-artifacts.sh. Under GITHUB_ACTIONS=true the script
+# refuses --candidate-binary.
+#
+# permissions are contents: read and attestations: read on the workflow and
+# on the job. id-token and actions: read are not granted. No job sets
+# environment:. The only token is GH_TOKEN on the smoke step.
+#
+# Records are lifecycle-<triple>.json and lifecycle-<triple>.md. The upload
+# lists those two paths. It does not use a glob: a backup tar contains
+# identity.secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prior_tag:
+        description: "Previous published tag (vX.Y.Z or vX.Y.Z-rc.N), for example v0.1.0-rc.5"
+        required: true
+        type: string
+      candidate_tag:
+        description: "Candidate published tag (vX.Y.Z or vX.Y.Z-rc.N), for example v0.1.0-rc.6"
+        required: true
+        type: string
+
+permissions:
+  contents: read # checkout and gh release download
+  attestations: read # gh attestation verify
+
+# One pair of tags at a time. The in-progress run keeps going.
+# A second dispatch waits. A third dispatch for the same pair cancels
+# the queued second one.
+concurrency:
+  group: lifecycle-${{ inputs.prior_tag }}-${{ inputs.candidate_tag }}
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    name: ${{ matrix.runner }} ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.probe }}
+    permissions:
+      contents: read # checkout and gh release download
+      attestations: read # gh attestation verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+            probe: false
+          - runner: macos-15
+            triple: aarch64-apple-darwin
+            probe: false
+          - runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+            probe: false
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            probe: false
+          - runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            probe: true
+          - runner: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+            probe: true
+    env:
+      PRIOR_TAG: ${{ inputs.prior_tag }}
+      CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+      TRIPLE: ${{ matrix.triple }}
+      MATRIX_PROBE: ${{ matrix.probe }}
+    steps:
+      - name: Validate tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          check_tag() {
+            local label="$1"
+            local value="$2"
+            # Match the whole value. A line-oriented check would accept a
+            # newline-separated extra line.
+            if [[ "$value" =~ $tag_re ]]; then
+              return 0
+            fi
+            printf 'error: %s must match %s (got %s)\n' "$label" "$tag_re" "$value" >&2
+            return 1
+          }
+          check_tag prior_tag "$PRIOR_TAG"
+          check_tag candidate_tag "$CANDIDATE_TAG"
+          if [[ "$PRIOR_TAG" == "$CANDIDATE_TAG" ]]; then
+            printf 'error: prior_tag and candidate_tag must differ\n' >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      # macOS images keep bash 3.2 at /bin/bash. The smoke script is invoked
+      # with that binary there. shell: bash is the step shell; on Linux it
+      # is also the interpreter for the script.
+      - name: Lifecycle smoke
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          printf 'github_ref=%s\n' "${GITHUB_REF-}"
+          printf 'github_event_name=%s\n' "${GITHUB_EVENT_NAME-}"
+          printf 'github_repository=%s\n' "${GITHUB_REPOSITORY-}"
+          printf 'github_workflow_ref=%s\n' "${GITHUB_WORKFLOW_REF-}"
+          printf 'runner_environment=%s\n' "${RUNNER_ENVIRONMENT-}"
+          printf 'github_actions=%s\n' "${GITHUB_ACTIONS-}"
+          if [[ "$(uname -s)" == "Darwin" ]]; then
+            smoke_bash=/bin/bash
+          else
+            smoke_bash=bash
+          fi
+          set +e
+          if [[ "$MATRIX_PROBE" == "true" ]]; then
+            "$smoke_bash" scripts/lifecycle-smoke.sh \
+              "$PRIOR_TAG" "$CANDIDATE_TAG" "$TRIPLE" --probe --out "$PWD"
+          else
+            "$smoke_bash" scripts/lifecycle-smoke.sh \
+              "$PRIOR_TAG" "$CANDIDATE_TAG" "$TRIPLE" --out "$PWD"
+          fi
+          smoke_code=$?
+          json="lifecycle-${TRIPLE}.json"
+          md="lifecycle-${TRIPLE}.md"
+          class=""
+          result=""
+          if [[ -f "$json" ]]; then
+            class="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("class", ""))' "$json")"
+            py_code=$?
+            if [[ "$py_code" -ne 0 ]]; then
+              printf 'error: could not read class from %s\n' "$json" >&2
+              class=""
+              if [[ "$smoke_code" -eq 0 ]]; then
+                smoke_code=1
+              fi
+            else
+              result="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("result", ""))' "$json")"
+              py_code=$?
+              if [[ "$py_code" -ne 0 ]]; then
+                printf 'error: could not read result from %s\n' "$json" >&2
+                result=""
+                if [[ "$smoke_code" -eq 0 ]]; then
+                  smoke_code=1
+                fi
+              else
+                printf 'recorded github_ref=%s class=%s result=%s\n' "${GITHUB_REF-}" "$class" "$result"
+              fi
+            fi
+          fi
+          if [[ ! -f "$json" || ! -f "$md" ]]; then
+            printf 'error: missing lifecycle record for %s\n' "$TRIPLE" >&2
+            if [[ "$smoke_code" -eq 0 ]]; then
+              smoke_code=1
+            fi
+          else
+            if [[ -z "$class" ]]; then
+              printf 'error: class missing\n' >&2
+              if [[ "$smoke_code" -eq 0 ]]; then
+                smoke_code=1
+              fi
+            else
+              expect=evidence
+              if [[ "$MATRIX_PROBE" == "true" || "${GITHUB_REF-}" != "refs/heads/main" ]]; then
+                expect=probe
+              fi
+              if [[ "$class" != "$expect" ]]; then
+                printf 'error: ref %s matrix_probe=%s recorded class %s, expected %s\n' \
+                  "${GITHUB_REF-}" "$MATRIX_PROBE" "$class" "$expect" >&2
+                if [[ "$smoke_code" -eq 0 ]]; then
+                  smoke_code=1
+                fi
+              fi
+            fi
+            # Every cell, including probe cells. Probe jobs stay continue-on-error.
+            if [[ "$result" != "PASS" ]]; then
+              printf 'error: result is %s, expected PASS\n' "$result" >&2
+              if [[ "$smoke_code" -eq 0 ]]; then
+                smoke_code=1
+              fi
+            fi
+          fi
+          exit "$smoke_code"
+
+      - name: Upload lifecycle record
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lifecycle-${{ matrix.runner }}-${{ matrix.triple }}
+          if-no-files-found: warn
+          path: |
+            lifecycle-${{ matrix.triple }}.json
+            lifecycle-${{ matrix.triple }}.md
