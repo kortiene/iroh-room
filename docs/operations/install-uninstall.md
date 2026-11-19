@@ -340,8 +340,10 @@ backup tar are created in the working directory. The tar contains
 Record the checkout before `cd`. After that, `scripts/verify-release-artifacts.sh`
 is not in the working directory. Later blocks use
 `${WORK:?set WORK first (see above)}` and, when they call a repository
-script, `${REPO:?set REPO first (see above)}`. An unset value stops the
-shell, including an interactive one.
+script, `${REPO:?set REPO first (see above)}`. When `WORK` or `REPO` is unset,
+bash writes an error to stderr and that command fails. A non-interactive shell
+exits. An interactive shell (`bash -i`) stays open, and only that command
+fails.
 
 ```bash
 REPO="$(git rev-parse --show-toplevel)"
@@ -475,7 +477,10 @@ if pgrep -x iroh-rooms >/dev/null 2>&1; then
   exit 1
 fi
 data="${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}"
-[[ -f "${data}/rooms.db" ]] || exit 1
+if [[ ! -f "${data}/rooms.db" ]]; then
+  printf 'error: %s is missing; sqlite3 would create an empty database\n' "${data}/rooms.db" >&2
+  exit 1
+fi
 sqlite3 "${data}/rooms.db" "PRAGMA wal_checkpoint(TRUNCATE);"
 if [[ -e "${data}/rooms.db-wal" ]]; then
   printf '%s still exists after checkpoint\n' "${data}/rooms.db-wal" >&2
@@ -597,6 +602,7 @@ only when `class` is `evidence`, and false for every other class.
 
 local / probe / unreleased: developer or diagnostic run; not GA evidence for #265, #293 or #347
 
-The workflow file named by that `GITHUB_WORKFLOW_REF` is planned and is not in
-this repository yet. See Lifecycle evidence in
-`docs/operations/release-operations.md` for what counts as evidence.
+`.github/workflows/lifecycle.yml` is `workflow_dispatch` only and has not been
+dispatched on `main`. No evidence-class lifecycle record exists. See Lifecycle
+evidence in `docs/operations/release-operations.md` for what counts as
+evidence.

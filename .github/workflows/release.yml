@@ -39,8 +39,9 @@ name: release
 #
 # The draft is never published here. The release owner publishes it, and
 # immutable releases reject a later overwrite. Nothing passes --clobber.
-# There is no tag ruleset, so before any release write the publish job checks
-# that refs/tags/v<VER> still peels to GITHUB_SHA.
+# The `release-tags` ruleset now restricts v* tags. Before any release write
+# the publish job still checks that refs/tags/v<VER> peels to GITHUB_SHA.
+# That publish-time tag peel check stays as defence in depth.
 #
 # id-token and attestations are granted only on sign-and-publish, after that
 # job re-verifies the archive bytes, the .sha256 lines, SHA256SUMS, and that
@@ -548,10 +549,11 @@ jobs:
             exit 1
           fi
 
-          # No tag ruleset: the tag can move between build and publish. Peel
-          # annotated tags to the commit and refuse anything other than this
-          # SHA before signing. The upload step peels again as the last read
-          # before it creates or uploads.
+          # The `release-tags` ruleset now restricts v* tags. The publish-time
+          # tag peel check stays as defence in depth: peel annotated tags to
+          # the commit and refuse anything other than this SHA before signing.
+          # The upload step peels again as the last read before it creates or
+          # uploads.
           ref_type="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.type)"
           ref_sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.sha)"
           case "$ref_type" in
