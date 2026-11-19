@@ -13,6 +13,11 @@
 //! malformed frame is the engine's logged drop, not a transport crash, spec §6).
 //! The only structural check here is the [`MAX_FRAME_BYTES`] guard, which denies
 //! a peer that claims an enormous frame before any allocation of that size.
+//! That check is [`decode_length_prefix`]: a plain synchronous decode of a
+//! length-prefixed buffer. [`read_frame`] calls it on the 4-byte prefix before
+//! it allocates, then reads exactly the declared number of body bytes. The same
+//! function accepts a whole buffer (prefix and body, or a hostile prefix with
+//! no body) so it can be fuzzed without a QUIC stream.
 
 use iroh::endpoint::{RecvStream, SendStream};
 
@@ -84,11 +89,84 @@ pub async fn write_frame(stream: &mut SendStream, body: &[u8]) -> Result<(), Fra
     Ok(())
 }
 
+/// One synchronous look at a length-prefixed buffer.
+///
+/// [`decode_length_prefix`] never allocates. A declared length above
+/// [`MAX_FRAME_BYTES`] is [`FrameError::Oversized`] before any body byte is
+/// copied. [`read_frame`] only allocates after this returns an in-range length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedFrame<'a> {
+    /// `input` was empty: a clean end at a frame boundary.
+    ///
+    /// [`read_frame`] maps a clean stream end to `Ok(None)` before calling
+    /// [`decode_length_prefix`], so the stream path does not observe this
+    /// variant. An empty buffer passed to the synchronous decoder does.
+    Empty,
+    /// The prefix is in range, but `input` does not yet contain `len` body bytes.
+    ///
+    /// No body buffer was allocated. [`read_frame`] treats this as "read exactly
+    /// `len` more bytes from the stream".
+    Incomplete {
+        /// Declared body length, already checked against [`MAX_FRAME_BYTES`].
+        len: u32,
+    },
+    /// The first complete frame's body.
+    ///
+    /// Bytes after this frame are not part of the result. A later frame in the
+    /// same buffer is left for the caller; [`read_frame`] never hands a buffer
+    /// that contains more than one prefix, because it reads the body from the
+    /// stream itself.
+    Body(&'a [u8]),
+}
+
+/// Decode one length-prefixed frame from `input`.
+///
+/// This is the synchronous core of [`read_frame`]:
+///
+/// * empty input → [`DecodedFrame::Empty`] (clean end at a frame boundary)
+/// * a short non-empty prefix (1–3 bytes) → [`FrameError::Truncated`]
+/// * a declared length above [`MAX_FRAME_BYTES`] → [`FrameError::Oversized`],
+///   and the following bytes are not copied
+/// * an in-range prefix whose body is not fully present →
+///   [`DecodedFrame::Incomplete`]
+/// * a complete prefix and body → [`DecodedFrame::Body`] of exactly the
+///   declared bytes
+///
+/// # Errors
+/// [`FrameError::Truncated`] when a non-empty buffer does not contain a full
+/// 4-byte prefix, or [`FrameError::Oversized`] when the declared length exceeds
+/// [`MAX_FRAME_BYTES`]. A short body is [`DecodedFrame::Incomplete`], not an
+/// error: unlike [`read_frame`], this function cannot tell "the stream ended"
+/// from "more bytes might arrive".
+pub fn decode_length_prefix(input: &[u8]) -> Result<DecodedFrame<'_>, FrameError> {
+    if input.is_empty() {
+        return Ok(DecodedFrame::Empty);
+    }
+    if input.len() < PREFIX_LEN {
+        return Err(FrameError::Truncated);
+    }
+    let mut raw = [0u8; PREFIX_LEN];
+    raw.copy_from_slice(&input[..PREFIX_LEN]);
+    let declared = u32::from_be_bytes(raw);
+    if declared > MAX_FRAME_BYTES {
+        return Err(FrameError::Oversized { declared });
+    }
+    let len = declared as usize;
+    let rest = &input[PREFIX_LEN..];
+    if rest.len() < len {
+        return Ok(DecodedFrame::Incomplete { len: declared });
+    }
+    Ok(DecodedFrame::Body(&rest[..len]))
+}
+
 /// Read one length-prefixed frame from `stream`.
 ///
 /// Returns `Ok(None)` on a **clean** end-of-stream (the peer finished the stream
 /// at a frame boundary). Returns the raw, un-decoded body bytes on success — the
 /// caller hands them verbatim to the engine.
+///
+/// The length check is [`decode_length_prefix`] on the 4-byte prefix. The body
+/// is allocated only after that call accepts the length.
 ///
 /// # Errors
 /// [`FrameError::Oversized`] if the declared length exceeds [`MAX_FRAME_BYTES`],
@@ -107,10 +185,15 @@ pub async fn read_frame(stream: &mut RecvStream) -> Result<Option<Vec<u8>>, Fram
         Err(e) => return Err(FrameError::Io(e.to_string())),
     }
 
-    let len = u32::from_be_bytes(prefix);
-    if len > MAX_FRAME_BYTES {
-        return Err(FrameError::Oversized { declared: len });
-    }
+    // Four prefix bytes: `Oversized`, `Incomplete { len }` for a non-zero
+    // in-range length, or `Body(&[])` when the declared length is zero.
+    // `read_frame` still performs the zero-length `read_exact` so a reset
+    // stream surfaces as `Io` the same way it did before the split.
+    let len = match decode_length_prefix(&prefix)? {
+        DecodedFrame::Incomplete { len } => len,
+        DecodedFrame::Body(_) => 0,
+        DecodedFrame::Empty => return Err(FrameError::Truncated),
+    };
 
     let mut body = vec![0u8; len as usize];
     match stream.read_exact(&mut body).await {
@@ -122,7 +205,7 @@ pub async fn read_frame(stream: &mut RecvStream) -> Result<Option<Vec<u8>>, Fram
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameError, MAX_FRAME_BYTES};
+    use super::{decode_length_prefix, DecodedFrame, FrameError, MAX_FRAME_BYTES, PREFIX_LEN};
 
     #[test]
     fn max_frame_bytes_is_one_mib() {
@@ -164,6 +247,123 @@ mod tests {
         assert!(
             io_err.contains("broken pipe"),
             "Io must include the reason: {io_err}"
+        );
+    }
+
+    /// Prefix-only classification [`read_frame`] relies on: the stream path
+    /// calls [`decode_length_prefix`] with exactly four bytes.
+    #[test]
+    fn prefix_only_buffer_matches_what_read_frame_classifies() {
+        assert_eq!(
+            decode_length_prefix(&0u32.to_be_bytes()).expect("zero length"),
+            DecodedFrame::Body(&[])
+        );
+        assert_eq!(
+            decode_length_prefix(&4u32.to_be_bytes()).expect("in-range length"),
+            DecodedFrame::Incomplete { len: 4 }
+        );
+        let err =
+            decode_length_prefix(&(MAX_FRAME_BYTES + 1).to_be_bytes()).expect_err("over the cap");
+        assert!(
+            matches!(err, FrameError::Oversized { declared } if declared == MAX_FRAME_BYTES + 1),
+            "expected Oversized, got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_empty_is_clean_end() {
+        assert_eq!(
+            decode_length_prefix(b"").expect("empty"),
+            DecodedFrame::Empty
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_short_prefix_is_truncated() {
+        for n in 1..PREFIX_LEN {
+            let err = decode_length_prefix(&vec![0xA5; n]).expect_err("short prefix");
+            assert!(
+                matches!(err, FrameError::Truncated),
+                "len {n}: expected Truncated, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_length_prefix_round_trips_a_body() {
+        let body = b"hello";
+        let mut input = Vec::new();
+        let len = u32::try_from(body.len()).expect("body fits u32");
+        input.extend_from_slice(&len.to_be_bytes());
+        input.extend_from_slice(body);
+        assert_eq!(
+            decode_length_prefix(&input).expect("frame"),
+            DecodedFrame::Body(body)
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_ignores_bytes_after_the_frame() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(0xAB);
+        input.extend_from_slice(b"next-frame");
+        assert_eq!(
+            decode_length_prefix(&input).expect("first frame"),
+            DecodedFrame::Body(&[0xAB])
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_zero_length_with_trailing_bytes_is_empty_body() {
+        let mut input = 0u32.to_be_bytes().to_vec();
+        input.extend_from_slice(b"next-frame");
+        assert_eq!(
+            decode_length_prefix(&input).expect("empty body"),
+            DecodedFrame::Body(&[])
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_short_body_is_incomplete() {
+        // Claim 50 bytes, supply 10. Must not allocate the declared length:
+        // the result borrows `input` and only reports the declared length.
+        let mut input = 50u32.to_be_bytes().to_vec();
+        input.extend_from_slice(&[0xAB; 10]);
+        assert_eq!(
+            decode_length_prefix(&input).expect("short body"),
+            DecodedFrame::Incomplete { len: 50 }
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_exact_cap_without_body_is_incomplete() {
+        let prefix = MAX_FRAME_BYTES.to_be_bytes();
+        assert_eq!(
+            decode_length_prefix(&prefix).expect("at the cap"),
+            DecodedFrame::Incomplete {
+                len: MAX_FRAME_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_rejects_oversized_prefix_with_a_trailing_payload() {
+        let mut input = (MAX_FRAME_BYTES + 1).to_be_bytes().to_vec();
+        input.extend_from_slice(b"not-part-of-an-allocated-body");
+        let err = decode_length_prefix(&input).expect_err("over the cap");
+        assert!(
+            matches!(err, FrameError::Oversized { declared } if declared == MAX_FRAME_BYTES + 1),
+            "expected Oversized, got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_length_prefix_rejects_u32_max_length() {
+        let err = decode_length_prefix(&u32::MAX.to_be_bytes()).expect_err("u32::MAX");
+        assert!(
+            matches!(err, FrameError::Oversized { declared } if declared == u32::MAX),
+            "expected Oversized of u32::MAX, got {err}"
         );
     }
 }
