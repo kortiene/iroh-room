@@ -60,7 +60,14 @@ jobs:
           - frame_length_prefix
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          persist-credentials: false
+      # Pinned date, not the floating `nightly` channel. A floating toolchain
+      # moved clippy with no code change (see verify.yml). This is the
+      # 2026-11-18 nightly.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-18
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz

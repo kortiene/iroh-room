@@ -11,7 +11,7 @@ workflow is `.github/workflows/fuzz.yml`. That workflow is not a required check.
 | `wire_event_decode` | `WireEvent::decode` |
 | `signed_event_decode` | `SignedEvent::decode` |
 | `sync_message_decode` | `SyncMessage::decode` |
-| `room_invite_ticket` | `RoomInviteTicket::from_str` on valid UTF-8 |
+| `room_invite_ticket` | `RoomInviteTicket::from_str`, twice: the raw UTF-8 token, and the same bytes wrapped as a CBOR body under a valid 4-byte BLAKE3 checksum |
 | `frame_length_prefix` | `decode_length_prefix` in `crates/iroh-rooms-net/src/frame.rs` |
 
 `read_frame` calls `decode_length_prefix` on the 4-byte length prefix before it
@@ -61,7 +61,15 @@ Crashes are files under `fuzz/artifacts/<target>/`.
 `room_invite_ticket` was started with the same `-max_total_time=300`. libFuzzer
 reported 502 seconds (505 seconds of wall clock) and then exited 0. The other
 four stopped at 301 seconds. No target wrote a crash artifact, and no decoder
-bug was fixed from this run.
+bug was found in this run.
+
+That `room_invite_ticket` run fed raw bytes to `from_str`. A mutated token dies
+at the 4-byte BLAKE3 checksum, so those executions did not reach the CBOR body
+parser. The harness now also wraps the fuzz bytes as `version || body` with a
+checksum that matches, and calls `from_str` on that token, so the body parser
+runs. The numbers in the table above are from the earlier raw-token run; they
+do not measure the wrapped path. `PipeHello::decode` and the post-decryption
+parse are not targets.
 
 `frame_length_prefix` reached coverage 29 and a 5-entry corpus within the
 first moments and stayed there. That matches the function: a 4-byte length, a

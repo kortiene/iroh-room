@@ -5,6 +5,13 @@ is its own Cargo workspace (`[workspace] members = ["."]`), and the root
 workspace `exclude`s it, so `cargo test --workspace` and stable clippy never
 build it.
 
+`fuzz/Cargo.lock` stays in sync with the root `Cargo.lock`: copy the root lock
+here, then add only `libfuzzer-sys`, `arbitrary`, and `jobserver`.
+
+Seeds under `fuzz/seeds/` were produced from `build_room_created`,
+`SyncMessage::encode`, and `RoomInviteTicket`'s `Display`, using fixed test
+keys, plus a few hand-written malformed prefixes.
+
 Targets:
 
 | Target | Entry point |
@@ -12,7 +19,7 @@ Targets:
 | `wire_event_decode` | `WireEvent::decode` |
 | `signed_event_decode` | `SignedEvent::decode` |
 | `sync_message_decode` | `SyncMessage::decode` |
-| `room_invite_ticket` | `RoomInviteTicket::from_str` (valid UTF-8 only) |
+| `room_invite_ticket` | `RoomInviteTicket::from_str` on the raw UTF-8 token, and again after the bytes are wrapped as a CBOR body with a valid 4-byte BLAKE3 checksum |
 | `frame_length_prefix` | `decode_length_prefix` (`read_frame` calls this) |
 
 ## Run locally

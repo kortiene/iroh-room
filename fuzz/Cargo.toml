@@ -12,6 +12,10 @@ libfuzzer-sys = "0.4"
 # `sync` exposes `SyncMessage`. Feature unification builds this once for every target.
 iroh-rooms-core = { path = "../crates/iroh-rooms-core", features = ["sync"] }
 iroh-rooms-net = { path = "../crates/iroh-rooms-net" }
+# Already in the root lock. The ticket harness uses them to wrap fuzz bytes in
+# a valid BLAKE3 checksum so `from_str` reaches the CBOR body.
+blake3 = "1"
+data-encoding = "2"
 
 # cargo-fuzz builds targets in release. Line tables keep crash symbolization
 # without full debuginfo.

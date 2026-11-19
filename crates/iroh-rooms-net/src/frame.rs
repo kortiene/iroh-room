@@ -13,11 +13,13 @@
 //! malformed frame is the engine's logged drop, not a transport crash, spec §6).
 //! The only structural check here is the [`MAX_FRAME_BYTES`] guard, which denies
 //! a peer that claims an enormous frame before any allocation of that size.
-//! That check is [`decode_length_prefix`]: a plain synchronous decode of a
+//! That check is `decode_length_prefix`: a plain synchronous decode of a
 //! length-prefixed buffer. [`read_frame`] calls it on the 4-byte prefix before
 //! it allocates, then reads exactly the declared number of body bytes. The same
 //! function accepts a whole buffer (prefix and body, or a hostile prefix with
-//! no body) so it can be fuzzed without a QUIC stream.
+//! no body) so it can be fuzzed without a QUIC stream. It is public only so
+//! the out-of-crate fuzz harness can call it, and `#[doc(hidden)]` keeps it
+//! out of the crate docs. A `pub(crate)` item cannot be re-exported.
 
 use iroh::endpoint::{RecvStream, SendStream};
 
@@ -95,6 +97,7 @@ pub async fn write_frame(stream: &mut SendStream, body: &[u8]) -> Result<(), Fra
 /// [`MAX_FRAME_BYTES`] is [`FrameError::Oversized`] before any body byte is
 /// copied. [`read_frame`] only allocates after this returns an in-range length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum DecodedFrame<'a> {
     /// `input` was empty: a clean end at a frame boundary.
     ///
@@ -138,6 +141,7 @@ pub enum DecodedFrame<'a> {
 /// [`MAX_FRAME_BYTES`]. A short body is [`DecodedFrame::Incomplete`], not an
 /// error: unlike [`read_frame`], this function cannot tell "the stream ended"
 /// from "more bytes might arrive".
+#[doc(hidden)]
 pub fn decode_length_prefix(input: &[u8]) -> Result<DecodedFrame<'_>, FrameError> {
     if input.is_empty() {
         return Ok(DecodedFrame::Empty);
@@ -165,7 +169,7 @@ pub fn decode_length_prefix(input: &[u8]) -> Result<DecodedFrame<'_>, FrameError
 /// at a frame boundary). Returns the raw, un-decoded body bytes on success — the
 /// caller hands them verbatim to the engine.
 ///
-/// The length check is [`decode_length_prefix`] on the 4-byte prefix. The body
+/// The length check is `decode_length_prefix` on the 4-byte prefix. The body
 /// is allocated only after that call accepts the length.
 ///
 /// # Errors
