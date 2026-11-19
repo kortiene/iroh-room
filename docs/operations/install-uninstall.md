@@ -630,6 +630,8 @@ has `runner_hosted` `github-hosted`, `runner_environment` `github-hosted`,
 | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu24` | `20261111.370.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39` |
 | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu24-arm64` | `20261111.182.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39` |
 
+The newer-store rollback refusal (rollback_b) is simulated by stamping the store user_version+1 (record field `simulated`), because rc.6 has no schema change. No real newer-schema store was exercised.
+
 Both 22.04 probe cells passed (`x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`). `class` is `probe`. `ldd --version` reports
 glibc 2.35. `evidence_grade` is false. The same run id, attempt, and SHA
