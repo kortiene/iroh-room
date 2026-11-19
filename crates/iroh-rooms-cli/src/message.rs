@@ -984,8 +984,10 @@ pub(crate) async fn run_managed_push(
     .context("could not bring up the network node")?;
 
     let ids: Vec<EndpointId> = dial_set.iter().map(|a| a.id).collect();
-    // Give already-listening siblings a moment to finish dialing, but do not
-    // burn the rest of `timeout` on a member who is actually offline.
+    // Already-listening siblings may still be finishing the handshake. Wait
+    // until every target is up or the caller's timeout expires. A timeout
+    // that finds nobody is not extended; a member still offline at the
+    // deadline does not get this live push.
     await_roster(&node, &ids, timeout).await;
     let mut reached = connected_ids(&node, &ids);
 
@@ -1132,20 +1134,64 @@ fn classify_dial_outcome(node: &Node, ids: &[EndpointId]) -> SyncReport {
     }
 }
 
-/// After the first peer connects, wait briefly for the rest of `ids` so a
-/// removal reaches every member that is already listening. Returns as soon as
-/// all of them are up, and does not extend a timeout that found nobody.
+/// Total time [`await_roster`] may wait, as a multiple of the caller's
+/// `timeout`, measured from the start of the wait.
+///
+/// `1` is the original `--timeout` deadline, not a second magic duration.
+/// The first peer has to connect inside that timeout; if nobody does, the
+/// wait returns and is not extended. Targets that are still dialing keep the
+/// same deadline, so a slow removed device can still receive the live
+/// terminal push instead of being cut off 200 ms after the first peer.
+/// The wait returns as soon as every target is up. A member still offline
+/// when the deadline passes does not get this push.
+const ROSTER_WAIT_BUDGET: u32 = 1;
+
+/// After the first peer connects, keep waiting for the rest of `ids` until
+/// the caller's timeout budget ([`ROSTER_WAIT_BUDGET`]) runs out, so a
+/// removal still reaches a slow listener.
+///
+/// Returns as soon as every id is connected. A timeout that finds nobody
+/// returns then and is not extended. Targets still down at the deadline are
+/// not reached by this push; they learn a removal only from a peer that
+/// already has it.
 async fn await_roster(node: &Node, ids: &[EndpointId], timeout: Duration) {
-    let connected = wait_for_any_connected(node, ids, timeout).await;
-    if connected == 0 || connected == ids.len() {
+    await_roster_for(timeout, ids.len(), || connected_count(node, ids)).await;
+}
+
+/// [`await_roster`] with an injected connected-count, so the deadline is
+/// testable without a live node. `connected` is how many of the dial targets
+/// are up right now; `expected` is the full target count.
+async fn await_roster_for(timeout: Duration, expected: usize, connected: impl Fn() -> usize) {
+    let started = tokio::time::Instant::now();
+    let connected_now = tokio::time::timeout(timeout, async {
+        loop {
+            let n = connected();
+            if n > 0 {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(0);
+    if connected_now == 0 || connected_now == expected {
         return;
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-    while tokio::time::Instant::now() < deadline {
-        if connected_count(node, ids) == ids.len() {
+    // Remaining targets share the original deadline. `started` is before the
+    // first wait, so time already spent finding the first peer counts against
+    // the caller's timeout and is not granted again.
+    let budget = timeout.saturating_mul(ROSTER_WAIT_BUDGET);
+    let deadline = started + budget;
+    loop {
+        if connected() == expected {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let step = Duration::from_millis(20).min(deadline.saturating_duration_since(now));
+        tokio::time::sleep(step).await;
     }
 }
 
@@ -1699,4 +1745,124 @@ mod tests {
 
     // `short_id` and `iso8601_utc` moved to `crate::display` (spec IR-0106 D5/D6);
     // their unit tests live alongside them there.
+}
+
+#[cfg(test)]
+mod await_roster_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::await_roster_for;
+
+    /// The pre-fix post-connect grace. A target that connects after this, but
+    /// inside the caller's timeout, must still be awaited.
+    const OLD_POST_CONNECT_GRACE: Duration = Duration::from_millis(200);
+
+    /// Join `handle` if it has already finished. Abort it otherwise so a
+    /// paused-time wait cannot hang the test.
+    async fn finish_now<T>(handle: tokio::task::JoinHandle<T>, why: &str) -> T {
+        tokio::task::yield_now().await;
+        if !handle.is_finished() {
+            handle.abort();
+            panic!("{why}");
+        }
+        handle.await.expect("roster wait task")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_target_after_200ms_is_still_awaited_then_returns() {
+        let timeout = Duration::from_millis(1_000);
+        let connected = Arc::new(AtomicUsize::new(1));
+        let seen = Arc::clone(&connected);
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            await_roster_for(timeout, 2, || seen.load(Ordering::Relaxed)).await;
+            seen.load(Ordering::Relaxed)
+        });
+
+        // The first target is already up, so the post-connect window starts
+        // immediately. Step past the old 200 ms grace and stop inside `timeout`.
+        tokio::task::yield_now().await;
+        tokio::time::advance(OLD_POST_CONNECT_GRACE + Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "a target still dialing after 200 ms, inside the caller's timeout, must still be awaited"
+        );
+
+        connected.store(2, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(20)).await;
+        let observed = finish_now(
+            handle,
+            "wait should return once every target is up, before the caller's timeout",
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            observed, 2,
+            "returned before the slow target connected (observed {observed})"
+        );
+        assert!(
+            elapsed > OLD_POST_CONNECT_GRACE,
+            "did not actually wait past the old 200 ms grace; elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < timeout,
+            "did not return early once every target was up; elapsed {elapsed:?}, timeout {timeout:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returns_immediately_when_every_target_is_already_up() {
+        let timeout = Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            await_roster_for(timeout, 2, || 2).await;
+        });
+        finish_now(handle, "a complete roster must return without waiting").await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a complete roster must not sleep at all"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_that_finds_nobody_is_not_extended() {
+        let timeout = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            await_roster_for(timeout, 2, || 0).await;
+        });
+
+        tokio::task::yield_now().await;
+        let before_deadline = timeout
+            .checked_sub(Duration::from_millis(20))
+            .expect("caller timeout is longer than one poll");
+        tokio::time::advance(before_deadline).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "the caller timeout has not elapsed yet"
+        );
+
+        // One poll past the deadline. The old 200 ms grace must not be added
+        // on top of a timeout that found nobody.
+        tokio::time::advance(Duration::from_millis(40)).await;
+        finish_now(
+            handle,
+            "a timeout that found nobody must return, not gain another grace",
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timeout + OLD_POST_CONNECT_GRACE,
+            "nobody-found timeout was extended to {elapsed:?}"
+        );
+        assert!(
+            elapsed >= timeout,
+            "returned before the caller timeout; elapsed {elapsed:?}"
+        );
+    }
 }
