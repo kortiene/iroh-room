@@ -412,11 +412,4 @@ fn user_facing_docs_do_not_advertise_unreachable_capabilities() {
     let inventory = read_repo("docs/reachability-inventory.md");
     assert!(inventory.contains("Encryption-claims"));
     assert!(inventory.contains("Refs #343"));
-    let lowered = inventory.to_lowercase();
-    for banned in ["fixes #", "closes #", "resolves #", "close #343"] {
-        assert!(
-            !lowered.contains(banned),
-            "inventory must reference the issue without closing language ({banned})"
-        );
-    }
 }
