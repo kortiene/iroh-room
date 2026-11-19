@@ -72,7 +72,10 @@ fn experimental_session_paths_resolve() {
     assert!(!name_of::<session::PeerTable>().is_empty());
     assert!(!name_of::<session::RejectCause>().is_empty());
     assert!(!name_of::<session::OfflineReason>().is_empty());
+    assert!(!name_of::<session::PathType>().is_empty());
     assert!(!name_of::<session::TracingAudit>().is_empty());
+    assert_eq!(session::PathType::Direct.label(), "direct");
+    assert_eq!(session::PathType::None.label(), "none");
 
     // iroh transport identities re-exported verbatim (issue #87) — the paths must
     // resolve here; `iroh_transport_reexports_are_the_net_api_types` below proves
@@ -269,8 +272,12 @@ fn experimental_sync_paths_resolve() {
     assert!(!name_of::<sync::Outgoing>().is_empty());
     assert!(!name_of::<sync::Window>().is_empty());
     assert!(!name_of::<sync::PeerId>().is_empty());
+    assert!(!name_of::<sync::KeyHistoryChunk>().is_empty());
     // `WireBytes` is a type alias (`Vec<u8>`); it still resolves through the façade.
     assert!(!name_of::<sync::WireBytes>().is_empty());
+    const {
+        assert!(sync::MAX_FRAME_BYTES > 0);
+    }
 
     // `SyncConfig` is a plain value type — constructing its default is offline.
     assert!(!format!("{:?}", sync::SyncConfig::default()).is_empty());
@@ -318,8 +325,11 @@ fn experimental_pipe_runtime_paths_resolve() {
     // Trait re-export, proven through `TracingPipeAudit`'s impl.
     assert!(!pipe_audit_name::<pipe_runtime::TracingPipeAudit>().is_empty());
 
-    // Const re-export.
+    // Const re-exports.
     assert!(!pipe_runtime::PIPE_ALPN.is_empty());
+    const {
+        assert!(pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS > 0);
+    }
 
     // `EndpointId` is duplicated into `pipe_runtime` (issue #87) so a pipe-only
     // consumer need not reach into `session` — it is the type `PipeSessionInfo.device`
@@ -354,5 +364,11 @@ fn pipe_runtime_helpers_are_pure() {
 #[test]
 fn rotation_builder_is_experimental() {
     assert!(!name_of::<rotation::DistributionError>().is_empty());
+    assert!(!name_of::<rotation::SealError>().is_empty());
+    assert!(!name_of::<rotation::UnreadableReason>().is_empty());
     assert!(!std::any::type_name_of_val(&rotation::build_member_removed_with_rotation).is_empty());
+    assert!(!std::any::type_name_of_val(&rotation::build_content_encrypted).is_empty());
+    assert!(!std::any::type_name_of_val(&rotation::open_encrypted_content).is_empty());
+    assert!(!std::any::type_name_of_val(&rotation::build_key_distribution_content).is_empty());
+    assert!(!std::any::type_name_of_val(&rotation::build_member_key_distribution).is_empty());
 }

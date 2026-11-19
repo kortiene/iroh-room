@@ -1986,8 +1986,6 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "iroh-rooms",
- "iroh-rooms-core",
- "iroh-rooms-net",
  "predicates",
  "rusqlite",
  "serde",

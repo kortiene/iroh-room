@@ -381,7 +381,7 @@ fn wrong_identity_exits_3_with_coded_line() {
 /// token (valid or corrupted) nor the secret's hex appears on any stream.
 #[test]
 fn corrupted_ticket_never_echoes_token_or_secret() {
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::room::RoomInviteTicket;
 
     let home_admin = TempDir::new().unwrap();
     let ticket = admin_invite_ticket(&home_admin, INVITEE_HEX);

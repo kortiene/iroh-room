@@ -676,7 +676,7 @@ fn invite_agent_role_appears_in_members_as_agent() {
 /// exercises the CLI's random secret draw and output path.
 #[test]
 fn invite_ticket_decodes_to_correct_invitee_key() {
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::room::RoomInviteTicket;
     use std::str::FromStr;
 
     let home = TempDir::new().unwrap();
@@ -703,7 +703,7 @@ fn invite_ticket_decodes_to_correct_invitee_key() {
 
     // AC4 substrate: the ticket's recomputed capability hash must be
     // self-consistent (BLAKE3 of room ‖ invite ‖ secret == ticket.capability_hash()).
-    let recomputed = iroh_rooms_core::event::capability_hash(
+    let recomputed = iroh_rooms::events::capability_hash(
         &ticket.room_id,
         &ticket.invite_id,
         &ticket.capability_secret,

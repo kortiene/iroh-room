@@ -688,3 +688,61 @@ fn active_room() -> ActiveRoom {
         heads: vec![join_id],
     }
 }
+
+/// Names the stable payload structs and membership-cap symbols the CLI reaches
+/// through the façade (RB-SDK-001). A missing re-export fails this test at
+/// compile time.
+#[test]
+fn stable_payloads_and_member_cap_are_nameable() {
+    use iroh_rooms::events::{
+        AgentStatus, EncryptedContent, MemberKeyDistribution, MessageText, WrappedKeyEntry,
+    };
+    use iroh_rooms::files::FileShared;
+    use iroh_rooms::pipes::{PipeClosed, PipeOpened};
+    use iroh_rooms::room::{
+        active_member_warning_crossed, MemberInvited, MemberJoined, MemberLeft, MemberRemoved,
+        RoomCreated, ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS,
+    };
+
+    let _payloads = (
+        std::any::type_name::<RoomCreated>(),
+        std::any::type_name::<MemberInvited>(),
+        std::any::type_name::<MemberJoined>(),
+        std::any::type_name::<MemberLeft>(),
+        std::any::type_name::<MemberRemoved>(),
+        std::any::type_name::<MessageText>(),
+        std::any::type_name::<AgentStatus>(),
+        std::any::type_name::<FileShared>(),
+        std::any::type_name::<PipeOpened>(),
+        std::any::type_name::<PipeClosed>(),
+        std::any::type_name::<EncryptedContent>(),
+        std::any::type_name::<MemberKeyDistribution>(),
+        std::any::type_name::<WrappedKeyEntry>(),
+    );
+
+    const {
+        assert!(ACTIVE_MEMBER_WARNING_THRESHOLD == MAX_ACTIVE_MEMBERS.saturating_sub(1));
+    }
+    assert!(active_member_warning_crossed(
+        Some(ACTIVE_MEMBER_WARNING_THRESHOLD - 1),
+        ACTIVE_MEMBER_WARNING_THRESHOLD,
+    ));
+    assert!(!active_member_warning_crossed(
+        Some(ACTIVE_MEMBER_WARNING_THRESHOLD),
+        ACTIVE_MEMBER_WARNING_THRESHOLD,
+    ));
+
+    let identity = SigningKey::generate();
+    let device = SigningKey::generate();
+    let nonce = [0x5au8; 16];
+    let room_id = derive_room_id(&identity.identity_key(), &nonce, CREATED_AT);
+    let genesis = build_room_created(&identity, &device, "cap", &nonce, CREATED_AT);
+    let ctx = ValidationContext::for_room(room_id);
+    let validated = validate_wire_bytes(&genesis.to_bytes(), &ctx).expect("genesis");
+    let mut fold = RoomMembership::new(room_id);
+    assert_eq!(fold.membership_projection_generation(), 0);
+    assert!(matches!(fold.ingest(validated), Ingest::Accepted { .. }));
+    assert!(fold.membership_projection_generation() > 0);
+    let snap = fold.snapshot();
+    assert_eq!(snap.active_member_limit(), MAX_ACTIVE_MEMBERS);
+}

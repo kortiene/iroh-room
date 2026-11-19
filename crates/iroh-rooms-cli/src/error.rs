@@ -21,9 +21,9 @@
 
 use std::fmt;
 
-use iroh_rooms_core::event::RejectReason;
-use iroh_rooms_core::ticket::TicketError;
-use iroh_rooms_net::OfflineReason;
+use iroh_rooms::events::RejectReason;
+use iroh_rooms::experimental::session::OfflineReason;
+use iroh_rooms::room::TicketError;
 
 /// The unified CLI-facing failure taxonomy (spec §5.1). Wrapped arms
 /// ([`Self::Reject`], [`Self::Ticket`]) delegate their [`code`](Self::code) to the
@@ -389,9 +389,9 @@ pub fn code_of(err: &anyhow::Error) -> Option<ErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::{CliError, CodedResultExt, ErrorCategory, ErrorCode};
-    use iroh_rooms_core::event::RejectReason;
-    use iroh_rooms_core::ticket::TicketError;
-    use iroh_rooms_net::OfflineReason;
+    use iroh_rooms::events::RejectReason;
+    use iroh_rooms::experimental::session::OfflineReason;
+    use iroh_rooms::room::TicketError;
 
     // ── ErrorCode::code() is pinned for every variant ────────────────────────
 

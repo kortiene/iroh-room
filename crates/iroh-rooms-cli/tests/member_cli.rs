@@ -19,18 +19,19 @@ use std::str::FromStr;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-use iroh_rooms_core::event::content::Content;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{
-    build_member_joined, build_member_left, build_member_removed, build_message_text,
-    build_pipe_opened, DeviceBinding, HashRef, IdentityKey, RoomId, SigningKey,
-};
-use iroh_rooms_core::membership::{
+use iroh_rooms::events::build_message_text;
+use iroh_rooms::events::Content;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::files::HashRef;
+use iroh_rooms::identity::{DeviceBinding, IdentityKey, SigningKey};
+use iroh_rooms::pipes::build_pipe_opened;
+use iroh_rooms::room::RoomInviteTicket;
+use iroh_rooms::room::{
     blob_serve_allowed, pipe_connect_allowed, BlobDecision, DenyReason, MembershipSnapshot,
     PipeDecision, RoomMembership, MAX_ACTIVE_MEMBERS,
 };
-use iroh_rooms_core::store::EventStore;
-use iroh_rooms_core::ticket::RoomInviteTicket;
+use iroh_rooms::room::{build_member_joined, build_member_left, build_member_removed, RoomId};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

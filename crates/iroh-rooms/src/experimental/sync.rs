@@ -7,7 +7,9 @@
 //! harness) is intentionally **not** re-exported — it is a test-only tool, not
 //! part of the SDK surface.
 
+pub use iroh_rooms_core::sync::message::KeyHistoryChunk;
 pub use iroh_rooms_core::sync::{
     Completeness, MessageError, Outgoing, PeerId, Severity, SyncConfig, SyncCounters, SyncDigest,
     SyncEngine, SyncError, SyncMessage, SyncTransport, TrustDecision, Window, WireBytes,
+    MAX_FRAME_BYTES,
 };

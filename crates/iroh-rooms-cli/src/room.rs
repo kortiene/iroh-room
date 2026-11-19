@@ -16,11 +16,11 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use iroh_rooms::events::{validate_wire_bytes, Content, SignedEvent, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
 use iroh_rooms::identity::IdentityKey;
 use iroh_rooms::room::{
     build_room_created, derive_room_id, MembershipSnapshot, Role, RoomId, RoomMembership,
 };
-use iroh_rooms_core::store::EventStore;
 use serde_json::{json, Map, Value};
 
 use crate::error::CodedResultExt;
@@ -604,14 +604,16 @@ mod tests {
         validate_room_name, MAX_ROOM_NAME_BYTES,
     };
     use crate::identity;
-    use iroh_rooms_core::event::binding::DeviceBinding;
-    use iroh_rooms_core::event::content::{
-        AgentStatus, Content, EncryptedContent, EventType, FileShared, MemberInvited, MemberJoined,
-        MemberLeft, MemberRemoved, MessageText, PipeClosed, PipeOpened, RoomCreated,
-    };
-    use iroh_rooms_core::event::ids::{EventId, HashRef, RoomId};
-    use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, Signature};
-    use iroh_rooms_core::membership::Role;
+    use iroh_rooms::events::EventId;
+    use iroh_rooms::events::{AgentStatus, Content, EncryptedContent, EventType, MessageText};
+    use iroh_rooms::files::FileShared;
+    use iroh_rooms::files::HashRef;
+    use iroh_rooms::identity::DeviceBinding;
+    use iroh_rooms::identity::{DeviceKey, IdentityKey, Signature};
+    use iroh_rooms::pipes::{PipeClosed, PipeOpened};
+    use iroh_rooms::room::Role;
+    use iroh_rooms::room::RoomId;
+    use iroh_rooms::room::{MemberInvited, MemberJoined, MemberLeft, MemberRemoved, RoomCreated};
     use tempfile::TempDir;
 
     // ── validate_room_name ────────────────────────────────────────────────────

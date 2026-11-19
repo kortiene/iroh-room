@@ -7,6 +7,19 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- **SDK façade (additive).** Re-export the stable content payloads the CLI
+  already matches (`RoomCreated`, membership payloads, `MessageText`,
+  `AgentStatus`, `EncryptedContent`, `MemberKeyDistribution`,
+  `WrappedKeyEntry`), the active-member cap
+  (`MAX_ACTIVE_MEMBERS`, `ACTIVE_MEMBER_WARNING_THRESHOLD`,
+  `active_member_warning_crossed`), `experimental::session::PathType`,
+  `experimental::pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS`,
+  `experimental::sync::{KeyHistoryChunk, MAX_FRAME_BYTES}`, and the
+  content-encryption builders next to the existing rotation builder under
+  `experimental::rotation`. No existing path was renamed or removed.
+- **CLI:** production code and integration tests import `iroh-rooms` only.
+  The binary no longer declares a direct dependency on `iroh-rooms-core` or
+  `iroh-rooms-net`.
 - Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the

@@ -37,6 +37,9 @@
 //! assert!(snapshot.is_active(&admin_identity.identity_key()));
 //! ```
 
+pub use iroh_rooms_core::event::content::{
+    MemberInvited, MemberJoined, MemberLeft, MemberRemoved, RoomCreated,
+};
 pub use iroh_rooms_core::event::ids::RoomId; // also surfaced here for discoverability
 pub use iroh_rooms_core::event::signed::derive_room_id;
 pub use iroh_rooms_core::event::{
@@ -44,7 +47,8 @@ pub use iroh_rooms_core::event::{
     build_room_created,
 };
 pub use iroh_rooms_core::membership::{
-    blob_serve_allowed, pipe_connect_allowed, AncestorView, BlobDecision, DenyReason, Ingest,
-    Member, MembershipSnapshot, PipeDecision, Role, RoomMembership, Status,
+    active_member_warning_crossed, blob_serve_allowed, pipe_connect_allowed, AncestorView,
+    BlobDecision, DenyReason, Ingest, Member, MembershipSnapshot, PipeDecision, Role,
+    RoomMembership, Status, ACTIVE_MEMBER_WARNING_THRESHOLD, MAX_ACTIVE_MEMBERS,
 };
 pub use iroh_rooms_core::ticket::{RoomInviteTicket, TicketError};
