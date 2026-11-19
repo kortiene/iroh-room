@@ -14,22 +14,66 @@ The fences below are compared to clap's command tree and to the façade
 ## Encryption-claims (OD-1)
 
 v0.1 GA ships room content as plaintext, encrypted in transit only between
-admitted peers (ADR-0014 OD-1, roadmap amendment RB-1.2). No CLI command, no
-stable SDK item, and no production call site outside tests sets
-`SyncConfig::encrypted_content_writes` (the field defaults to `false` in
-`crates/iroh-rooms-core/src/sync/config.rs`). `room remove` and `room leave`
-call `iroh_rooms::room::build_member_removed` and `build_member_left`.
-`build_member_removed` hard-codes `rotation: None`. The rotation builder
-`build_member_removed_with_rotation` is only
-`iroh_rooms::experimental::rotation`.
+admitted peers (ADR-0014 OD-1, roadmap amendment RB-1.2). The encryption
+machinery has three reachability states in today's tree. Cites below were
+checked against that tree. Inbound key adoption is not gated off.
 
-Shipped rooms therefore have no content confidentiality beyond transport
-encryption, and no forward secrecy after a member departs. Docs that said an
-operator rotates, that a `rooms.db` read yields only ciphertext, or that a
-deployment opts into post-departure secrecy were describing a path the
-shipped CLI cannot reach. Those sentences are corrected in the release-notes
-template, the threat model, and `docs/protocol.md`. Historical files under
-`docs/releases/` are left unchanged.
+### (a) Unreachable in the shipped binary
+
+Sealing and rotation authoring. `SyncConfig::default` sets
+`encrypted_content_writes: false`
+(`crates/iroh-rooms-core/src/sync/config.rs:209`). The writer gate refuses a
+locally authored `content.encrypted` publish while that flag is false
+(`crates/iroh-rooms-core/src/sync/engine.rs:838`). No CLI or
+`iroh-rooms-net` production source sets the flag or constructs a sealed
+content envelope. `room remove` and `room leave` call `build_member_removed`
+and `build_member_left`. `build_member_removed` sets `rotation: None`
+(`crates/iroh-rooms-core/src/event/removed.rs:60`).
+`build_member_removed_with_rotation` is not called from the shipped binary.
+
+### (b) Reachable from peer input in the shipped binary
+
+Live engines open with the local device seed. `room tail` does so at
+`crates/iroh-rooms-cli/src/message.rs:502-506`
+(`SyncEngine::open_with_local_device` with `SyncConfig::default()` and
+`Some(secret.device_seed())`). The same opener is used by `message.rs:639`,
+`message.rs:874`, `message.rs:957`, `message.rs:1061`, `file.rs:517`,
+`join.rs:160`, `pipe.rs:151`, `pipe.rs:285`, and `pipe.rs:447`.
+
+On insert, `apply_insert_outcome` calls `adopt_key_from_event`
+(`engine.rs:1790`). That function adopts a `MemberKeyDistribution` or the
+`rotation` payload on `member.removed` (`engine.rs:3098-3105`), calls
+`unwrap_room_key` (`engine.rs:3220`), and on a fresh adoption persists the
+key (`engine.rs:3283-3285`). An inbound `WantKeyHistory` is served and an
+inbound `KeyHistory` chunk is adopted (`engine.rs:933-938`). No CLI or net
+source constructs a `WantKeyHistory` message; the handler runs when a peer
+sends one.
+
+Content decryption of pipe and file envelopes is on that same path.
+`encrypted_bodies` calls `read_content` (`engine.rs:1256`). `pipe_opened`
+(`engine.rs:1304`), `pipe_is_closed` (`engine.rs:1355`), and
+`file_shared_hashes` (`engine.rs:1394`) call `encrypted_bodies`. The node
+pump calls `file_shared_hashes`
+(`crates/iroh-rooms-net/src/node.rs:341`). `pipe connect` calls
+`node.pipe_opened` (`crates/iroh-rooms-cli/src/pipe.rs:319`). A
+peer-supplied `content.encrypted` envelope of those inner types is opened
+during those lookups. `readable_content` itself has no CLI caller; message
+display does not use it.
+
+### (c) Reachable for experimental SDK embedders
+
+`SyncConfig::encrypted_content_writes` and
+`iroh_rooms::experimental::rotation` (`build_member_removed_with_rotation`,
+`DistributionError`) are reachable for an embedder who opts into the
+`experimental` feature. The paragraphs kept below state that the shipped CLI
+does not call them.
+
+Docs that said an operator rotates, that every `rooms.db` read yields only
+ciphertext, or that a deployment opts into post-departure secrecy described
+authoring the shipped CLI does not do. Inbound adoption and the pipe/file
+decryption walks above still run. Those sentences are corrected in the
+release-notes template, the threat model, and `docs/protocol.md`. Historical
+files under `docs/releases/` are left unchanged.
 
 ## Shipped feature gates
 
@@ -37,7 +81,7 @@ template, the threat model, and `docs/protocol.md`. Historical files under
 | --- | --- | --- | --- |
 | `iroh-rooms-net/gossip_overlay` | off | not named by the CLI or SDK manifests | `shipped_manifests_do_not_enable_gossip_or_the_40_member_cap` |
 | `iroh-rooms-core/large_rooms` (40-member cap) | off | enabled only by `gossip_overlay` | same test |
-| `SyncConfig::encrypted_content_writes` | `false` | no `src/` assignment to `true` | `production_sources_do_not_enable_encrypted_content_writes` |
+| `SyncConfig::encrypted_content_writes` | `false` (`config.rs:209`) | the field name appears in `src/` only in `sync/config.rs` and `sync/engine.rs` | `encrypted_content_writes_name_is_confined_to_config_and_engine` |
 
 `MAX_ACTIVE_MEMBERS` stays 5 on that default. README and `room members
 --status` advertise the 5-member ceiling; the 40-member cap is described as
@@ -255,7 +299,37 @@ iroh_rooms::events::WireEvent
 iroh_rooms::events::build_agent_status
 iroh_rooms::events::build_message_text
 iroh_rooms::events::capability_hash
-iroh_rooms::events::constants::*
+iroh_rooms::events::constants::BIND_CONTEXT
+iroh_rooms::events::constants::CLOCK_SKEW_FUTURE_MS
+iroh_rooms::events::constants::DIGEST_LEN
+iroh_rooms::events::constants::ENCRYPTED_AAD_CONTEXT
+iroh_rooms::events::constants::ENCRYPTED_NONCE_LEN
+iroh_rooms::events::constants::ENCRYPTED_SUITE_V1
+iroh_rooms::events::constants::ENCRYPTED_TAG_LEN
+iroh_rooms::events::constants::EVENT_CONTEXT
+iroh_rooms::events::constants::INVITE_CONTEXT
+iroh_rooms::events::constants::MAX_ARTIFACT_REFS
+iroh_rooms::events::constants::MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT
+iroh_rooms::events::constants::MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT
+iroh_rooms::events::constants::MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT
+iroh_rooms::events::constants::MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT
+iroh_rooms::events::constants::MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT
+iroh_rooms::events::constants::MAX_FILE_NAME_BYTES
+iroh_rooms::events::constants::MAX_FILE_PROVIDERS
+iroh_rooms::events::constants::MAX_MESSAGE_BODY_BYTES
+iroh_rooms::events::constants::MAX_MIME_TYPE_BYTES
+iroh_rooms::events::constants::MAX_PREV_EVENTS
+iroh_rooms::events::constants::MAX_SHARED_FILE_BYTES
+iroh_rooms::events::constants::MAX_STATUS_LABEL_BYTES
+iroh_rooms::events::constants::MAX_STATUS_MESSAGE_BYTES
+iroh_rooms::events::constants::PUBLIC_KEY_LEN
+iroh_rooms::events::constants::ROOMID_CONTEXT
+iroh_rooms::events::constants::SCHEMA_VERSION
+iroh_rooms::events::constants::SHORT_ID_LEN
+iroh_rooms::events::constants::SIGNATURE_LEN
+iroh_rooms::events::constants::WIRE_VERSION
+iroh_rooms::events::constants::WRAPPED_KEY_CIPHERTEXT_LEN
+iroh_rooms::events::constants::WRAPPED_KEY_NONCE_LEN
 iroh_rooms::events::validate_wire_bytes
 iroh_rooms::events::validate_with_membership
 iroh_rooms::files::FileShared

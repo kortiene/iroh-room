@@ -177,6 +177,45 @@ fn pub_use_names(stmt: &str) -> Vec<String> {
     }
 }
 
+fn facade_defined_items(source: &str, module: &str) -> BTreeSet<String> {
+    let stripped = strip_comments(source);
+    let (rest, inlines) = peel_inline_modules(&stripped);
+    let mut out = BTreeSet::new();
+    for (name, body) in inlines {
+        out.extend(facade_defined_items(&body, &format!("{module}::{name}")));
+    }
+    for line in rest.lines() {
+        if let Some(name) = defined_item_name(line.trim()) {
+            out.insert(format!("{module}::{name}"));
+        }
+    }
+    out
+}
+
+/// A `pub fn`, `pub struct`, or `pub const` declared in the façade, rather than
+/// brought in by `pub use`.
+fn defined_item_name(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix("pub ")?;
+    if rest.starts_with("use ") || rest.starts_with("mod ") || rest.starts_with('(') {
+        return None;
+    }
+    let rest = rest
+        .strip_prefix("async ")
+        .or_else(|| rest.strip_prefix("unsafe "))
+        .unwrap_or(rest);
+    let after = rest
+        .strip_prefix("const fn ")
+        .or_else(|| rest.strip_prefix("fn "))
+        .or_else(|| rest.strip_prefix("struct "))
+        .or_else(|| rest.strip_prefix("const "))?;
+    let name = take_ident(after);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 fn collect_facade(source: &str, module: &str, out: &mut BTreeSet<String>) {
     let stripped = strip_comments(source);
     let (rest, inlines) = peel_inline_modules(&stripped);
@@ -279,8 +318,68 @@ fn stable_and_experimental_fences_match_facade_sources() {
     );
     assert!(experimental
         .contains("iroh_rooms::experimental::rotation::build_member_removed_with_rotation"));
+    assert!(stable.contains("iroh_rooms::events::constants::MAX_MESSAGE_BODY_BYTES"));
+    assert!(
+        !stable.iter().any(|row| row.ends_with("::*")),
+        "the constants glob must be expanded: {stable:?}"
+    );
+    let root = workspace_root().join("crates/iroh-rooms/src");
+    let mut defined = BTreeSet::new();
+    for (file, module) in [
+        ("lib.rs", "iroh_rooms"),
+        ("events.rs", "iroh_rooms::events"),
+        ("files.rs", "iroh_rooms::files"),
+        ("identity.rs", "iroh_rooms::identity"),
+        ("pipes.rs", "iroh_rooms::pipes"),
+        ("room.rs", "iroh_rooms::room"),
+        ("experimental/mod.rs", "iroh_rooms::experimental"),
+        ("experimental/blob.rs", "iroh_rooms::experimental::blob"),
+        (
+            "experimental/pipe_runtime.rs",
+            "iroh_rooms::experimental::pipe_runtime",
+        ),
+        (
+            "experimental/rotation.rs",
+            "iroh_rooms::experimental::rotation",
+        ),
+        (
+            "experimental/session.rs",
+            "iroh_rooms::experimental::session",
+        ),
+        ("experimental/store.rs", "iroh_rooms::experimental::store"),
+        ("experimental/sync.rs", "iroh_rooms::experimental::sync"),
+    ] {
+        let source = fs::read_to_string(root.join(file)).expect(file);
+        defined.extend(facade_defined_items(&source, module));
+    }
+    assert!(
+        defined.is_empty(),
+        "façade item is not a re-export: {defined:?}"
+    );
     assert_fence_eq("reachability-sdk-stable", &stable);
     assert_fence_eq("reachability-sdk-experimental", &experimental);
+}
+
+#[test]
+fn defined_facade_items_fail_the_reexport_only_check() {
+    let source = "\
+pub use crate::room::RoomId;
+pub fn local_helper() {}
+pub struct Local;
+pub const LOCAL: u8 = 1;
+";
+    let offenders = facade_defined_items(source, "iroh_rooms::demo");
+    assert!(offenders.contains("iroh_rooms::demo::local_helper"));
+    assert!(offenders.contains("iroh_rooms::demo::Local"));
+    assert!(offenders.contains("iroh_rooms::demo::LOCAL"));
+    assert!(
+        !offenders.iter().any(|item| item.ends_with("RoomId")),
+        "a re-export must not be reported as façade-defined: {offenders:?}"
+    );
+    assert!(
+        !offenders.is_empty(),
+        "the re-export-only check must fail when the façade defines an item"
+    );
 }
 
 #[test]
@@ -318,44 +417,67 @@ fn uncommented(toml: &str) -> String {
 }
 
 #[test]
-fn production_sources_do_not_enable_encrypted_content_writes() {
-    let crates = workspace_root().join("crates");
-    let mut hits = Vec::new();
+fn encrypted_content_writes_name_is_confined_to_config_and_engine() {
+    let root = workspace_root();
     let mut files = 0usize;
-    for entry in
-        fs::read_dir(&crates).unwrap_or_else(|err| panic!("read {}: {err}", crates.display()))
-    {
-        let src = entry.expect("crate dir").path().join("src");
-        if src.is_dir() {
-            scan_tree(&src, &mut hits, &mut files);
-        }
-    }
+    let mut outside = Vec::new();
+    let mut allowed_hits = 0usize;
+    scan_src(
+        &root.join("crates"),
+        &root,
+        &mut files,
+        &mut outside,
+        &mut allowed_hits,
+    );
     assert!(
         files > 0,
         "the production-source scan did not see any crate src"
     );
     assert!(
-        hits.is_empty(),
-        "production source enables encrypted content writes: {hits:?}"
+        allowed_hits >= 2,
+        "config.rs and engine.rs must both name encrypted_content_writes"
+    );
+    assert!(
+        outside.is_empty(),
+        "encrypted_content_writes appears outside sync/config.rs and sync/engine.rs: {outside:?}"
     );
 }
 
-fn scan_tree(dir: &Path, hits: &mut Vec<String>, files: &mut usize) {
+fn scan_src(
+    dir: &Path,
+    root: &Path,
+    files: &mut usize,
+    outside: &mut Vec<String>,
+    allowed_hits: &mut usize,
+) {
     for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display())) {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
-            scan_tree(&path, hits, files);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let in_src = path.components().any(|c| c.as_os_str() == "src");
+            if name == "src" || in_src || dir.ends_with("crates") {
+                scan_src(&path, root, files, outside, allowed_hits);
+            }
             continue;
         }
-        if path.extension().is_none_or(|ext| ext != "rs") {
+        if !path.components().any(|c| c.as_os_str() == "src")
+            || path.extension().is_none_or(|ext| ext != "rs")
+        {
             continue;
         }
         *files += 1;
         let text = fs::read_to_string(&path).expect("source");
-        if text.contains("encrypted_content_writes: true")
-            || text.contains("encrypted_content_writes = true")
+        if !text.contains("encrypted_content_writes") {
+            continue;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.ends_with("crates/iroh-rooms-core/src/sync/config.rs")
+            || rel.ends_with("crates/iroh-rooms-core/src/sync/engine.rs")
         {
-            hits.push(path.display().to_string());
+            *allowed_hits += 1;
+        } else {
+            outside.push(rel);
         }
     }
 }
