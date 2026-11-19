@@ -132,12 +132,14 @@ async fn handle_stream(
     let target = match verdict {
         PipeGateVerdict::Accept(target) => target,
         PipeGateVerdict::Reject(cause) => {
-            // Write the reject byte (forwarding nothing) and finish the stream.
-            let _ = send.write_all(&[PIPE_REJECT]).await;
-            let _ = send.finish();
+            // Record the denial before the reject byte. The connector reports
+            // `Denied` as soon as it reads that byte, and the audit must
+            // already be visible then.
             state
                 .audit
                 .connect_rejected(device_eid, Some(&pipe_id), cause);
+            let _ = send.write_all(&[PIPE_REJECT]).await;
+            let _ = send.finish();
             return;
         }
     };
