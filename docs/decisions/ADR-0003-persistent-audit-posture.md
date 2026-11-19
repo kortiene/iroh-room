@@ -3,6 +3,7 @@
 Status: Accepted for Phase 2.5 Production Beta
 Date: 2026-07-07
 Owners: Release owner, security reviewer
+
 Amended: 2026-11-19, GA acceptances (roadmap amendment RB-1.6). Local-only,
 best-effort audit is accepted for v0.1 GA (`RB-SEC-016` / #239, `RB-SEC-017`
 / #254, `RB-SEC-018` / #269). This answers the Decision section's "Production
