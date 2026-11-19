@@ -543,7 +543,7 @@ If rollback is not supported:
 ## Lifecycle evidence
 
 Install, upgrade, rollback, and uninstall evidence comes from GitHub-hosted
-runners for all four release triples. That is owner decision Q2. Each
+runners for all four release triples. That is maintainer decision 2026-11-19, item 8 of https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384 (GitHub-hosted runners count as evidence). Each
 triple uses the same GitHub-hosted runner image the release workflow builds on:
 
 | Triple | GitHub-hosted runner |

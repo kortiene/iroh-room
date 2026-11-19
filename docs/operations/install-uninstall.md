@@ -607,8 +607,9 @@ measured by the record field `glibc_method`, is `GLIBC_2.34`:
 readelf -V "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1
 ```
 
-Coverage for that floor is RHEL 9, Debian 12, and Ubuntu 22.04 and newer.
-Ubuntu 20.04, Debian 11, and RHEL 8 are not supported.
+RHEL 9 and Debian 12 are supported by symbol version and are expected to work
+but not tested. Ubuntu 24.04 (evidence) and 22.04 (probe) were run. Ubuntu
+20.04, Debian 11, and RHEL 8 are not supported.
 
 The measurement is from lifecycle run
 [44541017067](https://github.com/kortiene/iroh-room/actions/runs/44541017067),
@@ -619,7 +620,7 @@ the source of truth for the fields below. `Run`, `Attempt`, and `SHA` are
 `github_run_id`, `github_run_attempt`, and `github_sha`. `ImageOS` and
 `ImageVersion` are `image_os` and `image_version`.
 
-These four rows are GitHub-hosted runners (owner decision Q2). Each record
+These four rows are GitHub-hosted runners (maintainer decision 2026-11-19, item 8 of https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384 (GitHub-hosted runners count as evidence)). Each record
 has `runner_hosted` `github-hosted`, `runner_environment` `github-hosted`,
 `class` `evidence`, `evidence_grade` true, and `result` `PASS`.
 
