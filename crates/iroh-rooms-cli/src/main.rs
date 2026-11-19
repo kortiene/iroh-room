@@ -19,6 +19,8 @@ mod member;
 mod message;
 mod paths;
 mod pipe;
+#[cfg(test)]
+mod reachability;
 mod room;
 
 fn main() -> ExitCode {

@@ -59,7 +59,7 @@ enum Command {
         #[command(subcommand)]
         action: FileAction,
     },
-    /// Invite and (later) drive agent participants.
+    /// Invite an agent participant and post signed agent status.
     Agent {
         #[command(subcommand)]
         action: AgentAction,
