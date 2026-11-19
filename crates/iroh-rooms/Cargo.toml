@@ -11,8 +11,11 @@ repository.workspace = true
 description = "Iroh Rooms Rust SDK: a curated, stability-tiered façade over iroh-rooms-core and iroh-rooms-net."
 readme = "README.md"
 keywords = ["p2p", "sdk", "iroh"]
-# Published SDK entry point. See `docs/sdk-publish.md`. The version stays a
-# pre-release while the dalek pin below the closure is a `-rc` release.
+# Pre-release by choice: Cargo recommends a library that depends on a
+# pre-release (ed25519-dalek =3.0.0-rc.0) be a pre-release itself.
+# `publish = false` stays in git. The dry run strips it in a throwaway
+# worktree. See `docs/sdk-publish.md`.
+publish = false
 # MSRV is feature-dependent, so this declares the floor of the DEFAULT (stable,
 # pure) tier and documents the rest. Default features resolve to rustc 1.87 (the
 # RustCrypto/dalek stack behind `iroh-rooms-core`, incl. `ctutils` >= 0.4.4). `experimental` / `full` /

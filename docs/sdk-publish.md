@@ -4,7 +4,7 @@ This is the release procedure for the supported Rust SDK crates. It is a dry-run
 
 ## Which crates
 
-Published, in this order, because each crate's public types are part of the next crate's API:
+The SDK closure, in publish order. Git keeps `publish = false` on all four until the release pull request:
 
 | Order | Package | Role |
 | --- | --- | --- |
@@ -24,9 +24,9 @@ Archive spikes under `archive/spikes/` are not workspace members and are not pub
 
 ## Versioning
 
-The four published crates share one version. The current version is `0.1.0-rc.6`.
+The four SDK crates share one version. The current version is `0.1.0-rc.6`.
 
-That version is a pre-release on purpose. `iroh-rooms-crypto` and `iroh-rooms-core` depend on `ed25519-dalek` `=3.0.0-rc.0`. crates.io rejects a non-pre-release crate that depends on a pre-release. Do not drop the `-rc` suffix until that pin is a stable release.
+Pre-release by choice: Cargo recommends a library that depends on a pre-release (`ed25519-dalek` `=3.0.0-rc.0`) be a pre-release itself. Cargo does not reject a stable crate that depends on a pre-release. The version string stays `0.1.0-rc.6` until the maintainer chooses otherwise.
 
 Within `0.x`, bump all four crates together:
 
@@ -44,25 +44,26 @@ This repository does not store that token, does not document a token value, and 
 
 ## Publish order
 
-Publish one crate, wait until it is visible on crates.io, then publish the next:
+Cargo 1.100 publishes the four crates in one invocation. The dry run checks them together against a local overlay, so each crate sees the others without those crates already being on crates.io. The package order inside that invocation is:
 
 1. `iroh-rooms-crypto`
 2. `iroh-rooms-core`
 3. `iroh-rooms-net`
 4. `iroh-rooms`
 
-A dependent crate's `cargo publish --dry-run` and `cargo package` both look the path dependency up on crates.io by version. Until that dependency has actually been published, both commands fail with "no matching package". That failure does not ask for a registry token and it is not a reason to publish. The leaf crate, `iroh-rooms-crypto`, has no path dependency, so its dry run is the check that the manifest metadata packages. After `iroh-rooms-crypto` is on crates.io, the same check moves to `iroh-rooms-core`, and so on.
+All four manifests in git keep `publish = false`. `scripts/verify.sh` fails if any of those lines is missing. Removing the lines is the real release pull request, and it waits for the maintainer.
 
-The real upload is not part of this procedure and is not a workflow in this repository. A maintainer runs it by hand, from a clean tag, after the dry run for that crate has succeeded against the registry.
+The real upload is not part of this procedure and is not a workflow in this repository.
 
 ## Dry run
 
-`scripts/publish-dry-run.sh` runs, in the order above, for each crate:
+`scripts/publish-dry-run.sh` checks out `HEAD` into a temporary detached worktree, deletes the four `publish = false` lines there, commits that only inside the worktree, and runs:
 
-- `cargo publish --dry-run --locked --allow-dirty --manifest-path <crate>/Cargo.toml`
-- `cargo package --locked --allow-dirty --no-verify --manifest-path <crate>/Cargo.toml`
+```text
+cargo publish --dry-run --locked --manifest-path <worktree>/Cargo.toml -p iroh-rooms-crypto -p iroh-rooms-core -p iroh-rooms-net -p iroh-rooms
+```
 
-It keeps going after a non-zero exit so every crate is attempted, then exits non-zero if any command did. The script refuses to start if its source contains `cargo login` or a `cargo publish` invocation that is not `--dry-run`. It does not read `CARGO_REGISTRY_TOKEN`.
+There is no `--allow-dirty` and no `--no-verify`. A trap removes the worktree on success and on failure. The script refuses to start if its source contains `cargo login` or a `cargo publish` invocation that is not `--dry-run`. It does not read `CARGO_REGISTRY_TOKEN`.
 
 `.github/workflows/sdk-publish-dry-run.yml` runs that script. It triggers only on `workflow_dispatch`. It has no registry secret and no upload step. Do not start that workflow from automation in this change.
 

@@ -8,8 +8,11 @@ rust-version.workspace = true
 description = "Deterministic Iroh Rooms event protocol: signing, validation, membership, tickets, and optional store and sync."
 readme = "README.md"
 keywords = ["p2p", "protocol", "cryptography"]
-# Published with the SDK closure. See `docs/sdk-publish.md`. The version stays
-# a pre-release while `ed25519-dalek` is pinned to a `-rc` release.
+# Pre-release by choice: Cargo recommends a library that depends on a
+# pre-release (ed25519-dalek =3.0.0-rc.0) be a pre-release itself.
+# `publish = false` stays in git. The dry run strips it in a throwaway
+# worktree. See `docs/sdk-publish.md`.
+publish = false
 
 [lib]
 path = "src/lib.rs"

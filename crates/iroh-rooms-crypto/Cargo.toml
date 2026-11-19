@@ -8,9 +8,11 @@ rust-version.workspace = true
 description = "SUITE_V1 content-key primitives: Ed25519 to X25519, HKDF-SHA-256 wrap, and AES-256-GCM."
 readme = "README.md"
 keywords = ["cryptography", "aes-gcm", "x25519", "hkdf"]
-# Pre-release on purpose: this crate depends on `ed25519-dalek` `3.0.0-rc.0`.
-# crates.io rejects a non-pre-release that depends on a pre-release. Publish
-# order is documented in `docs/sdk-publish.md`.
+# Pre-release by choice: Cargo recommends a library that depends on a
+# pre-release (ed25519-dalek =3.0.0-rc.0) be a pre-release itself.
+# `publish = false` stays in git. The dry run strips it in a throwaway
+# worktree. See `docs/sdk-publish.md`.
+publish = false
 
 [lib]
 path = "src/lib.rs"

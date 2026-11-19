@@ -20,8 +20,9 @@ rust-version = "1.91"
 description = "QUIC transport, blob serve and fetch, and live TCP pipes for Iroh Rooms."
 readme = "README.md"
 keywords = ["p2p", "quic", "networking"]
-# Published with the SDK closure, behind the façade's `experimental` feature.
-# See `docs/sdk-publish.md`.
+# `publish = false` stays in git. The dry run strips it in a throwaway
+# worktree. See `docs/sdk-publish.md`.
+publish = false
 
 [lib]
 path = "src/lib.rs"

@@ -15,32 +15,55 @@ if grep -nE '^[^#]*cargo[[:space:]]+publish' "$0" | grep -v -- '--dry-run' >/dev
   exit 2
 fi
 
-crates=(
-  crates/iroh-rooms-crypto
-  crates/iroh-rooms-core
-  crates/iroh-rooms-net
-  crates/iroh-rooms
-)
-
-status=0
-for crate in "${crates[@]}"; do
-  echo "===== cargo publish --dry-run: ${crate} ====="
-  if cargo publish --dry-run --locked --allow-dirty --manifest-path "${crate}/Cargo.toml"; then
-    echo "dry-run exit 0: ${crate}"
-  else
-    rc=$?
-    echo "dry-run exit ${rc}: ${crate}"
-    status=1
+work=""
+cleanup() {
+  rc=$?
+  if [[ -n "$work" ]]; then
+    git -C "$root" worktree remove --force --force "$work" >/dev/null 2>&1 || rm -rf "$work"
   fi
+  git -C "$root" worktree prune >/dev/null 2>&1 || true
+  exit "$rc"
+}
+trap cleanup EXIT
 
-  echo "===== cargo package --no-verify: ${crate} ====="
-  if cargo package --locked --allow-dirty --no-verify --manifest-path "${crate}/Cargo.toml"; then
-    echo "package exit 0: ${crate}"
-  else
-    rc=$?
-    echo "package exit ${rc}: ${crate}"
-    status=1
-  fi
-done
+work="$(mktemp -d "${TMPDIR:-/tmp}/iroh-rooms-publish-dry-run.XXXXXX")"
+git worktree add --detach "$work" HEAD
 
-exit "${status}"
+python3 - "$work" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+manifests = [
+    "crates/iroh-rooms-crypto/Cargo.toml",
+    "crates/iroh-rooms-core/Cargo.toml",
+    "crates/iroh-rooms-net/Cargo.toml",
+    "crates/iroh-rooms/Cargo.toml",
+]
+for rel in manifests:
+    path = root / rel
+    lines = path.read_text().splitlines(keepends=True)
+    kept = [line for line in lines if line.strip() != "publish = false"]
+    if len(kept) == len(lines):
+        raise SystemExit(f"{rel} has no publish = false line to strip")
+    path.write_text("".join(kept))
+PY
+
+# The throwaway commit is only in this detached worktree, so the dry run's
+# git tree is clean without --allow-dirty. It is deleted with the worktree.
+git -C "$work" add \
+  crates/iroh-rooms-crypto/Cargo.toml \
+  crates/iroh-rooms-core/Cargo.toml \
+  crates/iroh-rooms-net/Cargo.toml \
+  crates/iroh-rooms/Cargo.toml
+git -C "$work" \
+  -c user.name="sdk-publish-dry-run" \
+  -c user.email="sdk-publish-dry-run@localhost" \
+  commit -m "Strip publish = false for the dry run."
+
+cargo publish --dry-run --locked \
+  --manifest-path "$work/Cargo.toml" \
+  -p iroh-rooms-crypto \
+  -p iroh-rooms-core \
+  -p iroh-rooms-net \
+  -p iroh-rooms
