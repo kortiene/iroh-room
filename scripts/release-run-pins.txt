@@ -1,5 +1,5 @@
 # Release run pins. One line per tag: <tag> <run_id> <attempt>
 # The invocationId on each verified provenance bundle must equal
 # https://github.com/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>
-# Add the line before the release is published. --expected-run overrides this file.
+# Add the line before the release is published. --expected-run is accepted only for a tag with no line here, and must equal the line otherwise.
 v0.1.0-rc.6 43835416665 1

@@ -24,10 +24,11 @@ set -euo pipefail
 # https://github.com/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>
 # with no normalization. The run id and attempt come from
 # scripts/release-run-pins.txt (one line: "<tag> <run_id> <attempt>").
-# --expected-run is allowed only when that file has no line for the tag
-# (a draft, before the pin is committed). If the tag is already pinned, the
-# flag must equal that line or the script exits 1. It never replaces a pin
-# and it does not skip a check. The pin is not read from the GitHub release.
+# --expected-run is allowed only when that file has other lines but none for
+# this tag (a draft, before the pin is committed). A missing, unreadable, or
+# empty pin file fails closed even when --expected-run is set. If the tag is
+# already pinned, the flag must equal that line or the script exits 1. It
+# never replaces a pin and it does not skip a check. The pin is not read from the GitHub release.
 # rc.1 through rc.5 do not consult the pin file. --offline still exits 1
 # without checking the pin. python3 decodes the DSSE payload. Run the script
 # from a checkout of current main: a checkout of the tag itself has no pin
@@ -391,17 +392,19 @@ set_expected_url() {
 }
 
 # Parses scripts/release-run-pins.txt. Sets pin_present, and pin_run_id /
-# pin_attempt when this tag has a line. A missing file means the tag is
-# unpinned. A malformed line or a duplicate tag still fails closed.
+# pin_attempt when this tag has a line. A missing, unreadable, or empty file
+# (no non-comment line) fails closed. A malformed line or a duplicate tag
+# fails closed too. --expected-run does not skip this.
 read_pin_file() {
   local line lineno=0
   local ptag prid pattempt
   local seen_tags=""
+  local data_lines=0
   pin_present=0
   pin_run_id=""
   pin_attempt=""
-  if [[ ! -f "$pin_file" ]]; then
-    return 0
+  if [[ ! -f "$pin_file" || ! -r "$pin_file" ]]; then
+    die 1 "run pin file ${pin_file} is missing or empty"
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
@@ -409,6 +412,7 @@ read_pin_file() {
     if [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]]; then
       continue
     fi
+    data_lines=$((data_lines + 1))
     if [[ ! "$line" =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]]; then
       die 1 "malformed run pin line ${lineno} in ${pin_file}"
     fi
@@ -433,6 +437,9 @@ read_pin_file() {
       pin_attempt="$pattempt"
     fi
   done <"$pin_file"
+  if [[ "$data_lines" -eq 0 ]]; then
+    die 1 "run pin file ${pin_file} is missing or empty"
+  fi
 }
 
 require_expected_run() {
@@ -455,9 +462,6 @@ require_expected_run() {
     set_expected_url
     echo "expected run pin ${expected_url} (--expected-run; tag is not in ${pin_file})"
     return
-  fi
-  if [[ ! -f "$pin_file" ]]; then
-    die 1 "no run pin for ${tag}: ${pin_file} is missing"
   fi
   die 1 "no run pin for ${tag} in ${pin_file}"
 }
@@ -885,5 +889,5 @@ check_verified_run_pins
 
 echo "verified ${tag} ${triple}: checksum, archive attestation, SHA256SUMS attestation, cosign signature, run pin ${expected_url} (source commit ${resolved_commit})"
 if [[ "$operator_supplied" -eq 1 ]]; then
-  echo "run pin: operator-supplied (not in release-run-pins.txt)"
+  echo "verified (operator-supplied pin; draft only, not release evidence)"
 fi

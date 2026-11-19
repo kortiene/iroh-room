@@ -349,12 +349,12 @@ fi
 prepare_case "override" "v0.1.0-rc.6" "v0.1.0-rc.6 11111111111 1" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0-rc.6" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
 assert_fail "expected-run conflicting with a pinned tag is rejected" "does not equal the pin"
-assert_absent "expected-run conflicting with a pinned tag is rejected" "run pin: operator-supplied"
+assert_absent "expected-run conflicting with a pinned tag is rejected" "operator-supplied pin"
 
 prepare_case "flag-matches-pin" "v0.1.0-rc.6" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0-rc.6" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
 assert_ok "expected-run that equals the pin passes" "$GOOD_URL"
-assert_absent "expected-run that equals the pin passes" "run pin: operator-supplied"
+assert_absent "expected-run that equals the pin passes" "operator-supplied pin"
 
 prepare_case "bad-run" "v0.1.0-rc.6" "$PIN_LINE" "$BAD_RUN_URL" "$BAD_RUN_URL" ok ok
 run_case "v0.1.0-rc.6"
@@ -412,7 +412,7 @@ ok "different digest is the gh attestation verify failure"
 
 prepare_case "no-pin" "v0.1.0-rc.6" "# no pins yet" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0-rc.6"
-assert_fail "missing pin line is rejected" "no run pin"
+assert_fail "comment-only pin file is rejected" "is missing or empty"
 
 prepare_case "malformed" "v0.1.0-rc.6" "v0.1.0-rc.6 not-a-run 1" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0-rc.6"
@@ -430,11 +430,11 @@ assert_absent "rc.5 skips the run pin" "malformed run pin"
 assert_absent "rc.5 skips the run pin" "no run pin"
 assert_absent "rc.5 skips the run pin" "run pin mismatch"
 
-prepare_case "stable" "v0.1.0" "# no pin" "$GOOD_URL" "$GOOD_URL" ok ok
+prepare_case "stable" "v0.1.0" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0"
 assert_fail "v0.1.0 with no pin is rejected" "no run pin"
 
-prepare_case "rc10" "v0.1.0-rc.10" "# no pin" "$GOOD_URL" "$GOOD_URL" ok ok
+prepare_case "rc10" "v0.1.0-rc.10" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0-rc.10"
 assert_fail "v0.1.0-rc.10 with no pin is rejected" "no run pin"
 
@@ -475,7 +475,7 @@ assert_absent "online result with one non-matching attestation is rejected" "ver
 prepare_case "operator" "v0.1.0" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
 run_case "v0.1.0" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
 assert_ok "operator-supplied pin for an unpinned tag passes" "$GOOD_URL"
-operator_line="run pin: operator-supplied (not in release-run-pins.txt)"
+operator_line="verified (operator-supplied pin; draft only, not release evidence)"
 if ! printf '%s\n' "$CASE_OUT" | grep -F -q -- "$operator_line"; then
   fail "operator-supplied pin did not print the required line: ${CASE_OUT}"
 fi
@@ -484,5 +484,16 @@ if [[ "$last_line" != "$operator_line" ]]; then
   fail "operator-supplied final line was [${last_line}]"
 fi
 ok "operator-supplied final line"
+
+prepare_case "missing-file" "v0.1.0-rc.6" "$PIN_LINE" "$GOOD_URL" "$GOOD_URL" ok ok
+rm -f "${CASE_DIR}/release-run-pins.txt"
+run_case "v0.1.0-rc.6" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
+assert_fail "missing pin file with --expected-run is rejected" "is missing or empty"
+assert_absent "missing pin file with --expected-run is rejected" "operator-supplied pin"
+
+prepare_case "empty-file" "v0.1.0-rc.6" "# comment only" "$GOOD_URL" "$GOOD_URL" ok ok
+run_case "v0.1.0-rc.6" --expected-run "$GOOD_RUN" "$GOOD_ATTEMPT"
+assert_fail "comment-only pin file with --expected-run is rejected" "is missing or empty"
+assert_absent "comment-only pin file with --expected-run is rejected" "operator-supplied pin"
 
 printf 'ok verify-release-artifacts-test\n'
