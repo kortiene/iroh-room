@@ -44,10 +44,15 @@ On insert, `apply_insert_outcome` calls `adopt_key_from_event`
 (`engine.rs:1790`). That function adopts a `MemberKeyDistribution` or the
 `rotation` payload on `member.removed` (`engine.rs:3098-3105`), calls
 `unwrap_room_key` (`engine.rs:3220`), and on a fresh adoption persists the
-key (`engine.rs:3283-3285`). An inbound `WantKeyHistory` is served and an
-inbound `KeyHistory` chunk is adopted (`engine.rs:933-938`). No CLI or net
-source constructs a `WantKeyHistory` message; the handler runs when a peer
-sends one.
+key (`engine.rs:3283-3285`). An inbound `WantKeyHistory` is served
+(`engine.rs:933-934`). Any current room member (a device admission accepts;
+removed members and provisional invitees are refused) running a non-shipped
+client can send KeyHistory chunks that the shipped engine adopts without
+binding them to an admin-signed distribution (engine.rs:936-938,
+:3291-3299), populating room_keys persistently. DAG key distributions are
+admin-gated (fold.rs:390). Tracked in <follow-up issue, pending>. Plaintext
+confidentiality holds for v0.1: the shipped CLI seals nothing and never
+decrypts for display.
 
 Content decryption of pipe and file envelopes is on that same path.
 `encrypted_bodies` calls `read_content` (`engine.rs:1256`). `pipe_opened`
@@ -57,8 +62,11 @@ pump calls `file_shared_hashes`
 (`crates/iroh-rooms-net/src/node.rs:341`). `pipe connect` calls
 `node.pipe_opened` (`crates/iroh-rooms-cli/src/pipe.rs:319`). A
 peer-supplied `content.encrypted` envelope of those inner types is opened
-during those lookups. `readable_content` itself has no CLI caller; message
-display does not use it.
+during those lookups. The decrypted `pipe.opened`, `pipe.closed`, and
+`file.shared` bodies drive pipe-authorization and blob-serving decisions,
+not just display. An unreadable remote encrypted pipe.closed makes
+pipe_is_closed close every pipe (engine.rs:1329-1366, pipe/gate.rs:52).
+`readable_content` itself has no CLI caller; message display does not use it.
 
 ### (c) Reachable for experimental SDK embedders
 
