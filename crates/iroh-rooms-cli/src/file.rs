@@ -3,10 +3,10 @@
 //! [`crate::message`] and [`crate::pipe`]:
 //!
 //! * `share` is the **producer/import** path: it content-addresses a local file
-//!   into the durable local blob store ([`iroh_rooms_net::BlobStore`]), records
+//!   into the durable local blob store ([`iroh_rooms::experimental::blob::BlobStore`]), records
 //!   this node as a local provider, then authors + self-validates + persists a
 //!   signed `file.shared` **reference** onto the local log via the pure core
-//!   builder ([`build_file_shared`](iroh_rooms_core::event::build_file_shared)).
+//!   builder ([`build_file_shared`](iroh_rooms::files::build_file_shared)).
 //!   It is deliberately **offline**: the blob bytes are never carried on the log
 //!   (PRD §9.2), and the event propagates through the already-landed sync engine
 //!   unchanged once peers reconcile. No network is contacted.
@@ -20,7 +20,7 @@
 //!   transfer the blob, independently verify BLAKE3-256 against the declared
 //!   hash, save the verified bytes, and print the saved path + verified hash. An
 //!   unauthorized peer is denied at the provider's room-ACL path (`net::blob`'s
-//!   two-gate serve, wired in via `room tail`'s [`iroh_rooms_net::BlobServeConfig`]);
+//!   two-gate serve, wired in via `room tail`'s [`iroh_rooms::experimental::session::BlobServeConfig`]);
 //!   an unavailable provider is reported honestly within a bounded timeout.
 
 use std::io::{ErrorKind, Write};
@@ -28,23 +28,24 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-// The offline authoring half of `share` goes through the SDK façade (spec
-// IR-0301 §5.4); the online engine/transport imports below stay direct
-// `core`/`net` deps (the optional online-path migration). `EndpointAddr` /
-// `EndpointId` / `SecretKey` route through the façade's re-export (issue #87)
-// rather than a direct `iroh` dependency.
+// Authoring, store, sync, blobs, and transport all go through the SDK façade
+// (spec IR-0301). `EndpointAddr` / `EndpointId` / `SecretKey` route through the
+// façade's re-export (issue #87) rather than a direct `iroh` dependency.
+use iroh_rooms::events::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
+use iroh_rooms::events::SignedEvent;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::events::{Content, EventType};
+use iroh_rooms::experimental::blob::{BlobError, BlobStore, FetchOutcome};
 use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms::experimental::session::{NetConfig, Node, DEFAULT_TICK};
+use iroh_rooms::experimental::store::{EventStore, StoredEvent};
+use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
 use iroh_rooms::files::build_file_shared;
-use iroh_rooms_core::event::constants::{MAX_SHARED_FILE_BYTES, SHORT_ID_LEN};
-use iroh_rooms_core::event::content::{Content, EventType, FileShared};
-use iroh_rooms_core::event::ids::{HashRef, RoomId};
-use iroh_rooms_core::event::keys::DeviceKey;
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::membership::Ingest;
-use iroh_rooms_core::store::{EventStore, StoredEvent};
-use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_net::{BlobError, BlobStore, FetchOutcome, NetConfig, Node, DEFAULT_TICK};
+use iroh_rooms::files::FileShared;
+use iroh_rooms::files::HashRef;
+use iroh_rooms::identity::DeviceKey;
+use iroh_rooms::room::Ingest;
+use iroh_rooms::room::RoomId;
 use serde_json::json;
 
 use crate::error::{CodedResultExt, ErrorCode};
@@ -57,7 +58,7 @@ use crate::{audit, clock, identity, paths};
 /// Directory (under the data-directory home) rooting the durable blob store (spec
 /// §4.1 / §5.5). Lives inside the `0700` home; `file share` tightens it to `0700`.
 /// `pub(crate)` so `message::tail` can pass the same path to
-/// [`iroh_rooms_net::BlobServeConfig`] (IR-0204 spec §6.6).
+/// [`iroh_rooms::experimental::session::BlobServeConfig`] (IR-0204 spec §6.6).
 pub(crate) const BLOBS_DIR: &str = "blobs";
 /// The only `blob_format` for MVP (spec §3.3 / §5.2 step 6); `hash_seq` is a
 /// follow-up (spike NOTES.md §6).
@@ -93,7 +94,7 @@ pub struct FileShareSummary {
     /// The BLAKE3-256 content hash.
     pub blob_hash: HashRef,
     /// The authored `file.shared` event id.
-    pub event_id: iroh_rooms_core::event::ids::EventId,
+    pub event_id: iroh_rooms::events::EventId,
     /// The room the file belongs to.
     pub room_id: RoomId,
     /// The original path as given (for the `imported:` line; not put on the log).
@@ -137,7 +138,7 @@ pub async fn share(
     let (mut membership, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&sender_id) {
         crate::bail_coded!(
-            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            crate::error::ErrorCode::Reject(iroh_rooms::events::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can share \
              files (this identity is {sender_id})"
         );
@@ -497,7 +498,7 @@ pub async fn fetch(
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
         crate::bail_coded!(
-            ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            ErrorCode::Reject(iroh_rooms::events::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can fetch \
              files (this identity is {self_id})"
         );
@@ -1103,11 +1104,11 @@ mod tests {
         resolve_providers, sanitize_name, save_atomic, short_endpoint, validate_mime,
         validate_share_name, FetchFailure, FetchTally, DOWNLOADS_ENV, MAX_SHARE_BYTES_ENV,
     };
+    use iroh_rooms::events::constants::MAX_SHARED_FILE_BYTES;
     use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
-    use iroh_rooms_core::event::constants::MAX_SHARED_FILE_BYTES;
-    use iroh_rooms_core::event::content::FileShared;
-    use iroh_rooms_core::event::ids::HashRef;
-    use iroh_rooms_core::event::keys::{DeviceKey, SigningKey};
+    use iroh_rooms::files::FileShared;
+    use iroh_rooms::files::HashRef;
+    use iroh_rooms::identity::{DeviceKey, SigningKey};
     use std::net::SocketAddr;
     use std::path::Path;
     use tempfile::TempDir;

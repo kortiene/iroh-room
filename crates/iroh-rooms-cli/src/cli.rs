@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use iroh_rooms_core::event::ids::RoomId;
+use iroh_rooms::room::RoomId;
 
 use crate::error::{CodedResultExt, ErrorCode};
 use crate::{agent, file, identity, invite, join, message, paths, pipe, room};
