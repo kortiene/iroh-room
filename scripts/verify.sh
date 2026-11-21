@@ -35,3 +35,18 @@ cargo test -p iroh-rooms-crypto --doc
 # Local lifecycle-smoke harness. The networked install is lifecycle-smoke.sh
 # itself and is not run here.
 scripts/lifecycle-smoke-test.sh
+
+# The four SDK crates stay unpublished in git. Flipping `publish = false` is
+# the release pull request's job. The dry-run script strips the line only in
+# a throwaway worktree.
+for manifest in \
+  crates/iroh-rooms-crypto/Cargo.toml \
+  crates/iroh-rooms-core/Cargo.toml \
+  crates/iroh-rooms-net/Cargo.toml \
+  crates/iroh-rooms/Cargo.toml
+do
+  if ! grep -qx 'publish = false' "$manifest"; then
+    printf 'error: %s must contain a publish = false line\n' "$manifest" >&2
+    exit 1
+  fi
+done
