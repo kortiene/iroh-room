@@ -15,8 +15,12 @@ where feasible); the **experimental** tier may change on any release.
   or reloaded row is adopted only when its source event is a stored admin
   distribution for the same epoch and commitment; the all-zero event id never
   binds; served chunks carry that id; and `new_epoch == u64::MAX` is rejected.
-  No CLI or `iroh-rooms-net` call site sets the flag. `insert_room_key` is
-  unchanged. Refs #429 #343 #286.
+  No CLI or `iroh-rooms-net` call site sets the flag. With the flag on, open
+  re-seeds the epoch watermark and the same-epoch commitment map from stored
+  admin distributions. Refs #429 #343 #286.
+- **Behaviour change:** `insert_room_key` still persists a row, but that row
+  uses the all-zero event id and open does not reload it. An embedder must
+  call `insert_room_key` again after every open. Refs #429.
 - Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the

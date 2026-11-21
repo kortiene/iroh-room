@@ -2593,9 +2593,9 @@ fn key_adoption_a2_flag_on_rejects_unbound_and_adopts_bound() {
         next_key.as_bytes()
     );
 
-    // A bound chunk whose epoch is ahead of the watermark is not adopted, and
-    // does not raise the watermark. Once a later DAG distribution moves the
-    // watermark, the same chunk is adopted.
+    // Flag off stores the distribution without adopting it. Reopen with the
+    // flag on re-seeds the watermark from that event, so the bound chunk
+    // adopts without a later DAG distribution.
     let (mut cold, cold_room, cold_genesis) = seeded_engine_with_admin_seed(adoption_config(false));
     let ahead_key = RoomKey::from_bytes([0x55; 32]);
     let ahead = crate::event::distribution::build_member_key_distribution(
@@ -2624,18 +2624,24 @@ fn key_adoption_a2_flag_on_rejects_unbound_and_adopts_bound() {
         Some(ADMIN_DEV_SEED),
     )
     .expect("reopen flag on");
-    assert!(!cold.has_room_key(5));
-    let ahead_chunk = history_chunk(&cold_room, 5, &ahead_key, ahead_id, sk(2).device_key());
-    deliver_chunks(&mut cold, NODE_B, cold_room, vec![ahead_chunk.clone()]);
     assert!(
         !cold.has_room_key(5),
-        "a bound chunk must not adopt an epoch above the watermark"
+        "flag off wrote no room_keys row to reload"
+    );
+    let ahead_chunk = history_chunk(&cold_room, 5, &ahead_key, ahead_id, sk(2).device_key());
+    deliver_chunks(&mut cold, NODE_B, cold_room, vec![ahead_chunk.clone()]);
+    assert_eq!(
+        cold.room_key(5)
+            .expect("seeded watermark lets the bound chunk adopt")
+            .as_bytes(),
+        ahead_key.as_bytes()
     );
     assert!(
-        cold.logs()
+        !cold
+            .logs()
             .iter()
             .any(|line| line.starts_with("key_history_epoch_rejected ")),
-        "ahead-of-watermark chunks are logged, got {:?}",
+        "a chunk at the seeded watermark is not ahead, got {:?}",
         cold.logs()
     );
     let later_key = RoomKey::from_bytes([0x66; 32]);
@@ -2824,4 +2830,318 @@ fn key_adoption_a4_serving_follows_the_flag() {
     assert_eq!(chunks[0].epoch, 2);
     assert_eq!(chunks[0].distribution_event_id, dist_id);
     assert_ne!(chunks[0].distribution_event_id, zero_event_id());
+}
+
+/// Restart seeding. An admin distribution at epoch 5 is stored but not
+/// unwrapped. After reopen the watermark is 5, so a bound chunk adopts, and a
+/// lower-epoch DAG distribution is a backward replay.
+#[test]
+fn key_adoption_restart_seeds_watermark_from_stored_distribution() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let epoch5_key = RoomKey::from_bytes([0x55; 32]);
+    let other = sk(4).device_key();
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        5,
+        &epoch5_key,
+        &[other],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    let dist_bytes = dist.to_bytes();
+    let dist_id = frame_id(&dist_bytes, room);
+    engine.publish(&dist_bytes).expect("publish");
+    assert!(
+        !engine.has_room_key(5),
+        "the distribution does not wrap the local device"
+    );
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(!engine.has_room_key(5));
+    deliver_chunks(
+        &mut engine,
+        NODE_B,
+        room,
+        vec![history_chunk(
+            &room,
+            5,
+            &epoch5_key,
+            dist_id,
+            sk(2).device_key(),
+        )],
+    );
+    assert_eq!(
+        engine
+            .room_key(5)
+            .expect("bound chunk adopts at the seeded watermark")
+            .as_bytes(),
+        epoch5_key.as_bytes()
+    );
+
+    let lower_key = RoomKey::from_bytes([0x33; 32]);
+    let lower = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        3,
+        &lower_key,
+        &[sk(2).device_key()],
+        &[dist_id],
+        T0 + 2,
+    )
+    .expect("lower distribution");
+    engine
+        .publish(&lower.to_bytes())
+        .expect("publish lower epoch");
+    assert!(
+        !engine.has_room_key(3),
+        "a lower epoch than the seeded watermark is a backward replay"
+    );
+    assert!(
+        engine
+            .logs()
+            .iter()
+            .any(|line| line.starts_with("backward_epoch_rejected ")),
+        "backward rejection is logged, got {:?}",
+        engine.logs()
+    );
+}
+
+/// A removal rotation is part of the same scan. With no other distribution,
+/// it is what seeds the watermark.
+#[test]
+fn key_adoption_restart_seeds_watermark_from_removal_rotation() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let epoch_key = RoomKey::from_bytes([0x44; 32]);
+    let subject = sk(9).identity_key();
+    let removal = build_member_removed_with_rotation(
+        &sk(1),
+        &sk(2),
+        &room,
+        &subject,
+        None,
+        None,
+        None,
+        Some(5),
+        Some(&epoch_key),
+        &[sk(4).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("removal rotation");
+    let bytes = removal.to_bytes();
+    let removal_id = frame_id(&bytes, room);
+    engine.publish(&bytes).expect("publish removal");
+    assert!(!engine.has_room_key(5));
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    deliver_chunks(
+        &mut engine,
+        NODE_B,
+        room,
+        vec![history_chunk(
+            &room,
+            5,
+            &epoch_key,
+            removal_id,
+            sk(2).device_key(),
+        )],
+    );
+    assert_eq!(
+        engine
+            .room_key(5)
+            .expect("removal rotation seeds the watermark")
+            .as_bytes(),
+        epoch_key.as_bytes()
+    );
+}
+
+/// After reopen, a new distribution with a different commitment poisons the
+/// epoch even when this device cannot unwrap it.
+#[test]
+fn key_adoption_restart_seeded_commitment_catches_equivocation() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let first_key = RoomKey::from_bytes([0x11; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &first_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("first distribution");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish first");
+    assert!(engine.has_room_key(2));
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert_eq!(
+        engine.room_key(2).expect("bound row reloads").as_bytes(),
+        first_key.as_bytes()
+    );
+
+    let second_key = RoomKey::from_bytes([0x22; 32]);
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &second_key,
+        &[sk(4).device_key()],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("conflicting distribution");
+    engine
+        .publish(&second.to_bytes())
+        .expect("publish conflict");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "the seeded commitment must conflict with the new distribution"
+    );
+    assert!(!engine.has_room_key(2));
+}
+
+/// A non-admin distribution inserted past the fold does not bind a chunk.
+#[test]
+fn key_adoption_non_admin_store_row_does_not_bind() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let stranger_id = sk(9);
+    let stranger_dev = sk(10);
+    let planted = RoomKey::from_bytes([0x77; 32]);
+    let wire = crate::event::distribution::build_member_key_distribution(
+        &stranger_id,
+        &stranger_dev,
+        &room,
+        0,
+        &planted,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("non-admin distribution");
+    let bytes = wire.to_bytes();
+    let validated = validate_wire_bytes(&bytes, &ValidationContext::for_room(room))
+        .expect("stateless validation does not apply the admin gate");
+    engine
+        .store_mut()
+        .insert(&validated)
+        .expect("direct insert");
+    deliver_chunks(
+        &mut engine,
+        NODE_B,
+        room,
+        vec![history_chunk(
+            &room,
+            0,
+            &planted,
+            validated.event_id,
+            sk(2).device_key(),
+        )],
+    );
+    assert!(
+        !engine.has_room_key(0),
+        "a non-admin source event must not bind a chunk"
+    );
+    assert!(
+        engine
+            .logs()
+            .iter()
+            .any(|line| line.starts_with("key_history_unbound ")),
+        "the unbound chunk is logged, got {:?}",
+        engine.logs()
+    );
+}
+
+/// A-5. No production call site in the CLI or net crates sets the flag.
+#[test]
+fn key_adoption_a5_shipped_crates_do_not_set_the_flag() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut hits = Vec::new();
+    for rel in ["../iroh-rooms-cli/src", "../iroh-rooms-net/src"] {
+        let dir = root.join(rel);
+        assert!(dir.is_dir(), "missing {}", dir.display());
+        collect_flag_sets(&dir, &mut hits);
+    }
+    assert!(
+        hits.is_empty(),
+        "no non-test CLI or net source may set experimental_room_key_adoption. Found:\n{}",
+        hits.join("\n")
+    );
+}
+
+fn collect_flag_sets(dir: &std::path::Path, hits: &mut Vec<String>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|_| panic!("read {}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_flag_sets(&path, hits);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {}", path.display()));
+        let mut depth: usize = 0;
+        let mut skip_until: Option<usize> = None;
+        let mut cfg_test_pending = false;
+        for (idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if skip_until.is_none()
+                && trimmed.starts_with("#[")
+                && trimmed.contains("cfg(")
+                && trimmed.contains("test")
+            {
+                cfg_test_pending = true;
+            }
+            if skip_until.is_none() && cfg_test_pending && trimmed.contains('{') {
+                skip_until = Some(depth);
+                cfg_test_pending = false;
+            }
+            let in_test = skip_until.is_some() || cfg_test_pending;
+            if cfg_test_pending && trimmed.ends_with(';') && !trimmed.contains('{') {
+                cfg_test_pending = false;
+            }
+            let code = trimmed.split("//").next().unwrap_or(trimmed);
+            if !in_test && code.contains("experimental_room_key_adoption") {
+                hits.push(format!("{}:{}: {}", path.display(), idx + 1, trimmed));
+            }
+            depth = depth.saturating_add(line.matches('{').count());
+            depth = depth.saturating_sub(line.matches('}').count());
+            if let Some(stop) = skip_until {
+                if depth <= stop {
+                    skip_until = None;
+                }
+            }
+        }
+    }
 }

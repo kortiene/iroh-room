@@ -333,7 +333,9 @@ when its source event id is a stored event sent by the room admin whose content 
 `new_epoch` and `key_commitment` match. The all-zero event id never binds. Served chunks
 carry that source id; all-zero-id keys are not served. A chunk does not raise the epoch
 watermark and is adopted only when its epoch is less than or equal to the watermark a DAG
-distribution already reached. `new_epoch == u64::MAX` is rejected on the DAG, chunk, and
+distribution already reached. With the flag on, open re-seeds that watermark and the
+same-epoch commitment map from stored admin distributions (`member.key_distribution` and
+`member.removed` rotations), skipping `u64::MAX`. `new_epoch == u64::MAX` is rejected on the DAG, chunk, and
 reload paths. No v1 signed bytes, CBOR encoding, or `SyncMessage` shape changes; only the
 value of `KeyHistoryChunk.distribution_event_id` changes from all zeros to the real source id.
 

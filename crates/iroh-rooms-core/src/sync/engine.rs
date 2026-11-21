@@ -707,6 +707,15 @@ impl SyncEngine {
             admin.as_ref(),
             config.experimental_room_key_adoption,
         );
+        // Flag on: the epoch watermark and D5a commitment map are session
+        // memory. Re-seed both from stored admin distributions so a restart
+        // does not treat a later historical chunk as ahead of the watermark
+        // or miss a conflicting commitment (Refs #429).
+        let (highest_epoch_seen, epoch_commitments) = if config.experimental_room_key_adoption {
+            seed_epoch_watermark(&store, &room_id, admin.as_ref())?
+        } else {
+            (0, BTreeMap::new())
+        };
 
         let mut engine = Self {
             room_id,
@@ -739,8 +748,8 @@ impl SyncEngine {
             pending_batch: PendingStoreBatch::new(),
             room_keys,
             local_device_seed,
-            epoch_commitments: BTreeMap::new(),
-            highest_epoch_seen: 0,
+            epoch_commitments,
+            highest_epoch_seen,
         };
         for line in key_logs {
             engine.log(&line);
@@ -931,7 +940,11 @@ impl SyncEngine {
                 self.log(&format!("peer lacks {} requested ids", ids.len()));
             }
             SyncMessage::WantKeyHistory { have_epochs, .. } => {
-                // Flag off: do not serve key material (Refs #429).
+                // Extra layer (Refs #429). A flag-off engine only holds
+                // all-zero-id keys from `insert_room_key`, and serving already
+                // skips those, so this gate is not reachable from a test: open
+                // never loads a real-source key while the flag is off. It still
+                // refuses to serve if such a key were present.
                 if self.config.experimental_room_key_adoption {
                     self.serve_want_key_history(from, &have_epochs, &mut out);
                 }
@@ -1153,11 +1166,12 @@ impl SyncEngine {
     /// epoch (spec D5a: the engine adopts *neither* key; reads for the epoch
     /// become unreadable; further offers are refused) — resolution belongs to
     /// the rotation lifecycle's deterministic fork rule (§7 step 6), never to
-    /// arrival order. Until step 6 wires fold-driven distribution, this is the
-    /// only way keys enter the engine (a local provisioning API).
+    /// arrival order.
     ///
-    /// A successful fresh insertion is persisted to the `room_keys` derived
-    /// cache so the key survives restart (spec D7).
+    /// The persisted row is attributed to the all-zero event id. Open does not
+    /// reload an all-zero row, so this key does not come back after restart.
+    /// An embedder that provisions keys here must call `insert_room_key` again
+    /// after every [`open`](Self::open).
     ///
     /// # Errors
     /// [`SyncError::EpochKeyConflict`] on a conflicting offer.
@@ -3540,6 +3554,11 @@ fn load_persisted_room_keys(
             if adopt {
                 for (epoch, (key, source_event_id)) in keys {
                     let commitment = room_key_commitment(&key, room_id.as_bytes(), epoch);
+                    // Extra layer. `save_room_key` rejects `u64::MAX` (it does
+                    // not fit a SQLite INTEGER), and the DAG and chunk paths
+                    // reject that epoch before persist, so a row here cannot
+                    // be planted through the store API. The check stays so a
+                    // row that did exist would not reload.
                     if epoch == u64::MAX
                         || !distribution_is_bound(
                             store,
@@ -3570,6 +3589,72 @@ fn load_persisted_room_keys(
     (room_keys, logs)
 }
 
+type EpochCommitmentMap = BTreeMap<u64, (EventId, [u8; 32])>;
+
+/// Re-seed the session epoch watermark and the D5a commitment map from
+/// stored admin distributions.
+///
+/// Scans `member.key_distribution` and `member.removed` through
+/// [`EventStore::by_type`] (the `idx_events_room_type` index). A removal
+/// counts only when it carries a rotation. Non-admin senders and
+/// `new_epoch == u64::MAX` are skipped. `highest_epoch_seen` is the max
+/// remaining epoch, or 0 when there is none. Each epoch's seeded commitment
+/// is the one on the minimum event id, so a later conflicting distribution
+/// still poisons the epoch after a restart. Historical conflicts are not
+/// re-poisoned here: a resolved `room_keys` row reloads separately.
+fn seed_epoch_watermark(
+    store: &EventStore,
+    room_id: &RoomId,
+    admin: Option<&IdentityKey>,
+) -> Result<(u64, EpochCommitmentMap), StoreError> {
+    let Some(admin) = admin else {
+        return Ok((0, BTreeMap::new()));
+    };
+    let mut highest = 0u64;
+    let mut commitments = EpochCommitmentMap::new();
+    for ty in [EventType::MemberKeyDistribution, EventType::MemberRemoved] {
+        for stored in store.by_type(room_id, ty)? {
+            let Ok(signed) = SignedEvent::decode(&stored.wire.signed) else {
+                continue;
+            };
+            if &signed.sender_id != admin {
+                continue;
+            }
+            let Some(distribution) = distribution_of(&signed.content) else {
+                continue;
+            };
+            if distribution.new_epoch == u64::MAX {
+                continue;
+            }
+            highest = highest.max(distribution.new_epoch);
+            match commitments.get_mut(&distribution.new_epoch) {
+                Some((id, commitment)) => {
+                    if stored.event_id < *id {
+                        *id = stored.event_id;
+                        *commitment = distribution.key_commitment;
+                    }
+                }
+                None => {
+                    commitments.insert(
+                        distribution.new_epoch,
+                        (stored.event_id, distribution.key_commitment),
+                    );
+                }
+            }
+        }
+    }
+    Ok((highest, commitments))
+}
+
+/// The distribution payload on a key-distribution event or a removal rotation.
+fn distribution_of(content: &Content) -> Option<&MemberKeyDistribution> {
+    match content {
+        Content::MemberKeyDistribution(distribution) => Some(distribution),
+        Content::MemberRemoved(removed) => removed.rotation.as_ref(),
+        _ => None,
+    }
+}
+
 /// Whether `event_id` is a stored admin distribution for `epoch` and
 /// `key_commitment`.
 ///
@@ -3597,6 +3682,8 @@ fn distribution_is_bound(
     let Ok(signed) = SignedEvent::decode(&stored.wire.signed) else {
         return false;
     };
+    // The fold's admin gate is what normally keeps a non-admin distribution
+    // out of the store. This check covers an event inserted past the fold.
     if &signed.sender_id != admin {
         return false;
     }
