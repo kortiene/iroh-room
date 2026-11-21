@@ -50,7 +50,7 @@ removed members and provisional invitees are refused) running a non-shipped
 client can send KeyHistory chunks that the shipped engine adopts without
 binding them to an admin-signed distribution (engine.rs:936-938,
 :3291-3299), populating room_keys persistently. DAG key distributions are
-admin-gated (fold.rs:390). Tracked in <follow-up issue, pending>. Plaintext
+admin-gated (fold.rs:390). See #429. Plaintext
 confidentiality holds for v0.1: the shipped CLI seals nothing and never
 decrypts for display.
 
