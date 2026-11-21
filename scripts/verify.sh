@@ -7,6 +7,10 @@ scripts/check-release-environment.sh
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Shipping config: default features, gossip_overlay off. The --all-features
+# run above compiles the gossip-only helpers, so it does not catch dead code
+# on the default build. A failure here fails the required verify check.
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets --all-features
 
 # `cargo test --all-targets` does not run doctests; the SDK façade's stable
@@ -34,3 +38,18 @@ scripts/lifecycle-smoke-test.sh
 
 # Release run-pin harness. No network. The published-asset check is not run here.
 scripts/verify-release-artifacts-test.sh
+
+# The four SDK crates stay unpublished in git. Flipping `publish = false` is
+# the release pull request's job. The dry-run script strips the line only in
+# a throwaway worktree.
+for manifest in \
+  crates/iroh-rooms-crypto/Cargo.toml \
+  crates/iroh-rooms-core/Cargo.toml \
+  crates/iroh-rooms-net/Cargo.toml \
+  crates/iroh-rooms/Cargo.toml
+do
+  if ! grep -qx 'publish = false' "$manifest"; then
+    printf 'error: %s must contain a publish = false line\n' "$manifest" >&2
+    exit 1
+  fi
+done
