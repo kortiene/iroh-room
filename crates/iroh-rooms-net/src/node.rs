@@ -1136,6 +1136,14 @@ impl Node {
         self.pipe_query.pipe_opened(pipe_id).await
     }
 
+    /// Whether `pipe_is_closed` counts a close for `pipe_id` on this node.
+    ///
+    /// This is the engine lookup the connect gate and the teardown watcher use.
+    /// Fail-closed: a missing engine or a failed read answers `true`.
+    pub async fn pipe_is_closed(&self, pipe_id: [u8; 16]) -> bool {
+        self.pipe_query.pipe_is_closed(pipe_id).await
+    }
+
     /// **Expose** a local TCP service as a pipe (spec §6.5.1): validate the loopback
     /// target (D6) and non-empty allow-list (no default-all), draw a CSPRNG
     /// `pipe_id`, register the real target locally, author + publish the signed

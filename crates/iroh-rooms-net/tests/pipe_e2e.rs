@@ -44,7 +44,7 @@ use iroh_rooms_crypto::RoomKey;
 use iroh_rooms_net::pipe::PipeHello;
 use iroh_rooms_net::{
     AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, PipeAuditSink, PipeDenyCause,
-    PipeOutcome, TracingAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
+    PipeForwarder, PipeOutcome, TracingAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1631,6 +1631,41 @@ async fn publish_carols_closes(
         .expect("bob learns carol's unreadable close");
 }
 
+/// Alice forwards one echo and the returned socket is kept open so the owner's
+/// session stays registered.
+async fn open_forwarded_session(
+    alice_node: &Node,
+    bob_node: &Node,
+    pipe_id: [u8; 16],
+    echo_count: &AtomicUsize,
+) -> (PipeForwarder, TcpStream) {
+    let mut forwarder = alice_node
+        .pipe_connect(loopback_addr(bob_node), pipe_id, 0)
+        .await
+        .expect("alice dials bob's pipe");
+    let mut client = TcpStream::connect(forwarder.local_addr())
+        .await
+        .expect("connect local");
+    client.write_all(b"ping").await.expect("write");
+    let mut buf = [0u8; 4];
+    tokio::time::timeout(WAIT, client.read_exact(&mut buf))
+        .await
+        .expect("alice's round-trip within budget")
+        .expect("read echo");
+    assert_eq!(&buf, b"ping", "Alice's bytes must echo");
+    assert_eq!(
+        forwarder.next_outcome().await,
+        Some(PipeOutcome::Forwarded),
+        "Alice's stream must be forwarded"
+    );
+    assert!(
+        echo_count.load(Ordering::SeqCst) >= 1,
+        "Bob's target must have accepted Alice's connection"
+    );
+    wait_sessions(bob_node, 1).await;
+    (forwarder, client)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn carol_closes_do_not_stop_alice_and_bob_close_tears_down() {
     let (room, log, alice, bob, carol) = build_room();
@@ -1675,42 +1710,34 @@ async fn carol_closes_do_not_stop_alice_and_bob_close_tears_down() {
         .expect("bob exposes pipe");
     wait_pipe_opened(&alice_node, pipe_id).await;
     wait_pipe_opened(&carol_node, pipe_id).await;
-    publish_carols_closes(&alice_node, &bob_node, &carol_node, &carol, room, pipe_id).await;
 
-    let mut forwarder = alice_node
-        .pipe_connect(loopback_addr(&bob_node), pipe_id, 0)
-        .await
-        .expect("alice dials bob's pipe");
-    let local = forwarder.local_addr();
-    let echoed = tokio::time::timeout(WAIT, async {
-        let mut client = TcpStream::connect(local).await.expect("connect local");
-        client.write_all(b"ping").await.expect("write");
-        let mut buf = [0u8; 4];
-        client.read_exact(&mut buf).await.expect("read echo");
-        buf
-    })
-    .await
-    .expect("alice's round-trip within budget");
-    assert_eq!(
-        &echoed, b"ping",
-        "Carol's closes must not stop Alice connecting to Bob's pipe"
-    );
-    assert_eq!(
-        forwarder.next_outcome().await,
-        Some(PipeOutcome::Forwarded),
-        "Alice's stream must be forwarded"
-    );
+    // `_client` stays open so dropping the local socket does not deregister
+    // the session before the watcher tick below.
+    let (forwarder, _client) =
+        open_forwarded_session(&alice_node, &bob_node, pipe_id, &echo_count).await;
+
+    publish_carols_closes(&alice_node, &bob_node, &carol_node, &carol, room, pipe_id).await;
     assert!(
-        echo_count.load(Ordering::SeqCst) >= 1,
-        "Bob's target must have accepted Alice's connection"
+        !bob_node.pipe_is_closed(pipe_id).await,
+        "Carol's closes must leave pipe_is_closed false on the enforcing node"
     );
-    wait_sessions(&bob_node, 1).await;
+    // The teardown watcher re-evaluates every live session once per tick.
+    tokio::time::sleep(TICK * 3).await;
+    assert_eq!(
+        bob_node.live_pipe_sessions_for(pipe_id),
+        1,
+        "Carol's closes must not tear the live session down on a watcher tick"
+    );
 
     bob_node
         .pipe_close(&bob.id, &bob.dev, &room, pipe_id, Some("closed"), T0 + 400)
         .await
         .expect("bob closes his pipe");
     wait_sessions(&bob_node, 0).await;
+    assert!(
+        bob_node.pipe_is_closed(pipe_id).await,
+        "Bob's own close must count in pipe_is_closed"
+    );
 
     let mut reconnect = alice_node
         .pipe_connect(loopback_addr(&bob_node), pipe_id, 0)

@@ -629,7 +629,7 @@ authored by an `Active` member; verify fetched bytes' BLAKE3-256 against `blob_h
 1. remote identity ∈ `Active` members,
 2. remote identity ∈ the pipe's `allowed_members` (no default-all),
 3. the governing `pipe.opened` was authored by its `Active` owner,
-4. no `pipe.closed` for that `pipe_id` is causally known,
+4. no `pipe.closed` for that `pipe_id` counts under the owner-or-admin rule (the signed cleartext sender is the governing `pipe.opened`'s `owner_id` or the room admin; see the enforcement note in [§6](#6-mvp-event-type-registry)),
 5. `expires_at` (if present) `>=` local wall clock (the boundary `now == expires_at` still
    admits; only `now > expires_at` denies).
 
@@ -642,10 +642,10 @@ lookups (`file_shared_hashes`, `pipe_opened`, `pipe_is_closed`) use **authentica
 decryption**: an envelope feeds a projection only if it opens under a held epoch key AND the
 recovered body survives the strict per-type parse and the owner field rules. Fail-closed, never
 fail-open: an unreadable `file.shared` serves no blob hash; an unreadable `pipe.opened` leaves
-the pipe unknown (unauthorized); and an unreadable close-typed envelope — whose `pipe_id` is
-sealed inside the ciphertext and so cannot be attributed — conservatively closes **every** pipe
-on that node until the epoch key arrives, because a close that might target a given pipe must
-never be missed. A keyless node deterministically sees *fewer* capabilities than a keyed one —
+the pipe unknown (unauthorized); and an unreadable close-typed envelope is counted by the
+owner-or-admin rule in the [§6](#6-mvp-event-type-registry) enforcement note: the admin's
+unreadable close covers every pipe, an owner's covers only that owner's pipes, and anyone
+else's is ignored. A keyless node deterministically sees *fewer* capabilities than a keyed one —
 with one scoped asymmetry: a `pipe_id` deliberately reused across a plaintext and an encrypted
 `pipe.opened` can govern by a different candidate depending on key possession (both candidates
 are field-rule-bound to the same owner, so an owner can confuse enforcement of its *own* pipe

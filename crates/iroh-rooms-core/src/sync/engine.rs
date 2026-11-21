@@ -1460,27 +1460,40 @@ impl SyncEngine {
         admin == Some(sender) || sender == owner
     }
 
-    /// `true` when this freshly inserted close will not be counted for a
-    /// specific pipe by [`pipe_is_closed`](Self::pipe_is_closed): a readable
-    /// close whose sender is neither the owner nor the admin, or any
-    /// unreadable close (its `pipe_id` is sealed).
-    fn inserted_pipe_close_is_unattributed(&self, ev: &ValidatedEvent) -> bool {
+    /// The insert-time log for a `pipe.closed`, if any.
+    ///
+    /// `pipe_close_unreadable` means the body did not open, so the `pipe_id` is
+    /// sealed. An admin or owner unreadable close still counts at query time;
+    /// the line does not mean the close was ignored.
+    /// `pipe_close_unattributed` means a readable close whose sender is neither
+    /// the owner nor the admin, so [`pipe_is_closed`](Self::pipe_is_closed)
+    /// ignores it.
+    fn pipe_close_insert_label(&self, ev: &ValidatedEvent) -> Option<&'static str> {
         match &ev.event.content {
             Content::PipeClosed(closed) => {
-                !self.pipe_close_sender_attributed(&ev.event.sender_id, &closed.pipe_id)
+                if self.pipe_close_sender_attributed(&ev.event.sender_id, &closed.pipe_id) {
+                    None
+                } else {
+                    Some("pipe_close_unattributed")
+                }
             }
             Content::Encrypted(env) if env.inner_type == EventType::PipeClosed => {
                 match self.read_content(&ev.event) {
                     Ok(Content::PipeClosed(closed)) => {
-                        !self.pipe_close_sender_attributed(&ev.event.sender_id, &closed.pipe_id)
+                        if self.pipe_close_sender_attributed(&ev.event.sender_id, &closed.pipe_id) {
+                            None
+                        } else {
+                            Some("pipe_close_unattributed")
+                        }
                     }
                     // A readable close-typed envelope recovers `PipeClosed`.
-                    Ok(_) => false,
-                    // The pipe id is inside the ciphertext.
-                    Err(_) => true,
+                    Ok(_) => None,
+                    // The pipe id is inside the ciphertext. The sender rule
+                    // still decides whether the close counts.
+                    Err(_) => Some("pipe_close_unreadable"),
                 }
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -1500,14 +1513,15 @@ impl SyncEngine {
             .is_some_and(|opened| &opened.owner_id == sender)
     }
 
-    /// Log `pipe_close_unattributed event= sender=` once, from the insert that
-    /// lands. Callers must not invoke this from a query or a tick.
-    fn note_unattributed_pipe_close(&mut self, ev: &ValidatedEvent) {
-        if !self.inserted_pipe_close_is_unattributed(ev) {
+    /// Log once, from the insert that lands. Callers must not invoke this from
+    /// a query or a tick. See [`pipe_close_insert_label`](Self::pipe_close_insert_label)
+    /// for which label is which.
+    fn note_pipe_close_insert(&mut self, ev: &ValidatedEvent) {
+        let Some(label) = self.pipe_close_insert_label(ev) else {
             return;
-        }
+        };
         self.log(&format!(
-            "pipe_close_unattributed event={} sender={}",
+            "{label} event={} sender={}",
             ev.event_id, ev.event.sender_id
         ));
     }
@@ -1922,7 +1936,7 @@ impl SyncEngine {
                 self.counters.accepted += 1;
                 // Once, on the insert that lands — not on a duplicate re-see and
                 // not from `pipe_is_closed`, which the pipe gate calls every tick.
-                self.note_unattributed_pipe_close(ev);
+                self.note_pipe_close_insert(ev);
                 // The validated set grew: the memoized authorization closure is
                 // stale, and a memoized covered-downset may under-cover (a
                 // claimed id we lacked — skipped then — may now be held, and a

@@ -111,17 +111,21 @@ fn ingest(engine: &mut SyncEngine, bytes: &[u8], id: EventId, what: &str) {
     );
 }
 
-fn unattributed_lines(engine: &SyncEngine) -> Vec<String> {
+const LOG_UNREADABLE: &str = "pipe_close_unreadable";
+const LOG_UNATTRIBUTED: &str = "pipe_close_unattributed";
+
+fn close_log_lines(engine: &SyncEngine, label: &str) -> Vec<String> {
+    let prefix = format!("{label} ");
     engine
         .logs()
         .iter()
-        .filter(|line| line.starts_with("pipe_close_unattributed "))
+        .filter(|line| line.starts_with(&prefix))
         .cloned()
         .collect()
 }
 
-fn unattributed_line(event: EventId, sender: IdentityKey) -> String {
-    format!("pipe_close_unattributed event={event} sender={sender}")
+fn close_log_line(label: &str, event: EventId, sender: IdentityKey) -> String {
+    format!("{label} event={event} sender={sender}")
 }
 
 /// Genesis plus Bob and Carol joined. Alice is the admin and is not a pipe
@@ -318,20 +322,21 @@ fn ingest_encrypted_close(
 
 fn assert_logged_once_and_not_per_tick(
     engine: &mut SyncEngine,
+    label: &str,
     event: EventId,
     sender: IdentityKey,
 ) {
-    let expected = vec![unattributed_line(event, sender)];
+    let expected = vec![close_log_line(label, event, sender)];
     assert_eq!(
-        unattributed_lines(engine),
+        close_log_lines(engine, label),
         expected,
-        "an unattributed close is logged once at insert"
+        "{label} is logged once at insert"
     );
     let _ = engine.pipe_is_closed(&PIPE_B).expect("closed?");
     let _ = engine.pipe_is_closed(&PIPE_C).expect("closed?");
     let _ = engine.on_tick(0);
     assert_eq!(
-        unattributed_lines(engine),
+        close_log_lines(engine, label),
         expected,
         "querying pipe_is_closed or ticking must not log the close again"
     );
@@ -379,11 +384,11 @@ fn non_owner_unreadable_close_leaves_owners_pipe_open() {
             engine.pipe_is_closed(&NEVER_OPENED).expect("closed?"),
             "a pipe id with no pipe.opened keeps the previous lookup"
         );
-        assert_logged_once_and_not_per_tick(&mut engine, id, cast.carol.identity());
+        assert_logged_once_and_not_per_tick(&mut engine, LOG_UNREADABLE, id, cast.carol.identity());
         ingest(&mut engine, &bytes, id, "duplicate unreadable close");
         assert_eq!(
-            unattributed_lines(&engine),
-            vec![unattributed_line(id, cast.carol.identity())],
+            close_log_lines(&engine, LOG_UNREADABLE),
+            vec![close_log_line(LOG_UNREADABLE, id, cast.carol.identity())],
             "a duplicate insert must not log the close again"
         );
     }
@@ -412,7 +417,7 @@ fn non_owner_plaintext_close_leaves_owners_pipe_open() {
         engine.pipe_opened(&PIPE_B).expect("lookup").is_some(),
         "the open stays known"
     );
-    assert_logged_once_and_not_per_tick(&mut engine, id, cast.carol.identity());
+    assert_logged_once_and_not_per_tick(&mut engine, LOG_UNATTRIBUTED, id, cast.carol.identity());
 }
 
 /// B-3. An unreadable admin close covers every pipe. An unreadable owner close
@@ -475,8 +480,12 @@ fn unreadable_close_is_scoped_to_admin_or_that_owner() {
         "a pipe id with no pipe.opened keeps the previous lookup"
     );
     assert_eq!(
-        unattributed_lines(&engine),
-        vec![unattributed_line(bob_close, cast.bob.identity())]
+        close_log_lines(&engine, LOG_UNREADABLE),
+        vec![close_log_line(
+            LOG_UNREADABLE,
+            bob_close,
+            cast.bob.identity()
+        )]
     );
 
     let alice_close = ingest_encrypted_close(
@@ -497,15 +506,15 @@ fn unreadable_close_is_scoped_to_admin_or_that_owner() {
         "an unreadable close from the admin closes every pipe"
     );
     assert_eq!(
-        unattributed_lines(&engine),
+        close_log_lines(&engine, LOG_UNREADABLE),
         vec![
-            unattributed_line(bob_close, cast.bob.identity()),
-            unattributed_line(alice_close, cast.alice.identity()),
+            close_log_line(LOG_UNREADABLE, bob_close, cast.bob.identity()),
+            close_log_line(LOG_UNREADABLE, alice_close, cast.alice.identity()),
         ]
     );
     let _ = engine.pipe_is_closed(&PIPE_C);
     let _ = engine.on_tick(0);
-    assert_eq!(unattributed_lines(&engine).len(), 2);
+    assert_eq!(close_log_lines(&engine, LOG_UNREADABLE).len(), 2);
 }
 
 /// B-3 continued. A readable encrypted close from a non-owner is ignored. A
@@ -550,8 +559,12 @@ fn readable_non_owner_close_is_ignored_and_owner_close_is_honoured() {
         "a readable close from a non-owner must leave the pipe open"
     );
     assert_eq!(
-        unattributed_lines(&engine),
-        vec![unattributed_line(carol_readable, cast.carol.identity())]
+        close_log_lines(&engine, LOG_UNATTRIBUTED),
+        vec![close_log_line(
+            LOG_UNATTRIBUTED,
+            carol_readable,
+            cast.carol.identity()
+        )]
     );
 
     let bob_readable = ingest_encrypted_close(
@@ -573,8 +586,11 @@ fn readable_non_owner_close_is_ignored_and_owner_close_is_honoured() {
         "the owner's readable close names his own pipe"
     );
     assert!(
-        !unattributed_lines(&engine)
-            .contains(&unattributed_line(bob_readable, cast.bob.identity())),
+        !close_log_lines(&engine, LOG_UNATTRIBUTED).contains(&close_log_line(
+            LOG_UNATTRIBUTED,
+            bob_readable,
+            cast.bob.identity()
+        )),
         "an owner close of his own pipe is attributed and is not logged"
     );
 }
@@ -619,7 +635,8 @@ fn readable_admin_or_owner_close_is_honoured_and_does_not_reopen() {
         "the admin close names Carol's pipe"
     );
     assert!(
-        unattributed_lines(&engine).is_empty(),
+        close_log_lines(&engine, LOG_UNATTRIBUTED).is_empty()
+            && close_log_lines(&engine, LOG_UNREADABLE).is_empty(),
         "an admin close is attributed; event {admin_close} must not be logged"
     );
 
@@ -636,7 +653,11 @@ fn readable_admin_or_owner_close_is_honoured_and_does_not_reopen() {
         "a plaintext close from the owner is honoured"
     );
     assert!(
-        !unattributed_lines(&engine).contains(&unattributed_line(owner_close, cast.bob.identity())),
+        !close_log_lines(&engine, LOG_UNATTRIBUTED).contains(&close_log_line(
+            LOG_UNATTRIBUTED,
+            owner_close,
+            cast.bob.identity()
+        )),
         "the owner's plaintext close is attributed"
     );
     ingest_encrypted_close(
