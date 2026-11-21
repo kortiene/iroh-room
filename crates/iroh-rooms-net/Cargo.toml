@@ -17,7 +17,11 @@ repository.workspace = true
 # instead of only described (spec OQ-1 / A5). Enabling `gossip_overlay` adds no
 # new floor — `iroh-gossip 0.101.0` also declares 1.91.
 rust-version = "1.91"
-# Keep `publish` gated until the CLI (N1) wires the adapter into a runtime.
+description = "QUIC transport, blob serve and fetch, and live TCP pipes for Iroh Rooms."
+readme = "README.md"
+keywords = ["p2p", "quic", "networking"]
+# `publish = false` stays in git. The dry run strips it in a throwaway
+# worktree. See `docs/sdk-publish.md`.
 publish = false
 
 [lib]
@@ -52,7 +56,7 @@ path = "src/bin/net_smoke.rs"
 [dependencies]
 # `sync` transitively enables `store`, so `SyncEngine` + `EventStore` are both
 # available to the driver/binary from this single feature.
-iroh-rooms-core = { path = "../iroh-rooms-core", features = ["sync"] }
+iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-alpha.1", features = ["sync"] }
 # Same pin proven by `spike-blobs` (crates.io index 2026-06-29). Only the iroh 1.0
 # stable core (`Endpoint`/`Router`/`ProtocolHandler`/`Connection`/`EndpointId`) is
 # used — zero 0.x crates on the event critical path (ADR-1 churn argument / D5).
