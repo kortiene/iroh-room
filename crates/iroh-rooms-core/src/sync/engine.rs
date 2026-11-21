@@ -590,12 +590,14 @@ pub struct SyncEngine {
     pending_batch: PendingStoreBatch,
 
     /// In-memory `epoch → room_key` store for `content.encrypted` bodies
-    /// (#191 step 4 + step 6, spec D5a/D7). Keys arrive via fold-driven
-    /// adoption from `member.key_distribution` / `member.removed.rotation`
-    /// payloads and via the local provisioning API
-    /// [`insert_room_key`](Self::insert_room_key). Adopted keys are persisted
-    /// to `room_keys` and reloaded on `open`. `RoomKey` zeroizes on drop, so an
-    /// engine drop wipes in-memory keys; the T28 at-rest posture is deferred.
+    /// (#191 step 4 + step 6, spec D5a/D7). Keys arrive via the local
+    /// provisioning API [`insert_room_key`](Self::insert_room_key) and, only
+    /// when [`SyncConfig::experimental_room_key_adoption`] is set, via
+    /// fold-driven adoption from `member.key_distribution` /
+    /// `member.removed.rotation` payloads and from the `room_keys` table.
+    /// Adopted keys are persisted to `room_keys`. `RoomKey` zeroizes on drop,
+    /// so an engine drop wipes in-memory keys; the T28 at-rest posture is
+    /// deferred.
     room_keys: EpochKeyStore,
     /// The local device's Ed25519 secret seed, used to unwrap epoch keys from
     /// distributions targeted at this device. `None` when the engine was opened
@@ -695,21 +697,16 @@ impl SyncEngine {
 
         // Load previously adopted epoch keys from the derived cache. A failure
         // here is not fatal: the keys can be re-obtained from the distribution
-        // events in `events` via backfill/re-fold, so log and continue.
-        let mut room_keys = EpochKeyStore::default();
-        match store.load_room_keys(&room_id) {
-            Ok(keys) => {
-                for (epoch, (key, source_event_id)) in keys {
-                    // load_room_keys returns only successfully adopted keys, so
-                    // they cannot conflict; ignore the rare impossible conflict.
-                    let _ = room_keys.insert(epoch, key, source_event_id);
-                }
-            }
-            Err(e) => {
-                // Log only; correctness does not depend on this derived cache.
-                eprintln!("iroh-rooms: failed to load room keys for {room_id}: {e}");
-            }
-        }
+        // events in `events` via backfill/re-fold, so log and continue. With
+        // `experimental_room_key_adoption` off, rows stay on disk and are not
+        // loaded (Refs #429).
+        let admin = membership_projection.snapshot.admin().copied();
+        let (room_keys, key_logs) = load_persisted_room_keys(
+            &store,
+            &room_id,
+            admin.as_ref(),
+            config.experimental_room_key_adoption,
+        );
 
         let mut engine = Self {
             room_id,
@@ -745,6 +742,9 @@ impl SyncEngine {
             epoch_commitments: BTreeMap::new(),
             highest_epoch_seen: 0,
         };
+        for line in key_logs {
+            engine.log(&line);
+        }
         // Restore the genuinely non-rebuildable transient state (the orphan park,
         // the unconfirmed admin-tip suspicion, the backfill token buckets, the
         // trust-decision audit, and adopted room keys) from the v2 sync-cache
@@ -931,11 +931,19 @@ impl SyncEngine {
                 self.log(&format!("peer lacks {} requested ids", ids.len()));
             }
             SyncMessage::WantKeyHistory { have_epochs, .. } => {
-                self.serve_want_key_history(from, &have_epochs, &mut out);
+                // Flag off: do not serve key material (Refs #429).
+                if self.config.experimental_room_key_adoption {
+                    self.serve_want_key_history(from, &have_epochs, &mut out);
+                }
             }
             SyncMessage::KeyHistory { chunks, .. } => {
-                for chunk in chunks {
-                    self.adopt_key_history_chunk(chunk);
+                // Flag off: drop every chunk. One log line per message.
+                if self.config.experimental_room_key_adoption {
+                    for chunk in chunks {
+                        self.adopt_key_history_chunk(chunk);
+                    }
+                } else {
+                    self.log(&format!("key_history_ignored n={}", chunks.len()));
                 }
             }
         }
@@ -2286,10 +2294,15 @@ impl SyncEngine {
     }
 
     /// Serve a `WantKeyHistory` request (spec D6): return bounded chunks for
-    /// every epoch the requester lacks, drawn from the persisted `room_keys`
-    /// derived cache. Only successfully adopted keys are served; poisoned or
-    /// unresolved epochs are skipped. The response is chunked so the encoded
-    /// `KeyHistory` message stays under [`MAX_FRAME_BYTES`](super::message::MAX_FRAME_BYTES).
+    /// every epoch the requester lacks, drawn from the in-memory key store.
+    /// Only successfully adopted keys are served; poisoned or unresolved
+    /// epochs are skipped, and keys attributed to the all-zero event id are
+    /// skipped. Each chunk carries the held key's real source event id. The
+    /// response is chunked so the encoded `KeyHistory` message stays under
+    /// [`MAX_FRAME_BYTES`](super::message::MAX_FRAME_BYTES).
+    ///
+    /// The caller serves this only when
+    /// [`SyncConfig::experimental_room_key_adoption`] is set.
     fn serve_want_key_history(
         &mut self,
         from: PeerId,
@@ -2298,12 +2311,19 @@ impl SyncEngine {
     ) {
         let mut chunks = Vec::new();
         let mut budget = super::message::MAX_FRAME_BYTES - KEY_HISTORY_ENVELOPE_ALLOWANCE;
-        let held = self
-            .room_keys
-            .iter_held()
-            .map(|(epoch, key)| (epoch, key.clone()))
+        let zero_id = EventId::from_bytes([0u8; 32]);
+        let epochs = self.room_keys.held_epochs();
+        let held = epochs
+            .into_iter()
+            .filter_map(|epoch| {
+                let (key, source) = self.room_keys.get_with_source(epoch)?;
+                if source == zero_id {
+                    return None;
+                }
+                Some((epoch, key.clone(), source))
+            })
             .collect::<Vec<_>>();
-        for (epoch, key) in held {
+        for (epoch, key, source) in held {
             if have_epochs.contains(&epoch) {
                 continue;
             }
@@ -2315,7 +2335,7 @@ impl SyncEngine {
             // Build a chunk wrapped only for the requesting device. This bounds
             // every chunk to a constant size regardless of room membership.
             let requester = DeviceKey::from_bytes(*from.as_bytes());
-            let Some(chunk) = self.build_key_history_chunk(epoch, &key, requester) else {
+            let Some(chunk) = self.build_key_history_chunk(epoch, &key, source, requester) else {
                 continue;
             };
             let chunk_cost =
@@ -2360,6 +2380,7 @@ impl SyncEngine {
         &self,
         epoch: u64,
         key: &RoomKey,
+        source_event_id: EventId,
         requester: DeviceKey,
     ) -> Option<KeyHistoryChunk> {
         let _seed = self.local_device_seed?;
@@ -2377,7 +2398,7 @@ impl SyncEngine {
         )
         .ok()?;
         Some(KeyHistoryChunk {
-            distribution_event_id: EventId::from_bytes([0u8; 32]),
+            distribution_event_id: source_event_id,
             epoch,
             key_commitment: distribution.key_commitment,
             wrapped_keys: distribution.wrapped_keys,
@@ -3096,6 +3117,11 @@ impl SyncEngine {
     /// verify the D5 commitment, and adopt it. Same-epoch conflicts poison the
     /// epoch and retain candidates for deterministic resolution.
     fn adopt_key_from_event(&mut self, event_id: EventId, content: &Content) {
+        // Flag off: the event is already stored and the fold verdict stands;
+        // the key itself does not enter the engine (Refs #429).
+        if !self.config.experimental_room_key_adoption {
+            return;
+        }
         let distribution = match content {
             Content::MemberKeyDistribution(d) => Some(d),
             Content::MemberRemoved(c) => c.rotation.as_ref(),
@@ -3127,8 +3153,19 @@ impl SyncEngine {
         let epoch = distribution.new_epoch;
         let room_id = self.room_id;
 
+        // `u64::MAX` can never be a real epoch: adopting it pins
+        // `highest_epoch_seen` and blocks every later DAG distribution.
+        // Reject it before any watermark or commitment change (Refs #429).
+        if epoch == u64::MAX {
+            self.log(&format!(
+                "epoch_max_rejected epoch={epoch} event={event_id}"
+            ));
+            return;
+        }
+
         // Backward-epoch replay protection: a DAG distribution for a lower
         // epoch than the highest already seen is a protocol violation.
+        // No forward-jump cap on the DAG path.
         if !allow_backward && epoch < self.highest_epoch_seen {
             self.log(&format!(
                 "backward_epoch_rejected epoch={epoch} highest={} event={event_id}",
@@ -3136,7 +3173,16 @@ impl SyncEngine {
             ));
             return;
         }
-        if epoch > self.highest_epoch_seen {
+        // Chunks fill epochs the DAG has already reached. They must not raise
+        // the watermark (a forged chunk used to pin it at `u64::MAX`).
+        if allow_backward && epoch > self.highest_epoch_seen {
+            self.log(&format!(
+                "key_history_epoch_rejected epoch={epoch} highest={} event={event_id}",
+                self.highest_epoch_seen
+            ));
+            return;
+        }
+        if !allow_backward && epoch > self.highest_epoch_seen {
             self.highest_epoch_seen = epoch;
         }
 
@@ -3286,10 +3332,31 @@ impl SyncEngine {
     }
 
     /// Adopt one key-history chunk received over the sync channel (spec D6).
-    /// The chunk carries a distribution payload plus the original event id for
-    /// deterministic conflict resolution.
+    ///
+    /// Binding runs before any watermark or commitment change. The chunk is
+    /// dropped unless `distribution_event_id` is a stored admin distribution
+    /// (or removal rotation) for the same epoch and commitment. The all-zero
+    /// id never binds (Refs #429).
     fn adopt_key_history_chunk(&mut self, chunk: super::message::KeyHistoryChunk) {
         let event_id = chunk.distribution_event_id;
+        let bound = {
+            let admin = self.membership_projection.snapshot.admin().copied();
+            distribution_is_bound(
+                &self.store,
+                &self.room_id,
+                admin.as_ref(),
+                &event_id,
+                chunk.epoch,
+                &chunk.key_commitment,
+            )
+        };
+        if !bound {
+            self.log(&format!(
+                "key_history_unbound epoch={} event={event_id}",
+                chunk.epoch
+            ));
+            return;
+        }
         let distribution = MemberKeyDistribution {
             new_epoch: chunk.epoch,
             key_commitment: chunk.key_commitment,
@@ -3451,6 +3518,97 @@ impl SyncEngine {
         }
         self.logs.push(msg.to_owned());
     }
+}
+
+/// Load `room_keys` rows into memory.
+///
+/// Flag off: load nothing, delete nothing, and log `room_keys_ignored n=`
+/// when any row exists. Flag on: load a row only when its `source_event_id`
+/// binds to a stored admin distribution for the same epoch and commitment.
+/// All-zero ids and `epoch == u64::MAX` are not reloaded. Rows that fail the
+/// check stay on disk.
+fn load_persisted_room_keys(
+    store: &EventStore,
+    room_id: &RoomId,
+    admin: Option<&IdentityKey>,
+    adopt: bool,
+) -> (EpochKeyStore, Vec<String>) {
+    let mut room_keys = EpochKeyStore::default();
+    let mut logs = Vec::new();
+    match store.load_room_keys(room_id) {
+        Ok(keys) => {
+            if adopt {
+                for (epoch, (key, source_event_id)) in keys {
+                    let commitment = room_key_commitment(&key, room_id.as_bytes(), epoch);
+                    if epoch == u64::MAX
+                        || !distribution_is_bound(
+                            store,
+                            room_id,
+                            admin,
+                            &source_event_id,
+                            epoch,
+                            &commitment,
+                        )
+                    {
+                        logs.push(format!(
+                            "room_key_unbound epoch={epoch} event={source_event_id}"
+                        ));
+                        continue;
+                    }
+                    // One row per epoch, so a conflict here is a store bug.
+                    let _ = room_keys.insert(epoch, key, source_event_id);
+                }
+            } else if !keys.is_empty() {
+                logs.push(format!("room_keys_ignored n={}", keys.len()));
+            }
+        }
+        Err(e) => {
+            // Log only; correctness does not depend on this derived cache.
+            eprintln!("iroh-rooms: failed to load room keys for {room_id}: {e}");
+        }
+    }
+    (room_keys, logs)
+}
+
+/// Whether `event_id` is a stored admin distribution for `epoch` and
+/// `key_commitment`.
+///
+/// The event must be in `room_id`, its sender must be `admin`, and its
+/// content must be `MemberKeyDistribution` or `MemberRemoved` with a rotation
+/// payload whose `new_epoch` and `key_commitment` match. The all-zero event
+/// id never binds.
+fn distribution_is_bound(
+    store: &EventStore,
+    room_id: &RoomId,
+    admin: Option<&IdentityKey>,
+    event_id: &EventId,
+    epoch: u64,
+    key_commitment: &[u8; 32],
+) -> bool {
+    if event_id.as_bytes() == &[0u8; 32] {
+        return false;
+    }
+    let Some(admin) = admin else {
+        return false;
+    };
+    let Ok(Some(stored)) = store.get_in_room(room_id, event_id) else {
+        return false;
+    };
+    let Ok(signed) = SignedEvent::decode(&stored.wire.signed) else {
+        return false;
+    };
+    if &signed.sender_id != admin {
+        return false;
+    }
+    let distribution = match signed.content {
+        Content::MemberKeyDistribution(d) => d,
+        Content::MemberRemoved(removed) => match removed.rotation {
+            Some(d) => d,
+            None => return false,
+        },
+        _ => return false,
+    };
+    distribution.new_epoch == epoch && distribution.key_commitment == *key_commitment
 }
 
 /// Build an [`Outgoing`] addressed to `peer`.

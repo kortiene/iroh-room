@@ -7,6 +7,16 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- **Experimental (`SyncConfig`):** `experimental_room_key_adoption` (default
+  off) gates adopting epoch keys from peers and from the `room_keys` table.
+  With the flag off, `KeyHistory` chunks are ignored, `WantKeyHistory` is not
+  served, DAG key-distribution events are stored but not adopted, and existing
+  `room_keys` rows are left in place and not loaded. With the flag on, a chunk
+  or reloaded row is adopted only when its source event is a stored admin
+  distribution for the same epoch and commitment; the all-zero event id never
+  binds; served chunks carry that id; and `new_epoch == u64::MAX` is rejected.
+  No CLI or `iroh-rooms-net` call site sets the flag. `insert_room_key` is
+  unchanged. Refs #429 #343 #286.
 - Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the

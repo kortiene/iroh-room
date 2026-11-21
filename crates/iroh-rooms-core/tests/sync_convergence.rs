@@ -2452,6 +2452,7 @@ fn removal_with_rotation_converges_and_removed_device_reads_ciphertext_only() {
     let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
     let cfg = SyncConfig {
         encrypted_content_writes: true,
+        experimental_room_key_adoption: true,
         ..SyncConfig::default()
     };
 
@@ -2663,6 +2664,7 @@ fn key_history_transfer_unlocks_backlog_for_new_member() {
     let room = signed::derive_room_id(&alice.identity(), &NONCE, T0);
     let cfg = SyncConfig {
         encrypted_content_writes: true,
+        experimental_room_key_adoption: true,
         ..SyncConfig::default()
     };
 
@@ -2923,6 +2925,7 @@ fn key_history_transfer_unlocks_backlog_for_new_member() {
 fn encrypted_cfg() -> SyncConfig {
     SyncConfig {
         encrypted_content_writes: true,
+        experimental_room_key_adoption: true,
         ..SyncConfig::default()
     }
 }

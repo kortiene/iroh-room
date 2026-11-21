@@ -181,7 +181,6 @@ impl EpochKeyStore {
     }
 
     /// Every epoch that currently holds a usable key, in ascending order.
-    #[allow(dead_code)] // used by the key-history serve path (step 7)
     pub fn held_epochs(&self) -> Vec<u64> {
         self.epochs
             .iter()
@@ -189,14 +188,6 @@ impl EpochKeyStore {
                 matches!(state, EpochKeyState::Key(_, _)).then_some(*epoch)
             })
             .collect()
-    }
-
-    /// Iterate held `(epoch, key)` pairs in ascending epoch order.
-    pub fn iter_held(&self) -> impl Iterator<Item = (u64, &RoomKey)> {
-        self.epochs.iter().filter_map(|(epoch, state)| match state {
-            EpochKeyState::Key(k, _) => Some((*epoch, k)),
-            EpochKeyState::Poisoned => None,
-        })
     }
 
     /// Poisoned epochs that still have no deterministic resolution.
