@@ -121,8 +121,8 @@ Rough timing targets (from `PRD.v0.3.md` §17.2), so you know what "good" feels 
 - **Rust:** 1.91 or newer — the CLI links the iroh 1.0 stack, whose crates declare
   `rust-version = "1.91"`. Install a toolchain ≥ 1.91 via [rustup](https://rustup.rs/).
   (The pure protocol crates — `iroh-rooms-core`, `iroh-rooms-v2-core`,
-  `iroh-rooms-crypto` — build on 1.87 or newer; `iroh-rooms-core`'s `store`/`sync`
-  features need 1.89.)
+  `iroh-rooms-crypto` — build on 1.89 or newer, the same floor their
+  `store`/`sync` features need.)
 - **git**, plus `python3` and `curl` for the live-pipe step (a `nc` alternative is noted there).
 
 Clone and build a release binary:

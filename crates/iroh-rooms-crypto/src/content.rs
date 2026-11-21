@@ -10,7 +10,7 @@
 //! steps 3–4).
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
 
 use crate::error::CryptoError;
 use crate::keys::RoomKey;
@@ -34,10 +34,10 @@ pub fn seal_content(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(room_key.as_bytes()));
+    let cipher = Aes256Gcm::new(room_key.as_bytes().into());
     cipher
         .encrypt(
-            Nonce::from_slice(nonce),
+            nonce.into(),
             Payload {
                 msg: plaintext,
                 aad,
@@ -67,10 +67,10 @@ pub fn open_content(
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     ensure_suite(suite)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(room_key.as_bytes()));
+    let cipher = Aes256Gcm::new(room_key.as_bytes().into());
     cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            nonce.into(),
             Payload {
                 msg: ciphertext,
                 aad,

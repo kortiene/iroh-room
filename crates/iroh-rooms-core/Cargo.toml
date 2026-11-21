@@ -70,9 +70,10 @@ zeroize = "1"
 # `libsqlite3`, reproducible CI. Its FFI lives in `libsqlite3-sys`, a separate
 # crate, so the workspace `unsafe_code = "forbid"` lint (which targets our code) is
 # unaffected. Optional + behind the `store` feature.
-# 0.41 bundles `libsqlite3-sys` 0.39 (RUSTSEC-2026-0459, SQLite CVE fix).
+# 0.42 bundles `libsqlite3-sys` 0.40 (SQLite 3.54.1).
 # rusqlite >= 0.41 declares `rust-version = "1.89"`, so the `store`/`sync`
-# features need rustc 1.89; the pure default tier keeps the 1.87 floor.
+# features need rustc 1.89 — the same floor the pure default tier now sits
+# on (`aes 0.9` via `iroh-rooms-crypto`).
 rusqlite = { version = "0.42", features = ["bundled"], optional = true }
 # The pure SUITE_V1 crypto crate (#191 step 2) — a production dependency since
 # the R2 write path (§7 step 4): `event::encrypted` seals/opens content bodies
