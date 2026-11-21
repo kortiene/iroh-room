@@ -391,7 +391,8 @@ enum RoomAction {
         /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
         #[arg(long = "peer")]
         peers: Vec<String>,
-        /// Best-effort connect timeout as <int>{ms|s|m}, e.g. 5s.
+        /// Wait up to this long for every member to connect before pushing
+        /// (returns early once all are up), e.g. 5s.
         #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
         timeout: String,
         /// Use the loopback/CI network stack instead of real-network discovery.
@@ -412,7 +413,8 @@ enum RoomAction {
         /// Peer to dial, repeatable: <ENDPOINT_ID>[@<ip:port>] (else discovery).
         #[arg(long = "peer")]
         peers: Vec<String>,
-        /// Best-effort connect timeout as <int>{ms|s|m}, e.g. 5s.
+        /// Wait up to this long for every member to connect before pushing
+        /// (returns early once all are up), e.g. 5s.
         #[arg(long, default_value = crate::message::DEFAULT_SEND_TIMEOUT)]
         timeout: String,
         /// Use the loopback/CI network stack instead of real-network discovery.
