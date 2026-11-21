@@ -1096,15 +1096,35 @@ pub(crate) async fn run_sync(
     Ok(report)
 }
 
-/// Wait until every dial target is `Connected`, `Unauthorized`, or `Offline`,
-/// or until `timeout`. A refusal is `Unauthorized` (the remote closed with the
-/// admission reject code); a missing path stays `Offline` or `Connecting`.
+/// Wait until every dial target is `Connected` or `Unauthorized`, or until
+/// `timeout`.
+///
+/// `Offline` is not final. `dial_loop` keeps redialing after a failed attempt,
+/// so an offline observation keeps this wait open until that dial resolves
+/// (`Connected`), the remote refuses it (`Unauthorized`), or the deadline
+/// passes. Only a target still unresolved at the deadline is reported offline
+/// by [`classify_dial_outcome`]. `Connected` and `Unauthorized` still end the
+/// wait for that target on the poll that first observes them.
 async fn await_dial_outcome(node: &Node, ids: &[EndpointId], timeout: Duration) {
+    await_dial_states(ids, timeout, |id| node.peer_state(id)).await;
+}
+
+/// [`await_dial_outcome`] over an arbitrary state source, so a test can drive
+/// the waiter without a live [`Node`].
+async fn await_dial_states<F>(ids: &[EndpointId], timeout: Duration, mut state_of: F)
+where
+    F: FnMut(EndpointId) -> Option<PeerConnState>,
+{
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let pending = ids
-            .iter()
-            .any(|id| matches!(node.peer_state(*id), None | Some(PeerConnState::Connecting)));
+        // `Offline` stays pending: the dial loop redials it. Only a live link
+        // or a refusal is final before the deadline.
+        let pending = ids.iter().any(|id| {
+            matches!(
+                state_of(*id),
+                None | Some(PeerConnState::Connecting | PeerConnState::Offline)
+            )
+        });
         if !pending || tokio::time::Instant::now() >= deadline {
             return;
         }
@@ -1113,13 +1133,22 @@ async fn await_dial_outcome(node: &Node, ids: &[EndpointId], timeout: Duration) 
 }
 
 /// `Unauthorized` is a refusal. `Connected` accepted the link. Everything else
-/// (including a dial that never left `Connecting`) is offline.
+/// (including a dial that never left `Connecting`, or one still `Offline` when
+/// the timeout expired) is offline.
 fn classify_dial_outcome(node: &Node, ids: &[EndpointId]) -> SyncReport {
+    classify_dial_states(ids, |id| node.peer_state(id))
+}
+
+/// [`classify_dial_outcome`] over an arbitrary state source.
+fn classify_dial_states<F>(ids: &[EndpointId], mut state_of: F) -> SyncReport
+where
+    F: FnMut(EndpointId) -> Option<PeerConnState>,
+{
     let mut connected = 0usize;
     let mut refused = 0usize;
     let mut offline = 0usize;
     for id in ids {
-        match node.peer_state(*id) {
+        match state_of(*id) {
             Some(PeerConnState::Connected) => connected += 1,
             Some(PeerConnState::Unauthorized) => refused += 1,
             Some(PeerConnState::Offline | PeerConnState::Connecting) | None => offline += 1,
@@ -1559,11 +1588,12 @@ pub(crate) fn render_endpoint_addr(addr: &EndpointAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_capacity_line, parse_event_id, parse_peer, parse_timeout, render_endpoint_addr,
-        validate_body, validate_format,
+        active_capacity_line, await_dial_states, classify_dial_states, parse_event_id, parse_peer,
+        parse_timeout, render_endpoint_addr, validate_body, validate_format,
     };
     use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
     use iroh_rooms_core::event::constants::MAX_MESSAGE_BODY_BYTES;
+    use iroh_rooms_net::PeerConnState;
     use std::time::Duration;
 
     // ── validate_body ─────────────────────────────────────────────────────────
@@ -1699,4 +1729,119 @@ mod tests {
 
     // `short_id` and `iso8601_utc` moved to `crate::display` (spec IR-0106 D5/D6);
     // their unit tests live alongside them there.
+
+    // ── await_dial_outcome ────────────────────────────────────────────────────
+    //
+    // Paused tokio time plus a state function (no `Node`). `Offline` must not
+    // end the wait: `dial_loop` redials after a failed attempt. Restoring the
+    // old pending match (`None | Connecting` only) makes both
+    // `offline_then_connected_before_deadline_yields_connected` and
+    // `offline_that_persists_past_deadline_yields_offline` return on the first
+    // `Offline` observation, before the deadline.
+
+    fn dial_id(byte: u8) -> iroh_rooms::experimental::session::EndpointId {
+        SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    #[test]
+    fn classify_dial_states_counts_refusal_and_unresolved_separately() {
+        let refused = dial_id(1);
+        let offline = dial_id(2);
+        let connecting = dial_id(3);
+        let missing = dial_id(4);
+        let report = classify_dial_states(&[refused, offline, connecting, missing], |id| {
+            if id == refused {
+                Some(PeerConnState::Unauthorized)
+            } else if id == offline {
+                Some(PeerConnState::Offline)
+            } else if id == connecting {
+                Some(PeerConnState::Connecting)
+            } else {
+                None
+            }
+        });
+        assert_eq!(report.connected, 0);
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.offline, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_ends_the_wait_immediately() {
+        let id = dial_id(8);
+        let timeout = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        await_dial_states(&[id], timeout, |_| Some(PeerConnState::Connected)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let report = classify_dial_states(&[id], |_| Some(PeerConnState::Connected));
+        assert_eq!(report.connected, 1);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.offline, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unauthorized_ends_the_wait_immediately() {
+        let id = dial_id(9);
+        let timeout = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        await_dial_states(&[id], timeout, |_| Some(PeerConnState::Unauthorized)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let report = classify_dial_states(&[id], |_| Some(PeerConnState::Unauthorized));
+        assert_eq!(report.connected, 0);
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.offline, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_then_connected_before_deadline_yields_connected() {
+        let id = dial_id(10);
+        let timeout = Duration::from_millis(200);
+        // Later than one 20 ms poll, earlier than the deadline, so the first
+        // observation is `Offline` and a later one is `Connected`.
+        let connect_at = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        await_dial_states(&[id], timeout, |_| {
+            if started.elapsed() >= connect_at {
+                Some(PeerConnState::Connected)
+            } else {
+                Some(PeerConnState::Offline)
+            }
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= connect_at,
+            "waiter returned after {elapsed:?}, before the dial connected at {connect_at:?}"
+        );
+        assert!(
+            elapsed < timeout,
+            "waiter held a resolved dial until {elapsed:?} (deadline {timeout:?})"
+        );
+        let report = classify_dial_states(&[id], |_| {
+            if started.elapsed() >= connect_at {
+                Some(PeerConnState::Connected)
+            } else {
+                Some(PeerConnState::Offline)
+            }
+        });
+        assert_eq!(report.connected, 1);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.offline, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_that_persists_past_deadline_yields_offline() {
+        let id = dial_id(11);
+        let timeout = Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        await_dial_states(&[id], timeout, |_| Some(PeerConnState::Offline)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= timeout,
+            "waiter treated Offline as final and returned after {elapsed:?}, before {timeout:?}"
+        );
+        let report = classify_dial_states(&[id], |_| Some(PeerConnState::Offline));
+        assert_eq!(report.connected, 0);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.offline, 1);
+    }
 }
