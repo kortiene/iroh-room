@@ -143,6 +143,7 @@ require_text ".github/ISSUE_TEMPLATE/bug_report.md" "full data-directory backups
 require_text "CONTRIBUTING.md" "Production Readiness" "contributing links production readiness"
 require_text "README.md" "Production Readiness" "readme links production readiness"
 require_file "scripts/lifecycle-smoke.sh"
+require_file ".github/workflows/lifecycle.yml"
 # The fence under "## Back Up Before Upgrade" and the documented_backup()
 # span must be the same lines, in order. The span starts at the
 # install-uninstall.md cite comment and runs through the line ending in

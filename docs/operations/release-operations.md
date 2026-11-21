@@ -109,6 +109,21 @@ gh api "repos/kortiene/iroh-room/environments/${name}/deployment-branch-policies
 `[]`, `"protection_rules": []`, or `"deployment_branch_policy": null` means
 stop. Do not push the tag.
 
+The repository ruleset `release-tags` (id 27471194, added 2026-11-17)
+restricts creating, updating, deleting and force-pushing `refs/tags/v*`.
+
+Its bypass list is the release owner's configuration: the Repository admin
+role, as set by the release owner on 2026-11-17. A non-admin token cannot
+read the bypass list, so this review did not verify it. With that setting,
+only accounts with the admin role on this repository can create, move or
+delete `v*` tags, and so can any token acting as one of them. Today that is
+kortiene. Other accounts, GitHub App tokens and the workflow `GITHUB_TOKEN`
+are rejected. Pushing the tag below is the release owner's step.
+
+The publish job still peels `refs/tags/v<VERSION>` to this
+run's `GITHUB_SHA` before any release write. That publish-time peel check
+stays as defence in depth.
+
 ```bash
 git tag v<VERSION> <COMMIT>
 git push origin v<VERSION>
@@ -548,6 +563,7 @@ environment it sees, and it sets `evidence_grade` true only when `class` is
 `evidence`. A record counts as evidence only when all of these hold:
 
 - `class` is `evidence` and `evidence_grade` is true.
+- `result` is `PASS`.
 - `triple` is one of the four release triples in the table above. A probe
   cell does not count, including one from an ubuntu-22.04 runner.
 - It is the artifact downloaded from a dispatch of the lifecycle workflow on
@@ -569,9 +585,9 @@ gh api "repos/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>" \
 Priors in `v0.1.0-rc.1` through `v0.1.0-rc.5` are recorded
 `prior_verification: checksum-only`. They are never signature-verified.
 
-The dispatch workflow is planned. The planned file is
-`.github/workflows/lifecycle.yml`, dispatched on `main`. That file is not in
-this repository; it lands in a later PR.
+`.github/workflows/lifecycle.yml` is in the repository. It is
+`workflow_dispatch` only. It has not been dispatched on `main`. No
+evidence-class lifecycle record exists.
 
 ## Security Reporting
 

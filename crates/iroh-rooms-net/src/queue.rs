@@ -330,6 +330,10 @@ impl BytePriorityQueue {
     /// [`try_push`](Self::try_push), but charged against the separate gossip
     /// ledger: same caps, independent budget, so gossip fan-in can never
     /// consume the event-plane budget whose saturation closes connections.
+    ///
+    /// Compiled only with `gossip_overlay`. The shipping default build has no
+    /// gossip caller, and this helper must not sit in that build as dead code.
+    #[cfg(feature = "gossip_overlay")]
     pub(crate) fn try_push_gossip(
         &self,
         peer: PeerId,

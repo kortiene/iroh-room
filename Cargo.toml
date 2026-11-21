@@ -22,8 +22,8 @@ members = [
   # beside it are archived under `archive/spikes/` and are not members.
   "crates/iroh-rooms-net",
   # The public Rust SDK façade (IR-0301): a curated, stability-tiered re-export
-  # of `iroh-rooms-core`/`iroh-rooms-net`'s already-shipped surface. `publish =
-  # false` for the Phase 2 developer preview; see crates/iroh-rooms/Cargo.toml.
+  # of `iroh-rooms-core`/`iroh-rooms-net`'s already-shipped surface. Publish
+  # order and the dry run live in `docs/sdk-publish.md`.
   "crates/iroh-rooms",
   # Throwaway measurement crates (spike-blobs, spike-nat, spike-transport,
   # spike-N40) live under `archive/spikes/` and are not workspace members.

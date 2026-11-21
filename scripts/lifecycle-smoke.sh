@@ -1545,6 +1545,11 @@ on_exit() {
       code=1
     fi
   fi
+  # A record that is not PASS is a failed run. Exit 0 would hide it.
+  # 129, 130, 143, and any other non-zero status stay as they are.
+  if [[ "${RESULT:-}" != "PASS" && "$code" -eq 0 ]]; then
+    code=1
+  fi
   remove_work || true
   exit "$code"
 }
