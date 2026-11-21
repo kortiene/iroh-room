@@ -5,10 +5,10 @@ This is the AC2 evidence artifact for issue #36 / IR-0301 (extended by issue
 `crates/iroh-rooms-cli/src` imports from `iroh-rooms-core` / `iroh-rooms-net` /
 `iroh` (in production code — not `#[cfg(test)] mod tests` blocks, which
 exercise the same symbols already listed below), mapped to its `iroh-rooms`
-façade path. The façade is a superset of what the CLI needs: every production
-import maps to a façade path — there is no CLI-internal residue, and
-`crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct `iroh`
-dependency at all.
+façade path. `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct
+`iroh` dependency. Two observability symbols are still imported from
+`iroh-rooms-core` and are not re-exported by the façade; see the drift note
+below. That is a missing façade path, not a CLI feature a user can call.
 
 Regenerate this table by re-running the `grep` in the "Method" section below
 whenever the CLI's imports change; a path listed here that no longer resolves
@@ -54,15 +54,16 @@ as pure/deterministic as the already-listed `capability_hash`; see
 **Drift note (issue #144).** `crates/iroh-rooms-cli/src/audit.rs` now imports
 `ACTIVE_MEMBER_WARNING_THRESHOLD` directly from `iroh_rooms_core::membership`,
 and `crates/iroh-rooms-net` uses `active_member_warning_crossed` from the same
-module. Neither symbol is re-exported through the `iroh-rooms` façade today, so
-the "façade is a strict superset of the CLI's needs" claim above is currently
-violated by these two observability-only symbols. The façade re-exports the
+module. Neither symbol is re-exported through the `iroh-rooms` façade today.
+Adding the re-export would publish two new stable symbols; this pass leaves
+them core-only and records that choice in
+[`docs/reachability-inventory.md`](reachability-inventory.md). The façade re-exports the
 `MembershipSnapshot` type itself (including its new `active_member_limit` /
 `active_member_headroom` methods), so the headroom surface IS reachable through
 `iroh_rooms::room`; only the threshold constant and the crossing detector are
-core-only. Resolving this drift is a one-line `pub use` in
-`crates/iroh-rooms/src/room.rs` and is tracked here rather than fixed in the
-issue #144 docs pass to keep that pass docs-only.
+core-only. A one-line `pub use` in `crates/iroh-rooms/src/room.rs` would close
+the drift. It is not part of the reachability pass, because it would add
+stable public symbols.
 
 ## Experimental tier (`iroh_rooms::experimental::*`)
 
@@ -152,8 +153,7 @@ Per issue #87, `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct
 `iroh` dependency at all: `file.rs`, `join.rs`, `message.rs`, `pipe.rs`, and
 `audit.rs` all import `EndpointAddr`/`EndpointId`/`SecretKey` through
 `iroh_rooms::experimental::session` instead. `crates/iroh-rooms-cli/Cargo.toml`
-depends on `iroh-rooms` (with the `experimental` feature, so the façade's
-re-exports stay a strict superset of the CLI's needs) alongside the existing
+depends on `iroh-rooms` (with the `experimental` feature) alongside the existing
 direct `iroh-rooms-core` / `iroh-rooms-net` dependencies used by the
 unmigrated files. The "imports only through the façade" claim is now fully
 true for the online tier: no CLI production source names `iroh::` directly.
