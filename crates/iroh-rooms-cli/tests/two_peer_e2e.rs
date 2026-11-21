@@ -72,6 +72,20 @@
 //! cargo test -p iroh-rooms-cli --test two_peer_e2e -- --ignored --test-threads=1
 //! ```
 //!
+//! ## CI job for live `room remove` / `room leave`
+//!
+//! `admin_removal_reaches_member_and_withholds_new_messages` and
+//! `member_leave_reaches_admin` stay `#[ignore]` so `scripts/verify.sh` does
+//! not start them: they need `--test-threads=1`, and the rest of this online
+//! tier is too broad for every pull request. They are not a silent gap.
+//! `.github/workflows/live-room-membership.yml` runs on every pull request
+//! (and on push to `main`), Linux only, and calls
+//! `scripts/ci-live-room-membership.sh`. That script passes
+//! `--ignored --test-threads=1 --exact` for those two names, bounds the run
+//! with `timeout`, and exits non-zero unless the harness reports exactly two
+//! passes. A failing assertion fails the job. Every other `#[ignore]` test
+//! in this file stays on `scripts/release-readiness.sh`.
+//!
 //! No production code is modified: everything the test drives (`--loopback`,
 //! `--peer`, `--accept-joins`, `room tail --offline --json`, `room members --json`,
 //! the `pipe expose` stderr audit sink) already ships.
@@ -957,7 +971,90 @@ fn multiple_messages_persist_across_restart_in_order() {
     );
 }
 
+/// Per-PR coverage for the live `room remove` / `room leave` process tests.
+///
+/// Those two stay `#[ignore]` so `scripts/verify.sh` does not start loopback
+/// processes. `.github/workflows/live-room-membership.yml` runs them on every
+/// pull request through `scripts/ci-live-room-membership.sh`, which must pass
+/// `--ignored --test-threads=1 --exact` and name only those two tests. The
+/// script exits non-zero unless the harness reports exactly two passes, so a
+/// dropped filter cannot exit 0.
+#[test]
+fn live_room_membership_job_targets_remove_and_leave_exactly() {
+    let script = include_str!("../../../scripts/ci-live-room-membership.sh");
+    let workflow = include_str!("../../../.github/workflows/live-room-membership.yml");
+    let source = include_str!("two_peer_e2e.rs");
+
+    for flag in ["--ignored", "--test-threads=1", "--exact", "timeout 30m"] {
+        assert!(
+            script.contains(flag),
+            "ci-live-room-membership.sh must pass {flag}"
+        );
+    }
+    for name in [
+        "admin_removal_reaches_member_and_withholds_new_messages",
+        "member_leave_reaches_admin",
+    ] {
+        assert!(
+            script.contains(name),
+            "ci-live-room-membership.sh must name {name}"
+        );
+        assert_live_membership_test_stays_ignored(source, name);
+    }
+    for other in [
+        "two_peers_converge_on_membership",
+        "authorized_pipe_forwards_bytes",
+        "unauthorized_pipe_connection_denied",
+        "authorized_file_fetch_saves_and_verifies_blob",
+        "every_provider_refused_is_peer_unauthorized",
+    ] {
+        assert!(
+            !script.contains(other),
+            "ci-live-room-membership.sh must not run the rest of the online tier ({other})"
+        );
+    }
+    assert!(
+        workflow.contains("bash scripts/ci-live-room-membership.sh"),
+        "the workflow must invoke the script"
+    );
+    assert!(
+        workflow.contains("pull_request:"),
+        "the job must run on pull requests"
+    );
+    assert!(
+        workflow.contains("timeout-minutes:"),
+        "the job must have a timeout"
+    );
+    assert!(
+        workflow
+            .lines()
+            .all(|line| !line.contains("continue-on-error")),
+        "a failing assertion must fail the job"
+    );
+}
+
+fn assert_live_membership_test_stays_ignored(source: &str, name: &str) {
+    let needle = format!("fn {name}(");
+    let idx = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} must exist"));
+    let prelude = &source[..idx];
+    let attr = prelude
+        .rfind("#[")
+        .unwrap_or_else(|| panic!("{name} must have an attribute"));
+    assert!(
+        prelude[attr..].contains("#[ignore"),
+        "{name} must stay #[ignore] so verify.sh does not start it"
+    );
+}
+
 // ══ Online tier (two live loopback processes; #[ignore]-gated) ════════════════
+//
+// verify.sh does not pass `--ignored`, so none of these tests run there.
+// The two member-removal tests at the bottom of this section still run on
+// every pull request: see the module docs ("CI job for live room remove /
+// room leave") and `.github/workflows/live-room-membership.yml`. The other
+// tests here stay release-readiness-only.
 
 /// AC2 — both peers agree on room membership. After Bob joins over loopback, both
 /// Alice's and Bob's `room members --json` rosters must be set-equal: admin = Alice,
@@ -1447,7 +1544,7 @@ fn wait_until_member_status(
 /// open a session, and a message Alice sends afterwards is not in Bob's store —
 /// he keeps only what he already had.
 #[test]
-#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+#[ignore = "two live loopback processes; verify.sh skips this. The live-room-membership job runs it with --ignored --test-threads=1 --exact"]
 fn admin_removal_reaches_member_and_withholds_new_messages() {
     let c = converge_two_member_room();
 
@@ -1543,7 +1640,7 @@ fn admin_removal_reaches_member_and_withholds_new_messages() {
 /// `room leave` over live loopback: Bob leaves while Alice's session runs; Alice
 /// folds Bob's departure.
 #[test]
-#[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
+#[ignore = "two live loopback processes; verify.sh skips this. The live-room-membership job runs it with --ignored --test-threads=1 --exact"]
 fn member_leave_reaches_admin() {
     let c = converge_two_member_room();
     let alice_tail = ChildSession::spawn(
