@@ -141,7 +141,7 @@ The `next: <action>` line is additive. It does not replace the machine-readable 
 | `1` | Internal | unexpected or uncoded failure | `internal` |
 | `2` | Usage | bad input, missing local state, or unreadable local files | `invalid_room_id`, `invalid_argument`, `no_such_file`, `permission_denied`, `file_too_large`, `identity_not_found`, `room_not_found`, `no_discovery_hint` |
 | `3` | Auth | membership, role, capability, identity, room-capacity, or peer authorization denial | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `room_full`, `wrong_identity`, `peer_unauthorized` |
-| `4` | Integrity | signature, event id, encoding, schema, content, room binding, or hash verification failure | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch` |
+| `4` | Integrity | signature, event id, encoding, schema, content, room binding, hash, or store-version rejection | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch`, `store_version_unsupported` |
 | `5` | Ticket | invite ticket decoding failure | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, `ticket_unsupported_version`, `ticket_bad_checksum`, `ticket_malformed` |
 | `6` | Connectivity | peer reachability or blob availability failure | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
 
@@ -176,6 +176,7 @@ Per-code reference:
 | `not_genesis_descended` | Integrity | `4` | non-genesis event has no parent | structural rejection, not user-fixable |
 | `room_id_mismatch` | Integrity | `4` | event room does not match the command context | structural rejection, not user-fixable |
 | `hash_mismatch` | Integrity | `4` | fetched bytes do not match the declared BLAKE3 hash | do not trust this file |
+| `store_version_unsupported` | Integrity | `4` | database user_version is newer than this binary | restore the pre-upgrade backup, or retry with the previous binary |
 | `ticket_bad_prefix` | Ticket | `5` | ticket prefix is wrong | check the whole ticket was copied |
 | `ticket_bad_base32` | Ticket | `5` | ticket body is not valid base32 | check the whole ticket was copied |
 | `ticket_truncated` | Ticket | `5` | ticket is incomplete | check the whole ticket was copied |

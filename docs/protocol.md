@@ -718,7 +718,7 @@ taxonomy (`README.md` "Error codes"):
 | `1` | Internal | `internal`, any uncoded failure |
 | `2` | Usage | `invalid_room_id`, `invalid_argument`, `room_not_found`, ... |
 | `3` | Auth | `not_a_member`, `unbound_device`, `insufficient_role`, `expired_invite`, `bad_capability`, `peer_unauthorized` |
-| `4` | Integrity | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch` |
+| `4` | Integrity | `bad_signature`, `id_mismatch`, `non_canonical_encoding`, `invalid_content`, `unknown_schema_version`, `unknown_event_type`, `too_many_parents`, `not_genesis_descended`, `room_id_mismatch`, `hash_mismatch`, `store_version_unsupported` |
 | `5` | Ticket | `ticket_bad_prefix`, `ticket_bad_base32`, `ticket_truncated`, ... |
 | `6` | Connectivity | `no_admin_reachable`, `peer_offline`, `blob_unavailable` |
 

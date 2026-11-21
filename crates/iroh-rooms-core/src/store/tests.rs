@@ -440,7 +440,7 @@ fn insert_rejects_mismatched_event_id() {
     assert_eq!(store.count(&room).unwrap(), 0);
 }
 
-// Schema migration guard: a future user_version returns StoreError::Migration.
+// Schema migration guard: a future user_version returns StoreError::NewerSchema.
 #[test]
 fn migration_rejects_future_schema_version() {
     use rusqlite::Connection;
@@ -449,9 +449,34 @@ fn migration_rejects_future_schema_version() {
         .unwrap();
     let err = super::schema::migrate(&conn).unwrap_err();
     assert!(
-        matches!(err, super::StoreError::Migration(_)),
-        "expected Migration error, got {err:?}"
+        matches!(
+            err,
+            super::StoreError::NewerSchema { found, supported }
+                if found == super::schema::USER_VERSION + 1
+                    && supported == super::schema::USER_VERSION
+        ),
+        "expected NewerSchema error, got {err:?}"
     );
+}
+
+/// The refusal sentence is pinned in full. The prefix matcher below stays a
+/// prefix check; this test owns the complete `Display` text and `source()`.
+#[test]
+fn newer_schema_display_is_the_full_refusal_sentence() {
+    let found = super::schema::USER_VERSION + 1;
+    let supported = super::schema::USER_VERSION;
+    let err = super::StoreError::NewerSchema { found, supported };
+    assert_eq!(
+        (found, supported),
+        (3, 2),
+        "the pinned sentence names user_version 3 against supported 2"
+    );
+    assert_eq!(
+        err.to_string(),
+        "store migration failed: database user_version 3 is newer than supported 2; \
+         restore from backup or retry with the previous binary"
+    );
+    assert!(std::error::Error::source(&err).is_none());
 }
 
 // ── issue #405: a newer user_version is refused before WAL pragmas ───────────
@@ -559,6 +584,17 @@ fn assert_refused_open_leaves_file_unchanged(path: &Path) {
     let err = open_err(path);
     let msg = err.to_string();
     assert_newer_user_version_prefix(&msg);
+    // Checkpointed stores are refused by the path probe
+    // (`refuse_newer_user_version_at`), before the read-write open.
+    assert!(
+        matches!(
+            err,
+            super::StoreError::NewerSchema { found, supported }
+                if found == super::schema::USER_VERSION + 1
+                    && supported == super::schema::USER_VERSION
+        ),
+        "expected NewerSchema from the path probe, got {err:?}"
+    );
 
     let after = std::fs::read(path).expect("read store after refused open");
     let after_header = header_bytes_18_19(&after);

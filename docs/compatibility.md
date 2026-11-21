@@ -211,6 +211,8 @@ release notes must call out script-breaking changes.
 
 ## Migration Failure Policy
 
+A newer `user_version` is `store_version_unsupported` (exit 4); its `next:` line points at this section.
+
 If migration fails:
 
 1. The binary must fail loudly.

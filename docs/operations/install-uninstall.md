@@ -545,8 +545,9 @@ mv "$tmp" "${PREFIX}/bin/iroh-rooms"
 "${PREFIX}/bin/iroh-rooms" --version
 ```
 
-**(b) The candidate raised `user_version`.** The older binary refuses the
-store and exits 1. stderr contains `error: could not open event store at <path>: store migration failed: `.
+**(b) The candidate raised `user_version`.** Prior releases exit 1 with one
+of the two uncoded forms. Builds that contain #406, and later, exit 4 with
+the coded form plus a `next:` line. Uncoded stderr contains `error: could not open event store at <path>: store migration failed: `.
 
 `v0.1.0-rc.1` through `v0.1.0-rc.6` have no suffix. `N` is the database
 `user_version` and `M` is the highest version that binary supports:
@@ -560,6 +561,14 @@ Builds that contain #409 (`7c20e93` on `main`, and later) append
 
 ```text
 error: could not open event store at <path>: store migration failed: database user_version N is newer than supported M; restore from backup or retry with the previous binary
+```
+
+Builds that contain #406, and later, use a stable code and a `next:` line.
+They exit 4:
+
+```text
+error[store_version_unsupported]: could not open event store at <path>: store migration failed: database user_version N is newer than supported M; restore from backup or retry with the previous binary
+next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)
 ```
 
 Reinstall the prior binary with the rollback (a) commands so `PREFIX` is

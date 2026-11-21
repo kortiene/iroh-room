@@ -958,6 +958,7 @@ const ALL_ERROR_CODES: &[&str] = &[
     "not_genesis_descended",
     "room_id_mismatch",
     "hash_mismatch",
+    "store_version_unsupported",
     // Ticket (exit 5)
     "ticket_bad_prefix",
     "ticket_bad_base32",
@@ -1128,6 +1129,7 @@ const NEXT_ACTION_PHRASES: &[(&str, &str)] = &[
     ("wrong_identity", "identity show"),
     ("peer_unauthorized", "membership has synced"),
     ("hash_mismatch", "do not trust this file"),
+    ("store_version_unsupported", "pre-upgrade backup"),
     ("no_admin_reachable", "--accept-joins"),
     ("peer_offline", "come online"),
     ("blob_unavailable", "retry `file fetch`"),

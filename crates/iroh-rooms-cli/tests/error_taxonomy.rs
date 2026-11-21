@@ -779,3 +779,108 @@ fn room_tail_verbose_conflicts_with_offline() {
         "the error must name the conflicting --verbose/--offline flags; got:\n{stderr}"
     );
 }
+
+// ── newer-store refusal (store_version_unsupported, exit 4) ──────────────────
+
+const STORE_VERSION_NEXT: &str = "next: restore the pre-upgrade backup, or retry with the previous binary (see docs/compatibility.md#migration-failure-policy)";
+
+/// Stamp `user_version + 1` into a checkpointed WAL store and return `(found, supported)`.
+fn stamp_newer_user_version(db: &Path) -> (i64, i64) {
+    let conn = rusqlite::Connection::open(db).expect("open rooms.db");
+    let supported: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read user_version");
+    let found = supported + 1;
+    conn.pragma_update(None, "user_version", found)
+        .expect("stamp a newer user_version");
+    let checkpoint: (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("checkpoint the WAL");
+    assert_eq!(checkpoint.0, 0, "wal checkpoint must not report busy");
+    drop(conn);
+    (found, supported)
+}
+
+fn newer_store_home() -> (TempDir, String, i64, i64) {
+    let home = TempDir::new().unwrap();
+    create_identity(&home);
+    let room_id = create_room(&home);
+    let (found, supported) = stamp_newer_user_version(&home.path().join("rooms.db"));
+    (home, room_id, found, supported)
+}
+
+fn assert_newer_store_stderr(stderr: &str, db: &Path, found: i64, supported: i64) {
+    let expected = format!(
+        "store migration failed: database user_version {found} is newer than supported {supported}; \
+         restore from backup or retry with the previous binary"
+    );
+    let mut lines = stderr.lines();
+    let first = lines.next().unwrap_or("");
+    assert!(
+        first.starts_with("error[store_version_unsupported]: could not open event store at "),
+        "{first}"
+    );
+    assert!(
+        first.contains(&db.display().to_string()),
+        "stderr must name the store path; got: {first}"
+    );
+    assert!(
+        first.contains(&expected),
+        "stderr must carry the full refusal sentence; got: {first}"
+    );
+    assert_eq!(lines.next().unwrap_or(""), STORE_VERSION_NEXT);
+    assert!(
+        lines.next().is_none(),
+        "stderr must be the coded line plus one next: line; got:\n{stderr}"
+    );
+    assert_eq!(count_next_lines(stderr), 1);
+}
+
+/// Opening a newer store renders the coded line, the full refusal sentence, and
+/// exactly one `next:` line, and exits 4.
+#[test]
+fn newer_store_refusal_exits_4_with_coded_line_and_next() {
+    let (home, room_id, found, supported) = newer_store_home();
+    assert_eq!(
+        (found, supported),
+        (3, 2),
+        "the pinned sentence is user_version 3 against supported 2"
+    );
+    let out = cmd(&home)
+        .args(["room", "tail", &room_id, "--offline"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_newer_store_stderr(&stderr, &home.path().join("rooms.db"), found, supported);
+}
+
+/// There is no JSON error envelope (IR-0110 OQ-5). `--json` on the same refused
+/// open keeps the coded stderr, exits 4, and writes nothing to stdout.
+#[test]
+fn newer_store_refusal_with_json_keeps_coded_stderr_and_empty_stdout() {
+    let (home, room_id, found, supported) = newer_store_home();
+    let human = cmd(&home)
+        .args(["room", "tail", &room_id, "--offline"])
+        .output()
+        .unwrap();
+    let json = cmd(&home)
+        .args(["room", "tail", &room_id, "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(4));
+    assert!(
+        json.stdout.is_empty(),
+        "stdout must stay empty under --json; got: {}",
+        String::from_utf8_lossy(&json.stdout)
+    );
+    let human_err = String::from_utf8(human.stderr).unwrap();
+    let json_err = String::from_utf8(json.stderr).unwrap();
+    assert_eq!(
+        json_err, human_err,
+        "--json must render the same coded stderr as the human refusal"
+    );
+    assert_newer_store_stderr(&json_err, &home.path().join("rooms.db"), found, supported);
+}
