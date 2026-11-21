@@ -900,6 +900,12 @@ impl PipeAuditSink for RecordingAudit {
         _pipe_id: Option<&[u8; 16]>,
         cause: PipeDenyCause,
     ) {
+        // Widen the window: if the reply byte were written before this audit
+        // push, the connector would see Denied while the sink is still empty.
+        // `block_in_place` is required because a plain `thread::sleep` does
+        // not reproduce that. The p10 test uses a multi-thread runtime so
+        // `block_in_place` is allowed.
+        tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(100)));
         self.rejects.lock().unwrap().push(cause);
     }
     fn torndown(&self, _device: EndpointId, _pipe_id: &[u8; 16], _cause: PipeDenyCause) {}

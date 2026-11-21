@@ -860,6 +860,11 @@ impl Shared {
     /// the event-plane budget whose saturation makes the event-plane reader
     /// close the peer's connection (`peer.rs`), or gossip load converts into
     /// link churn.
+    ///
+    /// Compiled only with `gossip_overlay`. Callers live in `gossip.rs` and in
+    /// the overlay's pump test; the shipping default build must not compile
+    /// this helper with no use.
+    #[cfg(feature = "gossip_overlay")]
     pub(crate) fn try_enqueue_inbound_gossip(
         &self,
         peer: PeerId,
