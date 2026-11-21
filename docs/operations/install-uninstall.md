@@ -50,21 +50,28 @@ else. Those candidates are checksum-only
 covered that gap and is retired for `v0.1.0-rc.6`. The release owner approved
 that sign-off on 2026-11-16. See
 [`v0.1.0-rc.6-production-beta-signoff.md`](../releases/v0.1.0-rc.6-production-beta-signoff.md)).
-Verify the signed release with the script below. Pin Actions run
+Verify the signed release with the script below. It checks the run pin for
+Actions run
 [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
+The line in `scripts/release-run-pins.txt` is `v0.1.0-rc.6 43835416665 1`.
 An archive whose SHA-256 matches the table in the rc.6 release notes is not
 an ungated run 43791394134 byte; those digests do not overlap.
 
 ```bash
 scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>
+```
+
+Exit 0 means the invocationId on each verified provenance bundle is exactly
+`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+People not using the script can still read that field after a separate
+`gh attestation verify --bundle` of the same `<archive>.sigstore.json`:
+
+```bash
 jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId
 ```
 
-The `jq` line must print
-`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
-This jq read only means something after `scripts/verify-release-artifacts.sh`
-has verified that same bundle, because reading the payload alone does not check
-its signature or provenance.
+That jq read only means something after the bundle has been verified, because
+reading the payload alone does not check its signature or provenance.
 
 Releases built by the signing workflow, starting with the first release after
 rc.5, publish the following assets for each of the four triples, plus the two
@@ -109,6 +116,8 @@ scripts/verify-release-artifacts.sh v<VERSION> <TRIPLE>
 scripts/verify-release-artifacts.sh --dir ./assets v<VERSION> <TRIPLE>
 # also require the peeled commit to be this SHA:
 scripts/verify-release-artifacts.sh --dir ./assets --commit <FULL_SHA> v<VERSION> <TRIPLE>
+# pre-publish, before scripts/release-run-pins.txt has this tag:
+scripts/verify-release-artifacts.sh --expected-run <RUN_ID> <ATTEMPT> --commit <FULL_SHA> v<VERSION> <TRIPLE>
 ```
 
 `<TRIPLE>` is `x86_64-apple-darwin`, `aarch64-apple-darwin`,
@@ -120,12 +129,22 @@ and the script requires it too. It probes `gh attestation verify --help` and
 exits 3 when either flag is missing. The signature check needs **cosign v3 or
 newer** (`cosign verify-blob --bundle`). The release workflow installs cosign
 v3.1.4. If `cosign` is missing or older after the `gh` checks have passed, the
-script exits 3 and says the signature was not checked. Exit 0 means the
-checksum, both archive attestation checks, the online `SHA256SUMS`
-attestation, and `cosign verify-blob` all passed. `--offline` skips the tag
-peel, the GitHub attestation lookup, and cosign, prints
-`PARTIAL: online checks skipped`, and exits 1. It is not a successful
-verification.
+script exits 3 and says the signature was not checked. For every tag except
+`v0.1.0-rc.1` through `v0.1.0-rc.5`, the script then checks the run pin in
+`scripts/release-run-pins.txt` (one line, `<tag> <run_id> <attempt>`, next to
+the script). Run the script from current `main`; a checkout of the tag
+itself has no pin for that tag. `--expected-run <RUN_ID> <ATTEMPT>` is only
+for a tag that is not in the pin file yet. If the tag is already pinned, the
+flag must equal that line. It does not replace a pin and it does not skip a
+check. Exit 0 means the checksum, both archive attestation
+checks, the online `SHA256SUMS` attestation, `cosign verify-blob`, and the
+run pin all passed. The pin is `.predicate.runDetails.metadata.invocationId`
+on each verified provenance bundle, exactly
+`https://github.com/kortiene/iroh-room/actions/runs/<RUN_ID>/attempts/<ATTEMPT>`.
+`v0.1.0-rc.1` through `v0.1.0-rc.5` do not read the pin file. `--offline`
+skips the tag peel, the GitHub attestation lookup, cosign, and the run pin,
+prints `PARTIAL: online checks skipped`, and exits 1. It is not a successful
+verification. python3 is required for the run pin.
 
 Fetch the assets with `gh` (this needs `gh auth login` on current GitHub CLI
 builds for a private lookup; a public release also accepts the curl URLs
