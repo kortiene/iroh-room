@@ -1209,8 +1209,10 @@ impl Node {
     }
 
     /// **Close** a pipe (spec §6.5.1): author + publish a signed `pipe.closed`,
-    /// remove the local target, and tear down every live session for it. The signer
-    /// must be the pipe owner or the room admin (folded downstream).
+    /// remove the local target, and tear down every live session for it. The
+    /// membership fold accepts a close from any Active member. The connect gate
+    /// honours it only when `pipe_is_closed` attributes the signed cleartext
+    /// sender as this pipe's owner or the room admin.
     ///
     /// # Errors
     /// A heads/publish failure (the local teardown still runs best-effort after a

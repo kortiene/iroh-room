@@ -320,10 +320,21 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 | `message.text` | Any current member. | room heads |
 | `file.shared` | Any current member. | room heads |
 | `pipe.opened` | Any current member (`owner_id == sender_id`). | room heads |
-| `pipe.closed` | The pipe owner or the admin. | room heads |
+| `pipe.closed` | The pipe owner or the admin. Counted by cleartext sender at query time (enforcement note below). | room heads |
 | `agent.status` | Any current member (typically `role == "agent"`). | room heads |
 | `content.encrypted` | Any current member. Encrypted-content envelope (spec `content-key-rotation.md` D2). Readers always parse it as opaque-but-valid; writers publish only behind the room's declared R2 floor (`SyncConfig::encrypted_content_writes`, rollout D8) — a floor no shipped CLI or `iroh-rooms-net` call site sets today. | room heads |
 | `member.key_distribution` | The **admin**'s device. Standalone distribution of a new content-key epoch to the remaining Active members (spec `content-key-rotation.md` D4/D6); the identical payload also rides inline on `member.removed.rotation`. | room heads |
+
+> **Enforcement (`pipe.closed`, Refs #429):** the membership fold still accepts a
+> plaintext `pipe.closed`, or a `content.encrypted` envelope of that inner type,
+> from any Active member. Rejecting it at ingest would make the fold depend on
+> who holds the epoch key and could split the DAG. `pipe_is_closed` counts a
+> close only when its signed cleartext sender is the governing `pipe.opened`'s
+> `owner_id` or the room admin. The rule covers plaintext, readable encrypted,
+> and unreadable closes. An unreadable close from the admin closes every pipe;
+> one from an owner closes only that owner's pipes; an unreadable close from
+> anyone else is ignored. When no governing `pipe.opened` is known, the lookup
+> is unchanged — the connect gate already denies that pipe.
 
 > **Removal is two distinct types**, not one type with a `reason` discriminator:
 > `member.left` (voluntary, signer == subject) and `member.removed` (admin kick, signer ==

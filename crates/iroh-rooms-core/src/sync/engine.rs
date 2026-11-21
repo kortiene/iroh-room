@@ -1221,9 +1221,9 @@ impl SyncEngine {
 
     /// Scan the stored `content.encrypted` envelopes whose cleartext
     /// `inner_type` is `inner`, yielding each envelope's canonical sort key
-    /// (mirroring `by_type`'s `lamport IS NULL, lamport, event_id` order) and
-    /// its authenticated-decryption outcome — the shared walk under the D9
-    /// key-aware authorization reads (#191 step 5).
+    /// (mirroring `by_type`'s `lamport IS NULL, lamport, event_id` order), the
+    /// cleartext `sender_id`, and its authenticated-decryption outcome — the
+    /// shared walk under the D9 key-aware authorization reads (#191 step 5).
     ///
     /// Cost: O(all stored `content.encrypted` rows) per call — the store has
     /// no `inner_type` column, so every envelope is CBOR-decoded before the
@@ -1232,11 +1232,18 @@ impl SyncEngine {
     /// unexposed floor flag; the rotation lifecycle (§7 step 6) is the point
     /// to add a store-level `inner_type` index, when encrypted volume becomes
     /// real.
-    #[allow(clippy::type_complexity)] // one row per envelope: (sort key, read outcome)
+    #[allow(clippy::type_complexity)] // one row per envelope: (sort key, sender, read outcome)
     fn encrypted_bodies(
         &self,
         inner: EventType,
-    ) -> Result<Vec<((bool, u64, EventId), Result<Content, UnreadableReason>)>, SyncError> {
+    ) -> Result<
+        Vec<(
+            (bool, u64, EventId),
+            IdentityKey,
+            Result<Content, UnreadableReason>,
+        )>,
+        SyncError,
+    > {
         let mut out = Vec::new();
         for se in self
             .store
@@ -1253,7 +1260,7 @@ impl SyncEngine {
                 continue;
             }
             let key = (se.lamport.is_none(), se.lamport.unwrap_or(0), se.event_id);
-            out.push((key, self.read_content(&event)));
+            out.push((key, event.sender_id, self.read_content(&event)));
         }
         Ok(out)
     }
@@ -1301,7 +1308,7 @@ impl SyncEngine {
                 }
             }
         }
-        for (key, body) in self.encrypted_bodies(EventType::PipeOpened)? {
+        for (key, _sender, body) in self.encrypted_bodies(EventType::PipeOpened)? {
             let Ok(Content::PipeOpened(opened)) = body else {
                 continue; // unreadable feeds nothing (D9 fail-closed)
             };
@@ -1324,22 +1331,46 @@ impl SyncEngine {
     /// Fail-closed: any decode failure surfaces as an error the caller treats
     /// as "closed".
     ///
-    /// **Key-aware (spec `content-key-rotation.md` D9, #191 step 5):** a
-    /// *readable* encrypted `pipe.closed` closes its `pipe_id` exactly like a
-    /// plaintext one. An **unreadable** close-typed envelope hides its
-    /// `pipe_id` inside the ciphertext, so it cannot be attributed to any one
-    /// pipe — and a close that might target *this* pipe must never be missed
-    /// (a missed close leaves a closed pipe authorized, the fail-open D9
-    /// forbids). The unattributable close is therefore treated conservatively:
-    /// it closes **every** pipe on this node until the epoch key arrives
-    /// (join-time transfer / rotation, §7 step 6) and the close becomes
-    /// readable. Deny-while-keyless is the documented cost of fail-closed —
-    /// the same posture as the blob gate serving nothing for unreadable
-    /// `file.shared` events.
+    /// **Sender attribution (Refs #429):** a close counts only when its signed
+    /// cleartext sender — the envelope `sender_id`, which sits outside the
+    /// ciphertext — is the governing [`pipe_opened`](Self::pipe_opened)'s
+    /// `owner_id` or the room admin. The rule covers a plaintext close, a
+    /// readable encrypted close, and an unreadable encrypted close. The
+    /// membership fold still accepts a close from any Active member; rejecting
+    /// it at ingest would make the fold depend on epoch-key possession and
+    /// could split the DAG.
+    ///
+    /// An **unreadable** close hides its `pipe_id`. The admin's unreadable
+    /// close therefore closes every pipe. An owner's unreadable close closes
+    /// only the pipes that owner announced. An unreadable close from anyone
+    /// else is ignored. A readable close names its `pipe_id` and is honoured
+    /// only for that id, and only from the owner or the admin. An unreadable
+    /// close never reopens a pipe an authorized close already shut (AC9).
+    ///
+    /// When [`pipe_opened`](Self::pipe_opened) is `None`, the lookup is
+    /// unchanged from the pre-attribution rule: any matching plaintext or
+    /// readable close, and any unreadable close, reads as closed. The connect
+    /// gate already denies a pipe with no governing open.
     ///
     /// # Errors
     /// [`SyncError::Store`] on a store read or decode failure.
     pub fn pipe_is_closed(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+    ) -> Result<bool, SyncError> {
+        let Some(opened) = self.pipe_opened(pipe_id)? else {
+            return self.pipe_is_closed_without_governing_open(pipe_id);
+        };
+        let admin = self.membership_projection.snapshot.admin().copied();
+        if self.attributed_plaintext_close(pipe_id, &opened.owner_id, admin.as_ref())? {
+            return Ok(true);
+        }
+        self.attributed_encrypted_close(pipe_id, &opened.owner_id, admin.as_ref())
+    }
+
+    /// The pre-attribution lookup, used only when no governing `pipe.opened`
+    /// is known. The connect gate already denies that pipe.
+    fn pipe_is_closed_without_governing_open(
         &self,
         pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
     ) -> Result<bool, SyncError> {
@@ -1352,7 +1383,7 @@ impl SyncEngine {
                 }
             }
         }
-        for (_, body) in self.encrypted_bodies(EventType::PipeClosed)? {
+        for (_, _, body) in self.encrypted_bodies(EventType::PipeClosed)? {
             match body {
                 Ok(Content::PipeClosed(closed)) => {
                     if &closed.pipe_id == pipe_id {
@@ -1362,11 +1393,123 @@ impl SyncEngine {
                 // A readable close-typed envelope can only recover PipeClosed
                 // (parse is keyed to inner_type); anything else is unreachable.
                 Ok(_) => {}
-                // Unattributable close: conservatively closes every pipe.
+                // Unattributable close of an unknown pipe: still closed.
                 Err(_) => return Ok(true),
             }
         }
         Ok(false)
+    }
+
+    /// Plaintext `pipe.closed` rows whose sender is `owner` or `admin` and
+    /// whose `pipe_id` matches.
+    fn attributed_plaintext_close(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+        owner: &IdentityKey,
+        admin: Option<&IdentityKey>,
+    ) -> Result<bool, SyncError> {
+        for se in self.store.by_type(&self.room_id, EventType::PipeClosed)? {
+            let event = SignedEvent::decode(&se.wire.signed)
+                .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            if let Content::PipeClosed(closed) = event.content {
+                if &closed.pipe_id == pipe_id
+                    && Self::close_sender_counts(&event.sender_id, owner, admin)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Encrypted `pipe.closed` envelopes. A readable body must name `pipe_id`.
+    /// An unreadable body closes this pipe when the sender is its owner or the
+    /// admin, and is ignored otherwise.
+    fn attributed_encrypted_close(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+        owner: &IdentityKey,
+        admin: Option<&IdentityKey>,
+    ) -> Result<bool, SyncError> {
+        for (_, sender, body) in self.encrypted_bodies(EventType::PipeClosed)? {
+            match body {
+                Ok(Content::PipeClosed(closed)) => {
+                    if &closed.pipe_id == pipe_id
+                        && Self::close_sender_counts(&sender, owner, admin)
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if Self::close_sender_counts(&sender, owner, admin) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The sender rule for a pipe whose governing open is known (Refs #429).
+    fn close_sender_counts(
+        sender: &IdentityKey,
+        owner: &IdentityKey,
+        admin: Option<&IdentityKey>,
+    ) -> bool {
+        admin == Some(sender) || sender == owner
+    }
+
+    /// `true` when this freshly inserted close will not be counted for a
+    /// specific pipe by [`pipe_is_closed`](Self::pipe_is_closed): a readable
+    /// close whose sender is neither the owner nor the admin, or any
+    /// unreadable close (its `pipe_id` is sealed).
+    fn inserted_pipe_close_is_unattributed(&self, ev: &ValidatedEvent) -> bool {
+        match &ev.event.content {
+            Content::PipeClosed(closed) => {
+                !self.pipe_close_sender_attributed(&ev.event.sender_id, &closed.pipe_id)
+            }
+            Content::Encrypted(env) if env.inner_type == EventType::PipeClosed => {
+                match self.read_content(&ev.event) {
+                    Ok(Content::PipeClosed(closed)) => {
+                        !self.pipe_close_sender_attributed(&ev.event.sender_id, &closed.pipe_id)
+                    }
+                    // A readable close-typed envelope recovers `PipeClosed`.
+                    Ok(_) => false,
+                    // The pipe id is inside the ciphertext.
+                    Err(_) => true,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `sender` is the admin or the owner of the governing open for
+    /// `pipe_id`. A missing open is not an owner match; the admin still counts.
+    fn pipe_close_sender_attributed(
+        &self,
+        sender: &IdentityKey,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+    ) -> bool {
+        if self.membership_projection.snapshot.admin() == Some(sender) {
+            return true;
+        }
+        self.pipe_opened(pipe_id)
+            .ok()
+            .flatten()
+            .is_some_and(|opened| &opened.owner_id == sender)
+    }
+
+    /// Log `pipe_close_unattributed event= sender=` once, from the insert that
+    /// lands. Callers must not invoke this from a query or a tick.
+    fn note_unattributed_pipe_close(&mut self, ev: &ValidatedEvent) {
+        if !self.inserted_pipe_close_is_unattributed(ev) {
+            return;
+        }
+        self.log(&format!(
+            "pipe_close_unattributed event={} sender={}",
+            ev.event_id, ev.event.sender_id
+        ));
     }
 
     /// The set of BLAKE3-256 blob hashes referenced by a valid `file.shared` in the
@@ -1391,7 +1534,7 @@ impl SyncEngine {
                 hashes.insert(*f.blob_hash.as_bytes());
             }
         }
-        for (_, body) in self.encrypted_bodies(EventType::FileShared)? {
+        for (_, _sender, body) in self.encrypted_bodies(EventType::FileShared)? {
             if let Ok(Content::FileShared(f)) = body {
                 hashes.insert(*f.blob_hash.as_bytes());
             }
@@ -1777,6 +1920,9 @@ impl SyncEngine {
             }
             InsertOutcome::Inserted => {
                 self.counters.accepted += 1;
+                // Once, on the insert that lands — not on a duplicate re-see and
+                // not from `pipe_is_closed`, which the pipe gate calls every tick.
+                self.note_unattributed_pipe_close(ev);
                 // The validated set grew: the memoized authorization closure is
                 // stale, and a memoized covered-downset may under-cover (a
                 // claimed id we lacked — skipped then — may now be held, and a

@@ -7,6 +7,13 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- A `pipe.closed` counts only when its signed cleartext sender is that pipe's
+  owner or the room admin. The membership fold still accepts any Active
+  member's close, plaintext or encrypted, so the log stays convergent without
+  depending on who holds the epoch key. An unreadable encrypted close from the
+  admin closes every pipe; one from an owner closes only that owner's pipes;
+  any other member's unreadable close is ignored. A pipe with no governing
+  `pipe.opened` is unchanged. Refs #429.
 - Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the
