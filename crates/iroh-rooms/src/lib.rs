@@ -44,11 +44,14 @@
 //!
 //! # Versioning
 //!
-//! This crate starts at `0.1.0` and follows a plain semver-for-0.x policy:
-//! within `0.x`, the **stable** tier changes only on a minor bump (with a
-//! `CHANGELOG.md` entry and a deprecation window where feasible); the
-//! **experimental** tier may change on any release. This is "stable-ish" —
-//! honestly scoped for a pre-1.0 developer preview, not a 1.0 guarantee.
+//! This crate is `0.1.0-alpha.1`. Within `0.x`, the **stable** tier changes
+//! only on a minor bump (with a `CHANGELOG.md` entry and a deprecation window
+//! where feasible); the **experimental** tier may change on any release.
+//! [`events::Content`] and [`room::MemberRemoved`] are `#[non_exhaustive]`,
+//! so a new content variant or removal field can land without a breaking
+//! match or struct literal. [`events::EventType`] stays exhaustive. This is
+//! "stable-ish" — honestly scoped for a pre-1.0 developer preview, not a
+//! 1.0 guarantee.
 //!
 //! # Getting started
 //!

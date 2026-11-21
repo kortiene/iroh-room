@@ -190,13 +190,7 @@ fn remove(
         event_type: EventType::MemberRemoved,
         created_at,
         prev_events: prev.to_vec(),
-        content: Content::MemberRemoved(MemberRemoved {
-            member_id: target,
-            removed_by: signer.identity(),
-            reason: None,
-            device_binding: None,
-            rotation: None,
-        }),
+        content: Content::MemberRemoved(MemberRemoved::new(target, signer.identity())),
     };
     validate(&ev, &signer.dev, room_id)
 }

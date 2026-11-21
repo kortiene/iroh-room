@@ -9,6 +9,8 @@
 //!   signatures, and a secret signing-key wrapper (§1).
 //! * [`ids`] — `EventId` / `RoomId` / `HashRef` named BLAKE3 hashes (§4/§5).
 //! * [`constants`] — domain-separation contexts and structural limits.
+//! * [`encryption`] — encrypted-content suite id, lengths, and plaintext caps
+//!   the parser enforces on `content.encrypted` (always compiled).
 //! * [`cbor`] — a purpose-built deterministic-CBOR encoder + strict canonical
 //!   reader for the canonical signed bytes (CSB) (§3, spec D1).
 //! * [`signed`] — the eight-field [`signed::SignedEvent`], CSB, BLAKE3 event-id
@@ -55,6 +57,7 @@ pub mod constants;
 pub mod content;
 pub mod distribution;
 pub mod encrypted;
+pub mod encryption;
 pub mod file;
 pub mod genesis;
 pub mod ids;
@@ -73,7 +76,7 @@ pub mod wire;
 
 // Convenience re-exports of the most-used types.
 pub use binding::DeviceBinding;
-pub use content::{capability_hash, Content, EventType};
+pub use content::{capability_hash, Content, EventType, MemberRemoved};
 pub use distribution::{
     build_key_distribution_content, build_member_key_distribution,
     build_member_removed_with_rotation, DistributionError,

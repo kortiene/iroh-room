@@ -4,7 +4,7 @@
 # initial-rust-sdk-surface.md` for the design rationale.
 [package]
 name = "iroh-rooms"
-version = "0.1.0-rc.6"
+version = "0.1.0-alpha.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -51,9 +51,9 @@ full = ["experimental"]
 
 [dependencies]
 # Stable tier: pure protocol only, no `store`/`sync` feature.
-iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-rc.6" }
+iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-alpha.1" }
 # Experimental tier only.
-iroh-rooms-net = { path = "../iroh-rooms-net", version = "0.1.0-rc.6", optional = true }
+iroh-rooms-net = { path = "../iroh-rooms-net", version = "0.1.0-alpha.1", optional = true }
 # Re-exported verbatim from `experimental::{session, blob, pipe_runtime}`
 # (issue #87): `EndpointAddr`/`EndpointId`/`SecretKey`/`Endpoint` are the
 # transport identities the online `Node` API names. Same-type re-export — this

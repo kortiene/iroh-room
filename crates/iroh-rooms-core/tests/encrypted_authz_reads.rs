@@ -27,11 +27,12 @@
 use std::collections::BTreeSet;
 
 use iroh_rooms_core::event::binding::DeviceBinding;
-use iroh_rooms_core::event::constants::{ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, SHORT_ID_LEN};
+use iroh_rooms_core::event::constants::SHORT_ID_LEN;
 use iroh_rooms_core::event::content::{
     Content, EncryptedContent, EventType, FileShared, PipeClosed, PipeOpened, RoomCreated,
 };
 use iroh_rooms_core::event::encrypted::{build_content_encrypted, encrypted_content_aad};
+use iroh_rooms_core::event::encryption::{ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1};
 use iroh_rooms_core::event::ids::{HashRef, RoomId};
 use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};

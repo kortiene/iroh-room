@@ -414,13 +414,10 @@ fn member_departure_lifecycle() {
         event_type: EventType::MemberRemoved,
         created_at: T3,
         prev_events: vec![v2.event_id],
-        content: Content::MemberRemoved(MemberRemoved {
-            member_id: charlie_id.identity_key(),
-            removed_by: alice_id.identity_key(),
-            reason: Some("spam".to_owned()),
-            device_binding: None,
-            rotation: None,
-        }),
+        content: Content::MemberRemoved(
+            MemberRemoved::new(charlie_id.identity_key(), alice_id.identity_key())
+                .with_reason("spam"),
+        ),
     };
     let v3 =
         validate_wire_bytes(&seal(&removed, &alice_dev), &ctx(room_id)).expect("member.removed");
@@ -794,13 +791,11 @@ fn member_removed_with_optional_device_binding_accepted() {
         event_type: EventType::MemberRemoved,
         created_at: T1,
         prev_events: vec![v0.event_id],
-        content: Content::MemberRemoved(MemberRemoved {
-            member_id: charlie_id.identity_key(),
-            removed_by: alice_id.identity_key(),
-            reason: Some("violation".to_owned()),
-            device_binding: Some(alice_binding),
-            rotation: None,
-        }),
+        content: Content::MemberRemoved(
+            MemberRemoved::new(charlie_id.identity_key(), alice_id.identity_key())
+                .with_reason("violation")
+                .with_device_binding(alice_binding),
+        ),
     };
     let validated = validate_wire_bytes(&seal(&removed, &alice_dev), &ctx(room_id))
         .expect("member.removed with device_binding must be accepted");

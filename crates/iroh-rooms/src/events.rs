@@ -19,6 +19,37 @@
 //! it is an implementation detail; consumers operate on [`WireEvent`] /
 //! [`validate_wire_bytes`], never raw CBOR bytes directly.
 //!
+//! Encrypted-content suite ids, lengths, and plaintext caps
+//! (`ENCRYPTED_AAD_CONTEXT`, `ENCRYPTED_SUITE_V1`, `ENCRYPTED_NONCE_LEN`,
+//! `ENCRYPTED_TAG_LEN`, `WRAPPED_KEY_NONCE_LEN`, `WRAPPED_KEY_CIPHERTEXT_LEN`,
+//! and the `MAX_ENCRYPTED_*_PLAINTEXT` bounds) are not in [`constants`].
+//! They live in `experimental::encryption`, behind the `experimental` feature.
+//!
+//! `Content` is [`non_exhaustive`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute).
+//! A match that names every current variant and no wildcard does not compile
+//! outside `iroh-rooms-core`:
+//!
+//! ```compile_fail
+//! use iroh_rooms::events::Content;
+//!
+//! fn label(content: &Content) -> &'static str {
+//!     match content {
+//!         Content::RoomCreated(_) => "room.created",
+//!         Content::MemberInvited(_) => "member.invited",
+//!         Content::MemberJoined(_) => "member.joined",
+//!         Content::MemberLeft(_) => "member.left",
+//!         Content::MemberRemoved(_) => "member.removed",
+//!         Content::MessageText(_) => "message.text",
+//!         Content::FileShared(_) => "file.shared",
+//!         Content::PipeOpened(_) => "pipe.opened",
+//!         Content::PipeClosed(_) => "pipe.closed",
+//!         Content::AgentStatus(_) => "agent.status",
+//!         Content::Encrypted(_) => "content.encrypted",
+//!         Content::MemberKeyDistribution(_) => "member.key_distribution",
+//!     }
+//! }
+//! ```
+//!
 //! ```
 //! use iroh_rooms::events::{
 //!     build_message_text, validate_wire_bytes, EventId, EventType, ValidationContext,
@@ -66,6 +97,9 @@ pub use iroh_rooms_core::PROTOCOL_VERSION;
 
 /// The trust-boundary structural bounds (`MAX_*`) every content validator
 /// enforces — e.g. `MAX_MESSAGE_BODY_BYTES`, `MAX_PREV_EVENTS`.
+///
+/// Encrypted-content constants are not in this module. They live in
+/// `experimental::encryption`, behind the `experimental` feature.
 pub mod constants {
     pub use iroh_rooms_core::event::constants::*;
 }

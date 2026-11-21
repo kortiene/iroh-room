@@ -24,9 +24,9 @@ Archive spikes under `archive/spikes/` are not workspace members and are not pub
 
 ## Versioning
 
-The four SDK crates share one version. The current version is `0.1.0-rc.6`.
+The four SDK crates share one version. The current version is `0.1.0-alpha.1`.
 
-Pre-release by choice: Cargo recommends a library that depends on a pre-release (`ed25519-dalek` `=3.0.0-rc.0`) be a pre-release itself. Cargo does not reject a stable crate that depends on a pre-release. The version string stays `0.1.0-rc.6` until the maintainer chooses otherwise.
+Pre-release by choice: Cargo recommends a library that depends on a pre-release (`ed25519-dalek` `=3.0.0-rc.0`) be a pre-release itself. Cargo does not reject a stable crate that depends on a pre-release. The four crates are `0.1.0-alpha.1`.
 
 Within `0.x`, bump all four crates together:
 

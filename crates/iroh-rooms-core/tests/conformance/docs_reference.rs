@@ -16,7 +16,7 @@
 //!   outcome) appears verbatim, and the core-taxonomy tables introduce no
 //!   invented code;
 //! * every domain-separation context string and structural bound is stated with
-//!   its exact `constants.rs` value;
+//!   its exact `constants.rs` / `encryption.rs` value;
 //! * the Tier-1 golden `room_id` / `event_id` / CSB values match the pinned
 //!   fixtures (the CSB is recomputed live, not copied);
 //! * every vector-to-test row names a `fn` that actually exists, and the two
@@ -31,16 +31,18 @@ use std::path::Path;
 
 use iroh_rooms_core::event::cbor::{decode_canonical, CborValue};
 use iroh_rooms_core::event::constants::{
-    BIND_CONTEXT, CLOCK_SKEW_FUTURE_MS, DIGEST_LEN, ENCRYPTED_AAD_CONTEXT, ENCRYPTED_NONCE_LEN,
-    ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN, EVENT_CONTEXT, INVITE_CONTEXT, MAX_ARTIFACT_REFS,
-    MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
-    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
-    MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
-    MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_PREV_EVENTS, MAX_SHARED_FILE_BYTES,
-    MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, ROOMID_CONTEXT, SHORT_ID_LEN,
-    SIGNATURE_LEN, WRAPPED_KEY_CIPHERTEXT_LEN, WRAPPED_KEY_NONCE_LEN,
+    BIND_CONTEXT, CLOCK_SKEW_FUTURE_MS, DIGEST_LEN, EVENT_CONTEXT, INVITE_CONTEXT,
+    MAX_ARTIFACT_REFS, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS, MAX_MESSAGE_BODY_BYTES,
+    MAX_MIME_TYPE_BYTES, MAX_PREV_EVENTS, MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES,
+    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, ROOMID_CONTEXT, SHORT_ID_LEN, SIGNATURE_LEN,
 };
 use iroh_rooms_core::event::content::EventType;
+use iroh_rooms_core::event::encryption::{
+    ENCRYPTED_AAD_CONTEXT, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN,
+    MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
+    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
+    MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, WRAPPED_KEY_CIPHERTEXT_LEN, WRAPPED_KEY_NONCE_LEN,
+};
 use iroh_rooms_core::event::reject::{Flag, RejectReason};
 
 use super::fixtures;
@@ -184,7 +186,7 @@ fn core_taxonomy_tables_name_no_unknown_code() {
 }
 
 // ---------------------------------------------------------------------------
-// Context strings + structural bounds must match `constants.rs`.
+// Context strings + structural bounds must match `constants.rs` / `encryption.rs`.
 // ---------------------------------------------------------------------------
 
 #[test]
