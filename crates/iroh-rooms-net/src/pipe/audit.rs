@@ -70,7 +70,7 @@ pub trait PipeAuditSink: Send + Sync + 'static {
     fn opened(&self, pipe_id: &[u8; 16], allowed: usize);
     /// A `pipe.closed` was published (`pipe_id`, `reason`).
     fn closed(&self, pipe_id: &[u8; 16], reason: &str);
-    /// A stream passed both gate stages and is now forwarding.
+    /// Both gate stages passed and the target connected; recorded before the accept byte is sent.
     fn connect_accepted(&self, device: EndpointId, pipe_id: &[u8; 16]);
     /// A connection / stream was refused at the gate.
     fn connect_rejected(
@@ -101,7 +101,7 @@ impl PipeAuditSink for TracingPipeAudit {
             reason = "pipe.connect.accepted",
             peer = %device,
             pipe = %hex16(pipe_id),
-            "pipe stream forwarding"
+            "both gate stages passed and the target connected; recorded before the accept byte is sent."
         );
     }
 
