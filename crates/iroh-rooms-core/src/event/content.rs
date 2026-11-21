@@ -18,13 +18,15 @@ use blake3::Hasher;
 use super::binding::DeviceBinding;
 use super::cbor::CborValue;
 use super::constants::{
-    DIGEST_LEN, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN, INVITE_CONTEXT,
-    MAX_ARTIFACT_REFS, MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
-    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
-    MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
+    DIGEST_LEN, INVITE_CONTEXT, MAX_ARTIFACT_REFS, MAX_FILE_NAME_BYTES, MAX_FILE_PROVIDERS,
     MAX_MESSAGE_BODY_BYTES, MAX_MIME_TYPE_BYTES, MAX_SHARED_FILE_BYTES, MAX_STATUS_LABEL_BYTES,
-    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN, WRAPPED_KEY_CIPHERTEXT_LEN,
-    WRAPPED_KEY_NONCE_LEN,
+    MAX_STATUS_MESSAGE_BYTES, PUBLIC_KEY_LEN, SHORT_ID_LEN,
+};
+use super::encryption::{
+    ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN,
+    MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT, MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT,
+    MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
+    MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT, WRAPPED_KEY_CIPHERTEXT_LEN, WRAPPED_KEY_NONCE_LEN,
 };
 use super::ids::{EventId, HashRef, RoomId};
 use super::keys::{DeviceKey, IdentityKey};
@@ -256,7 +258,14 @@ pub struct MemberLeft {
 }
 
 /// `member.removed` content.
+///
+/// `#[non_exhaustive]` so a future field is additive. Downstream crates
+/// construct a value with [`MemberRemoved::new`] and the `with_*` builders;
+/// the fields stay public for reads. [`build_member_removed`](super::removed::build_member_removed)
+/// and [`build_member_removed_with_rotation`](super::distribution::build_member_removed_with_rotation)
+/// remain the signed-authoring API.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MemberRemoved {
     /// Removed identity; MUST != `sender_id`.
     pub member_id: IdentityKey,
@@ -274,6 +283,46 @@ pub struct MemberRemoved {
     /// into encrypted content; omitted entirely in plaintext rooms so old
     /// parsers remain compatible.
     pub rotation: Option<MemberKeyDistribution>,
+}
+
+impl MemberRemoved {
+    /// A removal of `member_id` by `removed_by`, with no reason, device
+    /// binding, or key rotation.
+    ///
+    /// Chain [`with_reason`](Self::with_reason),
+    /// [`with_device_binding`](Self::with_device_binding), or
+    /// [`with_rotation`](Self::with_rotation) to set an optional field.
+    #[must_use]
+    pub fn new(member_id: IdentityKey, removed_by: IdentityKey) -> Self {
+        Self {
+            member_id,
+            removed_by,
+            reason: None,
+            device_binding: None,
+            rotation: None,
+        }
+    }
+
+    /// Set the free-form removal reason.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Attach a device-binding re-attestation of the removing admin.
+    #[must_use]
+    pub fn with_device_binding(mut self, device_binding: DeviceBinding) -> Self {
+        self.device_binding = Some(device_binding);
+        self
+    }
+
+    /// Attach an inline key-rotation payload for the remaining members.
+    #[must_use]
+    pub fn with_rotation(mut self, rotation: MemberKeyDistribution) -> Self {
+        self.rotation = Some(rotation);
+        self
+    }
 }
 
 /// `message.text` content.
@@ -380,7 +429,11 @@ pub struct EncryptedContent {
 }
 
 /// Typed, strictly-validated event content.
+///
+/// `#[non_exhaustive]`: a match outside this crate must include a wildcard.
+/// [`EventType`] stays a closed registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Content {
     /// See [`RoomCreated`].
     RoomCreated(RoomCreated),

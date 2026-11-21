@@ -2387,13 +2387,7 @@ mod admission_refresher_tests {
             event_type: EventType::MemberRemoved,
             created_at: T0 + 3,
             prev_events: vec![join_id],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: member.identity(),
-                removed_by: host.identity(),
-                reason: None,
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(MemberRemoved::new(member.identity(), host.identity())),
         };
         engine
             .publish(&wire(&remove, &host.dev))
@@ -2540,13 +2534,10 @@ mod terminal_removal_tests {
             event_type: EventType::MemberRemoved,
             created_at: T0 + 3,
             prev_events: vec![jid],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: member.identity(),
-                removed_by: admin.identity(),
-                reason: None,
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(MemberRemoved::new(
+                member.identity(),
+                admin.identity(),
+            )),
         };
         let remove_id = remove.event_id();
         let remove_bytes = seal(&remove, &admin.dev);
@@ -2771,13 +2762,10 @@ mod gossip_self_removal_tests {
             event_type: EventType::MemberRemoved,
             created_at: T0 + 3,
             prev_events: vec![join_ev],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: member.identity(),
-                removed_by: admin.identity(),
-                reason: None,
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(MemberRemoved::new(
+                member.identity(),
+                admin.identity(),
+            )),
         };
         let removed_snapshot = RoomMembership::from_events(
             room,

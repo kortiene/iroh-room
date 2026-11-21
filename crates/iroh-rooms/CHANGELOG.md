@@ -7,6 +7,23 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- **Breaking (stable tier):** `Content` and `MemberRemoved` are
+  `#[non_exhaustive]`. Construct a removal with `MemberRemoved::new` and the
+  `with_reason`, `with_device_binding`, and `with_rotation` builders; the
+  fields stay public for reads. `build_member_removed` and
+  `build_member_removed_with_rotation` remain the signed-authoring API.
+  The eleven encrypted-content constants (`ENCRYPTED_AAD_CONTEXT`,
+  `ENCRYPTED_SUITE_V1`, `ENCRYPTED_NONCE_LEN`, `ENCRYPTED_TAG_LEN`,
+  `WRAPPED_KEY_NONCE_LEN`, `WRAPPED_KEY_CIPHERTEXT_LEN`,
+  `MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT`,
+  `MAX_ENCRYPTED_FILE_SHARED_PLAINTEXT`,
+  `MAX_ENCRYPTED_PIPE_OPENED_PLAINTEXT`,
+  `MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT`,
+  `MAX_ENCRYPTED_AGENT_STATUS_PLAINTEXT`) moved from `events::constants` to
+  `experimental::encryption`, behind the existing `experimental` feature.
+  `EventType` stays exhaustive. `iroh-rooms`, `iroh-rooms-core`,
+  `iroh-rooms-net`, and `iroh-rooms-crypto` are `0.1.0-alpha.1`. The CLI
+  stays `0.1.0-rc.6`.
 - Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the

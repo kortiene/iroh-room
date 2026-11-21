@@ -239,13 +239,7 @@ fn build_log(n_chat: u32, with_removal: bool) -> Built {
             event_type: EventType::MemberRemoved,
             created_at: t,
             prev_events: vec![join_carol_eid, inv_carol_eid],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: carol.identity(),
-                removed_by: alice.identity(),
-                reason: None,
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(MemberRemoved::new(carol.identity(), alice.identity())),
         };
         events.push(wire_bytes(&remove, &alice.dev));
     }

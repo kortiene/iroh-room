@@ -57,8 +57,8 @@ use iroh_rooms_crypto::{open_content, seal_content, CryptoError, RoomKey};
 use zeroize::Zeroizing;
 
 use super::cbor::{self, CborValue};
-use super::constants::{ENCRYPTED_AAD_CONTEXT, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1};
 use super::content::{check_field_rules, Content, EncryptedContent, EventType};
+use super::encryption::{ENCRYPTED_AAD_CONTEXT, ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1};
 use super::ids::{EventId, RoomId};
 use super::keys::{DeviceKey, IdentityKey, SigningKey};
 use super::signed::{self, SignedEvent};
@@ -347,8 +347,9 @@ pub fn open_encrypted_content(
 #[cfg(test)]
 mod tests {
     use super::{build_content_encrypted, open_encrypted_content, SealError, UnreadableReason};
-    use crate::event::constants::{ENCRYPTED_NONCE_LEN, MAX_MESSAGE_BODY_BYTES};
+    use crate::event::constants::MAX_MESSAGE_BODY_BYTES;
     use crate::event::content::{Content, MemberLeft, MessageText, PipeOpened};
+    use crate::event::encryption::ENCRYPTED_NONCE_LEN;
     use crate::event::ids::EventId;
     use crate::event::keys::SigningKey;
     use crate::event::signed::{self, SignedEvent};
@@ -545,7 +546,7 @@ mod tests {
             &heads(),
             crate::event::content::EventType::MessageText,
             KEY_EPOCH,
-            crate::event::constants::ENCRYPTED_SUITE_V1,
+            crate::event::encryption::ENCRYPTED_SUITE_V1,
         );
         let ciphertext = iroh_rooms_crypto::seal_content(&room_key(), &NONCE, plaintext, &aad)
             .expect("raw seal succeeds");
@@ -560,7 +561,7 @@ mod tests {
             content: Content::Encrypted(crate::event::content::EncryptedContent {
                 inner_type: crate::event::content::EventType::MessageText,
                 key_epoch: KEY_EPOCH,
-                suite: crate::event::constants::ENCRYPTED_SUITE_V1,
+                suite: crate::event::encryption::ENCRYPTED_SUITE_V1,
                 nonce: NONCE,
                 ciphertext,
             }),

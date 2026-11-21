@@ -30,12 +30,12 @@
 //! freeze the envelope *encoding*; these freeze the *write path*.
 
 use iroh_rooms_core::event::cbor;
-use iroh_rooms_core::event::constants::{ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1};
 use iroh_rooms_core::event::content::{Content, EventType, MessageText};
 use iroh_rooms_core::event::encrypted::{
     aad_for, build_content_encrypted, encrypted_content_aad, open_encrypted_content,
     UnreadableReason,
 };
+use iroh_rooms_core::event::encryption::{ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1};
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};

@@ -24,11 +24,11 @@
 //! encoding** (field names, types, order — the OQ-2 resolution), not the AAD.
 
 use iroh_rooms_core::event::cbor::{self, CborValue};
-use iroh_rooms_core::event::constants::{
+use iroh_rooms_core::event::content::{Content, EncryptedContent, EventType, MessageText};
+use iroh_rooms_core::event::encryption::{
     ENCRYPTED_NONCE_LEN, ENCRYPTED_SUITE_V1, ENCRYPTED_TAG_LEN,
     MAX_ENCRYPTED_MESSAGE_TEXT_PLAINTEXT, MAX_ENCRYPTED_PIPE_CLOSED_PLAINTEXT,
 };
-use iroh_rooms_core::event::content::{Content, EncryptedContent, EventType, MessageText};
 use iroh_rooms_core::event::ids::EventId;
 use iroh_rooms_core::event::keys::{IdentityKey, SigningKey};
 use iroh_rooms_core::event::reject::RejectReason;

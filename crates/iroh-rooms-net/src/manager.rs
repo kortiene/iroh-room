@@ -679,13 +679,7 @@ mod tests {
             event_type: EventType::MemberRemoved,
             created_at: ts,
             prev_events: prev.to_vec(),
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: target,
-                removed_by: admin.identity(),
-                reason: None,
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(MemberRemoved::new(target, admin.identity())),
         };
         validate(&ev, &admin.dev_sk, room_id)
     }
