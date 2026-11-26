@@ -1279,12 +1279,13 @@ impl SyncEngine {
     /// The governing event is the lowest `(lamport, event_id)` across the
     /// plaintext and readable-encrypted candidates — deterministic for any two
     /// nodes holding the same validated set *and* the same epoch keys. A
-    /// keyless node sees fewer *pipes*; the one asymmetry: when a `pipe_id`
-    /// is deliberately reused across a plaintext and an encrypted open, key
-    /// possession can change *which* candidate governs. Both candidates are
-    /// the same owner's (the field rules bind `owner_id` to the sender of
-    /// each), so this lets an owner confuse enforcement of its *own* pipe
-    /// only — it never surfaces another member's pipe.
+    /// keyless node sees fewer *pipes*. Another member can publish a sibling
+    /// `pipe.opened` that reuses this `pipe_id` and sorts lower; this unscoped
+    /// lookup then returns that member's open. That view is a connector-side
+    /// hint only (`owner_endpoint` included). The owner's serving gate does
+    /// not use it: it calls [`pipe_opened_for_owner`](Self::pipe_opened_for_owner)
+    /// with the registry owner and ignores every open whose signed `sender_id`
+    /// is not that owner.
     ///
     /// # Errors
     /// [`SyncError::Store`] on a store read or decode failure.
@@ -1292,12 +1293,43 @@ impl SyncEngine {
         &self,
         pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
     ) -> Result<Option<crate::event::content::PipeOpened>, SyncError> {
+        self.governing_pipe_opened(pipe_id, None)
+    }
+
+    /// The governing `pipe.opened` for `pipe_id` among events whose **signed**
+    /// `sender_id` is `owner` (the registry owner on the serving path).
+    ///
+    /// A sibling open that reuses `pipe_id` but is signed by someone else is
+    /// not a candidate, whatever its `(lamport, event_id)`. Among the owner's
+    /// own opens the lowest `(lamport, event_id)` still governs. `None` means
+    /// the DAG has no open signed by `owner` — the serving gate denies.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read or decode failure.
+    pub fn pipe_opened_for_owner(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+        owner: &IdentityKey,
+    ) -> Result<Option<crate::event::content::PipeOpened>, SyncError> {
+        self.governing_pipe_opened(pipe_id, Some(owner))
+    }
+
+    /// `scope` is the registry owner on the serving path. `None` is the
+    /// unscoped connector-side hint.
+    fn governing_pipe_opened(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+        scope: Option<&IdentityKey>,
+    ) -> Result<Option<crate::event::content::PipeOpened>, SyncError> {
         // `by_type` is ordered `(lamport IS NULL, lamport, event_id)`, so the
-        // first plaintext match is the governing plaintext candidate.
+        // first in-scope plaintext match is the governing plaintext candidate.
         let mut governing: Option<((bool, u64, EventId), crate::event::content::PipeOpened)> = None;
         for se in self.store.by_type(&self.room_id, EventType::PipeOpened)? {
             let event = SignedEvent::decode(&se.wire.signed)
                 .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            if !Self::signed_sender_in_owner_scope(&event.sender_id, scope) {
+                continue;
+            }
             if let Content::PipeOpened(opened) = event.content {
                 if &opened.pipe_id == pipe_id {
                     governing = Some((
@@ -1308,7 +1340,10 @@ impl SyncEngine {
                 }
             }
         }
-        for (key, _sender, body) in self.encrypted_bodies(EventType::PipeOpened)? {
+        for (key, sender, body) in self.encrypted_bodies(EventType::PipeOpened)? {
+            if !Self::signed_sender_in_owner_scope(&sender, scope) {
+                continue;
+            }
             let Ok(Content::PipeOpened(opened)) = body else {
                 continue; // unreadable feeds nothing (D9 fail-closed)
             };
@@ -1324,6 +1359,13 @@ impl SyncEngine {
             }
         }
         Ok(governing.map(|(_, opened)| opened))
+    }
+
+    /// Serving-path owner filter (Refs #429). Only opens whose signed
+    /// `sender_id` equals the registry owner are candidates. `None` keeps the
+    /// unscoped connector hint.
+    fn signed_sender_in_owner_scope(sender: &IdentityKey, scope: Option<&IdentityKey>) -> bool {
+        scope.is_none_or(|owner| sender == owner)
     }
 
     /// Whether a `pipe.closed` for `pipe_id` is causally known (the
@@ -1366,6 +1408,35 @@ impl SyncEngine {
             return Ok(true);
         }
         self.attributed_encrypted_close(pipe_id, &opened.owner_id, admin.as_ref())
+    }
+
+    /// Serving-path close check. The governing open is
+    /// [`pipe_opened_for_owner`](Self::pipe_opened_for_owner), so a squatter's
+    /// sibling open cannot become the owner this rule uses. A close counts
+    /// only from that open's owner (the registry owner, when the owner filter
+    /// holds) or the room admin.
+    ///
+    /// No open signed by `owner` answers `true`: the serving gate denies, the
+    /// same fail-closed default as a missing engine reply.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read or decode failure.
+    pub fn pipe_is_closed_for_owner(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+        owner: &IdentityKey,
+    ) -> Result<bool, SyncError> {
+        let Some(opened) = self.pipe_opened_for_owner(pipe_id, owner)? else {
+            return Ok(true);
+        };
+        let admin = self.membership_projection.snapshot.admin().copied();
+        // Take the owner from the scoped open. With the owner filter that is
+        // the registry owner; without it a lower sibling can take the role.
+        let owner = &opened.owner_id;
+        if self.attributed_plaintext_close(pipe_id, owner, admin.as_ref())? {
+            return Ok(true);
+        }
+        self.attributed_encrypted_close(pipe_id, owner, admin.as_ref())
     }
 
     /// The pre-attribution lookup, used only when no governing `pipe.opened`

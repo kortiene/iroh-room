@@ -44,16 +44,19 @@ pub async fn evaluate(
     now_ms: u64,
 ) -> PipeGateVerdict {
     // The real forward target lives only in the owner's local registry. Its absence
-    // means "not an open pipe here" (or already closed) — fail closed.
-    let Some(target) = registry.target(&pipe_id) else {
+    // means "not an open pipe here" (or already closed) — fail closed. The
+    // registered `owner_id` is whose signed `pipe.opened` the gate may use.
+    let Some(registered) = registry.open(&pipe_id) else {
         return PipeGateVerdict::Reject(PipeDenyCause::Closed);
     };
-    // A causally-known `pipe.closed` voids the pipe (§5).
-    if query.pipe_is_closed(pipe_id).await {
+    let owner = registered.opened.owner_id;
+    // A close from that registry owner or the admin voids the pipe. A
+    // squatter's sibling open cannot make her the owner of this check.
+    if query.pipe_is_closed_for_owner(pipe_id, &owner).await {
         return PipeGateVerdict::Reject(PipeDenyCause::Closed);
     }
-    // The governing announcement supplies `allowed_members` / `owner_id` / expiry.
-    let Some(opened) = query.pipe_opened(pipe_id).await else {
+    // allowed_members and owner come only from an open this owner signed.
+    let Some(opened) = query.pipe_opened_for_owner(pipe_id, &owner).await else {
         return PipeGateVerdict::Reject(PipeDenyCause::Closed);
     };
     // The current snapshot drives identity → Active → allowed → owner-Active.
@@ -61,7 +64,7 @@ pub async fn evaluate(
         return PipeGateVerdict::Reject(PipeDenyCause::Closed);
     };
     match pipe_connect_allowed(&snapshot, device, &opened, Some(now_ms)) {
-        PipeDecision::Accept => PipeGateVerdict::Accept(target),
+        PipeDecision::Accept => PipeGateVerdict::Accept(registered.target),
         PipeDecision::Reject(reason) => PipeGateVerdict::Reject(reason.into()),
     }
 }
@@ -139,7 +142,7 @@ mod tests {
         let q = PipeQuery::new(tx);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let PipeQueryMsg::IsClosed(_, reply) = msg {
+                if let PipeQueryMsg::IsClosedForOwner(_, _, reply) = msg {
                     let _ = reply.send(true); // engine: this pipe is closed
                 }
             }
@@ -163,13 +166,15 @@ mod tests {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    PipeQueryMsg::IsClosed(_, reply) => {
+                    PipeQueryMsg::IsClosedForOwner(_, _, reply) => {
                         let _ = reply.send(false);
                     }
-                    PipeQueryMsg::Opened(_, reply) => {
-                        let _ = reply.send(None); // engine: no pipe.opened known yet
+                    PipeQueryMsg::OpenedForOwner(_, _, reply) => {
+                        let _ = reply.send(None); // no open signed by the registry owner
                     }
-                    PipeQueryMsg::Snapshot(_) => {} // unreached: denied at Opened==None
+                    PipeQueryMsg::Snapshot(_)
+                    | PipeQueryMsg::Opened(_, _)
+                    | PipeQueryMsg::IsClosed(_, _) => {}
                 }
             }
         });
@@ -192,15 +197,16 @@ mod tests {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    PipeQueryMsg::IsClosed(_, reply) => {
+                    PipeQueryMsg::IsClosedForOwner(_, _, reply) => {
                         let _ = reply.send(false);
                     }
-                    PipeQueryMsg::Opened(_, reply) => {
+                    PipeQueryMsg::OpenedForOwner(_, _, reply) => {
                         let _ = reply.send(Some(minimal_opened(PIPE_ID)));
                     }
                     PipeQueryMsg::Snapshot(reply) => {
                         drop(reply); // engine unable to answer — snapshot is gone
                     }
+                    PipeQueryMsg::Opened(_, _) | PipeQueryMsg::IsClosed(_, _) => {}
                 }
             }
         });

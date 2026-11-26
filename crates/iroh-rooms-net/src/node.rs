@@ -1263,6 +1263,10 @@ impl Node {
     /// local TCP connection over the pipe ALPN. Returns a [`PipeForwarder`] carrying
     /// the bound local address.
     ///
+    /// `owner_endpoint` is a client-side hint for which address to dial. The
+    /// owner's serving gate is the enforcement point: it admits a peer only
+    /// against opens signed by the registry owner.
+    ///
     /// # Errors
     /// [`PipeError::UnknownPipe`] if the announcement is not synced yet,
     /// [`PipeError::OwnerEndpointMismatch`] if the address does not match the signed
@@ -1463,8 +1467,23 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
         PipeQueryMsg::Opened(pipe_id, reply) => {
             let _ = reply.send(engine.pipe_opened(&pipe_id).ok().flatten());
         }
+        PipeQueryMsg::OpenedForOwner(pipe_id, owner, reply) => {
+            let _ = reply.send(
+                engine
+                    .pipe_opened_for_owner(&pipe_id, &owner)
+                    .ok()
+                    .flatten(),
+            );
+        }
         PipeQueryMsg::IsClosed(pipe_id, reply) => {
             let _ = reply.send(engine.pipe_is_closed(&pipe_id).unwrap_or(true));
+        }
+        PipeQueryMsg::IsClosedForOwner(pipe_id, owner, reply) => {
+            let _ = reply.send(
+                engine
+                    .pipe_is_closed_for_owner(&pipe_id, &owner)
+                    .unwrap_or(true),
+            );
         }
     }
 }

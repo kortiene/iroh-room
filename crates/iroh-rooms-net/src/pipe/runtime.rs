@@ -22,6 +22,7 @@
 //! queue state.
 
 use iroh_rooms_core::event::content::PipeOpened;
+use iroh_rooms_core::event::keys::IdentityKey;
 use iroh_rooms_core::membership::MembershipSnapshot;
 use tokio::sync::{mpsc, oneshot};
 
@@ -30,9 +31,14 @@ pub enum PipeQueryMsg {
     /// The current convergent membership snapshot.
     Snapshot(oneshot::Sender<MembershipSnapshot>),
     /// The governing `pipe.opened` for a `pipe_id`, if known.
+    /// Connector-side hint, not the serving gate.
     Opened([u8; 16], oneshot::Sender<Option<PipeOpened>>),
+    /// Serving-gate open: only events signed by this registry owner.
+    OpenedForOwner([u8; 16], IdentityKey, oneshot::Sender<Option<PipeOpened>>),
     /// Whether a `pipe.closed` for a `pipe_id` is causally known.
     IsClosed([u8; 16], oneshot::Sender<bool>),
+    /// Serving-gate close check, scoped to this registry owner.
+    IsClosedForOwner([u8; 16], IdentityKey, oneshot::Sender<bool>),
 }
 
 /// The Pipe plane's cloneable read handle onto the engine.
@@ -88,6 +94,40 @@ impl PipeQuery {
         if self
             .tx
             .try_send(PipeQueryMsg::IsClosed(pipe_id, reply))
+            .is_err()
+        {
+            return true;
+        }
+        rx.await.unwrap_or(true)
+    }
+
+    /// Serving-gate open. Only `pipe.opened` events signed by `owner` are
+    /// candidates. `None` on a missing pump, a saturated channel, or no such
+    /// open — the gate denies.
+    pub async fn pipe_opened_for_owner(
+        &self,
+        pipe_id: [u8; 16],
+        owner: &IdentityKey,
+    ) -> Option<PipeOpened> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .try_send(PipeQueryMsg::OpenedForOwner(pipe_id, *owner, reply))
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
+    /// Serving-gate close check for the registry `owner`. **Fail-closed**:
+    /// returns `true` if the engine is gone, the channel is saturated, the
+    /// reply is dropped, or the read fails.
+    pub async fn pipe_is_closed_for_owner(&self, pipe_id: [u8; 16], owner: &IdentityKey) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .try_send(PipeQueryMsg::IsClosedForOwner(pipe_id, *owner, reply))
             .is_err()
         {
             return true;

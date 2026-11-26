@@ -675,3 +675,132 @@ fn readable_admin_or_owner_close_is_honoured_and_does_not_reopen() {
         "an unreadable close never reopens a pipe an authorized close already shut"
     );
 }
+
+/// A sibling `pipe.opened` for `pipe_id` with the same parents and a lower
+/// `event_id`, signed by `squatter`.
+fn lower_sibling_open(
+    engine: &mut SyncEngine,
+    squatter: &Principal,
+    room: RoomId,
+    pipe_id: [u8; SHORT_ID_LEN],
+    parent: EventId,
+    below: EventId,
+) -> EventId {
+    let mut chosen = None;
+    for offset in 0..10_000u64 {
+        let ev = SignedEvent {
+            schema_version: 1,
+            room_id: room,
+            sender_id: squatter.identity(),
+            device_id: squatter.device(),
+            event_type: EventType::PipeOpened,
+            created_at: T0 + 1_000 + offset,
+            prev_events: vec![parent],
+            content: Content::PipeOpened(PipeOpened {
+                pipe_id,
+                owner_id: squatter.identity(),
+                owner_endpoint: squatter.device(),
+                kind: "tcp".to_owned(),
+                label: "squat".to_owned(),
+                target_hint: "localhost:9".to_owned(),
+                alpn: "iroh-rooms/pipe/0".to_owned(),
+                allowed_members: vec![squatter.identity()],
+                expires_at: None,
+            }),
+        };
+        if ev.event_id() < below {
+            chosen = Some(ev);
+            break;
+        }
+    }
+    let ev = chosen.expect("a created_at offset yields a lower event id");
+    publish(engine, &ev, &squatter.dev, "sibling squat open")
+}
+
+/// F-2. Carol's lower sibling open must not become the owner the close rule
+/// uses, and her `pipe.closed` must not close Bob's pipe.
+#[test]
+fn squat_open_and_close_do_not_close_bobs_pipe() {
+    let (mut engine, cast, head) = seeded();
+    let bob_open = open_pipe(
+        &mut engine,
+        &cast.bob,
+        cast.room,
+        PIPE_B,
+        head,
+        T0 + 30,
+        "bob",
+    );
+    lower_sibling_open(&mut engine, &cast.carol, cast.room, PIPE_B, head, bob_open);
+    plaintext_close(
+        &mut engine,
+        &cast.carol,
+        cast.room,
+        PIPE_B,
+        bob_open,
+        T0 + 2_000,
+    );
+
+    let governing = engine
+        .pipe_opened_for_owner(&PIPE_B, &cast.bob.identity())
+        .expect("lookup")
+        .expect("bob's pipe is known");
+    assert_eq!(
+        governing.owner_id,
+        cast.bob.identity(),
+        "a lower sibling open from Carol must not govern Bob's pipe"
+    );
+    assert_eq!(governing.label, "bob");
+    assert!(
+        !engine
+            .pipe_is_closed_for_owner(&PIPE_B, &cast.bob.identity())
+            .expect("closed?"),
+        "Carol's close must not close Bob's pipe by posing as its owner"
+    );
+}
+
+/// F-3. A later `pipe.opened` from Bob for the same id does not replace his
+/// earlier open. The lowest `(lamport, event_id)` among his own opens governs,
+/// with or without Carol's sibling.
+#[test]
+fn bobs_later_reopen_does_not_replace_his_governing_open() {
+    let (mut engine, cast, head) = seeded();
+    let first = open_pipe(
+        &mut engine,
+        &cast.bob,
+        cast.room,
+        PIPE_B,
+        head,
+        T0 + 30,
+        "first",
+    );
+    let _later = open_pipe(
+        &mut engine,
+        &cast.bob,
+        cast.room,
+        PIPE_B,
+        first,
+        T0 + 31,
+        "later",
+    );
+    lower_sibling_open(&mut engine, &cast.carol, cast.room, PIPE_B, head, first);
+
+    let scoped = engine
+        .pipe_opened_for_owner(&PIPE_B, &cast.bob.identity())
+        .expect("lookup")
+        .expect("bob's pipe is known");
+    assert_eq!(scoped.label, "first");
+    assert_eq!(scoped.owner_id, cast.bob.identity());
+    let unscoped = engine
+        .pipe_opened(&PIPE_B)
+        .expect("lookup")
+        .expect("an open is known");
+    // Carol's sibling can win the unscoped hint. The serving lookup does not.
+    assert_eq!(unscoped.label, "squat");
+    assert!(
+        !engine
+            .pipe_is_closed_for_owner(&PIPE_B, &cast.bob.identity())
+            .expect("closed?"),
+        "no close has been published"
+    );
+}

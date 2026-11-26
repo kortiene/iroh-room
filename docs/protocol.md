@@ -628,8 +628,8 @@ authored by an `Active` member; verify fetched bytes' BLAKE3-256 against `blob_h
 **Pipe connect gate.** Admit only if ALL hold against the local snapshot:
 1. remote identity ∈ `Active` members,
 2. remote identity ∈ the pipe's `allowed_members` (no default-all),
-3. the governing `pipe.opened` was authored by its `Active` owner,
-4. no `pipe.closed` for that `pipe_id` counts under the owner-or-admin rule (the signed cleartext sender is the governing `pipe.opened`'s `owner_id` or the room admin; see the enforcement note in [§6](#6-mvp-event-type-registry)),
+3. the serving gate's governing `pipe.opened` — the lowest `(lamport, event_id)` among opens whose signed `sender_id` is the registry owner — was authored by that `Active` owner,
+4. no `pipe.closed` for that `pipe_id` counts from that registry owner or the room admin (see the enforcement note in [§6](#6-mvp-event-type-registry)),
 5. `expires_at` (if present) `>=` local wall clock (the boundary `now == expires_at` still
    admits; only `now > expires_at` denies).
 
@@ -645,12 +645,15 @@ fail-open: an unreadable `file.shared` serves no blob hash; an unreadable `pipe.
 the pipe unknown (unauthorized); and an unreadable close-typed envelope is counted by the
 owner-or-admin rule in the [§6](#6-mvp-event-type-registry) enforcement note: the admin's
 unreadable close covers every pipe, an owner's covers only that owner's pipes, and anyone
-else's is ignored. A keyless node deterministically sees *fewer* capabilities than a keyed one —
-with one scoped asymmetry: a `pipe_id` deliberately reused across a plaintext and an encrypted
-`pipe.opened` can govern by a different candidate depending on key possession (both candidates
-are field-rule-bound to the same owner, so an owner can confuse enforcement of its *own* pipe
-only, never surface another member's). The governing `pipe.opened` stays the lowest
-`(lamport, event_id)` across plaintext and readable-encrypted candidates.
+else's is ignored. A keyless node deterministically sees *fewer* capabilities than a keyed one.
+An unscoped lookup still picks the lowest `(lamport, event_id)` across plaintext and
+readable-encrypted candidates, and key possession can change which of one owner's own
+candidates that is. Another member can also publish a sibling `pipe.opened` that reuses the
+same `pipe_id` and sorts lower — the field rule binds `owner_id` to that member's
+`sender_id`, so the unscoped view is their announcement, not the original owner's. The
+owner's serving gate ignores it: only opens whose signed `sender_id` equals the registry
+owner are candidates, and `owner_endpoint` stays a connector-side hint. The serving gate is
+the enforcement point. A missing registry entry, or no open signed by that owner, denies.
 
 **Revocation-on-learn.** Live connections are torn down as soon as the enforcing peer learns of
 a removal, `pipe.closed`, or expiry. Exposure is bounded by *removal-event reachability*, not by
