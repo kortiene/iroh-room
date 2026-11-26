@@ -297,7 +297,7 @@ The MVP should support only authenticated TCP forwarding between two peers. Term
 Example:
 
 ```bash
-iroh-rooms pipe expose <room-id> --tcp localhost:3000 --allow <member-id>
+iroh-rooms pipe expose <room-id> --tcp 127.0.0.1:3000 --allow <member-id>
 iroh-rooms pipe connect <room-id> <pipe-id> --local 3001
 ```
 
@@ -677,7 +677,7 @@ Acceptance criteria:
 Example:
 
 ```bash
-iroh-rooms room invite <room-id> --expires 24h
+iroh-rooms room invite <room-id> --invitee <identity-id> --expires 24h
 ```
 
 ### 15.4 Send Message
@@ -754,7 +754,7 @@ Acceptance criteria:
 Example:
 
 ```bash
-iroh-rooms pipe expose <room-id> --tcp localhost:3000 --allow <member-id>
+iroh-rooms pipe expose <room-id> --tcp 127.0.0.1:3000 --allow <member-id>
 iroh-rooms pipe connect <room-id> <pipe-id> --local 3001
 iroh-rooms pipe close <pipe-id>
 ```
@@ -788,7 +788,7 @@ iroh-rooms identity create --name "Sekou"
 iroh-rooms identity show
 
 iroh-rooms room create "Project Room"
-iroh-rooms room invite <room-id> --expires 24h
+iroh-rooms room invite <room-id> --invitee <identity-id> --expires 24h
 iroh-rooms room join <ticket>
 iroh-rooms room send <room-id> "hello"
 iroh-rooms room tail <room-id>
@@ -798,7 +798,7 @@ iroh-rooms file share <room-id> ./file.pdf
 iroh-rooms file list <room-id>
 iroh-rooms file fetch <room-id> <file-id>
 
-iroh-rooms pipe expose <room-id> --tcp localhost:3000 --allow <member-id>
+iroh-rooms pipe expose <room-id> --tcp 127.0.0.1:3000 --allow <member-id>
 iroh-rooms pipe list <room-id>
 iroh-rooms pipe connect <room-id> <pipe-id> --local 3001
 iroh-rooms pipe close <pipe-id>

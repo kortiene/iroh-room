@@ -123,6 +123,12 @@ expression is `RB-PRD3-001..007`. Their deliverables (`agent.artifact.shared`,
 `MembershipSnapshot::active_member_limit()` and derives the near-cap warning
 as one below that limit. `iroh-rooms-net` still calls the core function
 internally.
+[`docs/reachability-inventory.md`](reachability-inventory.md) records those
+symbols as core-only. Re-exporting them would add stable public symbols, and
+the reachability pass does not add that re-export. `MembershipSnapshot` on
+`iroh_rooms::room` also exposes `active_member_headroom`, so the headroom
+surface is reachable. The threshold constant and the crossing detector are
+not a CLI feature a user can call.
 
 ## Experimental symbols
 
