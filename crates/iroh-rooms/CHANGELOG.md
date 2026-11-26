@@ -7,6 +7,25 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- **Experimental (`SyncConfig`):** `experimental_room_key_adoption` (default
+  off) gates adopting epoch keys from peers and from the `room_keys` table.
+  With the flag off, `KeyHistory` chunks are ignored, `WantKeyHistory` is not
+  served, DAG key-distribution events are stored but not adopted, and existing
+  `room_keys` rows are left in place and not loaded. With the flag on, a chunk
+  or reloaded row is adopted only when its source event is a stored admin
+  distribution for the same epoch and commitment; the all-zero event id never
+  binds; served chunks carry that id; and `new_epoch == u64::MAX` is rejected.
+  No CLI or `iroh-rooms-net` call site sets the flag. With the flag on, open
+  re-seeds the epoch watermark and the same-epoch commitment map from stored
+  admin distributions. An epoch with more than one distinct admin commitment
+  is poisoned at open: the reloaded row is not readable or served, and later
+  offers for that epoch are refused. Refs #429 #343 #286.
+- **Behaviour change:** `insert_room_key` still persists a row, but that row
+  uses the all-zero event id and open does not reload it. An embedder must
+  call `insert_room_key` again after every open. A conflicting
+  `insert_room_key` poisons the epoch in the current session; after reopen
+  the epoch is not poisoned, because the call writes no admin distribution
+  and there is no equivocation to seed. Refs #429.
 - **SDK façade (additive, CLI-named only).** Stable re-exports:
   `room::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}`
   and `events::{MessageText, AgentStatus}`. Experimental re-exports:

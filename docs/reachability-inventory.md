@@ -41,16 +41,27 @@ Live engines open with the local device seed. `room tail` does so at
 `join.rs:160`, `pipe.rs:151`, `pipe.rs:285`, and `pipe.rs:447`.
 
 On insert, `apply_insert_outcome` calls `adopt_key_from_event`
-(`engine.rs:1790`). That function adopts a `MemberKeyDistribution` or the
-`rotation` payload on `member.removed` (`engine.rs:3098-3105`), calls
-`unwrap_room_key` (`engine.rs:3220`), and on a fresh adoption persists the
-key (`engine.rs:3283-3285`). An inbound `WantKeyHistory` is served
-(`engine.rs:933-934`). Any current room member (a device admission accepts;
-removed members and provisional invitees are refused) running a non-shipped
-client can send KeyHistory chunks that the shipped engine adopts without
-binding them to an admin-signed distribution (engine.rs:936-938,
-:3291-3299), populating room_keys persistently. DAG key distributions are
-admin-gated (fold.rs:390). See #429. Plaintext
+(`engine.rs:1823`). Peer and on-disk adoption run only when
+`experimental_room_key_adoption` is set; it defaults off
+(`sync/config.rs:235`) and no shipped call site sets it. With the flag off,
+`KeyHistory` chunks are ignored (`engine.rs:959-967`), `WantKeyHistory` is
+not served (`engine.rs:955-957`), and a stored distribution is not adopted
+(`engine.rs:3148-3149`). With the flag on, `adopt_key_from_event` adopts a
+`MemberKeyDistribution` or a `member.removed` rotation
+(`engine.rs:3151-3158`), `unwrap_room_key` runs at `engine.rs:3274`, and a
+fresh adoption persists the key (`engine.rs:3307-3308`). A chunk is adopted
+only when its `distribution_event_id` is a stored admin distribution or
+removal rotation for the same epoch and commitment (`engine.rs:3318-3336`,
+`distribution_is_bound` at `:3629`); the all-zero id never binds. A reloaded
+`room_keys` row is held only when that same binding check passes
+(`engine.rs:3511-3519`). A conflicting commitment or a conflicting key
+poisons the epoch and returns without installing a key, both live
+(`engine.rs:3232-3237`, `:3300-3304`) and on reopen when stored admin
+commitments for that epoch disagree (`engine.rs:720-725`,
+`seed_epoch_watermark` at `:3559`). DAG key distributions stay admin-gated
+(`fold.rs:390`). #436 owns an order-independent selection, live and on
+reopen, by rebuilding candidates from the store; the poisoned-epoch return
+does not record them (`engine.rs:3182-3191`). See #429. Plaintext
 confidentiality holds for v0.1: the shipped CLI seals nothing and never
 decrypts for display.
 

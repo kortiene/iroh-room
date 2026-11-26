@@ -28,9 +28,10 @@ enum EpochKeyState {
 }
 
 /// A same-epoch key conflict candidate: a distribution event that offered a
-/// key for this epoch. Kept only while the epoch is poisoned so a deterministic
-/// resolution can pick the winner.
+/// key for this epoch. Kept only while the epoch is poisoned. Live conflicts
+/// do not resolve from this set. #436 rebuilds it from the store (Refs #436).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields are read when #436 selects a candidate (Refs #436)
 pub(crate) struct ConflictCandidate {
     /// The distribution event that offered this key.
     pub event_id: EventId,
@@ -53,7 +54,8 @@ pub(crate) struct EpochKeyConflict {
 pub(crate) struct EpochKeyStore {
     epochs: BTreeMap<u64, EpochKeyState>,
     /// Conflict candidates retained only for poisoned epochs. Dropped when the
-    /// epoch is resolved or when the store is dropped.
+    /// epoch is resolved or when the store is dropped. Live conflicts do not
+    /// resolve from this set. #436 reads it again (Refs #436).
     candidates: BTreeMap<u64, Vec<ConflictCandidate>>,
 }
 
@@ -106,7 +108,9 @@ impl EpochKeyStore {
 
     /// Record a conflict candidate for a poisoned `epoch`. Silently ignored if
     /// the epoch is not currently poisoned (the candidate is irrelevant once
-    /// resolved or if no conflict ever occurred).
+    /// resolved or if no conflict ever occurred). Live conflicts do not call
+    /// this. #436 (Refs #436).
+    #[allow(dead_code)] // #436 (Refs #436)
     pub fn add_conflict_candidate(&mut self, epoch: u64, candidate: ConflictCandidate) {
         if self.is_poisoned(epoch) {
             self.candidates.entry(epoch).or_default().push(candidate);
@@ -129,6 +133,10 @@ impl EpochKeyStore {
     /// set of conflicting distributions selects the same winner because event
     /// ids are uniformly-distributed hashes and the candidate set is bounded by
     /// the distributions the node has observed.
+    ///
+    /// Live adoption does not call this. #436 brings an order-independent
+    /// selection back by rebuilding candidates from the store (Refs #436).
+    #[allow(dead_code)] // #436 (Refs #436)
     pub fn resolve(&mut self, epoch: u64) -> bool {
         if !self.is_poisoned(epoch) {
             return false;
@@ -181,7 +189,6 @@ impl EpochKeyStore {
     }
 
     /// Every epoch that currently holds a usable key, in ascending order.
-    #[allow(dead_code)] // used by the key-history serve path (step 7)
     pub fn held_epochs(&self) -> Vec<u64> {
         self.epochs
             .iter()
@@ -189,14 +196,6 @@ impl EpochKeyStore {
                 matches!(state, EpochKeyState::Key(_, _)).then_some(*epoch)
             })
             .collect()
-    }
-
-    /// Iterate held `(epoch, key)` pairs in ascending epoch order.
-    pub fn iter_held(&self) -> impl Iterator<Item = (u64, &RoomKey)> {
-        self.epochs.iter().filter_map(|(epoch, state)| match state {
-            EpochKeyState::Key(k, _) => Some((*epoch, k)),
-            EpochKeyState::Poisoned => None,
-        })
     }
 
     /// Poisoned epochs that still have no deterministic resolution.

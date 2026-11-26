@@ -255,7 +255,7 @@ structured self-review instead of an independent reviewer or firm.
   satisfied by the dated acceptance of WAIVER-PBETA-0003 together with the
   completed self-review record
   [`docs/security/v0.1-self-review.md`](docs/security/v0.1-self-review.md):
-  threat-model rows T01–T30 with status, evidence, and owner; the
+  threat-model rows T01–T33 with status, evidence, and owner; the
   reachability inventory tied to `RB-REL-007` (#343), including the OD-1
   unreachable-encryption check; a required `cargo-deny` check; and a fuzz
   target for the CBOR and frame parsers. This is the same narrow exception

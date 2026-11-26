@@ -149,6 +149,29 @@ pub struct SyncConfig {
     /// [epoch key store](super::SyncEngine::insert_room_key) means **no**
     /// content authoring at all: the writer needs a key to seal with.
     pub encrypted_content_writes: bool,
+    /// Experimental gate for adopting epoch keys from peers or from the
+    /// `room_keys` table (Refs #429 #343 #286). Default **off**. No CLI or
+    /// `iroh-rooms-net` call site sets it, and [`validate`](Self::validate)
+    /// does not constrain it.
+    ///
+    /// * `false` (default): no key material enters the engine from a peer or
+    ///   from disk. `KeyHistory` chunks are dropped (`key_history_ignored`),
+    ///   `WantKeyHistory` is not served, a DAG `member.key_distribution` /
+    ///   `member.removed` rotation is stored with its fold verdict unchanged
+    ///   but the key is not adopted, and `room_keys` rows are left on disk
+    ///   and not loaded (`room_keys_ignored`).
+    ///   [`SyncEngine::insert_room_key`](super::SyncEngine::insert_room_key)
+    ///   is unaffected.
+    /// * `true`: a `KeyHistory` chunk or a reloaded row is adopted only when
+    ///   its source event is stored in this room, was sent by the room admin,
+    ///   and is a `member.key_distribution` or a `member.removed` rotation
+    ///   whose `new_epoch` and `key_commitment` match. The all-zero event id
+    ///   never binds. Served chunks carry that source id; all-zero-id keys
+    ///   are not served. Chunks do not raise the epoch watermark and are
+    ///   adopted only at an epoch already reached by a DAG distribution.
+    ///   `new_epoch == u64::MAX` is rejected on the DAG, chunk, and reload
+    ///   paths.
+    pub experimental_room_key_adoption: bool,
 }
 
 impl Default for SyncConfig {
@@ -207,6 +230,9 @@ impl Default for SyncConfig {
             // Rollout phase R1 (#191 D8): writers stay disabled until the
             // operator explicitly declares the R2 floor for a room.
             encrypted_content_writes: false,
+            // Peer and on-disk epoch-key adoption stay off until an embedder
+            // opts in (Refs #429). Shipped CLI/net call sites use this default.
+            experimental_room_key_adoption: false,
         }
     }
 }
@@ -287,7 +313,9 @@ mod tests {
 
     #[test]
     fn default_is_valid() {
-        assert_eq!(SyncConfig::default().validate(), Ok(()));
+        let cfg = SyncConfig::default();
+        assert_eq!(cfg.validate(), Ok(()));
+        assert!(!cfg.experimental_room_key_adoption);
     }
 
     #[test]

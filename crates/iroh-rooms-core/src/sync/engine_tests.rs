@@ -28,14 +28,19 @@ use crate::membership::{Role, Status};
 use crate::store::EventStore;
 use iroh_rooms_crypto::RoomKey;
 
+use std::collections::BTreeSet;
+
 use super::engine::{Completeness, Severity, SyncEngine};
-use super::message::{Outgoing, PeerId, SyncMessage};
+use super::message::{KeyHistoryChunk, Outgoing, PeerId, SyncMessage};
+use super::sim::SimNet;
 use super::SyncConfig;
+use crate::event::distribution::build_key_distribution_content;
 
 const NONCE: [u8; 16] = [0xAA; 16];
 const T0: u64 = 1_750_000_000_000;
 const NODE_A: PeerId = PeerId::from_bytes([0xA1; 32]);
 const NODE_B: PeerId = PeerId::from_bytes([0xB1; 32]);
+const NODE_C: PeerId = PeerId::from_bytes([0xC3; 32]);
 
 fn sk(seed: u8) -> SigningKey {
     SigningKey::from_seed(&[seed; 32])
@@ -1669,6 +1674,14 @@ fn single_forced_pull_sweeps_every_peer_then_quiesces() {
 /// The deterministic admin device seed used by `seeded_engine` (`sk(2)`).
 const ADMIN_DEV_SEED: [u8; 32] = [0x02; 32];
 
+/// Peer and on-disk epoch-key adoption, opt-in (Refs #429).
+fn adoption_config(on: bool) -> SyncConfig {
+    SyncConfig {
+        experimental_room_key_adoption: on,
+        ..SyncConfig::default()
+    }
+}
+
 /// Like [`seeded_engine`] but opens the engine with the admin's device seed so
 /// it can unwrap epoch keys from distribution payloads.
 fn seeded_engine_with_admin_seed(cfg: SyncConfig) -> (SyncEngine, RoomId, EventId) {
@@ -1694,7 +1707,7 @@ fn active_device_keys(engine: &SyncEngine) -> Vec<DeviceKey> {
 
 #[test]
 fn removal_with_rotation_adopts_epoch_key_for_remaining_member() {
-    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
     let member_id = sk(3);
@@ -1774,7 +1787,7 @@ fn removal_with_rotation_adopts_epoch_key_for_remaining_member() {
 
 #[test]
 fn standalone_key_distribution_adopts_epoch_key() {
-    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
 
@@ -1806,7 +1819,7 @@ fn standalone_key_distribution_adopts_epoch_key() {
 
 #[test]
 fn conflicting_keys_for_same_epoch_poison_epoch() {
-    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
 
@@ -1837,37 +1850,23 @@ fn conflicting_keys_for_same_epoch_poison_epoch() {
     )
     .expect("build distribution B");
 
-    let id_a = frame_id(&dist_a.to_bytes(), room);
-    let id_b = frame_id(&dist_b.to_bytes(), room);
-    let expected_winner = if id_a.as_bytes() < id_b.as_bytes() {
-        &key_a
-    } else {
-        &key_b
-    };
-
     engine.publish(&dist_a.to_bytes()).expect("publish A");
     engine.publish(&dist_b.to_bytes()).expect("publish B");
 
-    // D5a: conflicting keys trigger deterministic resolution. The candidate with
-    // the lexicographically smallest event_id wins.
+    // A second commitment poisons the epoch. Neither key stays usable.
     assert!(
-        engine.has_room_key(2),
-        "deterministic resolution must leave a usable epoch 2 key"
+        engine.is_room_key_poisoned(2),
+        "a conflicting commitment must poison the epoch"
     );
     assert!(
-        !engine.is_room_key_poisoned(2),
-        "resolution must un-poison the epoch"
-    );
-    assert_eq!(
-        engine.room_key(2).expect("epoch 2 key").as_bytes(),
-        expected_winner.as_bytes(),
-        "smallest-event-id candidate must win"
+        engine.room_key(2).is_none(),
+        "neither conflicting key is held"
     );
 }
 
 #[test]
 fn adopted_keys_survive_engine_restart() {
-    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
 
@@ -1893,7 +1892,7 @@ fn adopted_keys_survive_engine_restart() {
     let reopened = SyncEngine::open_with_local_device(
         store,
         room,
-        SyncConfig::default(),
+        adoption_config(true),
         Some(ADMIN_DEV_SEED),
     )
     .expect("reopen");
@@ -1908,14 +1907,12 @@ fn adopted_keys_survive_engine_restart() {
     );
 }
 
-/// Restart durability with a D5a conflict (#191 step 7): a poisoned epoch's
-/// deterministic resolution (smallest `event_id` wins) is persisted via the
-/// winning key's `source_event_id`, so the resolved key — and its attribution —
-/// survive an engine restart. The reopened engine holds the same winning key
-/// and never re-adopts a losing candidate.
+/// Two admin commitments poison the epoch in the session. The first key's row
+/// can remain on disk, and open poisons the epoch again so that row is not
+/// readable (Refs #429 #436).
 #[test]
-fn poisoned_epoch_resolution_survives_restart() {
-    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
 
@@ -1947,20 +1944,13 @@ fn poisoned_epoch_resolution_survives_restart() {
     )
     .expect("build distribution B");
     let id_a = frame_id(&dist_a.to_bytes(), room);
-    let id_b = frame_id(&dist_b.to_bytes(), room);
-    let (winner_id, expected_winner) = if id_a.as_bytes() < id_b.as_bytes() {
-        (id_a, key_a.clone())
-    } else {
-        (id_b, key_b.clone())
-    };
 
     engine.publish(&dist_a.to_bytes()).expect("publish A");
     engine.publish(&dist_b.to_bytes()).expect("publish B");
-    assert!(engine.has_room_key(2), "resolution leaves a usable key");
-    assert!(!engine.is_room_key_poisoned(2));
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(engine.room_key(2).is_none());
 
-    // The persisted source_event_id for epoch 2 must be the winning
-    // distribution's event id (the resolution is durable).
+    // The first adoption's row stays. Open must not treat it as the winner.
     let persisted = engine
         .store_mut()
         .load_room_keys(&room)
@@ -1969,38 +1959,29 @@ fn poisoned_epoch_resolution_survives_restart() {
         .find(|(epoch, _)| *epoch == 2)
         .map(|(_, (_, source_event_id))| source_event_id)
         .expect("epoch 2 key persisted");
-    assert_eq!(
-        persisted, winner_id,
-        "the persisted source_event_id must be the winning distribution's event id"
-    );
+    assert_eq!(persisted, id_a);
 
-    // Restart: the in-memory poisoned state and candidates are gone; the
-    // resolved key reloads from the room_keys table with its attribution.
+    // Restart: both commitments are in the store, so open poisons the epoch
+    // and does not expose the persisted winner.
     let store = engine.into_store();
     let reopened = SyncEngine::open_with_local_device(
         store,
         room,
-        SyncConfig::default(),
+        adoption_config(true),
         Some(ADMIN_DEV_SEED),
     )
     .expect("reopen");
 
     assert!(
-        reopened.has_room_key(2),
-        "the resolved epoch 2 key must survive the restart"
+        reopened.is_room_key_poisoned(2),
+        "two stored commitments poison the epoch on open"
     );
     assert!(
-        !reopened.is_room_key_poisoned(2),
-        "the reopened engine must not see a poisoned epoch (resolution was durable)"
-    );
-    assert_eq!(
-        reopened.room_key(2).expect("epoch 2 key").as_bytes(),
-        expected_winner.as_bytes(),
-        "the restarted engine holds the same deterministically-chosen winner"
+        reopened.room_key(2).is_none(),
+        "the persisted winner is not readable after reopen"
     );
 
-    // The attribution survived: the reloaded key's source_event_id is still the
-    // winning distribution.
+    // The first adoption's row stays on disk. Open does not use it.
     let mut reopened = reopened;
     let persisted_after = reopened
         .store_mut()
@@ -2010,22 +1991,14 @@ fn poisoned_epoch_resolution_survives_restart() {
         .find(|(epoch, _)| *epoch == 2)
         .map(|(_, (_, source_event_id))| source_event_id)
         .expect("epoch 2 key persisted after restart");
-    assert_eq!(
-        persisted_after, winner_id,
-        "the winning source_event_id must persist across the restart"
-    );
+    assert_eq!(persisted_after, id_a);
 }
 
-/// D5a attribution is arrival-order-independent (PR #204 review): when the
-/// same key is offered under several event ids and a conflicting key later
-/// appears, the deterministic resolution must attribute the winning key to its
-/// *minimum* source event id — not whichever same-key copy arrived first, and
-/// not the conflicting distribution's id. Scenario `A < C < B`: key K under A
-/// and B, conflicting key K' under C; the winning key K must resolve to source
-/// A (the minimum), regardless of B arriving before C.
+/// A later conflicting key poisons the epoch. Order-independent selection of
+/// a winner is #436, not this session.
 #[test]
 fn conflict_resolution_attributes_winner_to_minimum_source_id() {
-    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(SyncConfig::default());
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
 
@@ -2065,54 +2038,1528 @@ fn conflict_resolution_attributes_winner_to_minimum_source_id() {
         T0 + 3,
     )
     .expect("build distribution C (conflicting key)");
-    let id_a = frame_id(&dist_a.to_bytes(), room);
-    let id_b = frame_id(&dist_b.to_bytes(), room);
-    let id_c = frame_id(&dist_c.to_bytes(), room);
-    // The D5a winner is the candidate with the smallest event_id among those
-    // this device can unwrap. A and B both offer key K; C offers K'. The
-    // canonical source for key K is the smaller of its two offering ids.
-    let min_k_source = id_a.min(id_b);
-    // The winning key is K iff K's minimum source beats C, else K'.
-    let (expected_winner_key, expected_winner_source) = if min_k_source < id_c {
-        (key_k.clone(), min_k_source)
-    } else {
-        (key_k_prime.clone(), id_c)
-    };
-
-    // Publish in the adversarial order the review called out: the larger-id
-    // same-key copy (B) and the conflicting key (C) arrive around the
-    // originally-held A. Arrival order must not change the outcome.
     engine.publish(&dist_a.to_bytes()).expect("publish A");
     engine.publish(&dist_b.to_bytes()).expect("publish B");
+    assert!(engine.has_room_key(2), "the same key re-offered stays held");
     engine.publish(&dist_c.to_bytes()).expect("publish C");
 
-    assert!(engine.has_room_key(2), "resolution leaves a usable key");
-    assert!(!engine.is_room_key_poisoned(2));
-    assert_eq!(
-        engine.room_key(2).expect("epoch 2 key").as_bytes(),
-        expected_winner_key.as_bytes(),
-        "the candidate with the smallest event_id must win (D5a)"
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(
+        engine.room_key(2).is_none(),
+        "the conflicting key poisons the epoch instead of selecting a winner"
     );
+}
 
-    // The persisted source id must be the canonical (minimum) source of the
-    // winning key — never a same-key-but-larger id, and never mis-attributed
-    // to a distribution for a different key.
-    let persisted = engine
+// ---------------------------------------------------------------------------
+// KeyHistory adoption gate (Refs #429 #343 #286)
+// ---------------------------------------------------------------------------
+
+fn open_member(room: RoomId, seed_byte: u8, cfg: SyncConfig) -> SyncEngine {
+    SyncEngine::open_with_local_device(
+        EventStore::open_in_memory().expect("store"),
+        room,
+        cfg,
+        Some([seed_byte; 32]),
+    )
+    .expect("open")
+}
+
+fn zero_event_id() -> EventId {
+    EventId::from_bytes([0u8; 32])
+}
+
+fn history_chunk(
+    room: &RoomId,
+    epoch: u64,
+    key: &RoomKey,
+    event_id: EventId,
+    recipient: DeviceKey,
+) -> KeyHistoryChunk {
+    let distribution =
+        build_key_distribution_content(room, epoch, key, &[recipient]).expect("wrap chunk");
+    KeyHistoryChunk {
+        distribution_event_id: event_id,
+        epoch,
+        key_commitment: distribution.key_commitment,
+        wrapped_keys: distribution.wrapped_keys,
+    }
+}
+
+fn deliver_chunks(
+    engine: &mut SyncEngine,
+    from: PeerId,
+    room: RoomId,
+    chunks: Vec<KeyHistoryChunk>,
+) {
+    let _ = engine.on_message(
+        from,
+        SyncMessage::KeyHistory {
+            room_id: room,
+            chunks,
+        },
+    );
+}
+
+/// Admin alice (`sk(1)`/`sk(2)`), member bob (`sk(3)`/`sk(4)`), member carol
+/// (`sk(5)`/`sk(6)`), converged. Returns carol's join id for parenting.
+fn converge_trio(cfg: SyncConfig) -> (SimNet, RoomId, EventId) {
+    let (admin_id, admin_dev) = (sk(1), sk(2));
+    let (bob_id, bob_dev) = (sk(3), sk(4));
+    let (carol_id, carol_dev) = (sk(5), sk(6));
+    let (genesis, room) = make_genesis(&admin_id, &admin_dev);
+    let mut net = SimNet::new(room);
+    net.add_peer(NODE_A, open_member(room, 0x02, cfg));
+    net.add_peer(NODE_B, open_member(room, 0x04, cfg));
+    net.add_peer(NODE_C, open_member(room, 0x06, cfg));
+
+    net.engine_mut(NODE_A).publish(&genesis).expect("genesis");
+    let mut prev = frame_id(&genesis, room);
+
+    let inv_bob_id = [0x11; 16];
+    let inv_bob_sec = [0x21; 16];
+    let inv_bob = make_invite(
+        &admin_id,
+        &admin_dev,
+        room,
+        prev,
+        bob_id.identity_key(),
+        inv_bob_id,
+        inv_bob_sec,
+        "member",
+        T0 + 1,
+    );
+    prev = frame_id(&inv_bob, room);
+    net.engine_mut(NODE_A)
+        .publish(&inv_bob)
+        .expect("invite bob");
+
+    let join_bob = make_join(
+        &bob_id,
+        &bob_dev,
+        room,
+        prev,
+        inv_bob_id,
+        inv_bob_sec,
+        "member",
+        T0 + 2,
+    );
+    prev = frame_id(&join_bob, room);
+    net.engine_mut(NODE_A).publish(&join_bob).expect("join bob");
+
+    let inv_carol_id = [0x12; 16];
+    let inv_carol_sec = [0x22; 16];
+    let inv_carol = make_invite(
+        &admin_id,
+        &admin_dev,
+        room,
+        prev,
+        carol_id.identity_key(),
+        inv_carol_id,
+        inv_carol_sec,
+        "member",
+        T0 + 3,
+    );
+    prev = frame_id(&inv_carol, room);
+    net.engine_mut(NODE_A)
+        .publish(&inv_carol)
+        .expect("invite carol");
+
+    let join_carol = make_join(
+        &carol_id,
+        &carol_dev,
+        room,
+        prev,
+        inv_carol_id,
+        inv_carol_sec,
+        "member",
+        T0 + 4,
+    );
+    let join_carol_id = frame_id(&join_carol, room);
+    net.engine_mut(NODE_A)
+        .publish(&join_carol)
+        .expect("join carol");
+
+    net.connect_all();
+    net.run_to_quiescence();
+    assert_eq!(
+        net.engine(NODE_C).snapshot().active_member_count(),
+        3,
+        "admin, attacker, and victim are Active"
+    );
+    (net, room, join_carol_id)
+}
+
+fn persisted_epochs(engine: &mut SyncEngine, room: RoomId) -> Vec<u64> {
+    engine
         .store_mut()
         .load_room_keys(&room)
         .expect("load room keys")
-        .into_iter()
-        .find(|(epoch, _)| *epoch == 2)
-        .map(|(_, (_, source_event_id))| source_event_id)
-        .expect("epoch 2 key persisted");
-    assert_eq!(
-        persisted, expected_winner_source,
-        "the winner must be attributed to its minimum source id (arrival-order-independent)"
+        .into_keys()
+        .collect()
+}
+
+/// A-1. Flag off: a forged `KeyHistory` (zeros id at epoch E, then `u64::MAX`)
+/// adopts nothing and writes no `room_keys` row. A later admin DAG distribution
+/// is stored and its key is not adopted.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn key_adoption_a1_flag_off_ignores_forged_history_and_dag() {
+    let (mut net, room, head) = converge_trio(adoption_config(false));
+    let carol_dev = sk(6).device_key();
+
+    // Epoch 0 equals the untouched watermark, so a bound chunk is not rejected
+    // by the epoch guard. The flag itself has to drop it.
+    let epoch0_key = RoomKey::from_bytes([0x10; 32]);
+    let dist0 = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        0,
+        &epoch0_key,
+        &[carol_dev],
+        &[head],
+        T0 + 5,
+    )
+    .expect("epoch 0 distribution");
+    let dist0_bytes = dist0.to_bytes();
+    let dist0_id = frame_id(&dist0_bytes, room);
+    net.engine_mut(NODE_A)
+        .publish(&dist0_bytes)
+        .expect("publish epoch 0");
+    net.engine_mut(NODE_C).ingest_frame(NODE_A, &dist0_bytes);
+    assert!(
+        net.engine_mut(NODE_C)
+            .store_mut()
+            .get_in_room(&room, &dist0_id)
+            .expect("get")
+            .is_some(),
+        "the epoch 0 distribution is stored"
     );
-    // Specifically: when K wins, its source is the minimum of A and B, not the
-    // larger same-key id and not the conflicting C.
-    if expected_winner_key.as_bytes() == key_k.as_bytes() {
-        assert_eq!(persisted, min_k_source);
-        assert_ne!(persisted, id_c, "the conflicting key's id must not win");
+    assert!(!net.engine(NODE_C).has_room_key(0));
+    deliver_chunks(
+        net.engine_mut(NODE_C),
+        NODE_B,
+        room,
+        vec![history_chunk(&room, 0, &epoch0_key, dist0_id, carol_dev)],
+    );
+    assert!(
+        !net.engine(NODE_C).has_room_key(0),
+        "flag off does not adopt a bound chunk"
+    );
+
+    let epoch_e: u64 = 3;
+    let forged = history_chunk(
+        &room,
+        epoch_e,
+        &RoomKey::from_bytes([0xEE; 32]),
+        zero_event_id(),
+        carol_dev,
+    );
+    let forged_max = history_chunk(
+        &room,
+        u64::MAX,
+        &RoomKey::from_bytes([0xEF; 32]),
+        zero_event_id(),
+        carol_dev,
+    );
+    deliver_chunks(
+        net.engine_mut(NODE_C),
+        NODE_B,
+        room,
+        vec![forged, forged_max],
+    );
+
+    assert!(
+        !net.engine(NODE_C).has_room_key(epoch_e),
+        "flag off must not adopt the forged epoch"
+    );
+    assert!(!net.engine(NODE_C).has_room_key(u64::MAX));
+    assert!(
+        net.engine(NODE_C)
+            .logs()
+            .iter()
+            .any(|line| line == "key_history_ignored n=2"),
+        "one ignore log per KeyHistory message, got {:?}",
+        net.engine(NODE_C).logs()
+    );
+    assert!(
+        persisted_epochs(net.engine_mut(NODE_C), room).is_empty(),
+        "forged chunks must not write a room_keys row"
+    );
+
+    let admin_key = RoomKey::from_bytes([0x44; 32]);
+    let admin_epoch = 4;
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        admin_epoch,
+        &admin_key,
+        &[carol_dev],
+        &[head],
+        T0 + 5,
+    )
+    .expect("admin distribution");
+    let bytes = dist.to_bytes();
+    let later_id = frame_id(&bytes, room);
+    net.engine_mut(NODE_A)
+        .publish(&bytes)
+        .expect("admin publishes the distribution");
+    net.engine_mut(NODE_C).ingest_frame(NODE_A, &bytes);
+
+    assert!(
+        net.engine_mut(NODE_C)
+            .store_mut()
+            .get_in_room(&room, &later_id)
+            .expect("get")
+            .is_some(),
+        "the admin distribution event is stored"
+    );
+    assert!(
+        !net.engine(NODE_C).has_room_key(admin_epoch),
+        "flag off stores the DAG distribution and does not adopt its key"
+    );
+    assert!(
+        !net.engine(NODE_C).has_room_key(epoch_e),
+        "the forged epoch is still absent after the DAG event"
+    );
+    assert!(
+        persisted_epochs(net.engine_mut(NODE_C), room).is_empty(),
+        "no room_keys row after the ignored DAG distribution"
+    );
+    assert_eq!(
+        net.engine(NODE_C).snapshot().active_member_count(),
+        3,
+        "ignoring key material does not change the fold"
+    );
+}
+
+/// A-2. Flag on: unbound chunks are rejected, the admin key for E survives the
+/// all-zero tie-break, `u64::MAX` does not pin the watermark, a later admin
+/// epoch is adopted, and a bound chunk from an honest server is adopted.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn key_adoption_a2_flag_on_rejects_unbound_and_adopts_bound() {
+    let (mut net, room, head) = converge_trio(adoption_config(true));
+    let carol_dev = sk(6).device_key();
+    let epoch_e: u64 = 2;
+    let admin_key = RoomKey::from_bytes([0x11; 32]);
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        epoch_e,
+        &admin_key,
+        &[sk(2).device_key(), carol_dev],
+        &[head],
+        T0 + 5,
+    )
+    .expect("epoch E distribution");
+    let bytes = dist.to_bytes();
+    let dist_id = frame_id(&bytes, room);
+    net.engine_mut(NODE_A).publish(&bytes).expect("publish E");
+    net.engine_mut(NODE_C).ingest_frame(NODE_A, &bytes);
+    net.engine_mut(NODE_B).ingest_frame(NODE_A, &bytes);
+    assert_eq!(
+        net.engine(NODE_C)
+            .room_key(epoch_e)
+            .expect("carol holds E")
+            .as_bytes(),
+        admin_key.as_bytes()
+    );
+    assert!(
+        !net.engine(NODE_B).has_room_key(epoch_e),
+        "bob was not in the wrap set"
+    );
+
+    let evil = RoomKey::from_bytes([0xEE; 32]);
+    let bob_join = net
+        .engine(NODE_C)
+        .room_tail(16)
+        .expect("tail")
+        .into_iter()
+        .find(|se| se.event_type == EventType::MemberJoined)
+        .expect("a join event")
+        .event_id;
+    let rejects = [
+        history_chunk(&room, epoch_e, &evil, zero_event_id(), carol_dev),
+        history_chunk(&room, epoch_e, &evil, bob_join, carol_dev),
+        history_chunk(&room, epoch_e + 9, &evil, dist_id, carol_dev),
+        history_chunk(&room, epoch_e, &evil, dist_id, carol_dev),
+        history_chunk(&room, u64::MAX, &evil, zero_event_id(), carol_dev),
+    ];
+    for chunk in rejects {
+        deliver_chunks(net.engine_mut(NODE_C), NODE_B, room, vec![chunk]);
+    }
+
+    assert_eq!(
+        net.engine(NODE_C)
+            .room_key(epoch_e)
+            .expect("admin key kept")
+            .as_bytes(),
+        admin_key.as_bytes(),
+        "unbound chunks must not win the all-zero tie-break"
+    );
+    assert!(!net.engine(NODE_C).is_room_key_poisoned(epoch_e));
+    assert!(!net.engine(NODE_C).has_room_key(epoch_e + 9));
+    assert!(!net.engine(NODE_C).has_room_key(u64::MAX));
+    let unbound_logs = net
+        .engine(NODE_C)
+        .logs()
+        .iter()
+        .filter(|line| line.starts_with("key_history_unbound "))
+        .count();
+    assert_eq!(unbound_logs, 5, "each unbound chunk is logged and dropped");
+
+    let max_key = RoomKey::from_bytes([0xFE; 32]);
+    let max_dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        u64::MAX,
+        &max_key,
+        &[carol_dev],
+        &[dist_id],
+        T0 + 6,
+    )
+    .expect("max epoch distribution");
+    let max_bytes = max_dist.to_bytes();
+    let max_id = frame_id(&max_bytes, room);
+    net.engine_mut(NODE_C).ingest_frame(NODE_A, &max_bytes);
+    assert!(
+        net.engine_mut(NODE_C)
+            .store_mut()
+            .get_in_room(&room, &max_id)
+            .expect("get")
+            .is_some(),
+        "the u64::MAX distribution event is stored"
+    );
+    assert!(
+        !net.engine(NODE_C).has_room_key(u64::MAX),
+        "u64::MAX is rejected on the DAG path"
+    );
+
+    let next_key = RoomKey::from_bytes([0x33; 32]);
+    let next_epoch = epoch_e + 1;
+    let later_dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        next_epoch,
+        &next_key,
+        &[sk(2).device_key(), carol_dev],
+        &[dist_id],
+        T0 + 7,
+    )
+    .expect("epoch E+1");
+    let next_bytes = later_dist.to_bytes();
+    let next_id = frame_id(&next_bytes, room);
+    net.engine_mut(NODE_A)
+        .publish(&next_bytes)
+        .expect("publish E+1");
+    net.engine_mut(NODE_C).ingest_frame(NODE_A, &next_bytes);
+    net.engine_mut(NODE_B).ingest_frame(NODE_A, &next_bytes);
+    assert_eq!(
+        net.engine(NODE_C)
+            .room_key(next_epoch)
+            .expect("E+1 adopted after the max-epoch attempt")
+            .as_bytes(),
+        next_key.as_bytes()
+    );
+
+    let bob_peer = PeerId::from_bytes(*sk(4).device_key().as_bytes());
+    let served = net.engine_mut(NODE_A).on_message(
+        bob_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: room,
+            have_epochs: BTreeSet::new(),
+        },
+    );
+    let mut served_ids = BTreeSet::new();
+    for outgoing in served {
+        let SyncMessage::KeyHistory { chunks, .. } = &outgoing.msg else {
+            panic!("honest server must answer with KeyHistory");
+        };
+        for chunk in chunks {
+            assert_ne!(
+                chunk.distribution_event_id,
+                zero_event_id(),
+                "served chunks carry the real source id"
+            );
+            served_ids.insert((chunk.epoch, chunk.distribution_event_id));
+        }
+        let _ = net.engine_mut(NODE_B).on_message(NODE_A, outgoing.msg);
+    }
+    assert!(
+        served_ids.contains(&(epoch_e, dist_id)),
+        "epoch E is served under its distribution event, got {served_ids:?}"
+    );
+    assert!(
+        served_ids.contains(&(next_epoch, next_id)),
+        "epoch E+1 is served under its distribution event, got {served_ids:?}"
+    );
+    assert_eq!(
+        net.engine(NODE_B)
+            .room_key(epoch_e)
+            .expect("bob adopts E")
+            .as_bytes(),
+        admin_key.as_bytes()
+    );
+    assert_eq!(
+        net.engine(NODE_B)
+            .room_key(next_epoch)
+            .expect("bob adopts E+1")
+            .as_bytes(),
+        next_key.as_bytes()
+    );
+
+    // Flag off stores the distribution without adopting it. Reopen with the
+    // flag on re-seeds the watermark from that event, so the bound chunk
+    // adopts without a later DAG distribution.
+    let (mut cold, cold_room, cold_genesis) = seeded_engine_with_admin_seed(adoption_config(false));
+    let ahead_key = RoomKey::from_bytes([0x55; 32]);
+    let ahead = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &cold_room,
+        5,
+        &ahead_key,
+        &[sk(2).device_key()],
+        &[cold_genesis],
+        T0 + 1,
+    )
+    .expect("ahead distribution");
+    let ahead_bytes = ahead.to_bytes();
+    let ahead_id = frame_id(&ahead_bytes, cold_room);
+    cold.publish(&ahead_bytes).expect("publish ahead");
+    assert!(
+        !cold.has_room_key(5),
+        "flag off does not adopt the distribution used to plant the event"
+    );
+    let store = cold.into_store();
+    let mut cold = SyncEngine::open_with_local_device(
+        store,
+        cold_room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen flag on");
+    assert!(
+        !cold.has_room_key(5),
+        "flag off wrote no room_keys row to reload"
+    );
+    let ahead_chunk = history_chunk(&cold_room, 5, &ahead_key, ahead_id, sk(2).device_key());
+    deliver_chunks(&mut cold, NODE_B, cold_room, vec![ahead_chunk.clone()]);
+    assert_eq!(
+        cold.room_key(5)
+            .expect("seeded watermark lets the bound chunk adopt")
+            .as_bytes(),
+        ahead_key.as_bytes()
+    );
+    assert!(
+        !cold
+            .logs()
+            .iter()
+            .any(|line| line.starts_with("key_history_epoch_rejected ")),
+        "a chunk at the seeded watermark is not ahead, got {:?}",
+        cold.logs()
+    );
+    let later_key = RoomKey::from_bytes([0x66; 32]);
+    let later = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &cold_room,
+        6,
+        &later_key,
+        &[sk(2).device_key()],
+        &[ahead_id],
+        T0 + 2,
+    )
+    .expect("later distribution");
+    cold.publish(&later.to_bytes()).expect("publish epoch 6");
+    assert!(
+        cold.has_room_key(6),
+        "the DAG distribution raises the watermark"
+    );
+    deliver_chunks(&mut cold, NODE_B, cold_room, vec![ahead_chunk]);
+    assert_eq!(
+        cold.room_key(5)
+            .expect("historical chunk adopted once covered")
+            .as_bytes(),
+        ahead_key.as_bytes()
+    );
+}
+
+/// A-3. Reload. Flag off loads nothing and keeps every row. Flag on skips an
+/// unbound (all-zero source) row and loads a row whose source event binds.
+#[test]
+fn key_adoption_a3_reload_skips_unbound_rows() {
+    let epoch_bound = 2u64;
+    let bound_key = RoomKey::from_bytes([0x11; 32]);
+    let planted_key = RoomKey::from_bytes([0x22; 32]);
+    let planted_epoch = 1u64;
+
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(false));
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        epoch_bound,
+        &bound_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    let dist_id = frame_id(&dist.to_bytes(), room);
+    engine.publish(&dist.to_bytes()).expect("publish");
+    assert!(!engine.has_room_key(epoch_bound));
+    engine
+        .store_mut()
+        .save_room_key(&room, planted_epoch, &planted_key, &zero_event_id())
+        .expect("plant zeros row");
+    engine
+        .store_mut()
+        .save_room_key(&room, epoch_bound, &bound_key, &dist_id)
+        .expect("plant bound row");
+    let store = engine.into_store();
+    let mut off = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(false),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen flag off");
+    assert!(!off.has_room_key(planted_epoch));
+    assert!(!off.has_room_key(epoch_bound));
+    assert!(
+        off.logs()
+            .iter()
+            .any(|line| line == "room_keys_ignored n=2"),
+        "flag off logs the ignored rows, got {:?}",
+        off.logs()
+    );
+    let kept: Vec<u64> = persisted_epochs(&mut off, room);
+    assert_eq!(kept, vec![planted_epoch, epoch_bound]);
+
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        epoch_bound,
+        &bound_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    engine.publish(&dist.to_bytes()).expect("publish");
+    assert!(engine.has_room_key(epoch_bound));
+    engine
+        .store_mut()
+        .save_room_key(&room, planted_epoch, &planted_key, &zero_event_id())
+        .expect("plant zeros row");
+    let store = engine.into_store();
+    let mut on = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen flag on");
+    assert!(
+        !on.has_room_key(planted_epoch),
+        "an all-zero source id is not reloaded"
+    );
+    assert_eq!(
+        on.room_key(epoch_bound)
+            .expect("bound row loads")
+            .as_bytes(),
+        bound_key.as_bytes()
+    );
+    assert!(
+        on.logs()
+            .iter()
+            .any(|line| line.starts_with("room_key_unbound epoch=1 ")),
+        "the skipped row is logged, got {:?}",
+        on.logs()
+    );
+    let kept: Vec<u64> = persisted_epochs(&mut on, room);
+    assert_eq!(
+        kept,
+        vec![planted_epoch, epoch_bound],
+        "skipped rows are kept"
+    );
+}
+
+/// A-4. Flag off does not answer `WantKeyHistory`. Flag on serves the real
+/// source id and skips keys attributed to the all-zero id.
+#[test]
+fn key_adoption_a4_serving_follows_the_flag() {
+    let (mut engine, room, _genesis) = seeded_engine_with_admin_seed(adoption_config(false));
+    engine
+        .insert_room_key(1, &RoomKey::from_bytes([0xAB; 32]))
+        .expect("local key");
+    assert!(engine.has_room_key(1));
+    let admin_peer = PeerId::from_bytes(*sk(2).device_key().as_bytes());
+    let out = engine.on_message(
+        admin_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: room,
+            have_epochs: BTreeSet::new(),
+        },
+    );
+    assert!(
+        out.is_empty(),
+        "flag off must not serve key history, got {out:?}"
+    );
+
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    engine
+        .insert_room_key(1, &RoomKey::from_bytes([0xAB; 32]))
+        .expect("zeros-id local key");
+    let real_key = RoomKey::from_bytes([0xCD; 32]);
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &real_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    let dist_id = frame_id(&dist.to_bytes(), room);
+    engine.publish(&dist.to_bytes()).expect("publish");
+    assert!(engine.has_room_key(1));
+    assert!(engine.has_room_key(2));
+    let out = engine.on_message(
+        admin_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: room,
+            have_epochs: BTreeSet::new(),
+        },
+    );
+    assert_eq!(out.len(), 1, "flag on serves one KeyHistory message");
+    let SyncMessage::KeyHistory { chunks, .. } = &out[0].msg else {
+        panic!("expected KeyHistory, got {:?}", out[0].msg);
+    };
+    assert_eq!(chunks.len(), 1, "the zeros-id key is not served");
+    assert_eq!(chunks[0].epoch, 2);
+    assert_eq!(chunks[0].distribution_event_id, dist_id);
+    assert_ne!(chunks[0].distribution_event_id, zero_event_id());
+}
+
+/// Restart seeding. An admin distribution at epoch 5 is stored but not
+/// unwrapped. After reopen the watermark is 5, so a bound chunk adopts, and a
+/// lower-epoch DAG distribution is a backward replay.
+#[test]
+fn key_adoption_restart_seeds_watermark_from_stored_distribution() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let epoch5_key = RoomKey::from_bytes([0x55; 32]);
+    let other = sk(4).device_key();
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        5,
+        &epoch5_key,
+        &[other],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    let dist_bytes = dist.to_bytes();
+    let dist_id = frame_id(&dist_bytes, room);
+    engine.publish(&dist_bytes).expect("publish");
+    assert!(
+        !engine.has_room_key(5),
+        "the distribution does not wrap the local device"
+    );
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(!engine.has_room_key(5));
+    deliver_chunks(
+        &mut engine,
+        NODE_B,
+        room,
+        vec![history_chunk(
+            &room,
+            5,
+            &epoch5_key,
+            dist_id,
+            sk(2).device_key(),
+        )],
+    );
+    assert_eq!(
+        engine
+            .room_key(5)
+            .expect("bound chunk adopts at the seeded watermark")
+            .as_bytes(),
+        epoch5_key.as_bytes()
+    );
+
+    let lower_key = RoomKey::from_bytes([0x33; 32]);
+    let lower = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        3,
+        &lower_key,
+        &[sk(2).device_key()],
+        &[dist_id],
+        T0 + 2,
+    )
+    .expect("lower distribution");
+    engine
+        .publish(&lower.to_bytes())
+        .expect("publish lower epoch");
+    assert!(
+        !engine.has_room_key(3),
+        "a lower epoch than the seeded watermark is a backward replay"
+    );
+    assert!(
+        engine
+            .logs()
+            .iter()
+            .any(|line| line.starts_with("backward_epoch_rejected ")),
+        "backward rejection is logged, got {:?}",
+        engine.logs()
+    );
+}
+
+/// A removal rotation is part of the same scan. With no other distribution,
+/// it is what seeds the watermark.
+#[test]
+fn key_adoption_restart_seeds_watermark_from_removal_rotation() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let epoch_key = RoomKey::from_bytes([0x44; 32]);
+    let subject = sk(9).identity_key();
+    let removal = build_member_removed_with_rotation(
+        &sk(1),
+        &sk(2),
+        &room,
+        &subject,
+        None,
+        None,
+        None,
+        Some(5),
+        Some(&epoch_key),
+        &[sk(4).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("removal rotation");
+    let bytes = removal.to_bytes();
+    let removal_id = frame_id(&bytes, room);
+    engine.publish(&bytes).expect("publish removal");
+    assert!(!engine.has_room_key(5));
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    deliver_chunks(
+        &mut engine,
+        NODE_B,
+        room,
+        vec![history_chunk(
+            &room,
+            5,
+            &epoch_key,
+            removal_id,
+            sk(2).device_key(),
+        )],
+    );
+    assert_eq!(
+        engine
+            .room_key(5)
+            .expect("removal rotation seeds the watermark")
+            .as_bytes(),
+        epoch_key.as_bytes()
+    );
+}
+
+fn served_epochs(engine: &mut SyncEngine, room: RoomId) -> BTreeSet<u64> {
+    let admin_peer = PeerId::from_bytes(*sk(2).device_key().as_bytes());
+    let out = engine.on_message(
+        admin_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: room,
+            have_epochs: BTreeSet::new(),
+        },
+    );
+    let mut epochs = BTreeSet::new();
+    for outgoing in out {
+        if let SyncMessage::KeyHistory { chunks, .. } = outgoing.msg {
+            for chunk in chunks {
+                epochs.insert(chunk.epoch);
+            }
+        }
+    }
+    epochs
+}
+
+/// D1 wraps us and arrives first; D2 does not. The live engine poisons the
+/// epoch. After reopen the reloaded row is not readable or served.
+#[test]
+fn key_adoption_reopen_multi_commitment_d1_first_is_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_one = RoomKey::from_bytes([0x11; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_one,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("D1");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish D1");
+    assert!(engine.has_room_key(2));
+
+    let key_two = RoomKey::from_bytes([0x22; 32]);
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_two,
+        &[sk(4).device_key()],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("D2");
+    engine.publish(&second.to_bytes()).expect("publish D2");
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(engine.room_key(2).is_none());
+    assert!(
+        !served_epochs(&mut engine, room).contains(&2),
+        "a poisoned epoch is not served"
+    );
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "reopen poisons an epoch with two admin commitments"
+    );
+    assert!(
+        engine.room_key(2).is_none(),
+        "the reloaded row must not be readable"
+    );
+    assert!(
+        persisted_epochs(&mut engine, room).contains(&2),
+        "the room_keys row is kept and not used"
+    );
+    assert!(
+        !served_epochs(&mut engine, room).contains(&2),
+        "the reloaded row must not be served"
+    );
+}
+
+/// D2 (does not wrap us) arrives before D1. After reopen the epoch is poisoned
+/// even though the live session may have resolved to a key.
+#[test]
+fn key_adoption_reopen_multi_commitment_d2_first_is_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_two = RoomKey::from_bytes([0x22; 32]);
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_two,
+        &[sk(4).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("D2");
+    let second_bytes = second.to_bytes();
+    let second_id = frame_id(&second_bytes, room);
+    engine.publish(&second_bytes).expect("publish D2");
+    assert!(!engine.has_room_key(2));
+
+    let key_one = RoomKey::from_bytes([0x11; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_one,
+        &[sk(2).device_key()],
+        &[second_id],
+        T0 + 2,
+    )
+    .expect("D1");
+    engine.publish(&first.to_bytes()).expect("publish D1");
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(engine.room_key(2).is_none());
+    assert!(!served_epochs(&mut engine, room).contains(&2));
+}
+
+/// One admin commitment reloads and is served.
+#[test]
+fn key_adoption_reopen_single_commitment_reloads() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key = RoomKey::from_bytes([0x11; 32]);
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    engine.publish(&dist.to_bytes()).expect("publish");
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(!engine.is_room_key_poisoned(2));
+    assert_eq!(
+        engine
+            .room_key(2)
+            .expect("single commitment reloads")
+            .as_bytes(),
+        key.as_bytes()
+    );
+    assert!(served_epochs(&mut engine, room).contains(&2));
+}
+
+/// A stored admin `u64::MAX` distribution must not pin the watermark across
+/// a reopen, so a later epoch still adopts.
+#[test]
+fn key_adoption_restart_max_epoch_does_not_pin_watermark() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let max_key = RoomKey::from_bytes([0xFE; 32]);
+    let max_dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        u64::MAX,
+        &max_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("max distribution");
+    let max_bytes = max_dist.to_bytes();
+    let max_id = frame_id(&max_bytes, room);
+    engine.publish(&max_bytes).expect("publish max");
+    assert!(!engine.has_room_key(u64::MAX));
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    let later_key = RoomKey::from_bytes([0x33; 32]);
+    let later = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &later_key,
+        &[sk(2).device_key()],
+        &[max_id],
+        T0 + 2,
+    )
+    .expect("later distribution");
+    engine.publish(&later.to_bytes()).expect("publish later");
+    assert_eq!(
+        engine
+            .room_key(2)
+            .expect("a later epoch adopts after a stored u64::MAX distribution")
+            .as_bytes(),
+        later_key.as_bytes()
+    );
+}
+
+/// A non-admin distribution inserted past the fold does not raise the
+/// watermark on reopen.
+#[test]
+fn key_adoption_restart_non_admin_does_not_raise_watermark() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let stranger_key = RoomKey::from_bytes([0x77; 32]);
+    let wire = crate::event::distribution::build_member_key_distribution(
+        &sk(9),
+        &sk(10),
+        &room,
+        5,
+        &stranger_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("non-admin distribution");
+    let validated = validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room))
+        .expect("stateless-valid");
+    engine
+        .store_mut()
+        .insert(&validated)
+        .expect("direct insert");
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    let admin_key = RoomKey::from_bytes([0x44; 32]);
+    let admin_dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        4,
+        &admin_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 2,
+    )
+    .expect("admin distribution");
+    engine
+        .publish(&admin_dist.to_bytes())
+        .expect("publish lower epoch");
+    assert_eq!(
+        engine
+            .room_key(4)
+            .expect("non-admin history must not pin the watermark")
+            .as_bytes(),
+        admin_key.as_bytes()
+    );
+}
+
+/// After reopen, a new distribution with a different commitment poisons the
+/// epoch even when this device cannot unwrap it.
+#[test]
+fn key_adoption_restart_seeded_commitment_catches_equivocation() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let first_key = RoomKey::from_bytes([0x11; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &first_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("first distribution");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish first");
+    assert!(engine.has_room_key(2));
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert_eq!(
+        engine.room_key(2).expect("bound row reloads").as_bytes(),
+        first_key.as_bytes()
+    );
+
+    let second_key = RoomKey::from_bytes([0x22; 32]);
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &second_key,
+        &[sk(4).device_key()],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("conflicting distribution");
+    engine
+        .publish(&second.to_bytes())
+        .expect("publish conflict");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "the seeded commitment must conflict with the new distribution"
+    );
+    assert!(!engine.has_room_key(2));
+}
+
+/// A non-admin distribution inserted past the fold does not bind a chunk.
+#[test]
+fn key_adoption_non_admin_store_row_does_not_bind() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let stranger_id = sk(9);
+    let stranger_dev = sk(10);
+    let planted = RoomKey::from_bytes([0x77; 32]);
+    let wire = crate::event::distribution::build_member_key_distribution(
+        &stranger_id,
+        &stranger_dev,
+        &room,
+        0,
+        &planted,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("non-admin distribution");
+    let bytes = wire.to_bytes();
+    let validated = validate_wire_bytes(&bytes, &ValidationContext::for_room(room))
+        .expect("stateless validation does not apply the admin gate");
+    engine
+        .store_mut()
+        .insert(&validated)
+        .expect("direct insert");
+    deliver_chunks(
+        &mut engine,
+        NODE_B,
+        room,
+        vec![history_chunk(
+            &room,
+            0,
+            &planted,
+            validated.event_id,
+            sk(2).device_key(),
+        )],
+    );
+    assert!(
+        !engine.has_room_key(0),
+        "a non-admin source event must not bind a chunk"
+    );
+    assert!(
+        engine
+            .logs()
+            .iter()
+            .any(|line| line.starts_with("key_history_unbound ")),
+        "the unbound chunk is logged, got {:?}",
+        engine.logs()
+    );
+}
+
+/// After reopen, bound chunks for both commitments and a new admin
+/// distribution must not install a key. The early return in
+/// `adopt_key_distribution` is what keeps the epoch poisoned.
+#[test]
+fn key_adoption_reopen_chunks_and_distribution_stay_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_one = RoomKey::from_bytes([0x11; 32]);
+    let key_two = RoomKey::from_bytes([0x22; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_one,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("D1");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish D1");
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_two,
+        &[sk(4).device_key()],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("D2");
+    let second_bytes = second.to_bytes();
+    let second_id = frame_id(&second_bytes, room);
+    engine.publish(&second_bytes).expect("publish D2");
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(engine.is_room_key_poisoned(2));
+    let local = sk(2).device_key();
+    // One chunk at a time. A same-commitment chunk is the offer that
+    // `resolve` would install if the poisoned-epoch return were skipped,
+    // and the other chunk must not be able to hide that by re-poisoning
+    // afterwards.
+    for (key, id) in [(&key_one, first_id), (&key_two, second_id)] {
+        deliver_chunks(
+            &mut engine,
+            NODE_B,
+            room,
+            vec![history_chunk(&room, 2, key, id, local)],
+        );
+        assert!(
+            engine.is_room_key_poisoned(2),
+            "a bound chunk must not clear the poison"
+        );
+        assert!(
+            engine.room_key(2).is_none(),
+            "a bound chunk must not install a key"
+        );
+    }
+    let third_key = RoomKey::from_bytes([0x33; 32]);
+    let third = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &third_key,
+        &[local],
+        &[second_id],
+        T0 + 3,
+    )
+    .expect("new distribution");
+    engine.publish(&third.to_bytes()).expect("publish third");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "chunks and a later distribution must not clear the poison"
+    );
+    assert!(engine.room_key(2).is_none());
+    assert!(
+        !served_epochs(&mut engine, room).contains(&2),
+        "no key is served for the poisoned epoch"
+    );
+}
+
+fn publish_pair(wrap_first: bool) -> (SyncEngine, RoomId, Vec<KeyHistoryChunk>) {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_wrap = RoomKey::from_bytes([0x11; 32]);
+    let key_other = RoomKey::from_bytes([0x22; 32]);
+    let local = sk(2).device_key();
+    let other_dev = sk(4).device_key();
+    let (first_key, first_for, second_key, second_for) = if wrap_first {
+        (&key_wrap, local, &key_other, other_dev)
+    } else {
+        (&key_other, other_dev, &key_wrap, local)
+    };
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        first_key,
+        &[first_for],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("first distribution");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish first");
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        second_key,
+        &[second_for],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("second distribution");
+    let second_bytes = second.to_bytes();
+    let second_id = frame_id(&second_bytes, room);
+    engine.publish(&second_bytes).expect("publish second");
+    let chunks = vec![
+        history_chunk(&room, 2, first_key, first_id, local),
+        history_chunk(&room, 2, second_key, second_id, local),
+    ];
+    (engine, room, chunks)
+}
+
+/// A local `insert_room_key` then an admin distribution for that epoch
+/// poisons the epoch. The distribution must not keep the inserted key.
+#[test]
+fn key_adoption_insert_then_distribution_stays_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let local_key = RoomKey::from_bytes([0x11; 32]);
+    engine
+        .insert_room_key(2, &local_key)
+        .expect("insert local key");
+    assert_eq!(
+        engine.room_key(2).map(RoomKey::as_bytes),
+        Some(local_key.as_bytes())
+    );
+    let distributed = RoomKey::from_bytes([0x22; 32]);
+    let event = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &distributed,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    engine
+        .publish(&event.to_bytes())
+        .expect("publish distribution");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "the distribution conflict poisons epoch 2"
+    );
+    assert!(engine.room_key(2).is_none(), "the inserted key is not kept");
+}
+
+/// Live conflicts stay poisoned in both arrival orders, including after chunks.
+#[test]
+fn key_adoption_live_conflict_both_orders_stay_poisoned() {
+    for wrap_first in [true, false] {
+        let (mut engine, room, chunks) = publish_pair(wrap_first);
+        assert!(
+            engine.is_room_key_poisoned(2),
+            "wrap_first={wrap_first}: conflict poisons before any chunk"
+        );
+        assert!(
+            engine.room_key(2).is_none(),
+            "wrap_first={wrap_first}: conflict does not install a key"
+        );
+        for chunk in chunks {
+            deliver_chunks(&mut engine, NODE_B, room, vec![chunk]);
+            assert!(
+                engine.is_room_key_poisoned(2),
+                "wrap_first={wrap_first}: a chunk must not clear the poison"
+            );
+            assert!(
+                engine.room_key(2).is_none(),
+                "wrap_first={wrap_first}: a chunk must not install a key"
+            );
+        }
+        assert!(
+            !served_epochs(&mut engine, room).contains(&2),
+            "wrap_first={wrap_first}: no key is served"
+        );
+    }
+}
+
+/// A-5. No production call site in the CLI, net, or façade crates sets the flag.
+#[test]
+fn key_adoption_a5_shipped_crates_do_not_set_the_flag() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut hits = Vec::new();
+    for rel in [
+        "../iroh-rooms-cli/src",
+        "../iroh-rooms-net/src",
+        "../iroh-rooms/src",
+    ] {
+        let dir = root.join(rel);
+        assert!(dir.is_dir(), "missing {}", dir.display());
+        collect_flag_sets(&dir, &mut hits);
+    }
+    assert!(
+        hits.is_empty(),
+        "no non-test CLI, net, or façade source may set experimental_room_key_adoption. Found:\n{}",
+        hits.join("\n")
+    );
+}
+
+fn is_cfg_test_attr(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("#[") && trimmed.contains("cfg(test)")
+}
+
+#[test]
+fn cfg_not_test_stays_in_the_production_scan() {
+    assert!(!is_cfg_test_attr("#[cfg(not(test))]"));
+    assert!(is_cfg_test_attr("#[cfg(test)]"));
+    assert!(is_cfg_test_attr("    #[cfg(test)]"));
+}
+
+fn collect_flag_sets(dir: &std::path::Path, hits: &mut Vec<String>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|_| panic!("read {}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_flag_sets(&path, hits);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {}", path.display()));
+        let mut depth: usize = 0;
+        let mut skip_until: Option<usize> = None;
+        let mut cfg_test_pending = false;
+        for (idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // `cfg(test)` exactly. `cfg(not(test))` contains "test" and must
+            // stay in the production scan.
+            if skip_until.is_none() && is_cfg_test_attr(trimmed) {
+                cfg_test_pending = true;
+            }
+            if skip_until.is_none() && cfg_test_pending && trimmed.contains('{') {
+                skip_until = Some(depth);
+                cfg_test_pending = false;
+            }
+            let in_test = skip_until.is_some() || cfg_test_pending;
+            if cfg_test_pending && trimmed.ends_with(';') && !trimmed.contains('{') {
+                cfg_test_pending = false;
+            }
+            let code = trimmed.split("//").next().unwrap_or(trimmed);
+            if !in_test && code.contains("experimental_room_key_adoption") {
+                hits.push(format!("{}:{}: {}", path.display(), idx + 1, trimmed));
+            }
+            depth = depth.saturating_add(line.matches('{').count());
+            depth = depth.saturating_sub(line.matches('}').count());
+            if let Some(stop) = skip_until {
+                if depth <= stop {
+                    skip_until = None;
+                }
+            }
+        }
     }
 }

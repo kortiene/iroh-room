@@ -322,6 +322,23 @@ join-time transfer is therefore **chunked** exactly like ordinary membership his
 Until the join-time transfer completes, the invitee reads membership (plaintext) but not
 historical content — a deliberate UX change from "read backlog immediately" (§6, §10 OQ-5).
 
+**Amendment (Refs #429 #343 #286).** `WantKeyHistory` / `KeyHistory` serving and
+adoption are gated by `SyncConfig::experimental_room_key_adoption` (default off; no CLI or
+net call site sets it; `validate` does not constrain it). With the flag off, chunks are
+dropped, `WantKeyHistory` is not served, a DAG distribution is stored with its fold verdict
+unchanged and its key is not adopted, and `room_keys` rows are left in place and not loaded.
+`insert_room_key` is unchanged. With the flag on, a chunk or a reloaded row is adopted only
+when its source event id is a stored event sent by the room admin whose content is
+`member.key_distribution` or `member.removed` with a rotation payload, and that payload's
+`new_epoch` and `key_commitment` match. The all-zero event id never binds. Served chunks
+carry that source id; all-zero-id keys are not served. A chunk does not raise the epoch
+watermark and is adopted only when its epoch is less than or equal to the watermark a DAG
+distribution already reached. With the flag on, open re-seeds that watermark and the
+same-epoch commitment map from stored admin distributions (`member.key_distribution` and
+`member.removed` rotations), skipping `u64::MAX`. `new_epoch == u64::MAX` is rejected on the DAG, chunk, and
+reload paths. No v1 signed bytes, CBOR encoding, or `SyncMessage` shape changes; only the
+value of `KeyHistoryChunk.distribution_event_id` changes from all zeros to the real source id.
+
 ### D7 — Old epochs stay decryptable; forward secrecy is post-removal only
 
 A removed/departed device already had access to content up to its departure; rotating keys
@@ -372,6 +389,11 @@ decryption**:
   and an unreadable close is treated conservatively as still-closed, not reopened).
 - The implementation plan (§7) includes these helpers and their fail-closed tests explicitly,
   not only `MessageText` rotation.
+
+**Amendment (Refs #429 #343 #286).** The epoch keys these reads decrypt with are not adopted
+from peers and are not reloaded from `room_keys` unless
+`SyncConfig::experimental_room_key_adoption` is set (see the D6 amendment). `insert_room_key`
+still provisions a local key. The fail-closed projection rules above are unchanged.
 
 ---
 
