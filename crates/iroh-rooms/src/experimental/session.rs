@@ -31,7 +31,7 @@ pub use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 pub use iroh_rooms_net::{
     Admission, AdmissionDecision, AdmissionView, AllowlistAdmission, AuditSink, BlobDenyCause,
     BlobServeConfig, BootstrapProof, ConnEvent, EventProtocolHandler, Inbound,
-    JoinBootstrapAdmission, NetConfig, NetMode, NetTransport, Node, OfflineReason, PeerConnState,
-    PeerEntry, PeerManager, PeerTable, RejectCause, Shared, SnapshotAdmission, TracingAudit,
-    DEFAULT_TICK, EVENT_ALPN, RELAY_ONLY_TEST_BUILD,
+    JoinBootstrapAdmission, NetConfig, NetMode, NetTransport, Node, OfflineReason, PathType,
+    PeerConnState, PeerEntry, PeerManager, PeerTable, RejectCause, Shared, SnapshotAdmission,
+    TracingAudit, DEFAULT_TICK, EVENT_ALPN, RELAY_ONLY_TEST_BUILD,
 };

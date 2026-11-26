@@ -243,7 +243,7 @@ fn extract_error_code(stream: &str) -> Option<String> {
 /// flow and the leg-4 corruptions operate on a *real* agent ticket.)
 #[test]
 fn agent_invite_mints_key_bound_agent_ticket() {
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::room::RoomInviteTicket;
 
     let home = TempDir::new().unwrap();
     let ticket = admin_agent_invite_ticket(&home, AGENT_HEX);
@@ -429,7 +429,7 @@ fn wrong_identity_agent_ticket_rejected_pre_io_names_bound_key() {
 /// the agent flow.
 #[test]
 fn corrupt_agent_ticket_never_echoes_token_or_capability_secret() {
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::room::RoomInviteTicket;
 
     let home_admin = TempDir::new().unwrap();
     let ticket = admin_agent_invite_ticket(&home_admin, AGENT_HEX);

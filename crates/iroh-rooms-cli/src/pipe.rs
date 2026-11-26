@@ -2,7 +2,7 @@
 //! (spec `live-tcp-pipe-path.md` §6.5.3; PRD §15.7 / §16).
 //!
 //! These complete the PRD pipe journey on top of the landed net `pipe` module
-//! ([`iroh_rooms_net::pipe`]): `expose` announces and serves a **loopback** TCP
+//! ([`iroh_rooms::experimental::pipe_runtime`]): `expose` announces and serves a **loopback** TCP
 //! service to explicitly named members (printing a clear security warning, PRD
 //! §13.2.4), `connect` forwards a local loopback port to it, `close` revokes it, and
 //! `list` shows the room's open pipes. They are thin orchestrators over the
@@ -14,18 +14,20 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::content::{Content, EventType};
-use iroh_rooms_core::event::ids::RoomId;
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::store::EventStore;
-use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_net::pipe::is_loopback_target;
-use iroh_rooms_net::{
-    AdmissionView, NetConfig, Node, PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome,
-    SnapshotAdmission, DEFAULT_TICK, PIPE_MAX_CONCURRENT_FORWARDS,
+use iroh_rooms::events::SignedEvent;
+use iroh_rooms::events::{Content, EventType};
+use iroh_rooms::experimental::pipe_runtime::is_loopback_target;
+use iroh_rooms::experimental::pipe_runtime::{
+    PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome, PIPE_MAX_CONCURRENT_FORWARDS,
 };
+use iroh_rooms::experimental::session::{
+    AdmissionView, NetConfig, Node, SnapshotAdmission, DEFAULT_TICK,
+};
+use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::RoomId;
 use serde_json::json;
 
 use crate::error::CodedResultExt;
@@ -343,7 +345,7 @@ pub async fn connect(
             Some(PipeError::OwnerUnreachable(_)) => {
                 crate::bail_coded!(
                     crate::error::ErrorCode::PeerOffline(
-                        iroh_rooms_net::OfflineReason::Unreachable
+                        iroh_rooms::experimental::session::OfflineReason::Unreachable
                     ),
                     "the pipe owner is unreachable: {err:#}"
                 );
@@ -570,7 +572,7 @@ fn hex16(id: &[u8; 16]) -> String {
 /// Resolve the owner's dialable address: a `--peer` whose id matches the signed
 /// `owner_endpoint` (deterministic), else a bare endpoint id (discovery).
 fn resolve_owner_addr(
-    owner_endpoint: &iroh_rooms_core::event::keys::DeviceKey,
+    owner_endpoint: &iroh_rooms::identity::DeviceKey,
     peer_addrs: &[EndpointAddr],
 ) -> Result<EndpointAddr> {
     let id = EndpointId::from_bytes(owner_endpoint.as_bytes())
@@ -606,7 +608,7 @@ fn open_pipe(
     store: &EventStore,
     room_id: &RoomId,
     pipe_id: &[u8; 16],
-) -> Result<Option<iroh_rooms_core::event::content::PipeOpened>> {
+) -> Result<Option<iroh_rooms::pipes::PipeOpened>> {
     let events = store
         .by_type(room_id, EventType::PipeOpened)
         .with_context(|| format!("could not read pipe.opened events for room {room_id}"))?;
@@ -752,7 +754,7 @@ fn short_endpoint(device: EndpointId) -> String {
 /// as stable, greppable lines on **stderr** (spec IR-0108 §4.3).
 ///
 /// The CLI installs no `tracing` subscriber, so the default
-/// [`TracingPipeAudit`](iroh_rooms_net::TracingPipeAudit) output is dropped; this
+/// [`TracingPipeAudit`](iroh_rooms::experimental::pipe_runtime::TracingPipeAudit) output is dropped; this
 /// sink makes "unauthorized connect rejected **and locally logged**" (AC3 / PRD
 /// §13.2.7) actually visible on the owner's terminal. Rejects and teardowns are
 /// security-relevant and always print; per-connection accepts are chatter and print
@@ -897,13 +899,15 @@ mod tests {
         short_pipe, LocalPipeAudit, StderrPipeAudit,
     };
 
+    use iroh_rooms::events::EventId;
+    use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms::experimental::pipe_runtime::{PipeAuditSink, PipeDenyCause};
     use iroh_rooms::experimental::session::EndpointAddr;
-    use iroh_rooms_core::event::ids::{EventId, RoomId};
-    use iroh_rooms_core::event::keys::SigningKey;
-    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-    use iroh_rooms_core::event::{build_pipe_opened, build_room_created};
-    use iroh_rooms_core::store::EventStore;
-    use iroh_rooms_net::{PipeAuditSink, PipeDenyCause};
+    use iroh_rooms::experimental::store::EventStore;
+    use iroh_rooms::identity::SigningKey;
+    use iroh_rooms::pipes::build_pipe_opened;
+    use iroh_rooms::room::build_room_created;
+    use iroh_rooms::room::RoomId;
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -930,7 +934,7 @@ mod tests {
         let (id, dev) = owner();
         let wire = build_room_created(&id, &dev, "Test Room", nonce, BASE_TS);
         let room_id = {
-            let ev = iroh_rooms_core::event::signed::SignedEvent::decode(&wire.signed).unwrap();
+            let ev = iroh_rooms::events::SignedEvent::decode(&wire.signed).unwrap();
             ev.room_id
         };
         let ctx = ValidationContext::for_room(room_id);

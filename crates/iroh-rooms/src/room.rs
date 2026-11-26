@@ -37,6 +37,9 @@
 //! assert!(snapshot.is_active(&admin_identity.identity_key()));
 //! ```
 
+pub use iroh_rooms_core::event::content::{
+    MemberInvited, MemberJoined, MemberLeft, MemberRemoved, RoomCreated,
+};
 pub use iroh_rooms_core::event::ids::RoomId; // also surfaced here for discoverability
 pub use iroh_rooms_core::event::signed::derive_room_id;
 pub use iroh_rooms_core::event::{

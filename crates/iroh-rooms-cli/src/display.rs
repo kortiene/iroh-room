@@ -17,12 +17,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use iroh_rooms_core::event::content::{Content, EventType};
-use iroh_rooms_core::event::ids::RoomId;
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::membership::Status;
-use iroh_rooms_core::store::EventStore;
+use iroh_rooms::events::SignedEvent;
+use iroh_rooms::events::{Content, EventType};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::RoomId;
+use iroh_rooms::room::Status;
 
 /// The presentational membership state of a member row (spec D5):
 /// `active | invited | removed | left`.
@@ -188,8 +188,8 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::{iso8601_utc, member_display_state, short_id, MemberDisplayState};
-    use iroh_rooms_core::event::keys::IdentityKey;
-    use iroh_rooms_core::membership::Status;
+    use iroh_rooms::identity::IdentityKey;
+    use iroh_rooms::room::Status;
     use std::collections::BTreeSet;
 
     fn key(b: u8) -> IdentityKey {

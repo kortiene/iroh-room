@@ -11,5 +11,5 @@ pub use iroh::EndpointId;
 pub use iroh_rooms_net::pipe::is_loopback_target;
 pub use iroh_rooms_net::{
     new_pipe_id, PipeAuditSink, PipeDenyCause, PipeError, PipeForwarder, PipeOutcome, PipeRegistry,
-    PipeSessionInfo, TracingPipeAudit, PIPE_ALPN,
+    PipeSessionInfo, TracingPipeAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
 };
