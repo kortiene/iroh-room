@@ -779,6 +779,25 @@ mod tests {
 /// removed device, a `room send` or first `room leave` flush does not forward
 /// a message once a removal is folded, and a `member.left` stored while peers
 /// are offline is re-delivered exactly once when they return.
+///
+/// **Home.** These are ordinary unit tests of the `iroh-rooms` binary.
+/// `scripts/verify.sh` runs `cargo test --workspace --all-targets --all-features`,
+/// which executes this module. That required `verify` job is their CI home.
+///
+/// **Deterministic.** Every node uses `NetMode::Loopback` (relay disabled,
+/// `127.0.0.1` only). A dial uses the listener's printed loopback address as
+/// `--peer`, so it resolves on `127.0.0.1` with no DNS lookup and no relay.
+/// Stores are temporary local files. The flush length is the `Duration`
+/// passed into the command (`OPEN_FLUSH`, or `message::FLUSH_GRACE` for the
+/// short retry). A follow-up frame is published only after the room-event
+/// broadcast delivers the departure.
+///
+/// **Cost.** Measured 2026-11-19 with rustc 1.100.0, the debug test profile,
+/// and `cargo test -p iroh-rooms-cli --bin iroh-rooms member::live::` on a
+/// 4-core host: 11.27s wall clock at `--test-threads=4` (the harness default
+/// on that host) and 39.85s at `--test-threads=1`. Eight tests. The slowest
+/// alone was `leave_redelivers_exactly_one_member_left_when_peers_return`
+/// at 8.76s.
 #[cfg(test)]
 mod live {
     use std::path::Path;
@@ -978,6 +997,20 @@ mod live {
     /// A third member sends after the removal is folded, while the admin's push
     /// node is still in its flush window. The removed device gets the terminal
     /// removal and not that send.
+    ///
+    /// `room remove` holds that window open with `message::run_managed_push`
+    /// (live roster admission, the former `PushStyle::SealRoster`). The same
+    /// test fails when `persist_and_push` is switched back to `message::run_push`
+    /// with `message::build_admission` of the pre-removal snapshot (a fixed
+    /// allowlist for the whole flush, the former `PushStyle::Ephemeral`) and
+    /// that path's post-publish sleep is held at `OPEN_FLUSH` (4s), the same
+    /// flush this test passes to `remove`. Captured 2026-11-19 on rustc 1.100.0
+    /// against `ec4bc74`, command
+    /// `cargo test -p iroh-rooms-cli --bin iroh-rooms member::live::removal_flush_does_not_forward_a_third_members_send`.
+    /// It finished in 5.11s and panicked with "a send accepted during the flush
+    /// must not be forwarded to the removed device". Carol's send had been
+    /// accepted during the flush, and Bob already stored the terminal
+    /// `member.removed`; the fixed allowlist still forwarded the send.
     #[tokio::test]
     async fn removal_flush_does_not_forward_a_third_members_send() {
         let (alice, members, room) = joined_room(&["Bob", "Carol"]);
