@@ -161,7 +161,7 @@ candidate unless a later RB-1.x amendment classifies them.
 | Encryption decision | RB-REL-007 | #343 | **OD-1 decided 2026-11-15 (RB-1.2):** v0.1 GA ships plaintext room content, encrypted in transit only, disclosed. `RB-SEC-011` (#268) and `RB-SEC-002` (#250) are `POST-GA`; `RB-REL-007` must add an encryption-claims entry |
 | Independent security review | — | #344, #353 (`POST-GA`) | **OD-2 decided 2026-11-15 (RB-1.3):** no independent review for v0.1 GA; WAIVER-PBETA-0003 accepted for v0.1 GA only and disclosed, with an internal structured self-review ([`docs/security/v0.1-self-review.md`](docs/security/v0.1-self-review.md)) as the gate evidence. `RB-SEC-010` and `RB-FC-009` are `POST-GA` |
 | Install/upgrade/rollback/uninstall on four platforms | RB-REL-004, RB-REL-005, RB-FC-004 | #265, #293, #347 | `RB-REL-005`'s dependency on RB-SEC-006 reads as the GA-P1 backup/restore state |
-| Real-network evidence | RB-NET-007, RB-NET-008, RB-FC-005 | #235, #236, #348 | Measured legs, or a dated maintainer acceptance of WAIVER-PBETA-0001/0002 for v0.1 GA only. `RB-FC-005` is scoped to Gate A |
+| Real-network evidence | RB-NET-007, RB-NET-008, RB-FC-005 | #235, #236, #348 | **RB-1.6 (2026-11-19):** dated maintainer acceptance of WAIVER-PBETA-0001/0002 for v0.1 GA only. `RB-FC-005` is scoped to Gate A |
 | Compatibility gate | RB-FC-006 | #349 | Scoped to v1, immutable-vector, prior-candidate (rc.5 data), and rollback compatibility; v2 migration is `POST-GA` |
 | Candidate gates | RB-FC-001, -002, -003, -010, -011, -012 | #345, #346, #352, #354, #355, #356 | Scoped to the v0.1 GA candidate |
 
@@ -259,7 +259,7 @@ structured self-review instead of an independent reviewer or firm.
   reachability inventory tied to `RB-REL-007` (#343), including the OD-1
   unreachable-encryption check; a required `cargo-deny` check; and a fuzz
   target for the CBOR and frame parsers. This is the same narrow exception
-  RB-1.1 made for WAIVER-PBETA-0001/0002; it does not complete any RB-1 row.
+  RB-1.1 made for WAIVER-PBETA-0001/0002 (dated acceptance recorded 2026-11-19, RB-1.6); it does not complete any RB-1 row.
 - WAIVER-PBETA-0003's expiry moves from "before public beta expansion or GA"
   to **before v0.2 or any public beta expansion, whichever comes first**. The
   approved rc.5 sign-off record is not rewritten (preservation invariants);
@@ -301,6 +301,26 @@ environment's required reviewer). The row's deliverable, dependencies,
 completion evidence, status, and cohort-blocking flag are unchanged. Status
 stays `not-started`: the signing workflow is on `main`, and no signed release
 has been published, so the signature-asset evidence does not exist yet.
+
+## RB-1.6 — GA acceptances
+
+On 2026-11-19 the maintainer accepted the v0.1 GA dispositions recorded in
+[`ADR-0014`](docs/decisions/ADR-0014-v0.1-ga-sdk-cli-small-rooms-scope.md#ga-acceptances-2026-11-19).
+The citable record is
+<https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384>.
+
+The real-network evidence note records that dated acceptance of
+WAIVER-PBETA-0001 and WAIVER-PBETA-0002. The RB-1.3 waiver note records that
+the same acceptance now exists. This amendment does not edit any other
+ROADMAP row, dependency, or cohort-blocking cell. #420 (T21 errata) moves
+the RB-REL-001/002 status cells to `partial`; item 9 supplies RB-REL-001's
+independent-verification reading. No row is reclassified: the 15 GA-P1 rows
+stay `GA-P1`, and the waiver and storage/audit items stay dispositioned for
+the v0.1 GA candidate only. `RB-COND-002` (#231) is Post-GA in the POST-GA
+table and is read as satisfied for GA; the row is not edited.
+
+The named-limitations list for the #354 GA release notes is in that ADR-0014
+subsection. This amendment does not create the notes file.
 
 ## Governance and entry decisions
 
@@ -629,3 +649,4 @@ afterwards.
 | RB-1.3 | 2026-11-15 | Decide OD-2: v0.1 GA ships with WAIVER-PBETA-0003 re-accepted and disclosed, backed by an internal structured self-review (`docs/security/v0.1-self-review.md`); reclassify `RB-SEC-010` and `RB-FC-009` `POST-GA`; let the accepted waiver plus the self-review record satisfy the security-review gate item for the v0.1 GA candidate only; align `RB-FC-003`; move the waiver's expiry to before v0.2 or public beta expansion. | Maintainer decision 2026-11-15 (OD-2, waiver option); recorded in ADR-0014; active on merge |
 | RB-1.4 | 2026-11-15 | Add `GA-P0` row `RB-GA-002` (#379): CLI `room remove` (admin only) and `room leave`, with honest removal wording (peers enforce removal once they see it; removed members keep what they already had); reword threat-model T07/T09/T18; record T09's v0.1 GA disposition as admin removal plus sticky departure. | Maintainer decision 2026-11-15 (member removal, option B, GA-P0); active on merge |
 | RB-1.5 | 2026-11-15 | `RB-REL-001`: hardware / external role becomes "release-workflow owner + release-environment reviewer". Keyless Sigstore signing has no signing key to custody. Deliverable, dependencies, evidence, status (`not-started`), and cohort-blocking flag unchanged. | Maintainer decision 2026-11-15 (signed-release design D8), <https://github.com/kortiene/iroh-room/issues/237#issuecomment-6896502278>; active on merge |
+| RB-1.6 | 2026-11-19 | Record the maintainer GA acceptances in ADR-0014: WAIVER-PBETA-0001/0002 are accepted for v0.1 GA only (#352 item 1); no later expiry was decided; plaintext local storage (ADR-0001) and local-only, best-effort audit (ADR-0003) accepted as disclosed limitations; the 15 named GA-P1 rows carried as named limitations with classification unchanged; cargo-deny becomes a required check on main (the maintainer sets it); fuzz minimum is 5 minutes per target (#376); the SDK is published to crates.io for GA; #392, #393, #395, #396, and #400 block GA; GitHub-hosted runners count as evidence for #346, and #237, #248, #265, and #293 can be closed by the maintainer once their evidence is linked; verification on GitHub-hosted runners in a separate, read-only workflow counts as independent verification for RB-REL-001; the run-pin check in verify-release-artifacts.sh is GA scope; with #285 carried as a named limitation, the hold on recording #265 and #293 evidence is cleared (rows unchanged); #231 (RB-COND-002) stays POST-GA and is read as satisfied for GA (row unchanged). #420 (T21 errata) moves the RB-REL-001/002 status cells to `partial`; item 9 supplies RB-REL-001's independent-verification reading. | Maintainer decisions 2026-11-19; <https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384>; active on merge |
