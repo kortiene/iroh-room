@@ -8,8 +8,11 @@ all-features = true
 # Every RustSec vulnerability fails the check. Unmaintained crates fail only
 # when they are direct workspace dependencies; transitive ones are reported by
 # `cargo audit` and tracked, but do not block (we cannot replace them without
-# upstream changes).
+# upstream changes). Unsound advisories fail only for direct workspace
+# dependencies; transitive ones are reported by `cargo audit` and tracked, but
+# do not block.
 unmaintained = "workspace"
+unsound = "workspace"
 yanked = "deny"
 ignore = [
   # Each entry needs an owner-approved reason and a tracking issue.
