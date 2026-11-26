@@ -72,7 +72,10 @@ fn experimental_session_paths_resolve() {
     assert!(!name_of::<session::PeerTable>().is_empty());
     assert!(!name_of::<session::RejectCause>().is_empty());
     assert!(!name_of::<session::OfflineReason>().is_empty());
+    assert!(!name_of::<session::PathType>().is_empty());
     assert!(!name_of::<session::TracingAudit>().is_empty());
+    assert_eq!(session::PathType::Direct.label(), "direct");
+    assert_eq!(session::PathType::None.label(), "none");
 
     // iroh transport identities re-exported verbatim (issue #87) — the paths must
     // resolve here; `iroh_transport_reexports_are_the_net_api_types` below proves
@@ -318,8 +321,11 @@ fn experimental_pipe_runtime_paths_resolve() {
     // Trait re-export, proven through `TracingPipeAudit`'s impl.
     assert!(!pipe_audit_name::<pipe_runtime::TracingPipeAudit>().is_empty());
 
-    // Const re-export.
+    // Const re-exports.
     assert!(!pipe_runtime::PIPE_ALPN.is_empty());
+    const {
+        assert!(pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS > 0);
+    }
 
     // `EndpointId` is duplicated into `pipe_runtime` (issue #87) so a pipe-only
     // consumer need not reach into `session` — it is the type `PipeSessionInfo.device`
@@ -354,5 +360,8 @@ fn pipe_runtime_helpers_are_pure() {
 #[test]
 fn rotation_builder_is_experimental() {
     assert!(!name_of::<rotation::DistributionError>().is_empty());
+    assert!(!name_of::<rotation::EncryptedContent>().is_empty());
+    assert!(!name_of::<rotation::MemberKeyDistribution>().is_empty());
+    assert!(!name_of::<rotation::WrappedKeyEntry>().is_empty());
     assert!(!std::any::type_name_of_val(&rotation::build_member_removed_with_rotation).is_empty());
 }

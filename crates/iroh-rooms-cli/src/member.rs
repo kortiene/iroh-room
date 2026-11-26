@@ -36,16 +36,17 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use iroh_rooms::events::EventId;
+use iroh_rooms::events::RejectReason;
+use iroh_rooms::events::SignedEvent;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::events::{Content, EventType};
 use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::RoomId;
 use iroh_rooms::room::{build_member_left, build_member_removed};
-use iroh_rooms_core::event::content::{Content, EventType};
-use iroh_rooms_core::event::ids::{EventId, RoomId};
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::RejectReason;
-use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, RoomMembership, Status};
-use iroh_rooms_core::store::EventStore;
+use iroh_rooms::room::{Ingest, MembershipSnapshot, RoomMembership, Status};
 
 use crate::error::{CodedResultExt, ErrorCode};
 use crate::identity;
@@ -704,8 +705,9 @@ mod tests {
     }
 
     use super::{departure_lines, DepartureKind, DepartureSummary};
-    use iroh_rooms_core::event::ids::{EventId, RoomId};
-    use iroh_rooms_core::event::keys::IdentityKey;
+    use iroh_rooms::events::EventId;
+    use iroh_rooms::identity::IdentityKey;
+    use iroh_rooms::room::RoomId;
 
     fn sample(redelivered: bool) -> DepartureSummary {
         DepartureSummary {
@@ -784,20 +786,21 @@ mod live {
     use std::time::Duration;
 
     use iroh_rooms::events::build_message_text;
-    use iroh_rooms::experimental::session::{EndpointId, SecretKey};
-    use iroh_rooms::identity::DeviceBinding;
-    use iroh_rooms::room::{
-        build_member_joined, build_member_left, build_member_removed, RoomInviteTicket,
-    };
-    use iroh_rooms_core::event::content::EventType;
-    use iroh_rooms_core::event::ids::{EventId, RoomId};
-    use iroh_rooms_core::event::keys::IdentityKey;
-    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-    use iroh_rooms_core::store::{EventStore, StoredEvent};
-    use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-    use iroh_rooms_net::{
+    use iroh_rooms::events::EventId;
+    use iroh_rooms::events::EventType;
+    use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms::experimental::session::{
         Admission, AdmissionView, AllowlistAdmission, NetConfig, NetMode, Node, SnapshotAdmission,
         TracingAudit, DEFAULT_TICK,
+    };
+    use iroh_rooms::experimental::session::{EndpointId, SecretKey};
+    use iroh_rooms::experimental::store::{EventStore, StoredEvent};
+    use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
+    use iroh_rooms::identity::DeviceBinding;
+    use iroh_rooms::identity::IdentityKey;
+    use iroh_rooms::room::RoomId;
+    use iroh_rooms::room::{
+        build_member_joined, build_member_left, build_member_removed, RoomInviteTicket,
     };
     use tokio::sync::broadcast;
 
@@ -1386,7 +1389,7 @@ mod live {
         carol: &Node,
         keys: &SecretKeys,
         room: RoomId,
-        recv: Result<iroh_rooms_core::store::StoredEvent, broadcast::error::RecvError>,
+        recv: Result<iroh_rooms::experimental::store::StoredEvent, broadcast::error::RecvError>,
     ) -> Option<EventId> {
         let event = match recv {
             Ok(event) if event.event_type == EventType::MemberRemoved => event,

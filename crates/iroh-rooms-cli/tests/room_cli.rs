@@ -23,13 +23,14 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-use iroh_rooms_core::event::signed;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{
+use iroh_rooms::events::capability_hash;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::identity::{DeviceBinding, SigningKey};
+use iroh_rooms::room::{
     build_member_invited, build_member_joined, build_member_left, build_member_removed,
-    build_room_created, capability_hash, DeviceBinding, SigningKey,
+    build_room_created,
 };
-use iroh_rooms_core::store::EventStore;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -842,7 +843,8 @@ fn seed_members_departed(home: &TempDir, departure: MembersDeparture) -> String 
     let member_id = SigningKey::from_seed(&AC3M_MEMBER_SEED);
     let member_dev = SigningKey::from_seed(&AC3M_MEMBER_DEV_SEED);
 
-    let room_id = signed::derive_room_id(&admin_id.identity_key(), &AC3M_ROOM_NONCE, AC3M_BASE_TS);
+    let room_id =
+        iroh_rooms::room::derive_room_id(&admin_id.identity_key(), &AC3M_ROOM_NONCE, AC3M_BASE_TS);
     let ctx = ValidationContext::for_room(room_id);
     let db_path = home.path().join("rooms.db");
     let mut store = EventStore::open(&db_path).expect("open store");
@@ -1104,7 +1106,8 @@ fn seed_members_invited(home: &TempDir) -> String {
     let admin_dev = SigningKey::from_seed(&AC3I_ADMIN_DEV_SEED);
     let member_id = SigningKey::from_seed(&AC3I_MEMBER_SEED);
 
-    let room_id = signed::derive_room_id(&admin_id.identity_key(), &AC3I_ROOM_NONCE, AC3I_BASE_TS);
+    let room_id =
+        iroh_rooms::room::derive_room_id(&admin_id.identity_key(), &AC3I_ROOM_NONCE, AC3I_BASE_TS);
     let ctx = ValidationContext::for_room(room_id);
     let db_path = home.path().join("rooms.db");
     let mut store = EventStore::open(&db_path).expect("open store");
