@@ -11,6 +11,8 @@ rust-version.workspace = true
 # it through separate, later issues.
 publish = false
 description = "Pure v2 crypto core: canonical CBOR, BLAKE3/Ed25519 identifiers, governance state machine, fork detection, sorted Merkle map. No network, no store, no async."
+# Outside the v1 SDK publish set. `publish = false` is intentional. See
+# `docs/sdk-publish.md`.
 
 [lib]
 path = "src/lib.rs"
