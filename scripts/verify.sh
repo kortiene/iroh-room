@@ -36,6 +36,9 @@ cargo test -p iroh-rooms-crypto --doc
 # itself and is not run here.
 scripts/lifecycle-smoke-test.sh
 
+# Release run-pin harness. No network. The published-asset check is not run here.
+scripts/verify-release-artifacts-test.sh
+
 # The four SDK crates stay unpublished in git. Flipping `publish = false` is
 # the release pull request's job. The dry-run script strips the line only in
 # a throwaway worktree.
