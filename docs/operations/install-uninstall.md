@@ -10,7 +10,7 @@ This runbook is the concrete install/remove/rollback surface referenced by
 Production Beta supports:
 
 - macOS developer machines.
-- Linux developer machines.
+- Linux developer machines on glibc 2.34 or newer ([glibc floor](#glibc-floor)).
 
 Binary artifacts are supported only for the exact platform triples listed in
 the release notes with SHA-256 checksums. Other users should build from source
@@ -50,21 +50,28 @@ else. Those candidates are checksum-only
 covered that gap and is retired for `v0.1.0-rc.6`. The release owner approved
 that sign-off on 2026-11-16. See
 [`v0.1.0-rc.6-production-beta-signoff.md`](../releases/v0.1.0-rc.6-production-beta-signoff.md)).
-Verify the signed release with the script below. Pin Actions run
+Verify the signed release with the script below. It checks the run pin for
+Actions run
 [43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665).
+The line in `scripts/release-run-pins.txt` is `v0.1.0-rc.6 43835416665 1`.
 An archive whose SHA-256 matches the table in the rc.6 release notes is not
 an ungated run 43791394134 byte; those digests do not overlap.
 
 ```bash
 scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>
+```
+
+Exit 0 means the invocationId on each verified provenance bundle is exactly
+`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+People not using the script can still read that field after a separate
+`gh attestation verify --bundle` of the same `<archive>.sigstore.json`:
+
+```bash
 jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId
 ```
 
-The `jq` line must print
-`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
-This jq read only means something after `scripts/verify-release-artifacts.sh`
-has verified that same bundle, because reading the payload alone does not check
-its signature or provenance.
+That jq read only means something after the bundle has been verified, because
+reading the payload alone does not check its signature or provenance.
 
 Releases built by the signing workflow, starting with the first release after
 rc.5, publish the following assets for each of the four triples, plus the two
@@ -109,6 +116,8 @@ scripts/verify-release-artifacts.sh v<VERSION> <TRIPLE>
 scripts/verify-release-artifacts.sh --dir ./assets v<VERSION> <TRIPLE>
 # also require the peeled commit to be this SHA:
 scripts/verify-release-artifacts.sh --dir ./assets --commit <FULL_SHA> v<VERSION> <TRIPLE>
+# pre-publish, before scripts/release-run-pins.txt has this tag:
+scripts/verify-release-artifacts.sh --expected-run <RUN_ID> <ATTEMPT> --commit <FULL_SHA> v<VERSION> <TRIPLE>
 ```
 
 `<TRIPLE>` is `x86_64-apple-darwin`, `aarch64-apple-darwin`,
@@ -120,12 +129,22 @@ and the script requires it too. It probes `gh attestation verify --help` and
 exits 3 when either flag is missing. The signature check needs **cosign v3 or
 newer** (`cosign verify-blob --bundle`). The release workflow installs cosign
 v3.1.4. If `cosign` is missing or older after the `gh` checks have passed, the
-script exits 3 and says the signature was not checked. Exit 0 means the
-checksum, both archive attestation checks, the online `SHA256SUMS`
-attestation, and `cosign verify-blob` all passed. `--offline` skips the tag
-peel, the GitHub attestation lookup, and cosign, prints
-`PARTIAL: online checks skipped`, and exits 1. It is not a successful
-verification.
+script exits 3 and says the signature was not checked. For every tag except
+`v0.1.0-rc.1` through `v0.1.0-rc.5`, the script then checks the run pin in
+`scripts/release-run-pins.txt` (one line, `<tag> <run_id> <attempt>`, next to
+the script). Run the script from current `main`; a checkout of the tag
+itself has no pin for that tag. `--expected-run <RUN_ID> <ATTEMPT>` is only
+for a tag that is not in the pin file yet. If the tag is already pinned, the
+flag must equal that line. It does not replace a pin and it does not skip a
+check. Exit 0 means the checksum, both archive attestation
+checks, the online `SHA256SUMS` attestation, `cosign verify-blob`, and the
+run pin all passed. The pin is `.predicate.runDetails.metadata.invocationId`
+on each verified provenance bundle, exactly
+`https://github.com/kortiene/iroh-room/actions/runs/<RUN_ID>/attempts/<ATTEMPT>`.
+`v0.1.0-rc.1` through `v0.1.0-rc.5` do not read the pin file. `--offline`
+skips the tag peel, the GitHub attestation lookup, cosign, and the run pin,
+prints `PARTIAL: online checks skipped`, and exits 1. It is not a successful
+verification. python3 is required for the run pin.
 
 Fetch the assets with `gh` (this needs `gh auth login` on current GitHub CLI
 builds for a private lookup; a public release also accepts the curl URLs
@@ -340,8 +359,10 @@ backup tar are created in the working directory. The tar contains
 Record the checkout before `cd`. After that, `scripts/verify-release-artifacts.sh`
 is not in the working directory. Later blocks use
 `${WORK:?set WORK first (see above)}` and, when they call a repository
-script, `${REPO:?set REPO first (see above)}`. An unset value stops the
-shell, including an interactive one.
+script, `${REPO:?set REPO first (see above)}`. When `WORK` or `REPO` is unset,
+bash writes an error to stderr and that command fails. A non-interactive shell
+exits. An interactive shell (`bash -i`) stays open, and only that command
+fails.
 
 ```bash
 REPO="$(git rev-parse --show-toplevel)"
@@ -475,7 +496,10 @@ if pgrep -x iroh-rooms >/dev/null 2>&1; then
   exit 1
 fi
 data="${IROH_ROOMS_HOME:-$HOME/.local/share/iroh-rooms-beta}"
-[[ -f "${data}/rooms.db" ]] || exit 1
+if [[ ! -f "${data}/rooms.db" ]]; then
+  printf 'error: %s is missing; sqlite3 would create an empty database\n' "${data}/rooms.db" >&2
+  exit 1
+fi
 sqlite3 "${data}/rooms.db" "PRAGMA wal_checkpoint(TRUNCATE);"
 if [[ -e "${data}/rooms.db-wal" ]]; then
   printf '%s still exists after checkpoint\n' "${data}/rooms.db-wal" >&2
@@ -588,6 +612,54 @@ only when `class` is `evidence`, and false for every other class.
 
 local / probe / unreleased: developer or diagnostic run; not GA evidence for #265, #293 or #347
 
-The workflow file named by that `GITHUB_WORKFLOW_REF` is planned and is not in
-this repository yet. See Lifecycle evidence in
-`docs/operations/release-operations.md` for what counts as evidence.
+`.github/workflows/lifecycle.yml` is `workflow_dispatch` only. It was
+dispatched on `main` and passed. The run, the glibc floor, and the evidence
+matrix are in [glibc floor](#glibc-floor). What counts as evidence is in
+Lifecycle evidence in `docs/operations/release-operations.md`.
+
+### glibc floor
+
+The Linux glibc floor is 2.34. On both Linux triples the max `GLIBC_` symbol,
+measured by the record field `glibc_method`, is `GLIBC_2.34`:
+
+```bash
+readelf -V "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1
+```
+
+RHEL 9 and Debian 12 are supported by symbol version and are expected to work
+but not tested. Ubuntu 24.04 (evidence) and 22.04 (probe) were run. Ubuntu
+20.04, Debian 11, and RHEL 8 are not supported.
+
+The measurement is from lifecycle run
+[44541017067](https://github.com/kortiene/iroh-room/actions/runs/44541017067),
+attempt 1, `workflow_dispatch` on `main` at
+`ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26`. The run conclusion is `success`.
+Prior tag `v0.1.0-rc.5`. Candidate tag `v0.1.0-rc.6`. The per-triple JSON is
+the source of truth for the fields below. `Run`, `Attempt`, and `SHA` are
+`github_run_id`, `github_run_attempt`, and `github_sha`. `ImageOS` and
+`ImageVersion` are `image_os` and `image_version`.
+
+These four rows are GitHub-hosted runners (maintainer decision 2026-11-19, item 8 of https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384 (GitHub-hosted runners count as evidence)). Each record
+has `runner_hosted` `github-hosted`, `runner_environment` `github-hosted`,
+`class` `evidence`, `evidence_grade` true, and `result` `PASS`.
+
+| Runner | Triple | Class | Result | Run | Attempt | SHA | ImageOS | ImageVersion | glibc_max_symbol | ldd --version |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `macos-15-intel` | `x86_64-apple-darwin` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `macos15` | `20260824.0482.1` | `n/a (Mach-O)` | `n/a` |
+| `macos-15` | `aarch64-apple-darwin` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `macos15` | `20261118.0550.1` | `n/a (Mach-O)` | `n/a` |
+| `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu24` | `20261111.370.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu24-arm64` | `20261111.182.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39` |
+
+The newer-store rollback refusal (rollback_b) is simulated by stamping the store user_version+1 (record field `simulated`), because rc.6 has no schema change. No real newer-schema store was exercised.
+
+Both 22.04 probe cells passed (`x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu`). `class` is `probe`. `ldd --version` reports
+glibc 2.35. `evidence_grade` is false. The same run id, attempt, and SHA
+apply.
+
+| Runner | Triple | Class | Result | Run | Attempt | SHA | ImageOS | ImageVersion | glibc_max_symbol | ldd --version |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | `probe` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu22` | `20261111.360.2` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.35-0ubuntu3.15) 2.35` |
+| `ubuntu-22.04-arm` | `aarch64-unknown-linux-gnu` | `probe` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu22-arm64` | `20261116.196.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.35-0ubuntu3.18) 2.35` |
+
+A 22.04 pass shows the binary runs there; it does not prove the 2.34 floor itself.

@@ -9,4 +9,7 @@
 //! published stable surface does not promise rotation. End-to-end content
 //! encryption is the v0.2 headline.
 
+pub use iroh_rooms_core::event::content::{
+    EncryptedContent, MemberKeyDistribution, WrappedKeyEntry,
+};
 pub use iroh_rooms_core::event::{build_member_removed_with_rotation, DistributionError};

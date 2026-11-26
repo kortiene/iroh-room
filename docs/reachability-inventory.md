@@ -291,12 +291,14 @@ builder is not in this list.
 
 ```text
 reachability-sdk-stable
+iroh_rooms::events::AgentStatus
 iroh_rooms::events::Content
 iroh_rooms::events::EventId
 iroh_rooms::events::EventType
 iroh_rooms::events::Flag
 iroh_rooms::events::HashRef
 iroh_rooms::events::MembershipOracle
+iroh_rooms::events::MessageText
 iroh_rooms::events::PROTOCOL_VERSION
 iroh_rooms::events::RejectReason
 iroh_rooms::events::RoomId
@@ -370,9 +372,14 @@ iroh_rooms::room::BlobDecision
 iroh_rooms::room::DenyReason
 iroh_rooms::room::Ingest
 iroh_rooms::room::Member
+iroh_rooms::room::MemberInvited
+iroh_rooms::room::MemberJoined
+iroh_rooms::room::MemberLeft
+iroh_rooms::room::MemberRemoved
 iroh_rooms::room::MembershipSnapshot
 iroh_rooms::room::PipeDecision
 iroh_rooms::room::Role
+iroh_rooms::room::RoomCreated
 iroh_rooms::room::RoomId
 iroh_rooms::room::RoomInviteTicket
 iroh_rooms::room::RoomMembership
@@ -411,6 +418,7 @@ iroh_rooms::experimental::blob::EndpointId
 iroh_rooms::experimental::blob::FetchOutcome
 iroh_rooms::experimental::pipe_runtime::EndpointId
 iroh_rooms::experimental::pipe_runtime::PIPE_ALPN
+iroh_rooms::experimental::pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS
 iroh_rooms::experimental::pipe_runtime::PipeAuditSink
 iroh_rooms::experimental::pipe_runtime::PipeDenyCause
 iroh_rooms::experimental::pipe_runtime::PipeError
@@ -422,6 +430,9 @@ iroh_rooms::experimental::pipe_runtime::TracingPipeAudit
 iroh_rooms::experimental::pipe_runtime::is_loopback_target
 iroh_rooms::experimental::pipe_runtime::new_pipe_id
 iroh_rooms::experimental::rotation::DistributionError
+iroh_rooms::experimental::rotation::EncryptedContent
+iroh_rooms::experimental::rotation::MemberKeyDistribution
+iroh_rooms::experimental::rotation::WrappedKeyEntry
 iroh_rooms::experimental::rotation::build_member_removed_with_rotation
 iroh_rooms::experimental::session::Admission
 iroh_rooms::experimental::session::AdmissionDecision
@@ -445,6 +456,7 @@ iroh_rooms::experimental::session::NetMode
 iroh_rooms::experimental::session::NetTransport
 iroh_rooms::experimental::session::Node
 iroh_rooms::experimental::session::OfflineReason
+iroh_rooms::experimental::session::PathType
 iroh_rooms::experimental::session::PeerConnState
 iroh_rooms::experimental::session::PeerEntry
 iroh_rooms::experimental::session::PeerManager

@@ -28,6 +28,14 @@ This release supports:
   lists.
 - Explicitly invited agent participants and signed `agent.status` updates.
 
+## Platforms And glibc Floor
+
+glibc floor <GLIBC_x.y>.
+
+lifecycle run <run URL, attempt, sha>.
+
+matrix: see docs/operations/install-uninstall.md#glibc-floor
+
 ## Known Limitations
 
 State these before install/run commands:

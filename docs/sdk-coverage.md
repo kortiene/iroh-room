@@ -1,182 +1,176 @@
-# SDK coverage audit (IR-0301)
+# SDK façade coverage (RB-SDK-001)
 
-This is the AC2 evidence artifact for issue #36 / IR-0301 (extended by issue
-#87 to the raw `iroh` transport types): every symbol
-`crates/iroh-rooms-cli/src` imports from `iroh-rooms-core` / `iroh-rooms-net` /
-`iroh` (in production code — not `#[cfg(test)] mod tests` blocks, which
-exercise the same symbols already listed below), mapped to its `iroh-rooms`
-façade path. `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct
-`iroh` dependency. Two observability symbols are still imported from
-`iroh-rooms-core` and are not re-exported by the façade; see the drift note
-below. That is a missing façade path, not a CLI feature a user can call.
+The supported Rust entry point is the `iroh-rooms` crate. It re-exports the
+same types `iroh-rooms-core` and `iroh-rooms-net` already expose; it does not
+wrap them. A default-features build can name only the stable modules
+(`identity`, `room`, `events`, `files`, `pipes`, `prelude`). The online
+runtime is `iroh_rooms::experimental`, behind the `experimental` feature.
 
-Regenerate this table by re-running the `grep` in the "Method" section below
-whenever the CLI's imports change; a path listed here that no longer resolves
-is a drift signal (spec R3).
+`crates/iroh-rooms-cli` is the reference consumer. Its `src/` and `tests/`
+name those types only through `iroh_rooms`. The manifest does not depend on
+`iroh-rooms-core` or `iroh-rooms-net`.
+`crates/iroh-rooms-cli/tests/no_direct_internal_deps.rs` fails if either
+direct path comes back. `tests/no_direct_iroh_dep.rs` is the sibling guard
+for a direct `iroh` dependency.
 
-## Stable tier (`iroh_rooms::{identity, room, events, files, pipes}`)
+Stable-surface tests live in `crates/iroh-rooms/tests/stable_surface.rs`
+(default features, façade paths only). Experimental paths are locked in
+`crates/iroh-rooms/tests/experimental_surface.rs`.
 
-| `core` symbol | Façade path | Used by |
-|---|---|---|
-| `event::keys::IdentityKey` | `identity::IdentityKey` | audit.rs, display.rs, invite.rs, join.rs, pipe.rs, room.rs |
-| `event::keys::DeviceKey` | `identity::DeviceKey` | file.rs |
-| `event::keys::SigningKey` | `identity::SigningKey` | identity.rs |
-| `event::keys::Signature` | `identity::Signature` | (test-only) |
-| `event::binding::DeviceBinding` | `identity::DeviceBinding` | join.rs |
-| `event::ids::RoomId` | `room::RoomId` (also `events::RoomId`) | cli.rs, display.rs, file.rs, invite.rs, join.rs, pipe.rs, room.rs |
-| `event::ids::EventId` | `events::EventId` | join.rs, message.rs |
-| `event::ids::HashRef` | `files::HashRef` (also `events::HashRef`) | file.rs |
-| `event::content::{Content, EventType}` | `events::{Content, EventType}` | display.rs, file.rs, join.rs, message.rs, pipe.rs, room.rs |
-| `event::content::FileShared` | `files::FileShared` | file.rs |
-| `event::signed::SignedEvent` | `events::SignedEvent` | display.rs, file.rs, join.rs, message.rs, pipe.rs, room.rs |
-| `event::signed::derive_room_id` | `room::derive_room_id` | room.rs (`create`) |
-| `event::validate::{validate_wire_bytes, ValidationContext}` | `events::{validate_wire_bytes, ValidationContext}` | file.rs, join.rs, message.rs, room.rs |
-| `event::RejectReason` | `events::RejectReason` | error.rs, join.rs |
-| `event::constants::{MAX_MESSAGE_BODY_BYTES, MAX_PREV_EVENTS, MAX_SHARED_FILE_BYTES, MAX_ARTIFACT_REFS, MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES, SHORT_ID_LEN}` | `events::constants::*` | agent.rs, file.rs, invite.rs, join.rs, message.rs |
-| `event::build_room_created` | `room::build_room_created` | room.rs |
-| `event::build_member_invited` | `room::build_member_invited` | invite.rs |
-| `event::build_member_joined` | `room::build_member_joined` | join.rs |
-| `event::{build_message_text, build_agent_status}` | `events::{build_message_text, build_agent_status}` | message.rs |
-| `event::build_file_shared` | `files::build_file_shared` | file.rs |
-| `event::build_pipe_opened` / `build_pipe_closed` | `pipes::build_pipe_opened` / `build_pipe_closed` | (test-only in pipe.rs) |
-| `event::capability_hash` | `events::capability_hash` | invite.rs |
-| `membership::{Ingest, MembershipSnapshot, Role, RoomMembership, Status}` | `room::{Ingest, MembershipSnapshot, Role, RoomMembership, Status}` | file.rs, invite.rs, join.rs, message.rs, room.rs, display.rs |
-| `ticket::{RoomInviteTicket, TicketError}` | `room::{RoomInviteTicket, TicketError}` | error.rs, invite.rs, join.rs |
+Rows below that are not implemented have no SDK symbol. This pass does not
+delete those capabilities from core, net, or the docs. Removal of
+advertised-but-unreachable behavior belongs to RB-REL-007.
 
-**Note on `derive_room_id`.** The spec's original §5.2 `room` module listing
-did not name this symbol, but the CLI's offline `room create` path computes
-`room_id` from `(sender_id, room_nonce, created_at)` *before*
-`build_room_created` returns a wire event — this audit surfaced that real
-dependency, so `derive_room_id` was added to `iroh_rooms::room` (it is exactly
-as pure/deterministic as the already-listed `capability_hash`; see
-`crates/iroh-rooms/src/room.rs`).
+## Dependency rows
 
-**Drift note (issue #144).** `crates/iroh-rooms-cli/src/audit.rs` now imports
-`ACTIVE_MEMBER_WARNING_THRESHOLD` directly from `iroh_rooms_core::membership`,
-and `crates/iroh-rooms-net` uses `active_member_warning_crossed` from the same
-module. Neither symbol is re-exported through the `iroh-rooms` façade today.
-Adding the re-export would publish two new stable symbols; this pass leaves
-them core-only and records that choice in
-[`docs/reachability-inventory.md`](reachability-inventory.md). The façade re-exports the
-`MembershipSnapshot` type itself (including its new `active_member_limit` /
-`active_member_headroom` methods), so the headroom surface IS reachable through
-`iroh_rooms::room`; only the threshold constant and the crossing detector are
-core-only. A one-line `pub use` in `crates/iroh-rooms/src/room.rs` would close
-the drift. It is not part of the reachability pass, because it would add
-stable public symbols.
+Each row is a dependency of RB-SDK-001. "SDK-visible surface" is the façade
+path a consumer can name today. "None" means the row's deliverable is not
+implemented, so there is nothing further to re-export.
 
-## Experimental tier (`iroh_rooms::experimental::*`)
+| Row | SDK-visible surface |
+|---|---|
+| RB-ENTRY-001 | None. Moderation envelope/body identifier consistency is not on the v1 façade. v2 code stays in `iroh-rooms-v2-core` and is not re-exported. |
+| RB-ENTRY-002 | None for the new `InvalidContent` classification. Existing rejects are `events::RejectReason`. |
+| RB-ENTRY-003 | None. The row is a coverage-scanner change, not a runtime type. |
+| RB-ENTRY-004 | None. Frozen member-Merkle fixtures are not an SDK type. |
+| RB-ENTRY-005 | None. The `activi` proof erratum is a fixture/docs successor, not an SDK type. |
+| RB-ENTRY-006 | None. The audit-claim erratum does not add a symbol. |
+| RB-ENTRY-007 | None. Successor v2 domains are not re-exported. |
+| RB-ADM-001 | `room::RoomMembership::membership_projection_generation` is the only cache key. The engine cache itself is inside `experimental::sync::SyncEngine`. |
+| RB-ADM-002 | `experimental::sync::{Completeness, Severity, TrustDecision}`. `Completeness::AdminForkDetected` is the fork verdict. |
+| RB-ADM-003 | Same sync verdicts, plus `experimental::session::AuditSink` for CLI audit hooks. There is no separate operator-divergence command or SDK method yet. |
+| RB-ADM-004 | `experimental::sync::Completeness` (partition/rejoin detection the engine already computes). No extra façade method. |
+| RB-ADM-005 | `experimental::rotation::build_member_removed_with_rotation` and `DistributionError`. Conflict resolution across epochs is not a separate SDK method. v0.1 GA removal uses `room::build_member_removed` and does not rotate. |
+| RB-SEC-001 | None for revocation. The ticket codec is `room::{RoomInviteTicket, TicketError}`. |
+| RB-SEC-002 | Shipped removal is `room::build_member_removed` (plaintext, no rotation). The rotation builder is `experimental::rotation::build_member_removed_with_rotation`. The CLI does not call it. |
+| RB-SEC-003 | None for device verification. The binding certificate is `identity::DeviceBinding`. |
+| RB-SEC-004 | None. `experimental::store::EventStore` is the local log; it is not an at-rest-encryption API. |
+| RB-SEC-005 | None. No recovery-phrase type. |
+| RB-SEC-006 | None. No backup/restore type on the façade. |
+| RB-SEC-007 | `room::Role` (`Admin`, `Member`, `Agent`) only. No separate agent trust-level type. |
+| RB-SEC-008 | Per-pipe allowlists: `pipes::build_pipe_opened` and `room::pipe_connect_allowed`. No room-level pipe-policy object. |
+| RB-SEC-009 | None. `experimental::blob::BlobStore` stores blobs; it does not encrypt them at rest. |
+| RB-SEC-011 | The CLI display test names `experimental::rotation::EncryptedContent`. The seal/open builders (`build_content_encrypted`, `open_encrypted_content`, `SealError`, `UnreadableReason`) stay in core: the CLI does not name them. v0.1 GA ships plaintext content, encrypted in transit only. |
+| RB-SEC-012 | `experimental::sync::SyncMessage` includes `WantKeyHistory` and `KeyHistory`. `KeyHistoryChunk` is not re-exported; the CLI does not name it. No CLI paging command. |
+| RB-SEC-013 | The CLI matches the `Content::MemberKeyDistribution` variant and never names the `MemberKeyDistribution` or `WrappedKeyEntry` types. Those payload types are re-exported at `experimental::rotation` for a façade consumer. No new provenance-id type. |
+| RB-SEC-014 | None beyond the sync engine. No poison-state SDK type. |
+| RB-SEC-015 | None. No blocklist or moderation product type. |
+| RB-SEC-016 | `experimental::session::AuditSink` (and `TracingAudit`). No retention/rotation API. The CLI's `audit.ndjson` writer is CLI-local. |
+| RB-SEC-017 | None. No tamper-evident audit chain type. |
+| RB-SEC-018 | None. No audit-export type. |
+| RB-NET-001 | None on the shipping façade. `actor.subscribe` bounding is a gossip-overlay concern. `experimental` does not enable `gossip_overlay`. |
+| RB-NET-002 | None specific. Mesh spawn/retry audit events are not a façade vocabulary. `experimental::session::AuditSink` is the generic hook. |
+| RB-NET-003 | None. No zero-neighbor resubscribe API. |
+| RB-NET-004 | None. The measurement harness is not an SDK type. |
+| RB-NET-005 | None. Real-network runs are operational evidence, not an SDK type. |
+| RB-NET-006 | None. The shipping façade does not forward `iroh-rooms-net`'s `gossip_overlay` feature, and `GOSSIP_ALPN` / `GOSSIP_BOOTSTRAP_SEEDS` are not re-exported. |
+| RB-NET-007 | None. Gate A measurements are not an SDK type. |
+| RB-NET-008 | None. Cellular relay measurements are not an SDK type. |
+| RB-UP-101 | None. No `room list` type or method. |
+| RB-UP-102 | None for an all-event NDJSON schema type. A consumer reads `experimental::store::{EventStore, StoredEvent}` and `events::SignedEvent`. |
+| RB-UP-103 | `events::Content` and the payload structs in the symbol table below. Rendering stays in the CLI. |
+| RB-UP-104 | `experimental::session::Node::pipe_session_info` returns `experimental::pipe_runtime::PipeSessionInfo`. No `pipe list --json` schema type. |
+| RB-UP-105 | `experimental::session::{PathType, PeerConnState, PeerEntry, OfflineReason, ConnEvent}`. `Node::peer_paths` is what the CLI's `diag:` block reads. No stable diagnostics-JSON schema type. |
+| RB-UP-106 | `experimental::sync::SyncCounters` and `experimental::blob::FetchOutcome`. `experimental::pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS` is the connector budget, not a byte counter. |
+| RB-CLI-001 | None. No smoke-check type. |
+| RB-PIPE-001 | None. No terminal-sharing type. TCP pipes are `pipes` plus `experimental::pipe_runtime`. |
+| RB-PIPE-002 | None. No Unix-socket forwarding type. |
+| RB-PIPE-003 | None for multiplexed services. The single-pipe budget is `experimental::pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS`. |
+| RB-PRD3-001 | None. No `task.created` type. |
+| RB-PRD3-002 | None. No `task.updated` type. |
+| RB-PRD3-003 | None. No `agent.output` type. Agent presence today is `room::Role::Agent` and `events::build_agent_status`. |
+| RB-PRD3-004 | None. No `agent.error` type. |
+| RB-PRD3-005 | None. No `agent.artifact.shared` type. |
+| RB-PRD3-006 | None. No `agent.review.requested` type. |
+| RB-PRD3-007 | None. No live-agent-log stream type. Authorized TCP pipes remain `pipes` and `experimental::pipe_runtime`. |
+| RB-PRD3-010 | None. No room-export type. |
 
-| `net`/`core` symbol | Façade path | Used by |
-|---|---|---|
-| `store::{EventStore, StoredEvent}` | `experimental::store::{EventStore, StoredEvent}` | agent.rs, display.rs, file.rs, invite.rs, join.rs, message.rs, pipe.rs, room.rs |
-| `sync::{SyncConfig, SyncEngine}` | `experimental::sync::{SyncConfig, SyncEngine}` | file.rs, join.rs, message.rs, pipe.rs |
-| `net::{Admission, AdmissionView, AllowlistAdmission, BlobServeConfig, ConnEvent, JoinBootstrapAdmission, NetConfig, NetMode, Node, PeerConnState, PeerEntry, PeerManager, SnapshotAdmission, DEFAULT_TICK}` | `experimental::session::*` | join.rs, message.rs, pipe.rs |
-| `net::{AuditSink, BlobDenyCause, RejectCause}` | `experimental::session::*` | audit.rs |
-| `net::OfflineReason` | `experimental::session::OfflineReason` | error.rs |
-| `net::{BlobError, BlobStore, FetchOutcome}` | `experimental::blob::*` | file.rs |
-| `net::{PipeAuditSink, PipeDenyCause, PipeError, PipeOutcome}` | `experimental::pipe_runtime::*` | pipe.rs |
-| `net::pipe::is_loopback_target` | `experimental::pipe_runtime::is_loopback_target` | pipe.rs |
+RB-PRD3-005, RB-PRD3-006, and RB-PRD3-007 are included because the dependency
+expression is `RB-PRD3-001..007`. Their deliverables (`agent.artifact.shared`,
+`agent.review.requested`, and live agent logs) are not façade types.
 
-### iroh transport types (issue #87)
+## Stable symbols
 
-The public online `Node` API (`iroh-rooms-net/src/node.rs`) names three raw
-`iroh` types in its signatures, plus `Endpoint` on `Node::endpoint`. These are
-re-exported *verbatim* (not wrapped — a same-type re-export, like every other
-façade path) so a consumer needs no direct `iroh` dependency of its own to
-drive the online API; the pin becomes an SDK-internal detail, kept
-byte-identical to `iroh-rooms-net`'s pin by hand (a `[workspace.dependencies]`
-hoist was considered and deferred; both `Cargo.toml`s cross-reference the
-other's pin — spec D6/OQ2):
+| Core symbol | Façade path |
+|---|---|
+| `event::keys::{IdentityKey, DeviceKey, SigningKey, Signature}` | `identity::{IdentityKey, DeviceKey, SigningKey, Signature}` |
+| `event::binding::DeviceBinding` | `identity::DeviceBinding` |
+| `event::ids::RoomId` | `room::RoomId` and `events::RoomId` |
+| `event::ids::EventId` | `events::EventId` |
+| `event::ids::HashRef` | `files::HashRef` and `events::HashRef` |
+| `event::content::{Content, EventType, capability_hash}` | `events::{Content, EventType, capability_hash}` |
+| `event::content::{MessageText, AgentStatus}` | `events::{MessageText, AgentStatus}` |
+| `event::content::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}` | `room::` of the same names |
+| `event::content::FileShared` | `files::FileShared` |
+| `event::content::{PipeOpened, PipeClosed}` | `pipes::{PipeOpened, PipeClosed}` |
+| `event::signed::SignedEvent` | `events::SignedEvent` |
+| `event::signed::derive_room_id` | `room::derive_room_id` |
+| `event::validate::{validate_wire_bytes, validate_with_membership, ValidatedEvent, ValidationContext}` | `events::` of the same names |
+| `event::reject::{Flag, MembershipOracle, RejectReason}` | `events::` of the same names |
+| `event::wire::WireEvent` | `events::WireEvent` |
+| `event::{build_message_text, build_agent_status}` | `events::` of the same names |
+| `event::build_file_shared` | `files::build_file_shared` |
+| `event::{build_pipe_opened, build_pipe_closed}` | `pipes::` of the same names |
+| `event::{build_room_created, build_member_invited, build_member_joined, build_member_left, build_member_removed}` | `room::` of the same names |
+| `event::constants::*` | `events::constants::*` |
+| `PROTOCOL_VERSION` | `events::PROTOCOL_VERSION` |
+| `membership::{RoomMembership, MembershipSnapshot, Member, Ingest, AncestorView, Role, Status, BlobDecision, PipeDecision, DenyReason, blob_serve_allowed, pipe_connect_allowed}` | `room::` of the same names |
+| `ticket::{RoomInviteTicket, TicketError}` | `room::` of the same names |
 
-| `iroh` symbol | Façade path | Used by |
-|---|---|---|
-| `EndpointAddr` | `experimental::session::EndpointAddr` | file.rs, join.rs, message.rs, pipe.rs |
-| `EndpointId` | `experimental::session::EndpointId` (also `blob::EndpointId`, `pipe_runtime::EndpointId`) | audit.rs, file.rs, join.rs, message.rs, pipe.rs |
-| `SecretKey` | `experimental::session::SecretKey` | file.rs, join.rs, message.rs, pipe.rs |
-| `Endpoint` | `experimental::session::Endpoint` | (none in CLI; completeness — `Node::endpoint()` returns it) |
+`MAX_ACTIVE_MEMBERS`, `ACTIVE_MEMBER_WARNING_THRESHOLD`, and
+`active_member_warning_crossed` are not re-exported. The cap is 5 without
+`large_rooms` and 40 with it, so a stable constant would lie. The CLI reads
+`MembershipSnapshot::active_member_limit()` and derives the near-cap warning
+as one below that limit. `iroh-rooms-net` still calls the core function
+internally.
+[`docs/reachability-inventory.md`](reachability-inventory.md) records those
+symbols as core-only. Re-exporting them would add stable public symbols, and
+the reachability pass does not add that re-export. `MembershipSnapshot` on
+`iroh_rooms::room` also exposes `active_member_headroom`, so the headroom
+surface is reachable. The threshold constant and the crossing detector are
+not a CLI feature a user can call.
 
-`EndpointId` is duplicated into `experimental::blob` and
-`experimental::pipe_runtime` (the `BlobAclView::is_active` / `PipeSessionInfo.device`
-/ `PipeAuditSink` call sites), following the same duplicate-where-used
-precedent as `RoomId` (`room`/`events`) and `HashRef` (`files`/`events`).
-`EndpointAddr` and `SecretKey` are session-only concepts and are not
-duplicated. All four are behind the `experimental` feature (gated by the
-optional `dep:iroh` on the façade's `Cargo.toml`); a default-features build
-cannot name any of them.
+## Experimental symbols
 
-**Resolution of spec OQ6** (promote `is_loopback_target`?): promoted. It is a
-small, genuinely reusable loopback-target guard for any consumer building a
-pipe connector, not a test-only hack, so it is re-exported from
-`experimental::pipe_runtime` rather than left CLI-internal.
+| Net or core symbol | Façade path |
+|---|---|
+| `store::{EventStore, StoredEvent, InsertOutcome, InsertStats, ParkedRow, StoreError, StoreOptions, SyncStateRow, TrustRow}` | `experimental::store::` |
+| `sync::{SyncConfig, SyncEngine, SyncMessage, SyncError, SyncTransport, Completeness, Severity, TrustDecision, SyncCounters, SyncDigest, ...}` | `experimental::sync::` |
+| `net` session/admission/transport types the CLI names, including `Node`, `NetConfig`, `PathType`, `BootstrapProof`, `AuditSink` | `experimental::session::` |
+| `iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey}` | `experimental::session::` (and `EndpointId` again on `blob` and `pipe_runtime`) |
+| `net::{BlobStore, BlobError, BlobImport, BlobAclView, FetchOutcome}` | `experimental::blob::` |
+| `net` pipe runtime, including `is_loopback_target` and `PIPE_MAX_CONCURRENT_FORWARDS` | `experimental::pipe_runtime::` |
+| `event::content::{EncryptedContent, MemberKeyDistribution, WrappedKeyEntry}` | `experimental::rotation::` of the same names |
+| `event::{build_member_removed_with_rotation, DistributionError}` | `experimental::rotation::` |
 
-## Confirmed absent from the façade (by design)
+`PathType` is the classification `Node::peer_paths` returns. The CLI's
+diagnostics block matches it. `classify_remote_info` is not re-exported: its
+argument is `iroh::endpoint::RemoteInfo`, and the CLI does not call it.
 
-- `event::cbor` — the raw deterministic-CBOR codec. Confirmed **not** imported
-  anywhere in `crates/iroh-rooms-cli/src` (grep returns nothing); consumers
-  operate on `WireEvent` / `validate_wire_bytes` only (spec §5.2 note, R1).
-- `sync::sim` — the in-memory sync test harness. Confirmed **not** imported by
-  the CLI (it is `iroh-rooms-core`'s own deterministic test tool, exercised
-  only from `iroh-rooms-core`'s test suite).
+`RoomKey` is not re-exported. The experimental encryption builders take
+`&iroh_rooms_crypto::RoomKey`, the same signature core publishes.
 
-## Migration status (AC2 conformance)
+## Intentionally not re-exported
 
-Per spec §5.4, only the **offline authoring path** was migrated to import
-through the façade (a mechanical, type-identical `pub use` swap — spec D5 —
-so every existing CLI test stays green unchanged):
+These stay public on the internal crate. They were not removed.
 
-- `identity.rs` — fully migrated (`iroh_rooms::identity::SigningKey`).
-- `room.rs` (`create` / `members`) — fully migrated to `iroh_rooms::{events,
-  identity, room}`; `store::EventStore` stays a direct `iroh-rooms-core`
-  import (the online/persistence tier, optional per §5.4).
-- `invite.rs` — fully migrated to `iroh_rooms::{events, identity, room}`;
-  `store::EventStore` stays direct, same reason.
-- `message.rs` / `file.rs` — only the `build_message_text` / `build_agent_status`
-  / `build_file_shared` call sites (and their content/id types where the
-  builder signature needs them) route through the façade
-  (`iroh_rooms::events` / `iroh_rooms::files`); the surrounding online engine,
-  transport, and store imports stay direct `iroh-rooms-core` /
-  `iroh-rooms-net` deps, as the spec explicitly scopes this narrower for the
-  two online-heavy files.
-- `agent.rs`, `cli.rs`, `display.rs`, `error.rs` — **not migrated** this issue
-  (the online/experimental-heavy files; §5.4 calls this "recommended but
-  optional"). Every symbol they use is already reachable through the façade
-  per the tables above, so a future migration is a pure import swap with no
-  design change.
-- `audit.rs`, `join.rs`, `pipe.rs` — their `event`/`store`/`sync`/`net`
-  imports stay direct `iroh-rooms-core` / `iroh-rooms-net` deps (unchanged
-  scope), but every `EndpointAddr` / `EndpointId` / `SecretKey` use now routes
-  through `iroh_rooms::experimental::session` (issue #87) — see the "iroh
-  transport types" table above.
-
-Per issue #87, `crates/iroh-rooms-cli/Cargo.toml` no longer carries a direct
-`iroh` dependency at all: `file.rs`, `join.rs`, `message.rs`, `pipe.rs`, and
-`audit.rs` all import `EndpointAddr`/`EndpointId`/`SecretKey` through
-`iroh_rooms::experimental::session` instead. `crates/iroh-rooms-cli/Cargo.toml`
-depends on `iroh-rooms` (with the `experimental` feature) alongside the existing
-direct `iroh-rooms-core` / `iroh-rooms-net` dependencies used by the
-unmigrated files. The "imports only through the façade" claim is now fully
-true for the online tier: no CLI production source names `iroh::` directly.
+- `MAX_ACTIVE_MEMBERS`, `ACTIVE_MEMBER_WARNING_THRESHOLD`, and `active_member_warning_crossed`. The CLI uses `MembershipSnapshot::active_member_limit()` instead. Net still calls the core function.
+- Encryption builders the CLI does not name: `build_content_encrypted`, `open_encrypted_content`, `build_key_distribution_content`, `build_member_key_distribution`, `SealError`, `UnreadableReason`.
+- `sync::message::KeyHistoryChunk` and `sync::MAX_FRAME_BYTES`. `SyncMessage` is re-exported; the CLI does not name the chunk type or the frame cap.
+- `event::cbor` — raw deterministic CBOR. Consumers use `WireEvent` and `validate_wire_bytes`.
+- `sync::sim` — in-memory test harness.
+- Gossip-only net items (`GOSSIP_ALPN`, `GOSSIP_BOOTSTRAP_SEEDS`) and the `gossip_overlay` feature. The shipping CLI and the façade's `experimental` feature keep full-mesh and the cap of 5.
+- Transport internals the CLI does not name: `FrameError`, `InboundReceiver`, `OutboundQueue`, `MAX_CONCURRENT_BIDI_STREAMS`.
+- `iroh-rooms-v2-core` — not part of the v1 façade.
 
 ## Method
 
-This table was produced by auditing every production `use iroh_rooms_core::` /
-`use iroh_rooms_net::` line in `crates/iroh-rooms-cli/src/*.rs`:
+Regenerate the CLI half of this audit when imports change:
 
 ```console
-grep -n "use iroh_rooms_core::\|use iroh_rooms_net::\|use iroh_rooms::" crates/iroh-rooms-cli/src/*.rs
+grep -n "iroh_rooms::" crates/iroh-rooms-cli/src/*.rs crates/iroh-rooms-cli/tests/*.rs
 ```
 
-against the façade's re-export lists in `crates/iroh-rooms/src/{identity,room,
-events,files,pipes}.rs` and `crates/iroh-rooms/src/experimental/*.rs`.
-
-Issue #87 extends the audit to the raw `iroh::` transport types (both `use`
-statements and inline fully-qualified paths), proving zero direct-`iroh`
-residue in CLI production code:
-
-```console
-grep -n "use iroh_rooms_core::\|use iroh_rooms_net::\|use iroh_rooms::\|iroh::" crates/iroh-rooms-cli/src/*.rs
-```
-
-After the migration, this surfaces only `iroh_rooms::` paths — no bare
-`iroh::` — in production source.
+That grep must not show `iroh_rooms_core::` or `iroh_rooms_net::` outside
+`tests/no_direct_iroh_dep.rs`, which documents the bare-`iroh` scanner.
+The guard test enforces the same rule.
