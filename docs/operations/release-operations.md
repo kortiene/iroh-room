@@ -341,14 +341,43 @@ gh attestation verify <archive> \
   --format json \
   --jq '.[].verificationResult.signature.certificate.sourceRepositoryDigest'
 ```
-2. Download the draft assets (or point `--dir` at a directory that has them)
-   and run, for each supported triple:
+2. Add the producing run to `scripts/release-run-pins.txt` before the release
+   is published. One line per tag: `<tag> <run_id> <attempt>`. For this
+   candidate that is `v<VERSION> <run_id> <attempt>`, where `<run_id>` and
+   `<attempt>` are the `sign-and-publish` run. The script reads that file from
+   the checkout that contains it. GitHub releases do not record the producing
+   run, so the file is the only source. Do not put the pin in
+   `docs/releases/`. If this tag is not in the file yet, a draft check may pass
+   `--expected-run <run_id> <attempt>`. If the tag is already pinned, that
+   flag must equal the line. It does not replace a pin.
+3. Download the draft assets (or point `--dir` at a directory that has them)
+   and run, for each supported triple. Run the script from current `main`;
+   a checkout of the tag itself has no pin for that tag.
 
 ```bash
 scripts/verify-release-artifacts.sh --commit <GITHUB_SHA> v<VERSION> <TRIPLE>
 ```
 
-Publish the draft only after both checks succeed. Publishing is a GitHub
+The script checks the checksums, the attestations, the cosign signature, and
+the run pin. After `gh attestation verify` and `cosign verify-blob` succeed,
+it requires `.predicate.runDetails.metadata.invocationId` on every verified
+provenance bundle to equal exactly
+`https://github.com/kortiene/iroh-room/actions/runs/<run_id>/attempts/<attempt>`.
+A missing pin, a malformed line, a duplicate tag, a missing invocationId, or
+any other mismatch exits non-zero. `v0.1.0-rc.1` through `v0.1.0-rc.5` stay
+on the checksum-only path and do not read the pin file.
+
+People not using the script can still read an archive bundle after
+`gh attestation verify --bundle` has accepted that same file:
+
+```bash
+jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId
+```
+
+That jq read only means something after the bundle has been verified, because
+reading the payload alone does not check its signature or provenance.
+
+Publish the draft only after these checks succeed. Publishing is a GitHub
 release action, outside this workflow. Immutable releases then reject a later
 overwrite of that release.
 
@@ -449,19 +478,19 @@ attached the archive and its `.sha256` only. Those releases stay checksum-only;
 their records are not rewritten. `WAIVER-PBETA-0004` is retired
 for `v0.1.0-rc.6`, the first published signed release. The release owner
 approved that sign-off on 2026-11-16. Verify it with
-`scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`
-and pin run
-[43835416665](https://github.com/kortiene/iroh-room/actions/runs/43835416665):
+`scripts/verify-release-artifacts.sh --commit bf353b78f63b08ff5e3f425273aa3e0983167679 v0.1.0-rc.6 <TRIPLE>`.
+The script checks the run pin. The line in `scripts/release-run-pins.txt` is
+`v0.1.0-rc.6 43835416665 1`, and the invocationId must equal
+`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
+People not using the script can still read the archive bundle after verifying
+it:
 
 ```bash
 jq -r .dsseEnvelope.payload <archive>.sigstore.json | base64 -d | jq -r .predicate.runDetails.metadata.invocationId
 ```
 
-That output must equal
-`https://github.com/kortiene/iroh-room/actions/runs/43835416665/attempts/1`.
-This jq read only means something after `scripts/verify-release-artifacts.sh`
-has verified that same bundle, because reading the payload alone does not check
-its signature or provenance.
+That jq read only means something after the bundle has been verified, because
+reading the payload alone does not check its signature or provenance.
 An archive whose SHA-256 matches the table in the rc.6 release notes is not
 an ungated run 43791394134 byte; those digests do not overlap. See
 `docs/releases/v0.1.0-rc.6-release-notes.md`.

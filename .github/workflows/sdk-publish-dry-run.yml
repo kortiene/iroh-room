@@ -1,0 +1,20 @@
+# Manual dry run of the SDK crates.io publish set.
+# workflow_dispatch only. No registry token, no upload, no tag.
+name: sdk-publish-dry-run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.100.0
+      - name: Dry-run crates.io publish
+        run: scripts/publish-dry-run.sh
