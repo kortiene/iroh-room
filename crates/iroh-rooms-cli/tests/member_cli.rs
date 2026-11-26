@@ -19,18 +19,19 @@ use std::str::FromStr;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-use iroh_rooms_core::event::content::Content;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{
-    build_member_joined, build_member_left, build_member_removed, build_message_text,
-    build_pipe_opened, DeviceBinding, HashRef, IdentityKey, RoomId, SigningKey,
-};
-use iroh_rooms_core::membership::{
+use iroh_rooms::events::build_message_text;
+use iroh_rooms::events::Content;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::files::HashRef;
+use iroh_rooms::identity::{DeviceBinding, IdentityKey, SigningKey};
+use iroh_rooms::pipes::build_pipe_opened;
+use iroh_rooms::room::RoomInviteTicket;
+use iroh_rooms::room::{
     blob_serve_allowed, pipe_connect_allowed, BlobDecision, DenyReason, MembershipSnapshot,
-    PipeDecision, RoomMembership, MAX_ACTIVE_MEMBERS,
+    PipeDecision, RoomMembership,
 };
-use iroh_rooms_core::store::EventStore;
-use iroh_rooms_core::ticket::RoomInviteTicket;
+use iroh_rooms::room::{build_member_joined, build_member_left, build_member_removed, RoomId};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -167,6 +168,22 @@ fn status_of(p: &Peer, room: &str, id: &str) -> Option<String> {
         .iter()
         .find(|m| m["identity_id"].as_str() == Some(id))
         .map(|m| m["status"].as_str().unwrap().to_owned())
+}
+
+/// Active-member ceiling reported by a fresh snapshot.
+///
+/// Default features (the shipping CLI) are the literal cap 5. A workspace
+/// `--all-features` build unifies `large_rooms`, and the same method returns
+/// 40. Either value is the protocol cap; the constant is not re-exported.
+fn active_member_cap() -> usize {
+    let cap = RoomMembership::new(RoomId::from_bytes([0; 32]))
+        .snapshot()
+        .active_member_limit();
+    assert!(
+        cap == 5 || cap == 40,
+        "default-features active-member cap is the literal 5 (large_rooms is 40), got {cap}"
+    );
+    cap
 }
 
 fn active_count(p: &Peer, room: &str) -> usize {
@@ -404,10 +421,13 @@ fn admin_can_cancel_an_open_invite_by_removing_the_invitee() {
 
 #[test]
 fn removal_frees_a_member_slot_for_a_new_invite() {
-    // Alice + (cap - 1) members = the active-member ceiling (5 in the shipped
-    // build; 40 under the non-shipped `large_rooms` feature `--all-features` enables).
-    let (alice, members, room_str, room) = room_with(MAX_ACTIVE_MEMBERS - 1);
-    assert_eq!(active_count(&alice, &room_str), MAX_ACTIVE_MEMBERS);
+    // Alice + (cap - 1) members = the active-member ceiling. The shipping CLI
+    // (default features) is the literal cap 5. `scripts/verify.sh` builds
+    // `--all-features`, which unifies `large_rooms` and the same snapshot
+    // method returns 40. The cap constant is not on the façade.
+    let cap = active_member_cap();
+    let (alice, members, room_str, room) = room_with(cap - 1);
+    assert_eq!(active_count(&alice, &room_str), cap);
 
     // One more join at the ceiling is refused by the fold (stays non-active).
     let frank = peer("Frank");
@@ -420,7 +440,7 @@ fn removal_frees_a_member_slot_for_a_new_invite() {
 
     // Removing one member frees a slot: a fresh invite + join now succeeds.
     ok(&alice.home, &remove_args(&room_str, &members[0].id));
-    assert_eq!(active_count(&alice, &room_str), MAX_ACTIVE_MEMBERS - 1);
+    assert_eq!(active_count(&alice, &room_str), cap - 1);
     let grace = peer("Grace");
     invite_and_join(&alice, &grace, &room_str, &room);
     assert_eq!(
@@ -428,7 +448,7 @@ fn removal_frees_a_member_slot_for_a_new_invite() {
         Some("active"),
         "the freed slot must admit a new member"
     );
-    assert_eq!(active_count(&alice, &room_str), MAX_ACTIVE_MEMBERS);
+    assert_eq!(active_count(&alice, &room_str), cap);
 }
 
 // ── room leave ────────────────────────────────────────────────────────────────

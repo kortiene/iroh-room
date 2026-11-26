@@ -23,10 +23,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use iroh_rooms_core::event::constants::{
+use iroh_rooms::events::constants::{
     MAX_ARTIFACT_REFS, MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES, SHORT_ID_LEN,
 };
-use iroh_rooms_core::event::ids::RoomId;
+use iroh_rooms::room::RoomId;
 
 use crate::error::{CodedResultExt, ErrorCode};
 use crate::invite::{self, InviteSummary};
@@ -161,7 +161,7 @@ mod tests {
     //! at the library boundary the CLI integration suite only observes through
     //! printed output.
 
-    use iroh_rooms_core::event::ids::RoomId;
+    use iroh_rooms::room::RoomId;
     use tempfile::TempDir;
 
     use crate::{identity, room};
@@ -271,7 +271,7 @@ mod tests {
     // the strict `parse_agent_status` D1 bounds so a bad invocation fails fast with
     // an actionable message and exit 2, before any store is touched.
 
-    use iroh_rooms_core::event::constants::{
+    use iroh_rooms::events::constants::{
         MAX_ARTIFACT_REFS, MAX_STATUS_LABEL_BYTES, MAX_STATUS_MESSAGE_BYTES, SHORT_ID_LEN,
     };
 
@@ -370,9 +370,9 @@ mod tests {
     // the persisted event's shape and the exact `ErrorCode` on the reject paths (the
     // assert_cmd stderr substrings in `tests/agent_cli.rs` cannot pin a code).
 
-    use iroh_rooms_core::event::content::{Content, EventType};
-    use iroh_rooms_core::event::signed::SignedEvent;
-    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms::events::SignedEvent;
+    use iroh_rooms::events::{Content, EventType};
+    use iroh_rooms::experimental::store::EventStore;
     use std::path::Path;
     use std::time::Duration;
 
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(
             code_of(&err),
             Some(ErrorCode::Reject(
-                iroh_rooms_core::event::RejectReason::NotAMember
+                iroh_rooms::events::RejectReason::NotAMember
             )),
             "a non-member is rejected NotAMember (exit 3)"
         );

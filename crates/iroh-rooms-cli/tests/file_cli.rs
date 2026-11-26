@@ -117,11 +117,11 @@ fn seed_foreign_room(
     device_seed: [u8; 32],
     nonce: [u8; 16],
 ) -> String {
-    use iroh_rooms_core::event::build_room_created;
-    use iroh_rooms_core::event::keys::SigningKey;
-    use iroh_rooms_core::event::signed::SignedEvent;
-    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms::events::SignedEvent;
+    use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms::experimental::store::EventStore;
+    use iroh_rooms::identity::SigningKey;
+    use iroh_rooms::room::build_room_created;
 
     let id_key = SigningKey::from_seed(&identity_seed);
     let dev_key = SigningKey::from_seed(&device_seed);
@@ -1275,12 +1275,13 @@ fn fetch_malformed_peer_exits_nonzero_pre_io() {
 
 #[test]
 fn fetch_unsupported_blob_format_exits_nonzero_and_writes_nothing() {
-    use iroh_rooms_core::event::build_file_shared;
-    use iroh_rooms_core::event::content::EventType;
-    use iroh_rooms_core::event::ids::{HashRef, RoomId};
-    use iroh_rooms_core::event::keys::SigningKey;
-    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms::events::EventType;
+    use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms::experimental::store::EventStore;
+    use iroh_rooms::files::build_file_shared;
+    use iroh_rooms::files::HashRef;
+    use iroh_rooms::identity::SigningKey;
+    use iroh_rooms::room::RoomId;
 
     let home = TempDir::new().unwrap();
     create_identity(&home);
@@ -1470,12 +1471,11 @@ fn fetch_self_only_provider_is_unavailable_with_prd_language() {
 /// coded state, and never hangs past the timeout.
 #[test]
 fn fetch_unreachable_named_provider_is_unavailable_within_timeout() {
-    use iroh_rooms_core::event::build_file_shared;
-    use iroh_rooms_core::event::content::EventType;
-    use iroh_rooms_core::event::ids::{HashRef, RoomId};
-    use iroh_rooms_core::event::keys::SigningKey;
-    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms::events::{validate_wire_bytes, EventType, ValidationContext};
+    use iroh_rooms::experimental::store::EventStore;
+    use iroh_rooms::files::{build_file_shared, HashRef};
+    use iroh_rooms::identity::SigningKey;
+    use iroh_rooms::room::RoomId;
 
     let home = TempDir::new().unwrap();
     create_identity(&home);
