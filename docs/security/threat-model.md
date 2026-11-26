@@ -38,15 +38,20 @@ The largest production risks are not in the event-signature core. They are:
    encrypted writes: the CLI `room remove` and `room leave` commands author
    departures without a rotation payload, there is no rotation command, and
    no production call site enables encrypted writes, so a room whose members
-   only run the shipped CLI stays plaintext with no opt-in. A shipped engine
-   still adopts a peer's key distribution, rotation payload, or key-history
-   chunk, and pipe/file lookups can open those envelopes. Any current room
-   member (a device admission accepts; removed members and provisional
-   invitees are refused) running a non-shipped client can send KeyHistory
-   chunks that the shipped engine adopts without binding them to an
-   admin-signed distribution (engine.rs:936-938, :3288-3296), populating
-   room_keys persistently. DAG key distributions are admin-gated
-   (fold.rs:390). See #429. Plaintext
+   only run the shipped CLI stays plaintext with no opt-in. Peer and on-disk
+   adoption run only when `experimental_room_key_adoption` is set; it
+   defaults off (`sync/config.rs:235`) and no shipped call site sets it.
+   With the flag off, `KeyHistory` chunks are ignored (`engine.rs:959-967`)
+   and a stored distribution is not adopted (`engine.rs:3148-3149`). With
+   the flag on, a chunk is adopted only when it binds to a stored admin
+   distribution or removal rotation for the same epoch and commitment
+   (`engine.rs:3318-3336`, `distribution_is_bound` at `:3629`). A conflicting
+   commitment or key poisons the epoch and returns with no key installed,
+   live (`engine.rs:3232-3237`, `:3300-3304`) and on reopen
+   (`engine.rs:720-725`, `seed_epoch_watermark` at `:3559`). That is
+   fail-closed. #436 defers order-independent selection; until then a
+   conflicted epoch stays poisoned (`engine.rs:3182-3191`). DAG key
+   distributions stay admin-gated (`fold.rs:390`). See #429. Plaintext
    confidentiality holds for v0.1: the shipped CLI seals nothing and never
    decrypts for display. Decided for v0.1 GA
    (ADR-0014 OD-1, 2026-11-15): content ships plaintext, encrypted in transit
