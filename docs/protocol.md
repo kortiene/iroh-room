@@ -320,10 +320,26 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 | `message.text` | Any current member. | room heads |
 | `file.shared` | Any current member. | room heads |
 | `pipe.opened` | Any current member (`owner_id == sender_id`). | room heads |
-| `pipe.closed` | The pipe owner or the admin. | room heads |
+| `pipe.closed` | The pipe owner or the admin. Counted by cleartext sender at query time (enforcement note below). | room heads |
 | `agent.status` | Any current member (typically `role == "agent"`). | room heads |
 | `content.encrypted` | Any current member. Encrypted-content envelope (spec `content-key-rotation.md` D2). Readers always parse it as opaque-but-valid; writers publish only behind the room's declared R2 floor (`SyncConfig::encrypted_content_writes`, rollout D8) — a floor no shipped CLI or `iroh-rooms-net` call site sets today. | room heads |
 | `member.key_distribution` | The **admin**'s device. Standalone distribution of a new content-key epoch to the remaining Active members (spec `content-key-rotation.md` D4/D6); the identical payload also rides inline on `member.removed.rotation`. | room heads |
+
+> **Enforcement (`pipe.closed`, Refs #429):** the membership fold still accepts a
+> plaintext `pipe.closed`, or a `content.encrypted` envelope of that inner type,
+> from any Active member. Rejecting it at ingest would make the fold depend on
+> who holds the epoch key and could split the DAG. On the serving side the
+> governing `pipe.opened` is the lowest `(lamport, event_id)` among opens whose
+> signed `sender_id` is the registry owner — only those opens — matching gate
+> steps 3–4. `pipe_is_closed_for_owner` there counts a close only from that registry owner
+> or the room admin. The rule covers plaintext, readable encrypted, and
+> unreadable closes. An unreadable close from the admin closes every pipe; one
+> from that owner closes only that owner's pipes; an unreadable close from
+> anyone else is ignored. When that serving lookup finds no open signed by the
+> registry owner, the connect gate denies. A connector refuses to dial when
+> more than one member has signed a plaintext or readable-encrypted
+> `pipe.opened` for the same `pipe_id`. Opens signed only by the same member
+> still connect.
 
 > **Removal is two distinct types**, not one type with a `reason` discriminator:
 > `member.left` (voluntary, signer == subject) and `member.removed` (admin kick, signer ==
@@ -617,8 +633,8 @@ authored by an `Active` member; verify fetched bytes' BLAKE3-256 against `blob_h
 **Pipe connect gate.** Admit only if ALL hold against the local snapshot:
 1. remote identity ∈ `Active` members,
 2. remote identity ∈ the pipe's `allowed_members` (no default-all),
-3. the governing `pipe.opened` was authored by its `Active` owner,
-4. no `pipe.closed` for that `pipe_id` is causally known,
+3. the serving gate's governing `pipe.opened` — the lowest `(lamport, event_id)` among opens whose signed `sender_id` is the registry owner — was authored by that `Active` owner,
+4. no `pipe.closed` for that `pipe_id` counts from that registry owner or the room admin (see the enforcement note in [§6](#6-mvp-event-type-registry)),
 5. `expires_at` (if present) `>=` local wall clock (the boundary `now == expires_at` still
    admits; only `now > expires_at` denies).
 
@@ -631,15 +647,18 @@ lookups (`file_shared_hashes`, `pipe_opened`, `pipe_is_closed`) use **authentica
 decryption**: an envelope feeds a projection only if it opens under a held epoch key AND the
 recovered body survives the strict per-type parse and the owner field rules. Fail-closed, never
 fail-open: an unreadable `file.shared` serves no blob hash; an unreadable `pipe.opened` leaves
-the pipe unknown (unauthorized); and an unreadable close-typed envelope — whose `pipe_id` is
-sealed inside the ciphertext and so cannot be attributed — conservatively closes **every** pipe
-on that node until the epoch key arrives, because a close that might target a given pipe must
-never be missed. A keyless node deterministically sees *fewer* capabilities than a keyed one —
-with one scoped asymmetry: a `pipe_id` deliberately reused across a plaintext and an encrypted
-`pipe.opened` can govern by a different candidate depending on key possession (both candidates
-are field-rule-bound to the same owner, so an owner can confuse enforcement of its *own* pipe
-only, never surface another member's). The governing `pipe.opened` stays the lowest
-`(lamport, event_id)` across plaintext and readable-encrypted candidates.
+the pipe unknown (unauthorized); and an unreadable close-typed envelope is counted by the
+owner-or-admin rule in the [§6](#6-mvp-event-type-registry) enforcement note: the admin's
+unreadable close covers every pipe, an owner's covers only that owner's pipes, and anyone
+else's is ignored. A keyless node deterministically sees *fewer* capabilities than a keyed one.
+An unscoped lookup still picks the lowest `(lamport, event_id)` across plaintext and
+readable-encrypted candidates, and key possession can change which of one owner's own
+candidates that is. Another member can also publish a sibling `pipe.opened` that reuses the
+same `pipe_id` and sorts lower — the field rule binds `owner_id` to that member's
+`sender_id`, so the unscoped view is their announcement, not the original owner's. The
+owner's serving gate ignores it: only opens whose signed `sender_id` equals the registry
+owner are candidates, and `owner_endpoint` stays a connector-side hint. The serving gate is
+the enforcement point. A missing registry entry, or no open signed by that owner, denies.
 
 **Revocation-on-learn.** Live connections are torn down as soon as the enforcing peer learns of
 a removal, `pipe.closed`, or expiry. Exposure is bounded by *removal-event reachability*, not by

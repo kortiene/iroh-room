@@ -1136,6 +1136,28 @@ impl Node {
         self.pipe_query.pipe_opened(pipe_id).await
     }
 
+    /// Whether the unscoped connector-side view counts a `pipe.closed` for
+    /// `pipe_id`.
+    ///
+    /// This is not the serving gate. The governing open here is the lowest
+    /// `(lamport, event_id)` across every member, so a sibling open can change
+    /// which owner it uses. The gate and the teardown watcher call
+    /// [`PipeQuery::pipe_is_closed_for_owner`](crate::pipe::PipeQuery::pipe_is_closed_for_owner)
+    /// with the registry owner instead.
+    /// Fail-closed: a missing engine or a failed read answers `true`.
+    pub async fn pipe_is_closed(&self, pipe_id: [u8; 16]) -> bool {
+        self.pipe_query.pipe_is_closed(pipe_id).await
+    }
+
+    /// Whether plaintext and readable-encrypted `pipe.opened` events for
+    /// `pipe_id` are signed by more than one member.
+    ///
+    /// Fail-closed: a missing engine or a failed read answers `true`, so the
+    /// connector will not dial.
+    pub async fn pipe_open_signers_conflict(&self, pipe_id: [u8; 16]) -> bool {
+        self.pipe_query.pipe_open_signers_conflict(pipe_id).await
+    }
+
     /// **Expose** a local TCP service as a pipe (spec §6.5.1): validate the loopback
     /// target (D6) and non-empty allow-list (no default-all), draw a CSPRNG
     /// `pipe_id`, register the real target locally, author + publish the signed
@@ -1209,8 +1231,10 @@ impl Node {
     }
 
     /// **Close** a pipe (spec §6.5.1): author + publish a signed `pipe.closed`,
-    /// remove the local target, and tear down every live session for it. The signer
-    /// must be the pipe owner or the room admin (folded downstream).
+    /// remove the local target, and tear down every live session for it. The
+    /// membership fold accepts a close from any Active member. The connect gate
+    /// honours it only when `pipe_is_closed` attributes the signed cleartext
+    /// sender as this pipe's owner or the room admin.
     ///
     /// # Errors
     /// A heads/publish failure (the local teardown still runs best-effort after a
@@ -1253,16 +1277,28 @@ impl Node {
     /// local TCP connection over the pipe ALPN. Returns a [`PipeForwarder`] carrying
     /// the bound local address.
     ///
+    /// `owner_endpoint` is a client-side hint for which address to dial. The
+    /// owner's serving gate is the enforcement point: it admits a peer only
+    /// against opens signed by the registry owner.
+    ///
     /// # Errors
-    /// [`PipeError::UnknownPipe`] if the announcement is not synced yet,
-    /// [`PipeError::OwnerEndpointMismatch`] if the address does not match the signed
-    /// `owner_endpoint`, or a listener-bind / owner-dial failure.
+    /// [`PipeError::ConflictingPipeOpeners`] when more than one member has
+    /// signed a plaintext or readable-encrypted `pipe.opened` for `pipe_id`
+    /// (the connector does not dial). [`PipeError::UnknownPipe`] if the
+    /// announcement is not synced yet, [`PipeError::OwnerEndpointMismatch`] if
+    /// the address does not match the signed `owner_endpoint`, or a
+    /// listener-bind / owner-dial failure.
     pub async fn pipe_connect(
         &self,
         owner_addr: EndpointAddr,
         pipe_id: [u8; 16],
         local_port: u16,
     ) -> Result<PipeForwarder> {
+        // Fail closed before any dial. A lower sibling open signed by someone
+        // else must not redirect this connector at that member's endpoint.
+        if self.pipe_open_signers_conflict(pipe_id).await {
+            return Err(PipeError::ConflictingPipeOpeners(pipe_id).into());
+        }
         let Some(opened) = self.pipe_opened(pipe_id).await else {
             bail!("{}", PipeError::UnknownPipe(pipe_id));
         };
@@ -1453,8 +1489,30 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
         PipeQueryMsg::Opened(pipe_id, reply) => {
             let _ = reply.send(engine.pipe_opened(&pipe_id).ok().flatten());
         }
+        PipeQueryMsg::OpenedForOwner(pipe_id, owner, reply) => {
+            let _ = reply.send(
+                engine
+                    .pipe_opened_for_owner(&pipe_id, &owner)
+                    .ok()
+                    .flatten(),
+            );
+        }
         PipeQueryMsg::IsClosed(pipe_id, reply) => {
             let _ = reply.send(engine.pipe_is_closed(&pipe_id).unwrap_or(true));
+        }
+        PipeQueryMsg::IsClosedForOwner(pipe_id, owner, reply) => {
+            let _ = reply.send(
+                engine
+                    .pipe_is_closed_for_owner(&pipe_id, &owner)
+                    .unwrap_or(true),
+            );
+        }
+        PipeQueryMsg::OpenSignersConflict(pipe_id, reply) => {
+            let _ = reply.send(
+                engine
+                    .pipe_opened_signers_conflict(&pipe_id)
+                    .unwrap_or(true),
+            );
         }
     }
 }

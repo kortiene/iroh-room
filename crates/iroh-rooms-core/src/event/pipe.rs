@@ -92,8 +92,10 @@ pub fn build_pipe_opened(
 
 /// Assemble and sign a `pipe.closed` event (Event Protocol §7).
 ///
-/// The signer is the pipe owner **or** the room admin (the §7 registry rule, folded
-/// downstream). `signer_identity_secret` provides `sender_id`; `signer_device_secret`
+/// The signer is the pipe owner **or** the room admin (the §7 registry rule).
+/// The membership fold accepts any Active member; the pipe gate counts the
+/// close only when this signer is that pipe's owner or the admin.
+/// `signer_identity_secret` provides `sender_id`; `signer_device_secret`
 /// signs. `reason` (`closed` | `expired` | `owner_exit` | `error`) follows the §7
 /// omit-when-empty rule. Pure and deterministic.
 #[must_use]

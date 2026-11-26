@@ -332,6 +332,12 @@ pub async fn connect(
         )
     })?;
 
+    // The unscoped open above is only a hint. More than one signer for this
+    // pipe_id means we do not dial that endpoint.
+    if node.pipe_open_signers_conflict(pipe_id).await {
+        return Err(PipeError::ConflictingPipeOpeners(pipe_id).into());
+    }
+
     // Resolve a dialable owner address: a matching --peer (deterministic) else by
     // bare endpoint id (discovery).
     let owner_addr = resolve_owner_addr(&opened.owner_endpoint, &peer_addrs)?;

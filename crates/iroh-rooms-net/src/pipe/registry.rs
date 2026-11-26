@@ -59,6 +59,19 @@ impl PipeRegistry {
         Ok(())
     }
 
+    /// The locally registered open, if this node owns `pipe_id`.
+    ///
+    /// The serving gate passes [`OpenPipe::opened`]'s `owner_id` into the
+    /// owner-scoped engine lookups. `None` means the gate denies.
+    #[must_use]
+    pub fn open(&self, pipe_id: &[u8; 16]) -> Option<OpenPipe> {
+        self.pipes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(pipe_id)
+            .cloned()
+    }
+
     /// The real loopback target for `pipe_id`, if this node owns an open pipe for it.
     /// `None` means "not an open pipe here" — the handler treats that as a `closed`
     /// reject (fail-closed; the target removal on close is itself a denial).

@@ -7,6 +7,24 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- `Node::pipe_is_closed` is the unscoped connector-side view. The serving gate
+  uses the owner-scoped lookup. A connector refuses to dial when more than one
+  member has signed a plaintext or readable-encrypted `pipe.opened` for the
+  same `pipe_id`, so that open cannot redirect the dial. A later open from the
+  same member still connects. Refs #429.
+- The owner's serving gate ignores a `pipe.opened` that reuses a `pipe_id` unless
+  that event's signed sender is the registry owner. Among those opens the lowest
+  `(lamport, event_id)` still governs, and a `pipe.closed` counts only from that
+  owner or the room admin. `owner_endpoint` remains a connector-side hint; the
+  serving gate is what admits a peer to the loopback target. No registry entry,
+  or no open signed by that owner, denies the connect. Refs #429.
+- A `pipe.closed` counts only when its signed cleartext sender is that pipe's
+  owner or the room admin. The membership fold still accepts any Active
+  member's close, plaintext or encrypted, so the log stays convergent without
+  depending on who holds the epoch key. An unreadable encrypted close from the
+  admin closes every pipe; one from an owner closes only that owner's pipes;
+  any other member's unreadable close is ignored. A pipe with no governing
+  `pipe.opened` is unchanged. Refs #429.
 - **SDK façade (additive, CLI-named only).** Stable re-exports:
   `room::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}`
   and `events::{MessageText, AgentStatus}`. Experimental re-exports:

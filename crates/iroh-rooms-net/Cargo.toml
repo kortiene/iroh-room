@@ -108,5 +108,8 @@ iroh-gossip = { version = "=0.101.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+# `pipe_e2e` seals a `content.encrypted` `pipe.closed` the shipped writer floor
+# refuses. `RoomKey` is not re-exported from core.
+iroh-rooms-crypto = { path = "../iroh-rooms-crypto", version = "0.1.0-rc.6" }
 # Per-test temp directory rooting the durable blob store in `blob.rs` unit tests.
 tempfile = "3"

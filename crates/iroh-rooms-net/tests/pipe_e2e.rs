@@ -17,6 +17,7 @@
 //! | P6 | An expired pipe is denied `expired` (the one wall-clock consultation) | §5 |
 //! | P11 | Two pipes exposed; per-pipe session count/info distinguish the connected pipe from the idle one, and closing one pipe decrements only its count | issue #86 |
 //! | P12 | The connector's stream budget saturates: forward #`N+1` is refused with a visible `PipeOutcome::Saturated` and an immediately-closed local socket, never accepted-then-starved | scale guardrails |
+//! | P13 | Carol authors a plaintext `pipe.closed` and an unreadable encrypted `pipe.closed` for Bob's pipe; Alice still connects, and Bob's own close tears the session down | Refs #429 |
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -27,19 +28,23 @@ use std::time::Duration;
 
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use iroh_rooms_core::event::binding::DeviceBinding;
+use iroh_rooms_core::event::constants::ENCRYPTED_NONCE_LEN;
 use iroh_rooms_core::event::content::{
-    capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved, RoomCreated,
+    capability_hash, Content, EventType, MemberInvited, MemberJoined, MemberRemoved, PipeClosed,
+    RoomCreated,
 };
 use iroh_rooms_core::event::ids::{EventId, RoomId};
 use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey, SigningKey};
 use iroh_rooms_core::event::signed::{self, SignedEvent};
 use iroh_rooms_core::event::wire::WireEvent;
+use iroh_rooms_core::event::{build_content_encrypted, build_pipe_closed, build_pipe_opened};
 use iroh_rooms_core::store::EventStore;
 use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
+use iroh_rooms_crypto::RoomKey;
 use iroh_rooms_net::pipe::PipeHello;
 use iroh_rooms_net::{
     AllowlistAdmission, NetConfig, NetMode, Node, PeerConnState, PipeAuditSink, PipeDenyCause,
-    PipeOutcome, TracingAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
+    PipeError, PipeForwarder, PipeOutcome, TracingAudit, PIPE_ALPN, PIPE_MAX_CONCURRENT_FORWARDS,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -218,9 +223,19 @@ fn spawn_node(
     room: RoomId,
     log: &[Vec<u8>],
 ) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
+    spawn_node_with(secret, admission, room, log, SyncConfig::default())
+}
+
+fn spawn_node_with(
+    secret: SecretKey,
+    admission: AllowlistAdmission,
+    room: RoomId,
+    log: &[Vec<u8>],
+    config: SyncConfig,
+) -> Pin<Box<dyn Future<Output = Node> + Send + '_>> {
     Box::pin(async move {
         let store = EventStore::open_in_memory().expect("in-memory store");
-        let mut engine = SyncEngine::open(store, room, SyncConfig::default()).expect("open engine");
+        let mut engine = SyncEngine::open(store, room, config).expect("open engine");
         for ev in log {
             engine.publish(ev).expect("seed event");
         }
@@ -1545,4 +1560,498 @@ async fn p12_over_budget_forward_is_refused_not_starved() {
     forwarder.shutdown();
     alice_node.shutdown().await.expect("shutdown alice");
     bob_node.shutdown().await.expect("shutdown bob");
+}
+
+// ---------------------------------------------------------------------------
+// P13 (Refs #429) — a non-owner's plaintext and unreadable closes do not shut
+// the owner's pipe; the owner's own close still tears the live session down.
+// ---------------------------------------------------------------------------
+
+/// Carol-signed plaintext close (submitted on Alice's floor-off engine) and
+/// Carol-signed unreadable encrypted close (published by Carol's floor-on
+/// engine). Returns once Bob, who enforces the gate, stores both.
+async fn publish_carols_closes(
+    alice_node: &Node,
+    bob_node: &Node,
+    carol_node: &Node,
+    carol: &Principal,
+    room: RoomId,
+    pipe_id: [u8; 16],
+) {
+    let heads = alice_node.heads().await.expect("alice heads");
+    let plain = build_pipe_closed(
+        &carol.id,
+        &carol.dev,
+        &room,
+        pipe_id,
+        Some("closed"),
+        &heads,
+        T0 + 300,
+    );
+    let plain_id = signed::event_id_from_bytes(&plain.signed);
+    alice_node
+        .publish(plain.to_bytes())
+        .await
+        .expect("carol's plaintext pipe.closed");
+    bob_node
+        .wait_until_contains(plain_id, WAIT)
+        .await
+        .expect("bob learns carol's plaintext close");
+
+    carol_node
+        .wait_until_contains(plain_id, WAIT)
+        .await
+        .expect("carol learns the plaintext close before sealing");
+    let heads = carol_node.heads().await.expect("carol heads");
+    let mut nonce = [0x5A; ENCRYPTED_NONCE_LEN];
+    nonce[ENCRYPTED_NONCE_LEN - 1] = 1;
+    let encrypted = build_content_encrypted(
+        &carol.id,
+        &carol.dev,
+        &room,
+        &Content::PipeClosed(PipeClosed {
+            pipe_id,
+            reason: Some("closed".to_owned()),
+        }),
+        3,
+        &RoomKey::from_bytes([0xEE; 32]),
+        &nonce,
+        &heads,
+        T0 + 301,
+    )
+    .expect("seal carol's pipe.closed");
+    let encrypted_id = signed::event_id_from_bytes(&encrypted.signed);
+    carol_node
+        .publish(encrypted.to_bytes())
+        .await
+        .expect("carol's encrypted pipe.closed");
+    bob_node
+        .wait_until_contains(encrypted_id, WAIT)
+        .await
+        .expect("bob learns carol's unreadable close");
+}
+
+/// Alice forwards one echo and the returned socket is kept open so the owner's
+/// session stays registered.
+async fn open_forwarded_session(
+    alice_node: &Node,
+    bob_node: &Node,
+    pipe_id: [u8; 16],
+    echo_count: &AtomicUsize,
+) -> (PipeForwarder, TcpStream) {
+    let mut forwarder = alice_node
+        .pipe_connect(loopback_addr(bob_node), pipe_id, 0)
+        .await
+        .expect("alice dials bob's pipe");
+    let mut client = TcpStream::connect(forwarder.local_addr())
+        .await
+        .expect("connect local");
+    client.write_all(b"ping").await.expect("write");
+    let mut buf = [0u8; 4];
+    tokio::time::timeout(WAIT, client.read_exact(&mut buf))
+        .await
+        .expect("alice's round-trip within budget")
+        .expect("read echo");
+    assert_eq!(&buf, b"ping", "Alice's bytes must echo");
+    assert_eq!(
+        forwarder.next_outcome().await,
+        Some(PipeOutcome::Forwarded),
+        "Alice's stream must be forwarded"
+    );
+    assert!(
+        echo_count.load(Ordering::SeqCst) >= 1,
+        "Bob's target must have accepted Alice's connection"
+    );
+    wait_sessions(bob_node, 1).await;
+    (forwarder, client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn carol_closes_do_not_stop_alice_and_bob_close_tears_down() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (echo, echo_count) = spawn_echo_server().await;
+    let admission = allowlist(&[&alice, &bob, &carol]);
+
+    let alice_node = spawn_node(alice.iroh_secret(), admission.clone(), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), admission.clone(), room, &log).await;
+    // Carol must publish an encrypted close. The writer floor is per engine, so
+    // her node opts into encrypted writes and Alice's floor-off node submits
+    // the plaintext close. Both frames are signed by Carol.
+    let carol_node = spawn_node_with(
+        carol.iroh_secret(),
+        admission,
+        room,
+        &log,
+        SyncConfig {
+            encrypted_content_writes: true,
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+    connect_event_plane(&alice_node, &alice, &carol_node, &carol).await;
+    connect_event_plane(&bob_node, &bob, &carol_node, &carol).await;
+
+    // Bob owns the pipe and allows Alice. Carol is Active and is neither the
+    // owner nor the admin.
+    let pipe_id = bob_node
+        .pipe_expose(
+            &bob.id,
+            &bob.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[alice.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("bob exposes pipe");
+    wait_pipe_opened(&alice_node, pipe_id).await;
+    wait_pipe_opened(&carol_node, pipe_id).await;
+
+    // `_client` stays open so dropping the local socket does not deregister
+    // the session before the watcher tick below.
+    let (forwarder, _client) =
+        open_forwarded_session(&alice_node, &bob_node, pipe_id, &echo_count).await;
+
+    publish_carols_closes(&alice_node, &bob_node, &carol_node, &carol, room, pipe_id).await;
+    assert!(
+        !bob_node.pipe_is_closed(pipe_id).await,
+        "Carol's closes must leave pipe_is_closed false on the enforcing node"
+    );
+    // The teardown watcher re-evaluates every live session once per tick.
+    tokio::time::sleep(TICK * 3).await;
+    assert_eq!(
+        bob_node.live_pipe_sessions_for(pipe_id),
+        1,
+        "Carol's closes must not tear the live session down on a watcher tick"
+    );
+
+    bob_node
+        .pipe_close(&bob.id, &bob.dev, &room, pipe_id, Some("closed"), T0 + 400)
+        .await
+        .expect("bob closes his pipe");
+    wait_sessions(&bob_node, 0).await;
+    assert!(
+        bob_node.pipe_is_closed(pipe_id).await,
+        "Bob's own close must count in pipe_is_closed"
+    );
+
+    let mut reconnect = alice_node
+        .pipe_connect(loopback_addr(&bob_node), pipe_id, 0)
+        .await
+        .expect("alice re-dials");
+    let _again = TcpStream::connect(reconnect.local_addr())
+        .await
+        .expect("connect local");
+    assert_eq!(
+        reconnect.next_outcome().await,
+        Some(PipeOutcome::Denied),
+        "Bob's own close must tear the pipe down"
+    );
+
+    forwarder.shutdown();
+    reconnect.shutdown();
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+    carol_node.shutdown().await.expect("shutdown carol");
+}
+
+// ---------------------------------------------------------------------------
+// F-1 (Refs #429) — a lower sibling pipe.opened that reuses Bob's pipe_id
+// must not be dialed. Both Carol and Alice are refused before a dial when
+// two members have signed an open for that id.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_squat_refuses_connectors_before_dial() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (echo, echo_count) = spawn_echo_server().await;
+    let admission = allowlist(&[&alice, &bob, &carol]);
+    let alice_node = spawn_node(alice.iroh_secret(), admission.clone(), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), admission.clone(), room, &log).await;
+    let carol_node = spawn_node(carol.iroh_secret(), admission, room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+    connect_event_plane(&bob_node, &bob, &carol_node, &carol).await;
+    connect_event_plane(&alice_node, &alice, &carol_node, &carol).await;
+
+    let parents = bob_node.heads().await.expect("heads before expose");
+    let pipe_id = bob_node
+        .pipe_expose(
+            &bob.id,
+            &bob.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[alice.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("bob exposes");
+    let bob_heads = bob_node.heads().await.expect("heads after expose");
+    let bob_open = bob_heads
+        .iter()
+        .find(|id| !parents.contains(id))
+        .copied()
+        .expect("bob's pipe.opened is a new head");
+    wait_pipe_opened(&carol_node, pipe_id).await;
+
+    let mut squat = None;
+    for offset in 0..10_000u64 {
+        let wire = build_pipe_opened(
+            &carol.id,
+            &carol.dev,
+            &room,
+            pipe_id,
+            &bob.device_key(),
+            "squat",
+            "localhost:echo",
+            "/iroh-rooms/pipe/1",
+            &[carol.identity()],
+            None,
+            &parents,
+            T0 + 100 + offset,
+        );
+        if signed::event_id_from_bytes(&wire.signed) < bob_open {
+            squat = Some(wire);
+            break;
+        }
+    }
+    let wire = squat.expect("a created_at offset yields a lower event id");
+    let squat_id = signed::event_id_from_bytes(&wire.signed);
+    carol_node
+        .publish(wire.to_bytes())
+        .await
+        .expect("carol publishes the sibling open");
+    bob_node
+        .wait_until_contains(squat_id, WAIT)
+        .await
+        .expect("bob stores carol's sibling open");
+    alice_node
+        .wait_until_contains(squat_id, WAIT)
+        .await
+        .expect("alice stores carol's sibling open");
+
+    for (node, label) in [(&carol_node, "carol"), (&alice_node, "alice")] {
+        match node
+            .pipe_connect(loopback_addr(&bob_node), pipe_id, 0)
+            .await
+        {
+            Ok(_forwarder) => panic!("{label} dialed a pipe_id signed by two members"),
+            Err(err) => match err.downcast_ref::<PipeError>() {
+                Some(PipeError::ConflictingPipeOpeners(id)) => assert_eq!(*id, pipe_id),
+                other => {
+                    panic!("{label}: expected conflicting_pipe_openers, got {other:?}; {err:#}")
+                }
+            },
+        }
+    }
+    assert_eq!(
+        echo_count.load(Ordering::SeqCst),
+        0,
+        "Bob's service must receive 0 bytes"
+    );
+    assert_eq!(bob_node.live_pipe_sessions(), 0);
+
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+    carol_node.shutdown().await.expect("shutdown carol");
+}
+
+// F-1b (Refs #429) — the serving gate itself must refuse a squatter who skips
+// the connector-side conflict check (raw PIPE_ALPN dial + PipeHello).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_dial_squatter_is_denied_by_serving_gate() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (echo, echo_count) = spawn_echo_server().await;
+    let admission = allowlist(&[&alice, &bob, &carol]);
+    let alice_node = spawn_node(alice.iroh_secret(), admission.clone(), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), admission.clone(), room, &log).await;
+    let carol_node = spawn_node(carol.iroh_secret(), admission, room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+    connect_event_plane(&bob_node, &bob, &carol_node, &carol).await;
+
+    let parents = bob_node.heads().await.expect("heads before expose");
+    let pipe_id = bob_node
+        .pipe_expose(
+            &bob.id,
+            &bob.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[alice.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("bob exposes");
+    let bob_heads = bob_node.heads().await.expect("heads");
+    let bob_open = bob_heads
+        .iter()
+        .find(|id| !parents.contains(id))
+        .copied()
+        .expect("bob's open");
+    wait_pipe_opened(&carol_node, pipe_id).await;
+    let mut squat = None;
+    for offset in 0..10_000u64 {
+        let wire = build_pipe_opened(
+            &carol.id,
+            &carol.dev,
+            &room,
+            pipe_id,
+            &bob.device_key(),
+            "squat",
+            "localhost:echo",
+            "/iroh-rooms/pipe/1",
+            &[carol.identity()],
+            None,
+            &parents,
+            T0 + 100 + offset,
+        );
+        if signed::event_id_from_bytes(&wire.signed) < bob_open {
+            squat = Some(wire);
+            break;
+        }
+    }
+    let wire = squat.expect("lower id");
+    let squat_id = signed::event_id_from_bytes(&wire.signed);
+    carol_node
+        .publish(wire.to_bytes())
+        .await
+        .expect("publish squat");
+    bob_node
+        .wait_until_contains(squat_id, WAIT)
+        .await
+        .expect("bob stores squat");
+
+    // Raw dial: no Node::pipe_connect, so no connector-side conflict check.
+    let conn = tokio::time::timeout(
+        WAIT,
+        carol_node
+            .endpoint()
+            .connect(loopback_addr(&bob_node), PIPE_ALPN),
+    )
+    .await
+    .expect("dial in budget")
+    .expect("QUIC handshake");
+    let _ = tokio::time::timeout(WAIT, async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        PipeHello::new(pipe_id).write_to(&mut send).await?;
+        send.write_all(b"ping").await?;
+        let mut buf = [0u8; 8];
+        let _ = recv.read(&mut buf).await;
+        anyhow::Ok(())
+    })
+    .await;
+    tokio::time::sleep(TICK * 3).await;
+    assert_eq!(
+        echo_count.load(Ordering::SeqCst),
+        0,
+        "the serving gate must not forward a squatter to Bob's target"
+    );
+    assert_eq!(bob_node.live_pipe_sessions(), 0);
+
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+    carol_node.shutdown().await.expect("shutdown carol");
+}
+
+/// Carol's sibling open names her own endpoint and allows Alice. Alice must
+/// be refused before any dial to that endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn squat_with_own_endpoint_refuses_alice_before_dial() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (echo, echo_count) = spawn_echo_server().await;
+    let admission = allowlist(&[&alice, &bob, &carol]);
+    let alice_node = spawn_node(alice.iroh_secret(), admission.clone(), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), admission.clone(), room, &log).await;
+    let carol_node = spawn_node(carol.iroh_secret(), admission, room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+    connect_event_plane(&alice_node, &alice, &carol_node, &carol).await;
+
+    let parents = bob_node.heads().await.expect("heads before expose");
+    let pipe_id = bob_node
+        .pipe_expose(
+            &bob.id,
+            &bob.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[alice.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("bob exposes");
+    let bob_heads = bob_node.heads().await.expect("heads after expose");
+    let bob_open = bob_heads
+        .iter()
+        .find(|id| !parents.contains(id))
+        .copied()
+        .expect("bob's pipe.opened");
+    wait_pipe_opened(&alice_node, pipe_id).await;
+
+    let mut squat = None;
+    for offset in 0..10_000u64 {
+        let wire = build_pipe_opened(
+            &carol.id,
+            &carol.dev,
+            &room,
+            pipe_id,
+            &carol.device_key(),
+            "squat",
+            "localhost:9",
+            "/iroh-rooms/pipe/1",
+            &[alice.identity()],
+            None,
+            &parents,
+            T0 + 500 + offset,
+        );
+        if signed::event_id_from_bytes(&wire.signed) < bob_open {
+            squat = Some(wire);
+            break;
+        }
+    }
+    let wire = squat.expect("a created_at offset yields a lower event id");
+    let squat_id = signed::event_id_from_bytes(&wire.signed);
+    carol_node
+        .publish(wire.to_bytes())
+        .await
+        .expect("carol publishes her endpoint");
+    alice_node
+        .wait_until_contains(squat_id, WAIT)
+        .await
+        .expect("alice stores both opens");
+
+    let err = match alice_node
+        .pipe_connect(loopback_addr(&carol_node), pipe_id, 0)
+        .await
+    {
+        Ok(_forwarder) => panic!("alice dialed; the conflicting-openers check must refuse first"),
+        Err(err) => err,
+    };
+    match err.downcast_ref::<PipeError>() {
+        Some(PipeError::ConflictingPipeOpeners(id)) => assert_eq!(*id, pipe_id),
+        other => panic!("expected conflicting_pipe_openers, got {other:?}; {err:#}"),
+    }
+    assert_eq!(
+        carol_node.live_pipe_sessions(),
+        0,
+        "alice must not open a pipe session on carol"
+    );
+    assert_eq!(
+        echo_count.load(Ordering::SeqCst),
+        0,
+        "neither Bob's service nor a dial to Carol may move bytes"
+    );
+
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+    carol_node.shutdown().await.expect("shutdown carol");
 }

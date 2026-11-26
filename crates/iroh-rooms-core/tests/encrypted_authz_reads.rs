@@ -10,10 +10,10 @@
 //! * an **unreadable** envelope feeds **nothing**: no blob hash is served, no
 //!   pipe is known — a keyless node deterministically sees fewer
 //!   capabilities, never different ones (fail-closed, never fail-open);
-//! * an **unreadable close** cannot be attributed to a pipe (its `pipe_id` is
-//!   inside the ciphertext), so it conservatively closes *every* pipe — a
-//!   close that might target this pipe is never missed, and an unreadable
-//!   close never reopens a closed pipe (AC9);
+//! * an **unreadable close** cannot name its `pipe_id`. The admin's unreadable
+//!   close conservatively closes every pipe; an owner's closes only that
+//!   owner's pipes; anyone else's is ignored (Refs #429). An unreadable close
+//!   never reopens a pipe an authorized close already shut (AC9);
 //! * a malicious Active key holder's sealed-but-invalid body feeds nothing
 //!   even where keys are held (D2b), and a foreign-owner encrypted
 //!   `pipe.opened` never surfaces;
@@ -364,10 +364,11 @@ fn encrypted_pipe_lifecycle_feeds_the_gate_key_aware() {
     );
 }
 
-/// The unattributable-close rule in isolation: an unreadable close-typed
-/// envelope closes EVERY pipe (its `pipe_id` is sealed — a close that might
-/// target this pipe must never be missed), while the plaintext-known pipe
-/// stays *known* (the open is not erased, only unauthorized via the gate).
+/// An unreadable close-typed envelope from the room admin (Alice, who also
+/// opened the pipe) closes every pipe: the `pipe_id` is sealed, so a close
+/// that might target this pipe must not be missed. A non-admin sender does
+/// not get that effect. The plaintext open stays known — only the close side
+/// is conservative.
 #[test]
 fn unreadable_close_conservatively_closes_every_pipe() {
     let mut engine = engine_with(SyncConfig::default());
@@ -398,7 +399,7 @@ fn unreadable_close_conservatively_closes_every_pipe() {
 
     assert!(
         engine.pipe_is_closed(&PIPE_ID).expect("closed?"),
-        "an unattributable close must conservatively close this pipe too"
+        "an unreadable close from the admin must conservatively close this pipe too"
     );
     assert!(
         engine.pipe_is_closed(&OTHER_PIPE_ID).expect("closed?"),

@@ -2043,6 +2043,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-gossip",
  "iroh-rooms-core",
+ "iroh-rooms-crypto",
  "n0-future",
  "tempfile",
  "tokio",
