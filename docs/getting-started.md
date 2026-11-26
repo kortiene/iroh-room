@@ -794,7 +794,8 @@ serving the pipe; press Ctrl-C to close it...
 The ⚠ SECURITY lines name the exposed target and each allowed member (short id); both go to
 stderr, so they stay visible even when stdout is redirected. Rejected connect attempts are
 also logged to Alice's stderr as `pipe.connect.rejected:<cause>`; pass `-v` to also log each
-accepted connection.
+accepted connection. A failed connection to the local target after the gate approves the
+member is not audited yet, and the connector reports it as Denied (see #428).
 
 Copy the `pipe_id:` value (32 lowercase hex chars) as `<PIPE_ID>`.
 
