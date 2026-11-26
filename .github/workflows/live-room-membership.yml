@@ -1,0 +1,51 @@
+name: live-room-membership
+
+# Real-process coverage for `room remove` and `room leave` (issue #392).
+#
+# `admin_removal_reaches_member_and_withholds_new_messages` and
+# `member_leave_reaches_admin` spawn two loopback `iroh-rooms` processes and
+# are `#[ignore]` so `scripts/verify.sh` does not run them (default thread
+# pool, no `--ignored`). This job runs only those two names, on every pull
+# request and on push to main, with `--ignored --test-threads=1 --exact` and
+# a timeout. The rest of the ignored online tier stays in
+# `scripts/release-readiness.sh` (scheduled / manual), not here.
+#
+# Linux only. The tests are loopback and do not need a macOS runner; the
+# Intel macOS cell on `verify` already builds the crate. A non-zero status
+# from the script fails this job. Branch protection can require the check
+# name below; this file does not weaken `verify`.
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  # Same reason as verify.yml: no target/ cache, so incremental compilation
+  # is overhead and its footprint has exhausted runner disks mid-link.
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-room-membership:
+    name: live room remove/leave
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned (not `@stable`): a floating toolchain let clippy 1.100's new
+      # lints turn `verify` red with no code change (PR #360). Bump this pin
+      # deliberately, in its own PR, across
+      # verify/release-readiness/release/live-room-membership.
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: clippy, rustfmt
+      - name: Live room remove and leave
+        run: bash scripts/ci-live-room-membership.sh

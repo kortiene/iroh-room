@@ -159,7 +159,8 @@ jobs:
       # in master history, or the commit can be garbage-collected). Rust stays
       # 1.100.0 via the toolchain input. The @1.100.0 ref bakes that version
       # into a branch tip that is not a durable SHA. Bump the toolchain
-      # deliberately, in its own PR, across verify/release-readiness/release.
+      # deliberately, in its own PR, across
+      # verify/release-readiness/release/live-room-membership.
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.100.0

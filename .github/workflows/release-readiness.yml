@@ -41,7 +41,8 @@ jobs:
       - uses: actions/checkout@v7
       # Pinned (not `@stable`): a floating toolchain let clippy 1.100's new
       # lints turn `verify` red with no code change (PR #360). Bump this pin
-      # deliberately, in its own PR, across verify/release-readiness/release.
+      # deliberately, in its own PR, across
+      # verify/release-readiness/release/live-room-membership.
       - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy, rustfmt
