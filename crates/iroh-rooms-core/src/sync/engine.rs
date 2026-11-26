@@ -701,7 +701,7 @@ impl SyncEngine {
         // `experimental_room_key_adoption` off, rows stay on disk and are not
         // loaded (Refs #429).
         let admin = membership_projection.snapshot.admin().copied();
-        let (room_keys, key_logs) = load_persisted_room_keys(
+        let (mut room_keys, key_logs) = load_persisted_room_keys(
             &store,
             &room_id,
             admin.as_ref(),
@@ -711,11 +711,18 @@ impl SyncEngine {
         // memory. Re-seed both from stored admin distributions so a restart
         // does not treat a later historical chunk as ahead of the watermark
         // or miss a conflicting commitment (Refs #429).
-        let (highest_epoch_seen, epoch_commitments) = if config.experimental_room_key_adoption {
-            seed_epoch_watermark(&store, &room_id, admin.as_ref())?
-        } else {
-            (0, BTreeMap::new())
-        };
+        let (highest_epoch_seen, epoch_commitments, multi_commitment) =
+            if config.experimental_room_key_adoption {
+                seed_epoch_watermark(&store, &room_id, admin.as_ref())?
+            } else {
+                (0, BTreeMap::new(), BTreeSet::new())
+            };
+        // More than one admin commitment for an epoch: drop the reloaded row
+        // and refuse the epoch. Stricter than the live session, which can
+        // still be holding a key depending on arrival order (Refs #429).
+        for epoch in &multi_commitment {
+            room_keys.poison(*epoch);
+        }
 
         let mut engine = Self {
             room_id,
@@ -3167,6 +3174,16 @@ impl SyncEngine {
         let epoch = distribution.new_epoch;
         let room_id = self.room_id;
 
+        // A seed-time multi-commitment poison, or a conflict already closed
+        // this epoch. Further offers stay refused; this path does not pick a
+        // winner after the fact (Refs #429).
+        if self.room_keys.is_poisoned(epoch) {
+            self.log(&format!(
+                "epoch_key_conflict epoch={epoch} event={event_id}"
+            ));
+            return;
+        }
+
         // `u64::MAX` can never be a real epoch: adopting it pins
         // `highest_epoch_seen` and blocks every later DAG distribution.
         // Reject it before any watermark or commitment change (Refs #429).
@@ -3599,19 +3616,26 @@ type EpochCommitmentMap = BTreeMap<u64, (EventId, [u8; 32])>;
 /// counts only when it carries a rotation. Non-admin senders and
 /// `new_epoch == u64::MAX` are skipped. `highest_epoch_seen` is the max
 /// remaining epoch, or 0 when there is none. Each epoch's seeded commitment
-/// is the one on the minimum event id, so a later conflicting distribution
-/// still poisons the epoch after a restart. Historical conflicts are not
-/// re-poisoned here: a resolved `room_keys` row reloads separately.
+/// is the one on the minimum event id.
+///
+/// An epoch with more than one distinct admin `key_commitment` is returned
+/// in the third tuple element so open can poison it: neither key is adopted,
+/// a reloaded `room_keys` row for that epoch is not readable or served, and
+/// further offers are refused. That is fail-closed and deliberately stricter
+/// than the live session, which can still hold a key depending on which
+/// distribution arrived first. The live order-dependence is a Post-GA
+/// follow-up; this open path does not pick a winner.
 fn seed_epoch_watermark(
     store: &EventStore,
     room_id: &RoomId,
     admin: Option<&IdentityKey>,
-) -> Result<(u64, EpochCommitmentMap), StoreError> {
+) -> Result<(u64, EpochCommitmentMap, BTreeSet<u64>), StoreError> {
     let Some(admin) = admin else {
-        return Ok((0, BTreeMap::new()));
+        return Ok((0, BTreeMap::new(), BTreeSet::new()));
     };
     let mut highest = 0u64;
     let mut commitments = EpochCommitmentMap::new();
+    let mut distinct: BTreeMap<u64, BTreeSet<[u8; 32]>> = BTreeMap::new();
     for ty in [EventType::MemberKeyDistribution, EventType::MemberRemoved] {
         for stored in store.by_type(room_id, ty)? {
             let Ok(signed) = SignedEvent::decode(&stored.wire.signed) else {
@@ -3627,6 +3651,10 @@ fn seed_epoch_watermark(
                 continue;
             }
             highest = highest.max(distribution.new_epoch);
+            distinct
+                .entry(distribution.new_epoch)
+                .or_default()
+                .insert(distribution.key_commitment);
             match commitments.get_mut(&distribution.new_epoch) {
                 Some((id, commitment)) => {
                     if stored.event_id < *id {
@@ -3643,7 +3671,12 @@ fn seed_epoch_watermark(
             }
         }
     }
-    Ok((highest, commitments))
+    let multi = distinct
+        .into_iter()
+        .filter(|(_, seen)| seen.len() > 1)
+        .map(|(epoch, _)| epoch)
+        .collect();
+    Ok((highest, commitments, multi))
 }
 
 /// The distribution payload on a key-distribution event or a removal rotation.

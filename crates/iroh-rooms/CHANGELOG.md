@@ -17,7 +17,9 @@ where feasible); the **experimental** tier may change on any release.
   binds; served chunks carry that id; and `new_epoch == u64::MAX` is rejected.
   No CLI or `iroh-rooms-net` call site sets the flag. With the flag on, open
   re-seeds the epoch watermark and the same-epoch commitment map from stored
-  admin distributions. Refs #429 #343 #286.
+  admin distributions. An epoch with more than one distinct admin commitment
+  is poisoned at open: the reloaded row is not readable or served, and later
+  offers for that epoch are refused. Refs #429 #343 #286.
 - **Behaviour change:** `insert_room_key` still persists a row, but that row
   uses the all-zero event id and open does not reload it. An embedder must
   call `insert_room_key` again after every open. Refs #429.

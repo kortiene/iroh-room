@@ -1921,13 +1921,12 @@ fn adopted_keys_survive_engine_restart() {
     );
 }
 
-/// Restart durability with a D5a conflict (#191 step 7): a poisoned epoch's
-/// deterministic resolution (smallest `event_id` wins) is persisted via the
-/// winning key's `source_event_id`, so the resolved key — and its attribution —
-/// survive an engine restart. The reopened engine holds the same winning key
-/// and never re-adopts a losing candidate.
+/// In-session D5a resolution still persists the winning key. Open with the
+/// adoption flag is stricter: two distinct admin commitments poison the epoch,
+/// so the reloaded row is not readable after restart (Refs #429). The row stays
+/// on disk.
 #[test]
-fn poisoned_epoch_resolution_survives_restart() {
+fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
     let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
     let admin_id = sk(1);
     let admin_dev = sk(2);
@@ -1971,6 +1970,10 @@ fn poisoned_epoch_resolution_survives_restart() {
     engine.publish(&dist_b.to_bytes()).expect("publish B");
     assert!(engine.has_room_key(2), "resolution leaves a usable key");
     assert!(!engine.is_room_key_poisoned(2));
+    assert_eq!(
+        engine.room_key(2).expect("in-session winner").as_bytes(),
+        expected_winner.as_bytes()
+    );
 
     // The persisted source_event_id for epoch 2 must be the winning
     // distribution's event id (the resolution is durable).
@@ -1987,8 +1990,8 @@ fn poisoned_epoch_resolution_survives_restart() {
         "the persisted source_event_id must be the winning distribution's event id"
     );
 
-    // Restart: the in-memory poisoned state and candidates are gone; the
-    // resolved key reloads from the room_keys table with its attribution.
+    // Restart: both commitments are in the store, so open poisons the epoch
+    // and does not expose the persisted winner.
     let store = engine.into_store();
     let reopened = SyncEngine::open_with_local_device(
         store,
@@ -1999,21 +2002,15 @@ fn poisoned_epoch_resolution_survives_restart() {
     .expect("reopen");
 
     assert!(
-        reopened.has_room_key(2),
-        "the resolved epoch 2 key must survive the restart"
+        reopened.is_room_key_poisoned(2),
+        "two stored commitments poison the epoch on open"
     );
     assert!(
-        !reopened.is_room_key_poisoned(2),
-        "the reopened engine must not see a poisoned epoch (resolution was durable)"
-    );
-    assert_eq!(
-        reopened.room_key(2).expect("epoch 2 key").as_bytes(),
-        expected_winner.as_bytes(),
-        "the restarted engine holds the same deterministically-chosen winner"
+        reopened.room_key(2).is_none(),
+        "the persisted winner is not readable after reopen"
     );
 
-    // The attribution survived: the reloaded key's source_event_id is still the
-    // winning distribution.
+    // The row stays on disk with the in-session winner. Open does not use it.
     let mut reopened = reopened;
     let persisted_after = reopened
         .store_mut()
@@ -2973,6 +2970,287 @@ fn key_adoption_restart_seeds_watermark_from_removal_rotation() {
     );
 }
 
+fn served_epochs(engine: &mut SyncEngine, room: RoomId) -> BTreeSet<u64> {
+    let admin_peer = PeerId::from_bytes(*sk(2).device_key().as_bytes());
+    let out = engine.on_message(
+        admin_peer,
+        SyncMessage::WantKeyHistory {
+            room_id: room,
+            have_epochs: BTreeSet::new(),
+        },
+    );
+    let mut epochs = BTreeSet::new();
+    for outgoing in out {
+        if let SyncMessage::KeyHistory { chunks, .. } = outgoing.msg {
+            for chunk in chunks {
+                epochs.insert(chunk.epoch);
+            }
+        }
+    }
+    epochs
+}
+
+/// D1 wraps us and arrives first; D2 does not. The live engine poisons the
+/// epoch. After reopen the reloaded row is not readable or served.
+#[test]
+fn key_adoption_reopen_multi_commitment_d1_first_is_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_one = RoomKey::from_bytes([0x11; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_one,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("D1");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish D1");
+    assert!(engine.has_room_key(2));
+
+    let key_two = RoomKey::from_bytes([0x22; 32]);
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_two,
+        &[sk(4).device_key()],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("D2");
+    engine.publish(&second.to_bytes()).expect("publish D2");
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(engine.room_key(2).is_none());
+    assert!(
+        !served_epochs(&mut engine, room).contains(&2),
+        "a poisoned epoch is not served"
+    );
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "reopen poisons an epoch with two admin commitments"
+    );
+    assert!(
+        engine.room_key(2).is_none(),
+        "the reloaded row must not be readable"
+    );
+    assert!(
+        persisted_epochs(&mut engine, room).contains(&2),
+        "the room_keys row is kept and not used"
+    );
+    assert!(
+        !served_epochs(&mut engine, room).contains(&2),
+        "the reloaded row must not be served"
+    );
+}
+
+/// D2 (does not wrap us) arrives before D1. After reopen the epoch is poisoned
+/// even though the live session may have resolved to a key.
+#[test]
+fn key_adoption_reopen_multi_commitment_d2_first_is_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_two = RoomKey::from_bytes([0x22; 32]);
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_two,
+        &[sk(4).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("D2");
+    let second_bytes = second.to_bytes();
+    let second_id = frame_id(&second_bytes, room);
+    engine.publish(&second_bytes).expect("publish D2");
+    assert!(!engine.has_room_key(2));
+
+    let key_one = RoomKey::from_bytes([0x11; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_one,
+        &[sk(2).device_key()],
+        &[second_id],
+        T0 + 2,
+    )
+    .expect("D1");
+    engine.publish(&first.to_bytes()).expect("publish D1");
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(engine.room_key(2).is_none());
+    assert!(!served_epochs(&mut engine, room).contains(&2));
+}
+
+/// One admin commitment reloads and is served.
+#[test]
+fn key_adoption_reopen_single_commitment_reloads() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key = RoomKey::from_bytes([0x11; 32]);
+    let dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    engine.publish(&dist.to_bytes()).expect("publish");
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(!engine.is_room_key_poisoned(2));
+    assert_eq!(
+        engine
+            .room_key(2)
+            .expect("single commitment reloads")
+            .as_bytes(),
+        key.as_bytes()
+    );
+    assert!(served_epochs(&mut engine, room).contains(&2));
+}
+
+/// A stored admin `u64::MAX` distribution must not pin the watermark across
+/// a reopen, so a later epoch still adopts.
+#[test]
+fn key_adoption_restart_max_epoch_does_not_pin_watermark() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let max_key = RoomKey::from_bytes([0xFE; 32]);
+    let max_dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        u64::MAX,
+        &max_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("max distribution");
+    let max_bytes = max_dist.to_bytes();
+    let max_id = frame_id(&max_bytes, room);
+    engine.publish(&max_bytes).expect("publish max");
+    assert!(!engine.has_room_key(u64::MAX));
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    let later_key = RoomKey::from_bytes([0x33; 32]);
+    let later = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &later_key,
+        &[sk(2).device_key()],
+        &[max_id],
+        T0 + 2,
+    )
+    .expect("later distribution");
+    engine.publish(&later.to_bytes()).expect("publish later");
+    assert_eq!(
+        engine
+            .room_key(2)
+            .expect("a later epoch adopts after a stored u64::MAX distribution")
+            .as_bytes(),
+        later_key.as_bytes()
+    );
+}
+
+/// A non-admin distribution inserted past the fold does not raise the
+/// watermark on reopen.
+#[test]
+fn key_adoption_restart_non_admin_does_not_raise_watermark() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let stranger_key = RoomKey::from_bytes([0x77; 32]);
+    let wire = crate::event::distribution::build_member_key_distribution(
+        &sk(9),
+        &sk(10),
+        &room,
+        5,
+        &stranger_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("non-admin distribution");
+    let validated = validate_wire_bytes(&wire.to_bytes(), &ValidationContext::for_room(room))
+        .expect("stateless-valid");
+    engine
+        .store_mut()
+        .insert(&validated)
+        .expect("direct insert");
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    let admin_key = RoomKey::from_bytes([0x44; 32]);
+    let admin_dist = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        4,
+        &admin_key,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 2,
+    )
+    .expect("admin distribution");
+    engine
+        .publish(&admin_dist.to_bytes())
+        .expect("publish lower epoch");
+    assert_eq!(
+        engine
+            .room_key(4)
+            .expect("non-admin history must not pin the watermark")
+            .as_bytes(),
+        admin_key.as_bytes()
+    );
+}
+
 /// After reopen, a new distribution with a different commitment poisons the
 /// epoch even when this device cannot unwrap it.
 #[test]
@@ -3081,21 +3359,37 @@ fn key_adoption_non_admin_store_row_does_not_bind() {
     );
 }
 
-/// A-5. No production call site in the CLI or net crates sets the flag.
+/// A-5. No production call site in the CLI, net, or façade crates sets the flag.
 #[test]
 fn key_adoption_a5_shipped_crates_do_not_set_the_flag() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut hits = Vec::new();
-    for rel in ["../iroh-rooms-cli/src", "../iroh-rooms-net/src"] {
+    for rel in [
+        "../iroh-rooms-cli/src",
+        "../iroh-rooms-net/src",
+        "../iroh-rooms/src",
+    ] {
         let dir = root.join(rel);
         assert!(dir.is_dir(), "missing {}", dir.display());
         collect_flag_sets(&dir, &mut hits);
     }
     assert!(
         hits.is_empty(),
-        "no non-test CLI or net source may set experimental_room_key_adoption. Found:\n{}",
+        "no non-test CLI, net, or façade source may set experimental_room_key_adoption. Found:\n{}",
         hits.join("\n")
     );
+}
+
+fn is_cfg_test_attr(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("#[") && trimmed.contains("cfg(test)")
+}
+
+#[test]
+fn cfg_not_test_stays_in_the_production_scan() {
+    assert!(!is_cfg_test_attr("#[cfg(not(test))]"));
+    assert!(is_cfg_test_attr("#[cfg(test)]"));
+    assert!(is_cfg_test_attr("    #[cfg(test)]"));
 }
 
 fn collect_flag_sets(dir: &std::path::Path, hits: &mut Vec<String>) {
@@ -3116,11 +3410,9 @@ fn collect_flag_sets(dir: &std::path::Path, hits: &mut Vec<String>) {
         let mut cfg_test_pending = false;
         for (idx, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
-            if skip_until.is_none()
-                && trimmed.starts_with("#[")
-                && trimmed.contains("cfg(")
-                && trimmed.contains("test")
-            {
+            // `cfg(test)` exactly. `cfg(not(test))` contains "test" and must
+            // stay in the production scan.
+            if skip_until.is_none() && is_cfg_test_attr(trimmed) {
                 cfg_test_pending = true;
             }
             if skip_until.is_none() && cfg_test_pending && trimmed.contains('{') {
