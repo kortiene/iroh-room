@@ -24,11 +24,11 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-use iroh_rooms_core::event::keys::SigningKey;
-use iroh_rooms_core::event::signed;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{build_pipe_closed, build_pipe_opened, build_room_created};
-use iroh_rooms_core::store::EventStore;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::identity::SigningKey;
+use iroh_rooms::pipes::{build_pipe_closed, build_pipe_opened};
+use iroh_rooms::room::build_room_created;
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
@@ -83,7 +83,7 @@ fn seed_room_with_pipe(
     let genesis_wire =
         build_room_created(&id_key, &dev_key, "Pipe Room", &nonce, 1_750_000_000_000);
     let room_id = {
-        let ev = signed::SignedEvent::decode(&genesis_wire.signed).unwrap();
+        let ev = iroh_rooms::events::SignedEvent::decode(&genesis_wire.signed).unwrap();
         ev.room_id
     };
     let ctx = ValidationContext::for_room(room_id);
@@ -138,7 +138,7 @@ fn seed_genesis_only(
     let genesis_wire =
         build_room_created(&id_key, &dev_key, "Other Room", &nonce, 1_750_000_000_000);
     let room_id = {
-        let ev = signed::SignedEvent::decode(&genesis_wire.signed).unwrap();
+        let ev = iroh_rooms::events::SignedEvent::decode(&genesis_wire.signed).unwrap();
         ev.room_id
     };
     let ctx = ValidationContext::for_room(room_id);
@@ -166,7 +166,7 @@ fn seed_room_with_opened_and_closed_pipe(
     let genesis_wire =
         build_room_created(&id_key, &dev_key, "Pipe Room", &nonce, 1_750_000_000_000);
     let room_id = {
-        let ev = signed::SignedEvent::decode(&genesis_wire.signed).unwrap();
+        let ev = iroh_rooms::events::SignedEvent::decode(&genesis_wire.signed).unwrap();
         ev.room_id
     };
     let ctx = ValidationContext::for_room(room_id);

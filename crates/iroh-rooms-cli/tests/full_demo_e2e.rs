@@ -90,14 +90,18 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::{
-    build_agent_status, build_file_shared, build_member_invited, build_member_joined,
-    build_member_left, build_member_removed, build_message_text, build_pipe_closed,
-    build_pipe_opened, build_room_created, capability_hash, signed, DeviceBinding, EventId,
-    HashRef, SigningKey, WireEvent,
+use iroh_rooms::events::{
+    build_agent_status, build_message_text, capability_hash, EventId, WireEvent,
 };
-use iroh_rooms_core::store::EventStore;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::files::{build_file_shared, HashRef};
+use iroh_rooms::identity::{DeviceBinding, SigningKey};
+use iroh_rooms::pipes::{build_pipe_closed, build_pipe_opened};
+use iroh_rooms::room::{
+    build_member_invited, build_member_joined, build_member_left, build_member_removed,
+    build_room_created,
+};
 
 /// Per-network-step budget (matches the sibling suites). Every wait is bounded
 /// by this so a rendezvous bug fails fast instead of hanging CI.
@@ -720,7 +724,7 @@ fn seed_full_event_type_chain(home: &TempDir) -> String {
     let agent_identity = SigningKey::from_seed(&FULL_AGENT_SEED);
     let agent_device = SigningKey::from_seed(&FULL_AGENT_DEV_SEED);
 
-    let room_id = signed::derive_room_id(
+    let room_id = iroh_rooms::room::derive_room_id(
         &admin_identity.identity_key(),
         &FULL_ROOM_NONCE,
         FULL_BASE_TS,
@@ -1262,8 +1266,11 @@ fn agent_posts_status_but_has_no_admin_privilege() {
     let admin_identity = SigningKey::from_seed(&AC5_ADMIN_SEED);
     let admin_device = SigningKey::from_seed(&AC5_ADMIN_DEV_SEED);
 
-    let room_id =
-        signed::derive_room_id(&admin_identity.identity_key(), &AC5_ROOM_NONCE, AC5_BASE_TS);
+    let room_id = iroh_rooms::room::derive_room_id(
+        &admin_identity.identity_key(),
+        &AC5_ROOM_NONCE,
+        AC5_BASE_TS,
+    );
     let ctx = ValidationContext::for_room(room_id);
     let mut store =
         EventStore::open(&agent_home.path().join("rooms.db")).expect("open agent's store to seed");

@@ -84,7 +84,9 @@
 //! assert_eq!(validated.event.event_type, EventType::MessageText);
 //! ```
 
-pub use iroh_rooms_core::event::content::{capability_hash, Content, EventType};
+pub use iroh_rooms_core::event::content::{
+    capability_hash, AgentStatus, Content, EventType, MessageText,
+};
 pub use iroh_rooms_core::event::ids::{EventId, HashRef, RoomId};
 pub use iroh_rooms_core::event::reject::{Flag, MembershipOracle, RejectReason};
 pub use iroh_rooms_core::event::signed::SignedEvent;

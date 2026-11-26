@@ -4,7 +4,7 @@
 //!
 //! These are the first **online** CLI commands — the first that leave the local
 //! filesystem and talk to another machine over the landed full-mesh QUIC carrier
-//! ([`iroh_rooms_net`]). They stay thin orchestrators over landed primitives, the
+//! ([`iroh_rooms::experimental::session`]). They stay thin orchestrators over landed primitives, the
 //! siblings of [`crate::room`] and [`crate::invite`]:
 //!
 //! * `send` is **offline-first, online-best-effort** (D3): it builds + self-checks
@@ -33,25 +33,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use iroh_rooms::events::constants::{MAX_MESSAGE_BODY_BYTES, MAX_PREV_EVENTS, SHORT_ID_LEN};
+use iroh_rooms::events::EventId;
+use iroh_rooms::events::SignedEvent;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::events::{Content, EventType};
 use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::constants::{MAX_MESSAGE_BODY_BYTES, MAX_PREV_EVENTS, SHORT_ID_LEN};
-use iroh_rooms_core::event::content::{Content, EventType};
-use iroh_rooms_core::event::ids::{EventId, RoomId};
-use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey};
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::membership::{Ingest, MembershipSnapshot, Role, RoomMembership, Status};
-// The offline authoring half of `send`/`send_agent_status` goes through the SDK
-// façade (spec IR-0301 §5.4); the online engine/transport imports above stay
-// direct `core`/`net` deps (the optional online-path migration).
+use iroh_rooms::identity::{DeviceKey, IdentityKey};
+use iroh_rooms::room::RoomId;
+use iroh_rooms::room::{Ingest, MembershipSnapshot, Role, RoomMembership, Status};
+// Authoring, store, sync, and transport all go through the SDK façade
+// (spec IR-0301). The CLI does not name `iroh-rooms-core` or `iroh-rooms-net`.
 use iroh_rooms::events::{build_agent_status, build_message_text};
-use iroh_rooms_core::store::{EventStore, StoredEvent};
-use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_net::{
+use iroh_rooms::experimental::session::{
     Admission, AdmissionView, AllowlistAdmission, BlobServeConfig, ConnEvent,
     JoinBootstrapAdmission, NetConfig, NetMode, Node, PathType, PeerConnState, PeerEntry,
     PeerManager, SnapshotAdmission, DEFAULT_TICK,
 };
+use iroh_rooms::experimental::store::{EventStore, StoredEvent};
+use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
 
 use crate::display::{self, display_names, iso8601_utc, short_id};
 use crate::error::CodedResultExt;
@@ -128,7 +128,7 @@ pub async fn send(
     let (mut membership, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&sender_id) {
         crate::bail_coded!(
-            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            crate::error::ErrorCode::Reject(iroh_rooms::events::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can send \
              messages (this identity is {sender_id})"
         );
@@ -292,7 +292,7 @@ pub async fn send_agent_status(
     let (mut membership, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&sender_id) {
         crate::bail_coded!(
-            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            crate::error::ErrorCode::Reject(iroh_rooms::events::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can post a \
              status (this identity is {sender_id})"
         );
@@ -469,7 +469,7 @@ pub async fn tail(
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
         crate::bail_coded!(
-            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            crate::error::ErrorCode::Reject(iroh_rooms::events::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can tail it \
              (this identity is {self_id})"
         );
@@ -622,7 +622,7 @@ pub async fn members_status(
     let (_, snapshot) = fold_room(&store, home, room_id)?;
     if !snapshot.is_active(&self_id) {
         crate::bail_coded!(
-            crate::error::ErrorCode::Reject(iroh_rooms_core::event::RejectReason::NotAMember),
+            crate::error::ErrorCode::Reject(iroh_rooms::events::RejectReason::NotAMember),
             "you are not an active member of room {room_id}; only an active member can query \
              connection status (this identity is {self_id})"
         );
@@ -730,8 +730,8 @@ fn print_members_status(
 /// `room members --status` (issue #144). Kept as a pure formatter so unit tests
 /// do not need to capture stdout; the `slot`/`slots` pluralization is the only
 /// piece of natural-language variance. `max` is taken from the caller (the
-/// snapshot's `active_member_limit()`, which returns [`MAX_ACTIVE_MEMBERS`]) so
-/// the helper stays trivially testable without constructing a snapshot.
+/// snapshot's `active_member_limit()`) so the helper stays trivially testable
+/// without constructing a snapshot.
 fn active_capacity_line(active: usize, max: usize) -> String {
     let remaining = max.saturating_sub(active);
     let slot = if remaining == 1 { "slot" } else { "slots" };
@@ -1562,8 +1562,8 @@ mod tests {
         active_capacity_line, parse_event_id, parse_peer, parse_timeout, render_endpoint_addr,
         validate_body, validate_format,
     };
+    use iroh_rooms::events::constants::MAX_MESSAGE_BODY_BYTES;
     use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
-    use iroh_rooms_core::event::constants::MAX_MESSAGE_BODY_BYTES;
     use std::time::Duration;
 
     // ── validate_body ─────────────────────────────────────────────────────────

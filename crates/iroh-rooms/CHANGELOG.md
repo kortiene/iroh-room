@@ -24,6 +24,18 @@ where feasible); the **experimental** tier may change on any release.
   `EventType` stays exhaustive. `iroh-rooms`, `iroh-rooms-core`,
   `iroh-rooms-net`, and `iroh-rooms-crypto` are `0.1.0-alpha.1`. The CLI
   stays `0.1.0-rc.6`.
+- **SDK façade (additive, CLI-named only).** Stable re-exports:
+  `room::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}`
+  and `events::{MessageText, AgentStatus}`. Experimental re-exports:
+  `session::PathType`, `pipe_runtime::PIPE_MAX_CONCURRENT_FORWARDS`, and
+  `rotation::{EncryptedContent, MemberKeyDistribution, WrappedKeyEntry}`.
+  `build_member_removed_with_rotation` was already experimental. The
+  feature-dependent member-cap constants and the encryption builders the CLI
+  does not name are not on the façade. No existing public path was renamed
+  or removed.
+- **CLI:** production code and integration tests import `iroh-rooms` only.
+  The binary no longer declares a direct dependency on `iroh-rooms-core` or
+  `iroh-rooms-net`.
 - Refusing to open a store whose `user_version` is newer than this binary
   does not rewrite the main file or `-wal` (it may create `-shm` and an empty
   `-wal`), and the

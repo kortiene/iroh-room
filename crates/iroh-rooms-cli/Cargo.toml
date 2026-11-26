@@ -28,33 +28,22 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-# `sync` compiles the bounded recent-sync engine (and, transitively, the SQLite
-# `EventStore` via `store`) into the binary: `room create`/`room members`/`room
-# invite` persist and fold the log, while `room send`/`room tail` drive a live
-# `SyncEngine` through `iroh-rooms-net` (spec IR-0105 D2). The membership fold is
-# always compiled (no feature).
-iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-alpha.1", features = ["sync"] }
-# The shipping QUIC event-transport carrier (IR-0005): `room send` and
-# `room tail` bring up a `Node` over it to push/receive `message.text` frames.
-# `gossip_overlay` is deliberately NOT enabled here. It pulls in
-# `iroh-rooms-core/large_rooms` (the 5 -> 40 active-member cap), and the
-# spec's Phase C gate — `docs/post-ga/specs/gossip-overlay-events-fan-out.md` Step 8, "only
-# after Step 7 passes" — is not fully met. The Step 7 acceptance criterion
-# itself now DOES pass on loopback: #193 (shipped in rc.5) fixed the three
-# stacked hub-overload defects, and the committed matrix is clean at every
+# The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
+# and imports core/net symbols only through this crate (see `docs/sdk-coverage.md`).
+# `experimental` enables the online runtime. It does NOT enable `gossip_overlay`.
+# That feature pulls in `iroh-rooms-core/large_rooms` (the 5 -> 40 active-member
+# cap), and the spec's Phase C gate — `docs/post-ga/specs/gossip-overlay-events-fan-out.md`
+# Step 8, "only after Step 7 passes" — is not fully met. The Step 7 acceptance
+# criterion itself now DOES pass on loopback: #193 (shipped in rc.5) fixed the
+# three stacked hub-overload defects, and the committed matrix is clean at every
 # required cell — N=5/10/20/40 x {1, 5 events/s}, 100% delivery, zero queue
 # saturations, zero reconnect churn
 # (`archive/spikes/spike-N40/results/results-gossip.md`). What is still owed is
 # real-network (non-loopback) overlay evidence, plus the admin same-seq
 # fail-closed wedge, which permanently wedges a room with no recovery path.
 # Until both are closed, the shipped CLI keeps the full-mesh topology and the
-# cap of 5. The overlay stays compiled and tested under `--all-features`.
-iroh-rooms-net = { path = "../iroh-rooms-net", version = "0.1.0-alpha.1" }
-# The public Rust SDK façade (IR-0301): the CLI is the SDK's reference consumer
-# (spec AC2). The offline authoring path imports stable items through here
-# instead of `iroh-rooms-core` directly; `experimental` is enabled so the
-# façade's re-exports stay a strict superset of what the CLI already needs
-# (see `docs/sdk-coverage.md`).
+# cap of 5. The overlay stays compiled and tested under `--all-features` on
+# `iroh-rooms-net`, not on this binary.
 iroh-rooms = { path = "../iroh-rooms", version = "0.1.0-alpha.1", features = ["experimental"] }
 # Async runtime for the two online commands (`room send`, `room tail`). The offline
 # commands stay synchronous; each online command enters a scoped runtime (D2).
@@ -105,9 +94,6 @@ assert_cmd = "2"
 predicates = "3"
 # Parse `identity show --json` output and `identity.secret` in integration tests.
 serde_json = "1"
-# Decode the `roomtkt1…` ticket token in CLI e2e tests that cross the
-# CLI-output → ticket-codec boundary (AC2/AC4 from the invite-ticket spec).
-iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-alpha.1", features = ["store"] }
 # The two-peer integration suite (`tests/two_peer_e2e.rs`, IR-0109) runs an
 # in-test loopback TCP echo target + client for the pipe tier. tokio is already a
 # normal dependency of this crate, so this adds no new resolution — only the

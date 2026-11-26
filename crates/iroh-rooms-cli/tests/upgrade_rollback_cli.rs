@@ -13,8 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
-use iroh_rooms_core::event::{validate_wire_bytes, RoomId, ValidatedEvent, ValidationContext};
-use iroh_rooms_core::store::EventStore;
+use iroh_rooms::events::{validate_wire_bytes, ValidatedEvent, ValidationContext};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::room::RoomId;
 use predicates::prelude::*;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;

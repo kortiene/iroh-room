@@ -9,7 +9,7 @@
 //! primitives — the ticket codec, the pure [`build_member_joined`] assembler, the
 //! membership fold's `gate_join`, and the bounded recent-sync engine — plus the one
 //! genuinely new seam: the join-bootstrap admission overlay in
-//! [`iroh_rooms_net`](iroh_rooms_net::JoinBootstrapAdmission) that lets a
+//! [`JoinBootstrapAdmission`](iroh_rooms::experimental::session::JoinBootstrapAdmission) that lets a
 //! not-yet-`Active` invitee pull the membership sub-DAG and push its join.
 //!
 //! The flow (spec D6):
@@ -35,21 +35,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use iroh_rooms::events::constants::SHORT_ID_LEN;
+use iroh_rooms::events::EventId;
+use iroh_rooms::events::RejectReason;
+use iroh_rooms::events::SignedEvent;
+use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+use iroh_rooms::events::{Content, EventType};
+use iroh_rooms::experimental::session::{
+    AllowlistAdmission, BootstrapProof, NetConfig, Node, DEFAULT_TICK,
+};
 use iroh_rooms::experimental::session::{EndpointAddr, EndpointId, SecretKey};
-use iroh_rooms_core::event::binding::DeviceBinding;
-use iroh_rooms_core::event::build_member_joined;
-use iroh_rooms_core::event::constants::SHORT_ID_LEN;
-use iroh_rooms_core::event::content::{Content, EventType};
-use iroh_rooms_core::event::ids::{EventId, RoomId};
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::event::signed::SignedEvent;
-use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-use iroh_rooms_core::event::RejectReason;
-use iroh_rooms_core::membership::Ingest;
-use iroh_rooms_core::store::EventStore;
-use iroh_rooms_core::sync::{SyncConfig, SyncEngine};
-use iroh_rooms_core::ticket::{RoomInviteTicket, TicketError};
-use iroh_rooms_net::{AllowlistAdmission, BootstrapProof, NetConfig, Node, DEFAULT_TICK};
+use iroh_rooms::experimental::store::EventStore;
+use iroh_rooms::experimental::sync::{SyncConfig, SyncEngine};
+use iroh_rooms::identity::DeviceBinding;
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::build_member_joined;
+use iroh_rooms::room::Ingest;
+use iroh_rooms::room::RoomId;
+use iroh_rooms::room::{RoomInviteTicket, TicketError};
 use zeroize::Zeroizing;
 
 use crate::error::{CodedResultExt, ErrorCode};
@@ -478,11 +481,11 @@ fn room_name_from_store(store: &EventStore, room_id: &RoomId) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::{build_bootstrap_dial_set, join_reject_message, DEFAULT_JOIN_TIMEOUT};
+    use iroh_rooms::events::RejectReason;
     use iroh_rooms::experimental::session::{EndpointAddr, SecretKey};
-    use iroh_rooms_core::event::ids::RoomId;
-    use iroh_rooms_core::event::keys::{DeviceKey, IdentityKey};
-    use iroh_rooms_core::event::RejectReason;
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::identity::{DeviceKey, IdentityKey};
+    use iroh_rooms::room::RoomId;
+    use iroh_rooms::room::RoomInviteTicket;
 
     fn device_key(seed: u8) -> DeviceKey {
         DeviceKey::from_bytes(

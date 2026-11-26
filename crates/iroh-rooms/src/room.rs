@@ -71,11 +71,14 @@
 //! };
 //! ```
 
+pub use iroh_rooms_core::event::content::{
+    MemberInvited, MemberJoined, MemberLeft, MemberRemoved, RoomCreated,
+};
 pub use iroh_rooms_core::event::ids::RoomId; // also surfaced here for discoverability
 pub use iroh_rooms_core::event::signed::derive_room_id;
 pub use iroh_rooms_core::event::{
     build_member_invited, build_member_joined, build_member_left, build_member_removed,
-    build_room_created, MemberRemoved,
+    build_room_created,
 };
 pub use iroh_rooms_core::membership::{
     blob_serve_allowed, pipe_connect_allowed, AncestorView, BlobDecision, DenyReason, Ingest,

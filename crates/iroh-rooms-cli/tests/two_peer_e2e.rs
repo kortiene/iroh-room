@@ -1289,12 +1289,13 @@ async fn authorized_file_fetch_saves_and_verifies_blob() {
 #[ignore = "two live loopback processes; run with --ignored --test-threads=1"]
 #[allow(clippy::too_many_lines)] // one linear converge-seed-fetch-assert flow; splitting hurts readability
 async fn every_provider_refused_is_peer_unauthorized() {
-    use iroh_rooms_core::event::build_file_shared;
-    use iroh_rooms_core::event::content::EventType;
-    use iroh_rooms_core::event::ids::{HashRef, RoomId};
-    use iroh_rooms_core::event::keys::SigningKey;
-    use iroh_rooms_core::event::validate::{validate_wire_bytes, ValidationContext};
-    use iroh_rooms_core::store::EventStore;
+    use iroh_rooms::events::EventType;
+    use iroh_rooms::events::{validate_wire_bytes, ValidationContext};
+    use iroh_rooms::experimental::store::EventStore;
+    use iroh_rooms::files::build_file_shared;
+    use iroh_rooms::files::HashRef;
+    use iroh_rooms::identity::SigningKey;
+    use iroh_rooms::room::RoomId;
 
     let c = converge_two_member_room();
 
