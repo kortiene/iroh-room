@@ -1862,6 +1862,105 @@ async fn sibling_squat_refuses_connectors_before_dial() {
     carol_node.shutdown().await.expect("shutdown carol");
 }
 
+// F-1b (Refs #429) — the serving gate itself must refuse a squatter who skips
+// the connector-side conflict check (raw PIPE_ALPN dial + PipeHello).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_dial_squatter_is_denied_by_serving_gate() {
+    let (room, log, alice, bob, carol) = build_room();
+    let (echo, echo_count) = spawn_echo_server().await;
+    let admission = allowlist(&[&alice, &bob, &carol]);
+    let alice_node = spawn_node(alice.iroh_secret(), admission.clone(), room, &log).await;
+    let bob_node = spawn_node(bob.iroh_secret(), admission.clone(), room, &log).await;
+    let carol_node = spawn_node(carol.iroh_secret(), admission, room, &log).await;
+    connect_event_plane(&alice_node, &alice, &bob_node, &bob).await;
+    connect_event_plane(&bob_node, &bob, &carol_node, &carol).await;
+
+    let parents = bob_node.heads().await.expect("heads before expose");
+    let pipe_id = bob_node
+        .pipe_expose(
+            &bob.id,
+            &bob.dev,
+            &room,
+            echo,
+            "echo",
+            "localhost:echo",
+            &[alice.identity()],
+            None,
+            T0 + 100,
+        )
+        .await
+        .expect("bob exposes");
+    let bob_heads = bob_node.heads().await.expect("heads");
+    let bob_open = bob_heads
+        .iter()
+        .find(|id| !parents.contains(id))
+        .copied()
+        .expect("bob's open");
+    wait_pipe_opened(&carol_node, pipe_id).await;
+    let mut squat = None;
+    for offset in 0..10_000u64 {
+        let wire = build_pipe_opened(
+            &carol.id,
+            &carol.dev,
+            &room,
+            pipe_id,
+            &bob.device_key(),
+            "squat",
+            "localhost:echo",
+            "/iroh-rooms/pipe/1",
+            &[carol.identity()],
+            None,
+            &parents,
+            T0 + 100 + offset,
+        );
+        if signed::event_id_from_bytes(&wire.signed) < bob_open {
+            squat = Some(wire);
+            break;
+        }
+    }
+    let wire = squat.expect("lower id");
+    let squat_id = signed::event_id_from_bytes(&wire.signed);
+    carol_node
+        .publish(wire.to_bytes())
+        .await
+        .expect("publish squat");
+    bob_node
+        .wait_until_contains(squat_id, WAIT)
+        .await
+        .expect("bob stores squat");
+
+    // Raw dial: no Node::pipe_connect, so no connector-side conflict check.
+    let conn = tokio::time::timeout(
+        WAIT,
+        carol_node
+            .endpoint()
+            .connect(loopback_addr(&bob_node), PIPE_ALPN),
+    )
+    .await
+    .expect("dial in budget")
+    .expect("QUIC handshake");
+    let _ = tokio::time::timeout(WAIT, async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        PipeHello::new(pipe_id).write_to(&mut send).await?;
+        send.write_all(b"ping").await?;
+        let mut buf = [0u8; 8];
+        let _ = recv.read(&mut buf).await;
+        anyhow::Ok(())
+    })
+    .await;
+    tokio::time::sleep(TICK * 3).await;
+    assert_eq!(
+        echo_count.load(Ordering::SeqCst),
+        0,
+        "the serving gate must not forward a squatter to Bob's target"
+    );
+    assert_eq!(bob_node.live_pipe_sessions(), 0);
+
+    alice_node.shutdown().await.expect("shutdown alice");
+    bob_node.shutdown().await.expect("shutdown bob");
+    carol_node.shutdown().await.expect("shutdown carol");
+}
+
 /// Carol's sibling open names her own endpoint and allows Alice. Alice must
 /// be refused before any dial to that endpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

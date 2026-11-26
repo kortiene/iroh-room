@@ -331,7 +331,7 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 > who holds the epoch key and could split the DAG. On the serving side the
 > governing `pipe.opened` is the lowest `(lamport, event_id)` among opens whose
 > signed `sender_id` is the registry owner — only those opens — matching gate
-> steps 3–4. `pipe_is_closed` there counts a close only from that registry owner
+> steps 3–4. `pipe_is_closed_for_owner` there counts a close only from that registry owner
 > or the room admin. The rule covers plaintext, readable encrypted, and
 > unreadable closes. An unreadable close from the admin closes every pipe; one
 > from that owner closes only that owner's pipes; an unreadable close from

@@ -27,6 +27,9 @@ use iroh_rooms_core::membership::MembershipSnapshot;
 use tokio::sync::{mpsc, oneshot};
 
 /// A read request from the Pipe plane to the engine pump.
+///
+/// New queries can be added without a breaking match in downstream crates.
+#[non_exhaustive]
 pub enum PipeQueryMsg {
     /// The current convergent membership snapshot.
     Snapshot(oneshot::Sender<MembershipSnapshot>),
