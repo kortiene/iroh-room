@@ -31,6 +31,10 @@ members = [
   # Gate A result files stay at `archive/spikes/spike-nat/results/` and remain
   # checked by the release and production readiness scripts.
 ]
+# `fuzz/` is its own workspace (nightly + libFuzzer). Exclude it so a future
+# members glob cannot pull that crate into `cargo test --workspace` or stable
+# clippy. It is also not listed above.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

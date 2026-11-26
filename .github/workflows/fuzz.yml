@@ -1,0 +1,113 @@
+name: fuzz
+
+# Coverage-guided fuzzing for the CBOR and frame parsers. Not a required check.
+#
+# Two budgets, one workflow:
+# - pull_request (path-filtered): 60 seconds per target. A smoke that the
+#   harness still builds and does not crash immediately. This is not on the
+#   required PR path (`verify` is).
+# - schedule and workflow_dispatch: 300 seconds per target (`-max_total_time`).
+#   A manual dispatch may only raise that floor, not lower it.
+#
+# Nightly is installed only in this workflow. `verify` stays on Rust 1.100.0.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds per target (minimum 300)"
+        required: false
+        default: "300"
+  schedule:
+    # Weekly, Monday 07:15 UTC. Offset from the daily release-readiness run.
+    - cron: "15 7 * * 1"
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/iroh-rooms-core/src/event/**"
+      - "crates/iroh-rooms-core/src/sync/message.rs"
+      - "crates/iroh-rooms-core/src/ticket.rs"
+      - "crates/iroh-rooms-net/src/frame.rs"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # No target cache between runs, so incremental compilation is only disk.
+  CARGO_INCREMENTAL: "0"
+  # A sanitized release build of the iroh stack is memory-heavy on the
+  # hosted runner. Two codegen jobs stays inside that budget.
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - wire_event_decode
+          - signed_event_decode
+          - sync_message_decode
+          - room_invite_ticket
+          - frame_length_prefix
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Pinned date, not the floating `nightly` channel. A floating toolchain
+      # moved clippy with no code change (see verify.yml). This is the
+      # 2026-11-18 nightly.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-18
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz
+        working-directory: fuzz
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_BUDGET: ${{ github.event.inputs.max_total_time }}
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            budget=60
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            budget="${DISPATCH_BUDGET:-300}"
+          else
+            budget=300
+          fi
+          if [[ ! "$budget" =~ ^[0-9]+$ ]]; then
+            echo "refusing non-numeric fuzz budget: ${budget}" >&2
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" != "pull_request" && "$budget" -lt 300 ]]; then
+            echo "campaign budget must be >= 300 seconds, got ${budget}" >&2
+            exit 1
+          fi
+          mkdir -p "corpus/${FUZZ_TARGET}"
+          if [[ -d "seeds/${FUZZ_TARGET}" ]]; then
+            cp -a "seeds/${FUZZ_TARGET}/." "corpus/${FUZZ_TARGET}/"
+          fi
+          echo "event=${EVENT_NAME} target=${FUZZ_TARGET} max_total_time=${budget}"
+          cargo fuzz run "${FUZZ_TARGET}" -- \
+            -max_total_time="${budget}" \
+            -timeout=15 \
+            -print_final_stats=1
+      - name: Upload corpus and crash artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-${{ matrix.target }}
+          if-no-files-found: warn
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
