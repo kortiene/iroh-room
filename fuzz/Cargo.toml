@@ -1,0 +1,63 @@
+[package]
+name = "iroh-room-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `sync` exposes `SyncMessage`. Feature unification builds this once for every target.
+iroh-rooms-core = { path = "../crates/iroh-rooms-core", features = ["sync"] }
+iroh-rooms-net = { path = "../crates/iroh-rooms-net" }
+# Already in the root lock. The ticket harness uses them to wrap fuzz bytes in
+# a valid BLAKE3 checksum so `from_str` reaches the CBOR body.
+blake3 = "1"
+data-encoding = "2"
+
+# cargo-fuzz builds targets in release. Line tables keep crash symbolization
+# without full debuginfo.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wire_event_decode"
+path = "fuzz_targets/wire_event_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed_event_decode"
+path = "fuzz_targets/signed_event_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_message_decode"
+path = "fuzz_targets/sync_message_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "room_invite_ticket"
+path = "fuzz_targets/room_invite_ticket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_length_prefix"
+path = "fuzz_targets/frame_length_prefix.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace: nightly + libFuzzer must not join the root workspace, or
+# `cargo test --workspace` and stable clippy would try to build these bins.
+[workspace]
+members = ["."]
