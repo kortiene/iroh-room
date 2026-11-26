@@ -688,3 +688,39 @@ fn active_room() -> ActiveRoom {
         heads: vec![join_id],
     }
 }
+
+/// Names the stable payload structs the CLI constructs through the façade.
+/// A missing re-export fails this test at compile time. Encryption payloads
+/// and the feature-dependent member cap stay off this default-features build.
+#[test]
+fn stable_payloads_the_cli_names_are_nameable() {
+    use iroh_rooms::events::{AgentStatus, MessageText};
+    use iroh_rooms::files::FileShared;
+    use iroh_rooms::pipes::{PipeClosed, PipeOpened};
+    use iroh_rooms::room::{MemberInvited, MemberJoined, MemberLeft, MemberRemoved, RoomCreated};
+
+    let _payloads = (
+        std::any::type_name::<RoomCreated>(),
+        std::any::type_name::<MemberInvited>(),
+        std::any::type_name::<MemberJoined>(),
+        std::any::type_name::<MemberLeft>(),
+        std::any::type_name::<MemberRemoved>(),
+        std::any::type_name::<MessageText>(),
+        std::any::type_name::<AgentStatus>(),
+        std::any::type_name::<FileShared>(),
+        std::any::type_name::<PipeOpened>(),
+        std::any::type_name::<PipeClosed>(),
+    );
+
+    let identity = SigningKey::generate();
+    let device = SigningKey::generate();
+    let nonce = [0x5au8; 16];
+    let room_id = derive_room_id(&identity.identity_key(), &nonce, CREATED_AT);
+    let genesis = build_room_created(&identity, &device, "cap", &nonce, CREATED_AT);
+    let ctx = ValidationContext::for_room(room_id);
+    let validated = validate_wire_bytes(&genesis.to_bytes(), &ctx).expect("genesis");
+    let mut fold = RoomMembership::new(room_id);
+    assert_eq!(fold.membership_projection_generation(), 0);
+    assert!(matches!(fold.ingest(validated), Ingest::Accepted { .. }));
+    assert!(fold.membership_projection_generation() > 0);
+}
