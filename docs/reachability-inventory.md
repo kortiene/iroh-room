@@ -516,7 +516,7 @@ rewritten. No reachable command, flag, or stable API item was deleted.
   device keeps decrypting shipped-room content until an operator rotates.
 - `docs/protocol.md` limitations no longer say content-key rotation buys
   forward secrecy in a deployment that opts in.
-- `docs/sdk-coverage.md` no longer claims every CLI import has a façade path.
+- `docs/sdk-coverage.md` says the CLI names its types only through `iroh_rooms`.
 - `PRD.v0.3.md` invite and pipe examples now match forms clap accepts.
 
 ## Needs a decision
@@ -533,9 +533,10 @@ because the file is a preserved record:
   validation limits for envelopes the engine can ingest. Removing the glob
   would break stable API users.
 - `ACTIVE_MEMBER_WARNING_THRESHOLD` and `active_member_warning_crossed` are
-  used from `iroh-rooms-core` and are not on the façade. Re-exporting them
-  would add stable symbols; deleting the call sites would change the
-  near-cap warning, which is reachable.
+  not on the façade. The CLI near-cap warning reads
+  `MembershipSnapshot::active_member_limit()`, not the constant.
+  `iroh-rooms-net` still calls the core function internally. Re-exporting
+  them would add stable symbols.
 - `docs/releases/*` still contain older sentences (rc.5's "content-key
   rotation available (opt-in)", and "the CLI has no member-removal"). Those
   records are not rewritten. rc.6 notes already state the later decision.
