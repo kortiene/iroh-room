@@ -8,7 +8,7 @@
 //! (`warning[clock_skew]: …`, never a failure) and a coarse rejected-frame note. The
 //! fine-grained per-code reject distinction AC1 needs (`bad_signature` vs
 //! `not_a_member`) is rendered by [`crate::message::tail`] polling
-//! [`Node::logs`](iroh_rooms_net::Node::logs) — see that module — so this sink
+//! [`Node::logs`](iroh_rooms::experimental::session::Node::logs) — see that module — so this sink
 //! stays a thin, always-available fallback for every command, not only `room
 //! tail`. stdout is never touched here (script-friendly output stays clean).
 //!
@@ -28,10 +28,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use iroh_rooms::experimental::session::EndpointId;
-use iroh_rooms_core::event::ids::RoomId;
-use iroh_rooms_core::event::keys::IdentityKey;
-use iroh_rooms_core::membership::ACTIVE_MEMBER_WARNING_THRESHOLD;
-use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+use iroh_rooms::experimental::session::{AuditSink, BlobDenyCause, RejectCause};
+use iroh_rooms::identity::IdentityKey;
+use iroh_rooms::room::RoomId;
 use serde_json::{json, Value};
 
 use crate::clock;
@@ -322,7 +321,10 @@ impl AuditSink for LocalAudit {
                 "active": active,
                 "max": max,
                 "remaining": remaining,
-                "threshold": ACTIVE_MEMBER_WARNING_THRESHOLD,
+                // One below the hard cap the caller passes as `max`
+                // (`MembershipSnapshot::active_member_limit()`). The cap
+                // constant itself is not on the façade: `large_rooms` changes it.
+                "threshold": max.saturating_sub(1),
             }),
         );
         self.stderr
@@ -436,9 +438,9 @@ impl AuditSink for StderrAudit {
 #[cfg(test)]
 mod tests {
     use super::{LocalAudit, PersistentAudit, StderrAudit, AUDIT_LOG_FILE};
+    use iroh_rooms::experimental::session::{AuditSink, BlobDenyCause, RejectCause};
     use iroh_rooms::experimental::session::{EndpointId, SecretKey};
-    use iroh_rooms_core::event::keys::IdentityKey;
-    use iroh_rooms_net::{AuditSink, BlobDenyCause, RejectCause};
+    use iroh_rooms::identity::IdentityKey;
     use serde_json::{json, Value};
     use tempfile::tempdir;
 
@@ -466,7 +468,7 @@ mod tests {
         sink.blob_serve_rejected(device(1), BlobDenyCause::NotActive, Some([0x22; 32]));
         sink.blob_serve_rejected(device(1), BlobDenyCause::PushDenied, None);
         sink.active_member_threshold_reached(
-            &iroh_rooms_core::event::ids::RoomId::from_bytes([0x33; 32]),
+            &iroh_rooms::room::RoomId::from_bytes([0x33; 32]),
             4,
             5,
             1,
@@ -518,7 +520,7 @@ mod tests {
         sink.rejected(device(1), RejectCause::UnknownDevice);
         sink.blob_serve_rejected(device(1), BlobDenyCause::NotReferenced, Some([0x44; 32]));
         sink.active_member_threshold_reached(
-            &iroh_rooms_core::event::ids::RoomId::from_bytes([0x55; 32]),
+            &iroh_rooms::room::RoomId::from_bytes([0x55; 32]),
             4,
             5,
             1,

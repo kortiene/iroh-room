@@ -232,7 +232,7 @@ fn agent_invite_appears_in_members_as_agent() {
 /// crossing the CLI ↔ ticket-codec boundary the pure core never exercises.
 #[test]
 fn agent_invite_ticket_decodes_with_agent_role() {
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::room::RoomInviteTicket;
     use std::str::FromStr;
 
     let home = TempDir::new().unwrap();
@@ -345,7 +345,7 @@ fn agent_invite_by_non_admin_is_rejected() {
 /// shared `member.invited` model, not a distinct principal type.
 #[test]
 fn agent_invite_matches_room_invite_role_agent() {
-    use iroh_rooms_core::ticket::RoomInviteTicket;
+    use iroh_rooms::room::RoomInviteTicket;
     use std::str::FromStr;
 
     let home = TempDir::new().unwrap();
