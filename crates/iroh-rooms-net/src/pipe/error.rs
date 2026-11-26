@@ -25,6 +25,11 @@ pub enum PipeError {
     /// The dialable owner address does not match the `owner_endpoint` named in the
     /// signed `pipe.opened` (a redirected / wrong address).
     OwnerEndpointMismatch,
+    /// More than one member signed a plaintext or readable-encrypted
+    /// `pipe.opened` for this `pipe_id`. The connector refuses to dial, so a
+    /// lower sibling open cannot redirect the connection at the other member's
+    /// `owner_endpoint`.
+    ConflictingPipeOpeners([u8; 16]),
     /// The pipe handshake was malformed (bad version / truncated control frame).
     BadHandshake,
     /// The owner could not be dialed over the pipe ALPN (offline / unreachable).
@@ -57,6 +62,12 @@ impl core::fmt::Display for PipeError {
                 "owner_endpoint_mismatch: the dialable address does not match the signed \
                  pipe.opened owner_endpoint",
             ),
+            Self::ConflictingPipeOpeners(id) => write!(
+                f,
+                "conflicting_pipe_openers: pipe {} was signed open by more than one member; \
+                 refusing to dial",
+                hex16(id)
+            ),
             Self::BadHandshake => f.write_str("bad_handshake: malformed pipe control frame"),
             Self::OwnerUnreachable(e) => write!(f, "owner_unreachable: {e}"),
             Self::Io(e) => write!(f, "pipe_io_error: {e}"),
@@ -87,6 +98,9 @@ mod tests {
         assert!(PipeError::OwnerEndpointMismatch
             .to_string()
             .starts_with("owner_endpoint_mismatch:"));
+        assert!(PipeError::ConflictingPipeOpeners([0xab; 16])
+            .to_string()
+            .starts_with("conflicting_pipe_openers:"));
         assert!(PipeError::BadHandshake
             .to_string()
             .starts_with("bad_handshake:"));

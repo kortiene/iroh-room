@@ -757,6 +757,12 @@ fn squat_open_and_close_do_not_close_bobs_pipe() {
             .expect("closed?"),
         "Carol's close must not close Bob's pipe by posing as its owner"
     );
+    assert!(
+        engine
+            .pipe_opened_signers_conflict(&PIPE_B)
+            .expect("signers"),
+        "Bob and Carol both signed an open for this pipe id"
+    );
 }
 
 /// F-3. A later `pipe.opened` from Bob for the same id does not replace his
@@ -782,6 +788,12 @@ fn bobs_later_reopen_does_not_replace_his_governing_open() {
         first,
         T0 + 31,
         "later",
+    );
+    assert!(
+        !engine
+            .pipe_opened_signers_conflict(&PIPE_B)
+            .expect("signers"),
+        "Bob's later re-open is the same signer and must still be dialable"
     );
     lower_sibling_open(&mut engine, &cast.carol, cast.room, PIPE_B, head, first);
 

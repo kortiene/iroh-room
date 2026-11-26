@@ -39,6 +39,9 @@ pub enum PipeQueryMsg {
     IsClosed([u8; 16], oneshot::Sender<bool>),
     /// Serving-gate close check, scoped to this registry owner.
     IsClosedForOwner([u8; 16], IdentityKey, oneshot::Sender<bool>),
+    /// Whether more than one member signed a readable open for this `pipe_id`.
+    /// The connector treats a failed reply as a conflict.
+    OpenSignersConflict([u8; 16], oneshot::Sender<bool>),
 }
 
 /// The Pipe plane's cloneable read handle onto the engine.
@@ -128,6 +131,21 @@ impl PipeQuery {
         if self
             .tx
             .try_send(PipeQueryMsg::IsClosedForOwner(pipe_id, *owner, reply))
+            .is_err()
+        {
+            return true;
+        }
+        rx.await.unwrap_or(true)
+    }
+
+    /// Whether more than one member signed a plaintext or readable-encrypted
+    /// open for `pipe_id`. **Fail-closed**: a missing pump, a saturated
+    /// channel, or a dropped reply answers `true`.
+    pub async fn pipe_open_signers_conflict(&self, pipe_id: [u8; 16]) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .try_send(PipeQueryMsg::OpenSignersConflict(pipe_id, reply))
             .is_err()
         {
             return true;

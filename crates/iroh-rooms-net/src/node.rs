@@ -1136,12 +1136,26 @@ impl Node {
         self.pipe_query.pipe_opened(pipe_id).await
     }
 
-    /// Whether `pipe_is_closed` counts a close for `pipe_id` on this node.
+    /// Whether the unscoped connector-side view counts a `pipe.closed` for
+    /// `pipe_id`.
     ///
-    /// This is the engine lookup the connect gate and the teardown watcher use.
+    /// This is not the serving gate. The governing open here is the lowest
+    /// `(lamport, event_id)` across every member, so a sibling open can change
+    /// which owner it uses. The gate and the teardown watcher call
+    /// [`PipeQuery::pipe_is_closed_for_owner`](crate::pipe::PipeQuery::pipe_is_closed_for_owner)
+    /// with the registry owner instead.
     /// Fail-closed: a missing engine or a failed read answers `true`.
     pub async fn pipe_is_closed(&self, pipe_id: [u8; 16]) -> bool {
         self.pipe_query.pipe_is_closed(pipe_id).await
+    }
+
+    /// Whether plaintext and readable-encrypted `pipe.opened` events for
+    /// `pipe_id` are signed by more than one member.
+    ///
+    /// Fail-closed: a missing engine or a failed read answers `true`, so the
+    /// connector will not dial.
+    pub async fn pipe_open_signers_conflict(&self, pipe_id: [u8; 16]) -> bool {
+        self.pipe_query.pipe_open_signers_conflict(pipe_id).await
     }
 
     /// **Expose** a local TCP service as a pipe (spec §6.5.1): validate the loopback
@@ -1268,15 +1282,23 @@ impl Node {
     /// against opens signed by the registry owner.
     ///
     /// # Errors
-    /// [`PipeError::UnknownPipe`] if the announcement is not synced yet,
-    /// [`PipeError::OwnerEndpointMismatch`] if the address does not match the signed
-    /// `owner_endpoint`, or a listener-bind / owner-dial failure.
+    /// [`PipeError::ConflictingPipeOpeners`] when more than one member has
+    /// signed a plaintext or readable-encrypted `pipe.opened` for `pipe_id`
+    /// (the connector does not dial). [`PipeError::UnknownPipe`] if the
+    /// announcement is not synced yet, [`PipeError::OwnerEndpointMismatch`] if
+    /// the address does not match the signed `owner_endpoint`, or a
+    /// listener-bind / owner-dial failure.
     pub async fn pipe_connect(
         &self,
         owner_addr: EndpointAddr,
         pipe_id: [u8; 16],
         local_port: u16,
     ) -> Result<PipeForwarder> {
+        // Fail closed before any dial. A lower sibling open signed by someone
+        // else must not redirect this connector at that member's endpoint.
+        if self.pipe_open_signers_conflict(pipe_id).await {
+            return Err(PipeError::ConflictingPipeOpeners(pipe_id).into());
+        }
         let Some(opened) = self.pipe_opened(pipe_id).await else {
             bail!("{}", PipeError::UnknownPipe(pipe_id));
         };
@@ -1482,6 +1504,13 @@ fn serve_pipe_query(engine: &SyncEngine, query: PipeQueryMsg) {
             let _ = reply.send(
                 engine
                     .pipe_is_closed_for_owner(&pipe_id, &owner)
+                    .unwrap_or(true),
+            );
+        }
+        PipeQueryMsg::OpenSignersConflict(pipe_id, reply) => {
+            let _ = reply.send(
+                engine
+                    .pipe_opened_signers_conflict(&pipe_id)
                     .unwrap_or(true),
             );
         }

@@ -1368,6 +1368,38 @@ impl SyncEngine {
         scope.is_none_or(|owner| sender == owner)
     }
 
+    /// Whether plaintext and readable-encrypted `pipe.opened` events for
+    /// `pipe_id` are signed by more than one member.
+    ///
+    /// An unreadable encrypted open is not counted: its body is not a
+    /// candidate. Two opens from the same member are not a conflict.
+    ///
+    /// # Errors
+    /// [`SyncError::Store`] on a store read or decode failure.
+    pub fn pipe_opened_signers_conflict(
+        &self,
+        pipe_id: &[u8; crate::event::constants::SHORT_ID_LEN],
+    ) -> Result<bool, SyncError> {
+        let mut signers = BTreeSet::new();
+        for se in self.store.by_type(&self.room_id, EventType::PipeOpened)? {
+            let event = SignedEvent::decode(&se.wire.signed)
+                .map_err(|r| SyncError::Store(StoreError::Decode(r)))?;
+            if let Content::PipeOpened(opened) = &event.content {
+                if opened.pipe_id == *pipe_id {
+                    signers.insert(event.sender_id);
+                }
+            }
+        }
+        for (_, sender, body) in self.encrypted_bodies(EventType::PipeOpened)? {
+            if let Ok(Content::PipeOpened(opened)) = body {
+                if opened.pipe_id == *pipe_id {
+                    signers.insert(sender);
+                }
+            }
+        }
+        Ok(signers.len() > 1)
+    }
+
     /// Whether a `pipe.closed` for `pipe_id` is causally known (the
     /// `pipe.closed` check the Pipe plane composes with the gate, spec §5).
     /// Fail-closed: any decode failure surfaces as an error the caller treats

@@ -328,13 +328,18 @@ Notation: `bstr[n]` = byte string of length n; `tstr` = UTF-8 text; `uint` = uns
 > **Enforcement (`pipe.closed`, Refs #429):** the membership fold still accepts a
 > plaintext `pipe.closed`, or a `content.encrypted` envelope of that inner type,
 > from any Active member. Rejecting it at ingest would make the fold depend on
-> who holds the epoch key and could split the DAG. `pipe_is_closed` counts a
-> close only when its signed cleartext sender is the governing `pipe.opened`'s
-> `owner_id` or the room admin. The rule covers plaintext, readable encrypted,
-> and unreadable closes. An unreadable close from the admin closes every pipe;
-> one from an owner closes only that owner's pipes; an unreadable close from
-> anyone else is ignored. When no governing `pipe.opened` is known, the lookup
-> is unchanged — the connect gate already denies that pipe.
+> who holds the epoch key and could split the DAG. On the serving side the
+> governing `pipe.opened` is the lowest `(lamport, event_id)` among opens whose
+> signed `sender_id` is the registry owner — only those opens — matching gate
+> steps 3–4. `pipe_is_closed` there counts a close only from that registry owner
+> or the room admin. The rule covers plaintext, readable encrypted, and
+> unreadable closes. An unreadable close from the admin closes every pipe; one
+> from that owner closes only that owner's pipes; an unreadable close from
+> anyone else is ignored. When that serving lookup finds no open signed by the
+> registry owner, the connect gate denies. A connector refuses to dial when
+> more than one member has signed a plaintext or readable-encrypted
+> `pipe.opened` for the same `pipe_id`. Opens signed only by the same member
+> still connect.
 
 > **Removal is two distinct types**, not one type with a `reason` discriminator:
 > `member.left` (voluntary, signer == subject) and `member.removed` (admin kick, signer ==

@@ -7,6 +7,11 @@ where feasible); the **experimental** tier may change on any release.
 
 ## Unreleased
 
+- `Node::pipe_is_closed` is the unscoped connector-side view. The serving gate
+  uses the owner-scoped lookup. A connector refuses to dial when more than one
+  member has signed a plaintext or readable-encrypted `pipe.opened` for the
+  same `pipe_id`, so that open cannot redirect the dial. A later open from the
+  same member still connects. Refs #429.
 - The owner's serving gate ignores a `pipe.opened` that reuses a `pipe_id` unless
   that event's signed sender is the registry owner. Among those opens the lowest
   `(lamport, event_id)` still governs, and a `pipe.closed` counts only from that

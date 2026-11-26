@@ -174,7 +174,8 @@ mod tests {
                     }
                     PipeQueryMsg::Snapshot(_)
                     | PipeQueryMsg::Opened(_, _)
-                    | PipeQueryMsg::IsClosed(_, _) => {}
+                    | PipeQueryMsg::IsClosed(_, _)
+                    | PipeQueryMsg::OpenSignersConflict(_, _) => {}
                 }
             }
         });
@@ -206,7 +207,9 @@ mod tests {
                     PipeQueryMsg::Snapshot(reply) => {
                         drop(reply); // engine unable to answer — snapshot is gone
                     }
-                    PipeQueryMsg::Opened(_, _) | PipeQueryMsg::IsClosed(_, _) => {}
+                    PipeQueryMsg::Opened(_, _)
+                    | PipeQueryMsg::IsClosed(_, _)
+                    | PipeQueryMsg::OpenSignersConflict(_, _) => {}
                 }
             }
         });
