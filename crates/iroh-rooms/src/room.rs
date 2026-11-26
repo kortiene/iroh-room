@@ -36,6 +36,40 @@
 //! let snapshot = fold.snapshot();
 //! assert!(snapshot.is_active(&admin_identity.identity_key()));
 //! ```
+//!
+//! [`MemberRemoved`] is `#[non_exhaustive]`. Build one with
+//! [`MemberRemoved::new`]; fields stay public for reads.
+//!
+//! ```
+//! use iroh_rooms::identity::IdentityKey;
+//! use iroh_rooms::room::MemberRemoved;
+//!
+//! let member = IdentityKey::from_bytes([0x11; 32]);
+//! let admin = IdentityKey::from_bytes([0x22; 32]);
+//! let removed = MemberRemoved::new(member, admin).with_reason("left the project");
+//! assert_eq!(removed.member_id, member);
+//! assert_eq!(removed.removed_by, admin);
+//! assert_eq!(removed.reason.as_deref(), Some("left the project"));
+//! assert!(removed.device_binding.is_none());
+//! assert!(removed.rotation.is_none());
+//! ```
+//!
+//! A struct literal does not compile outside `iroh-rooms-core`:
+//!
+//! ```compile_fail
+//! use iroh_rooms::identity::IdentityKey;
+//! use iroh_rooms::room::MemberRemoved;
+//!
+//! let member = IdentityKey::from_bytes([0x11; 32]);
+//! let admin = IdentityKey::from_bytes([0x22; 32]);
+//! let _removed = MemberRemoved {
+//!     member_id: member,
+//!     removed_by: admin,
+//!     reason: None,
+//!     device_binding: None,
+//!     rotation: None,
+//! };
+//! ```
 
 pub use iroh_rooms_core::event::content::{
     MemberInvited, MemberJoined, MemberLeft, MemberRemoved, RoomCreated,

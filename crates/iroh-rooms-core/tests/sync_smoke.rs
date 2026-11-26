@@ -255,13 +255,7 @@ fn build_log(n_chat: u32, with_removal: bool) -> Built {
             event_type: iroh_rooms_core::event::content::EventType::MemberRemoved,
             created_at: t,
             prev_events: vec![join_carol_eid, inv_carol_eid],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: carol.identity(),
-                removed_by: alice.identity(),
-                reason: None,
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(MemberRemoved::new(carol.identity(), alice.identity())),
         };
         events.push(wire(&remove, &alice.dev));
     }
@@ -855,13 +849,10 @@ fn same_effect_concurrent_admin_events_are_not_a_divergence() {
             event_type: iroh_rooms_core::event::content::EventType::MemberRemoved,
             created_at: T0 + 100,
             prev_events: vec![join_carol_eid, inv_carol_eid],
-            content: Content::MemberRemoved(MemberRemoved {
-                member_id: built.carol.identity(),
-                removed_by: built.alice.identity(),
-                reason: Some(reason.to_owned()),
-                device_binding: None,
-                rotation: None,
-            }),
+            content: Content::MemberRemoved(
+                MemberRemoved::new(built.carol.identity(), built.alice.identity())
+                    .with_reason(reason),
+            ),
         };
         wire(&ev, &built.alice.dev)
     };

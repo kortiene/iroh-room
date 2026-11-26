@@ -480,6 +480,7 @@ fn content_summary(content: &Content) -> String {
         Content::MemberKeyDistribution(c) => {
             format!("epoch={} recipients={}", c.new_epoch, c.wrapped_keys.len())
         }
+        _ => String::new(),
     }
 }
 
@@ -568,6 +569,7 @@ fn content_fields(content: &Content) -> Map<String, Value> {
             m.insert("new_epoch".into(), json!(c.new_epoch));
             m.insert("recipient_count".into(), json!(c.wrapped_keys.len()));
         }
+        _ => {}
     }
     m
 }
@@ -1338,13 +1340,10 @@ mod tests {
 
     #[test]
     fn content_fields_member_removed_has_subject_and_removed_by_no_reason() {
-        let content = Content::MemberRemoved(MemberRemoved {
-            member_id: IdentityKey::from_bytes([0x07; 32]),
-            removed_by: IdentityKey::from_bytes([0x08; 32]),
-            reason: None,
-            device_binding: None,
-            rotation: None,
-        });
+        let content = Content::MemberRemoved(MemberRemoved::new(
+            IdentityKey::from_bytes([0x07; 32]),
+            IdentityKey::from_bytes([0x08; 32]),
+        ));
         let fields = content_fields(&content);
         assert!(
             fields["subject"].as_str().is_some(),
@@ -1362,13 +1361,13 @@ mod tests {
 
     #[test]
     fn content_fields_member_removed_has_reason_when_set() {
-        let content = Content::MemberRemoved(MemberRemoved {
-            member_id: IdentityKey::from_bytes([0x07; 32]),
-            removed_by: IdentityKey::from_bytes([0x08; 32]),
-            reason: Some("policy violation".to_string()),
-            device_binding: None,
-            rotation: None,
-        });
+        let content = Content::MemberRemoved(
+            MemberRemoved::new(
+                IdentityKey::from_bytes([0x07; 32]),
+                IdentityKey::from_bytes([0x08; 32]),
+            )
+            .with_reason("policy violation"),
+        );
         let fields = content_fields(&content);
         assert_eq!(fields["reason"].as_str(), Some("policy violation"));
     }
@@ -1524,13 +1523,10 @@ mod tests {
 
     #[test]
     fn content_summary_member_removed_contains_subject_and_by() {
-        let content = Content::MemberRemoved(MemberRemoved {
-            member_id: IdentityKey::from_bytes([0x07; 32]),
-            removed_by: IdentityKey::from_bytes([0x08; 32]),
-            reason: None,
-            device_binding: None,
-            rotation: None,
-        });
+        let content = Content::MemberRemoved(MemberRemoved::new(
+            IdentityKey::from_bytes([0x07; 32]),
+            IdentityKey::from_bytes([0x08; 32]),
+        ));
         let summary = content_summary(&content);
         assert!(
             summary.contains("subject="),
@@ -1544,13 +1540,13 @@ mod tests {
 
     #[test]
     fn content_summary_member_removed_with_reason_contains_reason_text() {
-        let content = Content::MemberRemoved(MemberRemoved {
-            member_id: IdentityKey::from_bytes([0x07; 32]),
-            removed_by: IdentityKey::from_bytes([0x08; 32]),
-            reason: Some("abuse".to_string()),
-            device_binding: None,
-            rotation: None,
-        });
+        let content = Content::MemberRemoved(
+            MemberRemoved::new(
+                IdentityKey::from_bytes([0x07; 32]),
+                IdentityKey::from_bytes([0x08; 32]),
+            )
+            .with_reason("abuse"),
+        );
         let summary = content_summary(&content);
         assert!(
             summary.contains("abuse"),

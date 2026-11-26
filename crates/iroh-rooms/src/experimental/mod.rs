@@ -20,9 +20,11 @@
 //! sans-IO reconciliation engine + transport trait), [`store`] (local
 //! persistence), [`blob`] ([`crate::files`]' runtime half), and
 //! [`pipe_runtime`] ([`crate::pipes`]' runtime half), plus [`rotation`]
-//! (the content-key rotation builder, unsupported at v0.1 GA).
+//! (the content-key rotation builder, unsupported at v0.1 GA) and
+//! [`encryption`] (encrypted-content suite constants).
 
 pub mod blob;
+pub mod encryption;
 pub mod pipe_runtime;
 pub mod rotation;
 pub mod session;

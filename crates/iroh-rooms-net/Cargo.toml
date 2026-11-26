@@ -5,7 +5,7 @@
 # sans-IO `SyncEngine`. See `NOTES.md` for the spike findings (Gate-A status).
 [package]
 name = "iroh-rooms-net"
-version = "0.1.0-rc.6"
+version = "0.1.0-alpha.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -56,7 +56,7 @@ path = "src/bin/net_smoke.rs"
 [dependencies]
 # `sync` transitively enables `store`, so `SyncEngine` + `EventStore` are both
 # available to the driver/binary from this single feature.
-iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-rc.6", features = ["sync"] }
+iroh-rooms-core = { path = "../iroh-rooms-core", version = "0.1.0-alpha.1", features = ["sync"] }
 # Same pin proven by `spike-blobs` (crates.io index 2026-06-29). Only the iroh 1.0
 # stable core (`Endpoint`/`Router`/`ProtocolHandler`/`Connection`/`EndpointId`) is
 # used — zero 0.x crates on the event critical path (ADR-1 churn argument / D5).

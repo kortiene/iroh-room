@@ -188,13 +188,9 @@ fn build_member_removed(
         event_type: EventType::MemberRemoved,
         created_at,
         prev_events: prev,
-        content: Content::MemberRemoved(MemberRemoved {
-            member_id: subject.identity(),
-            removed_by: admin.identity(),
-            reason: Some("revoked".to_owned()),
-            device_binding: None,
-            rotation: None,
-        }),
+        content: Content::MemberRemoved(
+            MemberRemoved::new(subject.identity(), admin.identity()).with_reason("revoked"),
+        ),
     };
     wire_bytes(&ev, &admin.dev)
 }

@@ -361,13 +361,7 @@ pub fn member_removed(
         event_type: EventType::MemberRemoved,
         created_at,
         prev_events: prev.to_vec(),
-        content: Content::MemberRemoved(MemberRemoved {
-            member_id: *member_id,
-            removed_by: admin_id.identity_key(),
-            reason: None,
-            device_binding: None,
-            rotation: None,
-        }),
+        content: Content::MemberRemoved(MemberRemoved::new(*member_id, admin_id.identity_key())),
     };
     seal_validate(&event, admin_dev)
 }

@@ -44,7 +44,7 @@ workspace = true
 # Until both are closed, the shipped CLI keeps the full-mesh topology and the
 # cap of 5. The overlay stays compiled and tested under `--all-features` on
 # `iroh-rooms-net`, not on this binary.
-iroh-rooms = { path = "../iroh-rooms", version = "0.1.0-rc.6", features = ["experimental"] }
+iroh-rooms = { path = "../iroh-rooms", version = "0.1.0-alpha.1", features = ["experimental"] }
 # Async runtime for the two online commands (`room send`, `room tail`). The offline
 # commands stay synchronous; each online command enters a scoped runtime (D2).
 # `signal` powers `room tail`'s Ctrl-C shutdown.
