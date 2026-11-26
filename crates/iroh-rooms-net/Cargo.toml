@@ -13,7 +13,7 @@ repository.workspace = true
 # `rust-version = "1.91"` (`iroh`, `iroh-base`, `iroh-blobs`, `iroh-gossip`,
 # `iroh-dns`, `iroh-relay`, `iroh-tickets`, `iroh-util`, `irpc`, `n0-watcher`,
 # `netwatch`, `portmapper`), far above the workspace value that covers the pure
-# crates (1.87). Declaring it here makes the real floor machine-checkable
+# crates (1.89). Declaring it here makes the real floor machine-checkable
 # instead of only described (spec OQ-1 / A5). Enabling `gossip_overlay` adds no
 # new floor — `iroh-gossip 0.101.0` also declares 1.91.
 rust-version = "1.91"

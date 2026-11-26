@@ -17,7 +17,7 @@
 //! replayed for another epoch, room, or device without the AEAD failing.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
@@ -115,11 +115,11 @@ pub fn wrap_room_key_with(
     );
     let wrap_key = derive_wrap_key(&shared, room_id, key_epoch, recipient_device)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrap_key.as_slice()));
+    let cipher = Aes256Gcm::new((&*wrap_key).into());
     let aad = wrap_aad(room_id, key_epoch, recipient_device);
     let sealed = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            (&nonce).into(),
             Payload {
                 msg: room_key.as_bytes(),
                 aad: &aad,
@@ -174,12 +174,12 @@ pub fn unwrap_room_key(
     );
     let wrap_key = derive_wrap_key(&shared, room_id, key_epoch, &recipient_device)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrap_key.as_slice()));
+    let cipher = Aes256Gcm::new((&*wrap_key).into());
     let aad = wrap_aad(room_id, key_epoch, &recipient_device);
     let opened = Zeroizing::new(
         cipher
             .decrypt(
-                Nonce::from_slice(&wrapped.nonce),
+                (&wrapped.nonce).into(),
                 Payload {
                     msg: &wrapped.ciphertext,
                     aad: &aad,

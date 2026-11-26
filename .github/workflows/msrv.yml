@@ -2,7 +2,7 @@ name: msrv
 
 # Enforce the declared MSRVs on pinned toolchains so MSRV drift fails the PR
 # instead of silently merging. The workspace declares a per-tier MSRV
-# (`Cargo.toml`: `rust-version = "1.87"` for the pure tier; `iroh-rooms-cli` and
+# (`Cargo.toml`: `rust-version = "1.89"` for the pure tier; `iroh-rooms-cli` and
 # `iroh-rooms-net` declare `"1.91"` for the iroh stack). `verify.yml`'s floating
 # `@stable` masked the real floor for two iroh majors — a false `"1.80"` survived
 # until #209 corrected it to 1.91. This workflow is the machine check that
@@ -19,20 +19,22 @@ name: msrv
 #     compiles the `#[cfg(feature = "gossip_overlay")]` branches and skips the
 #     shipping `#[cfg(not(...))]` code, so this default-features job is what
 #     actually covers the binary we ship.
-#   - msrv-1-87: the pure tier (default features) on rustc 1.87, selecting the
+#   - msrv-1-89: the pure tier (default features) on rustc 1.89, selecting the
 #     pure crates explicitly (`-p`). `--workspace --exclude` does NOT work here:
 #     cargo still resolves the excluded members' deps (the iroh stack) and fails
-#     their >1.87 `rust-version` (portmapper 1.91, redb 1.89, …). This tier was
-#     1.85 until the ctutils RUSTSEC-2026-0385 fix (>= 0.4.4 declares 1.87).
+#     their >1.89 `rust-version` (portmapper 1.91, redb 1.89, …). This tier was
+#     1.85 until the ctutils RUSTSEC-2026-0385 fix (>= 0.4.4 declares 1.87) and
+#     1.87 until the aes-gcm 0.11 / aes 0.9 bump (aes 0.9 declares 1.89;
+#     sha2 0.11.1 / proptest 1.12 declare 1.88).
 #   - msrv-1-89-core-features: `iroh-rooms-core`'s non-default `store`/`sync`
 #     features (the vendored `rusqlite`) on rustc 1.89 — the pure default-features
 #     job does not exercise them, so a further rusqlite MSRV bump would otherwise
 #     be masked by the 1.91 `--all-features` job. This tier was 1.85 until the
 #     rusqlite 0.41 bump (RUSTSEC-2026-0459): rusqlite >= 0.41 and
-#     libsqlite3-sys >= 0.39 declare 1.89 / 1.88. The pure default tier is 1.87.
+#     libsqlite3-sys >= 0.39 declare 1.89 / 1.88. The pure default tier is 1.89.
 #
 # Maintenance: a NEW pure crate (inheriting the workspace `rust-version =
-# "1.87"`) MUST be added to the `-p` list in `msrv-1-87` (and to
+# "1.89"`) MUST be added to the `-p` list in `msrv-1-89` (and to
 # `msrv-1-89-core-features` if it has non-default store-tier features) to be
 # verified. A new iroh-tier crate (declaring `rust-version = "1.91"`) is
 # auto-covered by `msrv-1-91` / `msrv-1-91-default` and needs no change here.
@@ -74,8 +76,8 @@ jobs:
       - name: cargo check --workspace --all-targets --all-features (rustc 1.91)
         run: cargo check --workspace --all-targets --all-features --locked
 
-  msrv-1-87:
-    name: "MSRV 1.87 (pure tier: core/crypto/v2-core + iroh-rooms facade, default features) (${{ matrix.runner }})"
+  msrv-1-89:
+    name: "MSRV 1.89 (pure tier: core/crypto/v2-core + iroh-rooms facade, default features) (${{ matrix.runner }})"
     strategy:
       fail-fast: false
       matrix:
@@ -83,8 +85,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.87
-      - name: cargo check --all-targets (rustc 1.87, pure tier)
+      - uses: dtolnay/rust-toolchain@1.89
+      - name: cargo check --all-targets (rustc 1.89, pure tier)
         run: >
           cargo check --all-targets --locked
           -p iroh-rooms-core
