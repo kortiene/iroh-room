@@ -39,7 +39,7 @@ use crate::store::{
 };
 
 use super::config::SyncConfig;
-use super::keys::{ConflictCandidate, EpochKeyStore};
+use super::keys::EpochKeyStore;
 use super::message::{
     id_set, KeyHistoryChunk, Outgoing, PeerId, SyncMessage, Window, KEY_HISTORY_ENVELOPE_ALLOWANCE,
     MAX_KEY_HISTORY_CHUNKS_PER_RESPONSE,
@@ -3286,21 +3286,12 @@ impl SyncEngine {
         }
 
         // Already poisoned. The return at the top of this function normally
-        // prevents reaching here. If it was skipped, resolve adopts this offer
-        // alone, because no other candidate was recorded. That is the bug the
-        // return closes. #436 rebuilds the full candidate set from the store
-        // (Refs #429 #436).
+        // prevents reaching here. A key must not be installed on this path.
+        // #436 rebuilds candidates from the store (Refs #429 #436).
         if self.room_keys.is_poisoned(epoch) {
-            self.room_keys.add_conflict_candidate(
-                epoch,
-                ConflictCandidate {
-                    event_id,
-                    key: Some(key.clone()),
-                },
-            );
-            if self.room_keys.resolve(epoch) {
-                self.persist_resolved_room_key(epoch);
-            }
+            self.log(&format!(
+                "epoch_key_conflict epoch={epoch} event={event_id}"
+            ));
             return;
         }
 
@@ -3361,22 +3352,6 @@ impl SyncEngine {
         {
             self.log(&format!("checkpoint failed: room_key epoch={epoch}: {e}"));
         }
-    }
-
-    /// Persist the outcome of a deterministic D5a resolution: the winning key
-    /// and its winning `source_event_id`, read back from the in-memory store
-    /// after `resolve`. Without this the `room_keys` row keeps the
-    /// first-adopted (possibly losing) key, so a restart would reload a stale
-    /// key that diverges from every peer that resolved to the winner.
-    fn persist_resolved_room_key(&mut self, epoch: u64) {
-        let Some((key, source_event_id)) = self
-            .room_keys
-            .get_with_source(epoch)
-            .map(|(k, id)| (k.clone(), id))
-        else {
-            return;
-        };
-        self.persist_room_key(epoch, &key, &source_event_id);
     }
 
     // ------------------------------------------------------------------

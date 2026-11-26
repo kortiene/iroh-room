@@ -31,6 +31,7 @@ enum EpochKeyState {
 /// key for this epoch. Kept only while the epoch is poisoned. Live conflicts
 /// do not resolve from this set. #436 rebuilds it from the store (Refs #436).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields are read when #436 selects a candidate (Refs #436)
 pub(crate) struct ConflictCandidate {
     /// The distribution event that offered this key.
     pub event_id: EventId,
@@ -109,6 +110,7 @@ impl EpochKeyStore {
     /// the epoch is not currently poisoned (the candidate is irrelevant once
     /// resolved or if no conflict ever occurred). Live conflicts do not call
     /// this. #436 (Refs #436).
+    #[allow(dead_code)] // #436 (Refs #436)
     pub fn add_conflict_candidate(&mut self, epoch: u64, candidate: ConflictCandidate) {
         if self.is_poisoned(epoch) {
             self.candidates.entry(epoch).or_default().push(candidate);
@@ -132,10 +134,9 @@ impl EpochKeyStore {
     /// ids are uniformly-distributed hashes and the candidate set is bounded by
     /// the distributions the node has observed.
     ///
-    /// Live conflicts do not call this. Adoption calls it only for an epoch
-    /// that is already poisoned, and the return at the start of adoption
-    /// prevents that call. #436 brings an order-independent resolve back by
-    /// rebuilding candidates from the store (Refs #436).
+    /// Live adoption does not call this. #436 brings an order-independent
+    /// selection back by rebuilding candidates from the store (Refs #436).
+    #[allow(dead_code)] // #436 (Refs #436)
     pub fn resolve(&mut self, epoch: u64) -> bool {
         if !self.is_poisoned(epoch) {
             return false;

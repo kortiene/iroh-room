@@ -3419,6 +3419,41 @@ fn publish_pair(wrap_first: bool) -> (SyncEngine, RoomId, Vec<KeyHistoryChunk>) 
     (engine, room, chunks)
 }
 
+/// A local `insert_room_key` then an admin distribution for that epoch
+/// poisons the epoch. The distribution must not keep the inserted key.
+#[test]
+fn key_adoption_insert_then_distribution_stays_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let local_key = RoomKey::from_bytes([0x11; 32]);
+    engine
+        .insert_room_key(2, &local_key)
+        .expect("insert local key");
+    assert_eq!(
+        engine.room_key(2).map(RoomKey::as_bytes),
+        Some(local_key.as_bytes())
+    );
+    let distributed = RoomKey::from_bytes([0x22; 32]);
+    let event = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &distributed,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("distribution");
+    engine
+        .publish(&event.to_bytes())
+        .expect("publish distribution");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "the distribution conflict poisons epoch 2"
+    );
+    assert!(engine.room_key(2).is_none(), "the inserted key is not kept");
+}
+
 /// Live conflicts stay poisoned in both arrival orders, including after chunks.
 #[test]
 fn key_adoption_live_conflict_both_orders_stay_poisoned() {

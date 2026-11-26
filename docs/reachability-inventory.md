@@ -49,16 +49,16 @@ not served (`engine.rs:955-957`), and a stored distribution is not adopted
 (`engine.rs:3148-3149`). With the flag on, `adopt_key_from_event` adopts a
 `MemberKeyDistribution` or a `member.removed` rotation
 (`engine.rs:3151-3158`), `unwrap_room_key` runs at `engine.rs:3274`, and a
-fresh adoption persists the key (`engine.rs:3316-3317`). A chunk is adopted
+fresh adoption persists the key (`engine.rs:3307-3308`). A chunk is adopted
 only when its `distribution_event_id` is a stored admin distribution or
-removal rotation for the same epoch and commitment (`engine.rs:3327-3345`,
-`distribution_is_bound` at `:3654`); the all-zero id never binds. A reloaded
+removal rotation for the same epoch and commitment (`engine.rs:3318-3336`,
+`distribution_is_bound` at `:3629`); the all-zero id never binds. A reloaded
 `room_keys` row is held only when that same binding check passes
-(`engine.rs:3536-3544`). A conflicting commitment or a conflicting key
+(`engine.rs:3511-3519`). A conflicting commitment or a conflicting key
 poisons the epoch and returns without installing a key, both live
-(`engine.rs:3232-3237`, `:3309-3313`) and on reopen when stored admin
+(`engine.rs:3232-3237`, `:3300-3304`) and on reopen when stored admin
 commitments for that epoch disagree (`engine.rs:720-725`,
-`seed_epoch_watermark` at `:3584`). DAG key distributions stay admin-gated
+`seed_epoch_watermark` at `:3559`). DAG key distributions stay admin-gated
 (`fold.rs:390`). #436 owns an order-independent selection, live and on
 reopen, by rebuilding candidates from the store; the poisoned-epoch return
 does not record them (`engine.rs:3182-3191`). See #429. Plaintext
