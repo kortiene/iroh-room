@@ -572,7 +572,7 @@ If rollback is not supported:
 ## Lifecycle evidence
 
 Install, upgrade, rollback, and uninstall evidence comes from GitHub-hosted
-runners for all four release triples. That is a release-owner decision. Each
+runners for all four release triples. That is maintainer decision 2026-11-19, item 8 of https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384 (GitHub-hosted runners count as evidence). Each
 triple uses the same GitHub-hosted runner image the release workflow builds on:
 
 | Triple | GitHub-hosted runner |
@@ -615,8 +615,14 @@ Priors in `v0.1.0-rc.1` through `v0.1.0-rc.5` are recorded
 `prior_verification: checksum-only`. They are never signature-verified.
 
 `.github/workflows/lifecycle.yml` is in the repository. It is
-`workflow_dispatch` only. It has not been dispatched on `main`. No
-evidence-class lifecycle record exists.
+`workflow_dispatch` only. It was dispatched on `main` and passed.
+[Run 44541017067](https://github.com/kortiene/iroh-room/actions/runs/44541017067)
+is attempt 1. Its head SHA is `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26`,
+`head_branch` is `main`, `event` is `workflow_dispatch`, `path` is
+`.github/workflows/lifecycle.yml`, and the conclusion is `success`. The four
+evidence-class records are `PASS`. The matrix, including `ImageOS`,
+`ImageVersion`, `glibc_max_symbol`, and `ldd --version`, is under glibc floor
+in `docs/operations/install-uninstall.md`.
 
 ## Security Reporting
 

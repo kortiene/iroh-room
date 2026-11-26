@@ -10,7 +10,7 @@ This runbook is the concrete install/remove/rollback surface referenced by
 Production Beta supports:
 
 - macOS developer machines.
-- Linux developer machines.
+- Linux developer machines on glibc 2.34 or newer ([glibc floor](#glibc-floor)).
 
 Binary artifacts are supported only for the exact platform triples listed in
 the release notes with SHA-256 checksums. Other users should build from source
@@ -612,7 +612,54 @@ only when `class` is `evidence`, and false for every other class.
 
 local / probe / unreleased: developer or diagnostic run; not GA evidence for #265, #293 or #347
 
-`.github/workflows/lifecycle.yml` is `workflow_dispatch` only and has not been
-dispatched on `main`. No evidence-class lifecycle record exists. See Lifecycle
-evidence in `docs/operations/release-operations.md` for what counts as
-evidence.
+`.github/workflows/lifecycle.yml` is `workflow_dispatch` only. It was
+dispatched on `main` and passed. The run, the glibc floor, and the evidence
+matrix are in [glibc floor](#glibc-floor). What counts as evidence is in
+Lifecycle evidence in `docs/operations/release-operations.md`.
+
+### glibc floor
+
+The Linux glibc floor is 2.34. On both Linux triples the max `GLIBC_` symbol,
+measured by the record field `glibc_method`, is `GLIBC_2.34`:
+
+```bash
+readelf -V "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1
+```
+
+RHEL 9 and Debian 12 are supported by symbol version and are expected to work
+but not tested. Ubuntu 24.04 (evidence) and 22.04 (probe) were run. Ubuntu
+20.04, Debian 11, and RHEL 8 are not supported.
+
+The measurement is from lifecycle run
+[44541017067](https://github.com/kortiene/iroh-room/actions/runs/44541017067),
+attempt 1, `workflow_dispatch` on `main` at
+`ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26`. The run conclusion is `success`.
+Prior tag `v0.1.0-rc.5`. Candidate tag `v0.1.0-rc.6`. The per-triple JSON is
+the source of truth for the fields below. `Run`, `Attempt`, and `SHA` are
+`github_run_id`, `github_run_attempt`, and `github_sha`. `ImageOS` and
+`ImageVersion` are `image_os` and `image_version`.
+
+These four rows are GitHub-hosted runners (maintainer decision 2026-11-19, item 8 of https://github.com/kortiene/iroh-room/issues/352#issuecomment-7012603384 (GitHub-hosted runners count as evidence)). Each record
+has `runner_hosted` `github-hosted`, `runner_environment` `github-hosted`,
+`class` `evidence`, `evidence_grade` true, and `result` `PASS`.
+
+| Runner | Triple | Class | Result | Run | Attempt | SHA | ImageOS | ImageVersion | glibc_max_symbol | ldd --version |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `macos-15-intel` | `x86_64-apple-darwin` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `macos15` | `20260824.0482.1` | `n/a (Mach-O)` | `n/a` |
+| `macos-15` | `aarch64-apple-darwin` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `macos15` | `20261118.0550.1` | `n/a (Mach-O)` | `n/a` |
+| `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu24` | `20261111.370.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | `evidence` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu24-arm64` | `20261111.182.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39` |
+
+The newer-store rollback refusal (rollback_b) is simulated by stamping the store user_version+1 (record field `simulated`), because rc.6 has no schema change. No real newer-schema store was exercised.
+
+Both 22.04 probe cells passed (`x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu`). `class` is `probe`. `ldd --version` reports
+glibc 2.35. `evidence_grade` is false. The same run id, attempt, and SHA
+apply.
+
+| Runner | Triple | Class | Result | Run | Attempt | SHA | ImageOS | ImageVersion | glibc_max_symbol | ldd --version |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | `probe` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu22` | `20261111.360.2` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.35-0ubuntu3.15) 2.35` |
+| `ubuntu-22.04-arm` | `aarch64-unknown-linux-gnu` | `probe` | `PASS` | `44541017067` | `1` | `ec4bc744f9a514ab4116bf20f1cf2fbc5ce47d26` | `ubuntu22-arm64` | `20261116.196.1` | `GLIBC_2.34` | `ldd (Ubuntu GLIBC 2.35-0ubuntu3.18) 2.35` |
+
+A 22.04 pass shows the binary runs there; it does not prove the 2.34 floor itself.
