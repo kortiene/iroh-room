@@ -52,7 +52,7 @@ use crate::error::{CodedResultExt, ErrorCode};
 use crate::identity;
 use crate::message::{
     addr_hints, build_admission, build_dial_set, endpoint_id_of, fold_room, net_mode, parse_peers,
-    run_managed_push, run_sync, select_heads, DB_FILE,
+    run_managed_push, run_sync, select_heads, DB_FILE, DEPARTURE_ROSTER_WAIT,
 };
 
 /// Optional `reason` cap for a removal or leave (bytes). Mirrors the message
@@ -565,6 +565,7 @@ async fn persist_and_push(
             mode,
             wire_bytes,
             flush,
+            DEPARTURE_ROSTER_WAIT,
         ))
         .await;
         let delivered = match pushed {
