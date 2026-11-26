@@ -1850,31 +1850,17 @@ fn conflicting_keys_for_same_epoch_poison_epoch() {
     )
     .expect("build distribution B");
 
-    let id_a = frame_id(&dist_a.to_bytes(), room);
-    let id_b = frame_id(&dist_b.to_bytes(), room);
-    let expected_winner = if id_a.as_bytes() < id_b.as_bytes() {
-        &key_a
-    } else {
-        &key_b
-    };
-
     engine.publish(&dist_a.to_bytes()).expect("publish A");
     engine.publish(&dist_b.to_bytes()).expect("publish B");
 
-    // D5a: conflicting keys trigger deterministic resolution. The candidate with
-    // the lexicographically smallest event_id wins.
+    // A second commitment poisons the epoch. Neither key stays usable.
     assert!(
-        engine.has_room_key(2),
-        "deterministic resolution must leave a usable epoch 2 key"
+        engine.is_room_key_poisoned(2),
+        "a conflicting commitment must poison the epoch"
     );
     assert!(
-        !engine.is_room_key_poisoned(2),
-        "resolution must un-poison the epoch"
-    );
-    assert_eq!(
-        engine.room_key(2).expect("epoch 2 key").as_bytes(),
-        expected_winner.as_bytes(),
-        "smallest-event-id candidate must win"
+        engine.room_key(2).is_none(),
+        "neither conflicting key is held"
     );
 }
 
@@ -1921,10 +1907,9 @@ fn adopted_keys_survive_engine_restart() {
     );
 }
 
-/// In-session D5a resolution still persists the winning key. Open with the
-/// adoption flag is stricter: two distinct admin commitments poison the epoch,
-/// so the reloaded row is not readable after restart (Refs #429). The row stays
-/// on disk.
+/// Two admin commitments poison the epoch in the session. The first key's row
+/// can remain on disk, and open poisons the epoch again so that row is not
+/// readable (Refs #429 #436).
 #[test]
 fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
     let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
@@ -1959,24 +1944,13 @@ fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
     )
     .expect("build distribution B");
     let id_a = frame_id(&dist_a.to_bytes(), room);
-    let id_b = frame_id(&dist_b.to_bytes(), room);
-    let (winner_id, expected_winner) = if id_a.as_bytes() < id_b.as_bytes() {
-        (id_a, key_a.clone())
-    } else {
-        (id_b, key_b.clone())
-    };
 
     engine.publish(&dist_a.to_bytes()).expect("publish A");
     engine.publish(&dist_b.to_bytes()).expect("publish B");
-    assert!(engine.has_room_key(2), "resolution leaves a usable key");
-    assert!(!engine.is_room_key_poisoned(2));
-    assert_eq!(
-        engine.room_key(2).expect("in-session winner").as_bytes(),
-        expected_winner.as_bytes()
-    );
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(engine.room_key(2).is_none());
 
-    // The persisted source_event_id for epoch 2 must be the winning
-    // distribution's event id (the resolution is durable).
+    // The first adoption's row stays. Open must not treat it as the winner.
     let persisted = engine
         .store_mut()
         .load_room_keys(&room)
@@ -1985,10 +1959,7 @@ fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
         .find(|(epoch, _)| *epoch == 2)
         .map(|(_, (_, source_event_id))| source_event_id)
         .expect("epoch 2 key persisted");
-    assert_eq!(
-        persisted, winner_id,
-        "the persisted source_event_id must be the winning distribution's event id"
-    );
+    assert_eq!(persisted, id_a);
 
     // Restart: both commitments are in the store, so open poisons the epoch
     // and does not expose the persisted winner.
@@ -2010,7 +1981,7 @@ fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
         "the persisted winner is not readable after reopen"
     );
 
-    // The row stays on disk with the in-session winner. Open does not use it.
+    // The first adoption's row stays on disk. Open does not use it.
     let mut reopened = reopened;
     let persisted_after = reopened
         .store_mut()
@@ -2020,19 +1991,11 @@ fn poisoned_epoch_resolution_is_fail_closed_on_reopen() {
         .find(|(epoch, _)| *epoch == 2)
         .map(|(_, (_, source_event_id))| source_event_id)
         .expect("epoch 2 key persisted after restart");
-    assert_eq!(
-        persisted_after, winner_id,
-        "the winning source_event_id must persist across the restart"
-    );
+    assert_eq!(persisted_after, id_a);
 }
 
-/// D5a attribution is arrival-order-independent (PR #204 review): when the
-/// same key is offered under several event ids and a conflicting key later
-/// appears, the deterministic resolution must attribute the winning key to its
-/// *minimum* source event id — not whichever same-key copy arrived first, and
-/// not the conflicting distribution's id. Scenario `A < C < B`: key K under A
-/// and B, conflicting key K' under C; the winning key K must resolve to source
-/// A (the minimum), regardless of B arriving before C.
+/// A later conflicting key poisons the epoch. Order-independent selection of
+/// a winner is #436, not this session.
 #[test]
 fn conflict_resolution_attributes_winner_to_minimum_source_id() {
     let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
@@ -2075,56 +2038,16 @@ fn conflict_resolution_attributes_winner_to_minimum_source_id() {
         T0 + 3,
     )
     .expect("build distribution C (conflicting key)");
-    let id_a = frame_id(&dist_a.to_bytes(), room);
-    let id_b = frame_id(&dist_b.to_bytes(), room);
-    let id_c = frame_id(&dist_c.to_bytes(), room);
-    // The D5a winner is the candidate with the smallest event_id among those
-    // this device can unwrap. A and B both offer key K; C offers K'. The
-    // canonical source for key K is the smaller of its two offering ids.
-    let min_k_source = id_a.min(id_b);
-    // The winning key is K iff K's minimum source beats C, else K'.
-    let (expected_winner_key, expected_winner_source) = if min_k_source < id_c {
-        (key_k.clone(), min_k_source)
-    } else {
-        (key_k_prime.clone(), id_c)
-    };
-
-    // Publish in the adversarial order the review called out: the larger-id
-    // same-key copy (B) and the conflicting key (C) arrive around the
-    // originally-held A. Arrival order must not change the outcome.
     engine.publish(&dist_a.to_bytes()).expect("publish A");
     engine.publish(&dist_b.to_bytes()).expect("publish B");
+    assert!(engine.has_room_key(2), "the same key re-offered stays held");
     engine.publish(&dist_c.to_bytes()).expect("publish C");
 
-    assert!(engine.has_room_key(2), "resolution leaves a usable key");
-    assert!(!engine.is_room_key_poisoned(2));
-    assert_eq!(
-        engine.room_key(2).expect("epoch 2 key").as_bytes(),
-        expected_winner_key.as_bytes(),
-        "the candidate with the smallest event_id must win (D5a)"
+    assert!(engine.is_room_key_poisoned(2));
+    assert!(
+        engine.room_key(2).is_none(),
+        "the conflicting key poisons the epoch instead of selecting a winner"
     );
-
-    // The persisted source id must be the canonical (minimum) source of the
-    // winning key — never a same-key-but-larger id, and never mis-attributed
-    // to a distribution for a different key.
-    let persisted = engine
-        .store_mut()
-        .load_room_keys(&room)
-        .expect("load room keys")
-        .into_iter()
-        .find(|(epoch, _)| *epoch == 2)
-        .map(|(_, (_, source_event_id))| source_event_id)
-        .expect("epoch 2 key persisted");
-    assert_eq!(
-        persisted, expected_winner_source,
-        "the winner must be attributed to its minimum source id (arrival-order-independent)"
-    );
-    // Specifically: when K wins, its source is the minimum of A and B, not the
-    // larger same-key id and not the conflicting C.
-    if expected_winner_key.as_bytes() == key_k.as_bytes() {
-        assert_eq!(persisted, min_k_source);
-        assert_ne!(persisted, id_c, "the conflicting key's id must not win");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3357,6 +3280,174 @@ fn key_adoption_non_admin_store_row_does_not_bind() {
         "the unbound chunk is logged, got {:?}",
         engine.logs()
     );
+}
+
+/// After reopen, bound chunks for both commitments and a new admin
+/// distribution must not install a key. The early return in
+/// `adopt_key_distribution` is what keeps the epoch poisoned.
+#[test]
+fn key_adoption_reopen_chunks_and_distribution_stay_poisoned() {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_one = RoomKey::from_bytes([0x11; 32]);
+    let key_two = RoomKey::from_bytes([0x22; 32]);
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_one,
+        &[sk(2).device_key()],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("D1");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish D1");
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &key_two,
+        &[sk(4).device_key()],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("D2");
+    let second_bytes = second.to_bytes();
+    let second_id = frame_id(&second_bytes, room);
+    engine.publish(&second_bytes).expect("publish D2");
+
+    let store = engine.into_store();
+    let mut engine = SyncEngine::open_with_local_device(
+        store,
+        room,
+        adoption_config(true),
+        Some(ADMIN_DEV_SEED),
+    )
+    .expect("reopen");
+    assert!(engine.is_room_key_poisoned(2));
+    let local = sk(2).device_key();
+    // One chunk at a time. A same-commitment chunk is the offer that
+    // `resolve` would install if the poisoned-epoch return were skipped,
+    // and the other chunk must not be able to hide that by re-poisoning
+    // afterwards.
+    for (key, id) in [(&key_one, first_id), (&key_two, second_id)] {
+        deliver_chunks(
+            &mut engine,
+            NODE_B,
+            room,
+            vec![history_chunk(&room, 2, key, id, local)],
+        );
+        assert!(
+            engine.is_room_key_poisoned(2),
+            "a bound chunk must not clear the poison"
+        );
+        assert!(
+            engine.room_key(2).is_none(),
+            "a bound chunk must not install a key"
+        );
+    }
+    let third_key = RoomKey::from_bytes([0x33; 32]);
+    let third = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        &third_key,
+        &[local],
+        &[second_id],
+        T0 + 3,
+    )
+    .expect("new distribution");
+    engine.publish(&third.to_bytes()).expect("publish third");
+    assert!(
+        engine.is_room_key_poisoned(2),
+        "chunks and a later distribution must not clear the poison"
+    );
+    assert!(engine.room_key(2).is_none());
+    assert!(
+        !served_epochs(&mut engine, room).contains(&2),
+        "no key is served for the poisoned epoch"
+    );
+}
+
+fn publish_pair(wrap_first: bool) -> (SyncEngine, RoomId, Vec<KeyHistoryChunk>) {
+    let (mut engine, room, genesis_id) = seeded_engine_with_admin_seed(adoption_config(true));
+    let key_wrap = RoomKey::from_bytes([0x11; 32]);
+    let key_other = RoomKey::from_bytes([0x22; 32]);
+    let local = sk(2).device_key();
+    let other_dev = sk(4).device_key();
+    let (first_key, first_for, second_key, second_for) = if wrap_first {
+        (&key_wrap, local, &key_other, other_dev)
+    } else {
+        (&key_other, other_dev, &key_wrap, local)
+    };
+    let first = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        first_key,
+        &[first_for],
+        &[genesis_id],
+        T0 + 1,
+    )
+    .expect("first distribution");
+    let first_bytes = first.to_bytes();
+    let first_id = frame_id(&first_bytes, room);
+    engine.publish(&first_bytes).expect("publish first");
+    let second = crate::event::distribution::build_member_key_distribution(
+        &sk(1),
+        &sk(2),
+        &room,
+        2,
+        second_key,
+        &[second_for],
+        &[first_id],
+        T0 + 2,
+    )
+    .expect("second distribution");
+    let second_bytes = second.to_bytes();
+    let second_id = frame_id(&second_bytes, room);
+    engine.publish(&second_bytes).expect("publish second");
+    let chunks = vec![
+        history_chunk(&room, 2, first_key, first_id, local),
+        history_chunk(&room, 2, second_key, second_id, local),
+    ];
+    (engine, room, chunks)
+}
+
+/// Live conflicts stay poisoned in both arrival orders, including after chunks.
+#[test]
+fn key_adoption_live_conflict_both_orders_stay_poisoned() {
+    for wrap_first in [true, false] {
+        let (mut engine, room, chunks) = publish_pair(wrap_first);
+        assert!(
+            engine.is_room_key_poisoned(2),
+            "wrap_first={wrap_first}: conflict poisons before any chunk"
+        );
+        assert!(
+            engine.room_key(2).is_none(),
+            "wrap_first={wrap_first}: conflict does not install a key"
+        );
+        for chunk in chunks {
+            deliver_chunks(&mut engine, NODE_B, room, vec![chunk]);
+            assert!(
+                engine.is_room_key_poisoned(2),
+                "wrap_first={wrap_first}: a chunk must not clear the poison"
+            );
+            assert!(
+                engine.room_key(2).is_none(),
+                "wrap_first={wrap_first}: a chunk must not install a key"
+            );
+        }
+        assert!(
+            !served_epochs(&mut engine, room).contains(&2),
+            "wrap_first={wrap_first}: no key is served"
+        );
+    }
 }
 
 /// A-5. No production call site in the CLI, net, or façade crates sets the flag.

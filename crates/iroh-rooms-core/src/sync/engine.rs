@@ -39,7 +39,7 @@ use crate::store::{
 };
 
 use super::config::SyncConfig;
-use super::keys::{ConflictCandidate, EpochKeyConflict, EpochKeyStore};
+use super::keys::{ConflictCandidate, EpochKeyStore};
 use super::message::{
     id_set, KeyHistoryChunk, Outgoing, PeerId, SyncMessage, Window, KEY_HISTORY_ENVELOPE_ALLOWANCE,
     MAX_KEY_HISTORY_CHUNKS_PER_RESPONSE,
@@ -718,8 +718,8 @@ impl SyncEngine {
                 (0, BTreeMap::new(), BTreeSet::new())
             };
         // More than one admin commitment for an epoch: drop the reloaded row
-        // and refuse the epoch. Stricter than the live session, which can
-        // still be holding a key depending on arrival order (Refs #429).
+        // and refuse the epoch. Live adoption fail-closes the same way and
+        // does not pick a winner (Refs #429 #436).
         for epoch in &multi_commitment {
             room_keys.poison(*epoch);
         }
@@ -1179,6 +1179,10 @@ impl SyncEngine {
     /// reload an all-zero row, so this key does not come back after restart.
     /// An embedder that provisions keys here must call `insert_room_key` again
     /// after every [`open`](Self::open).
+    ///
+    /// A conflicting offer poisons the epoch for this session. Open does not
+    /// restore that poison: this call writes no admin distribution, so a
+    /// reopen sees one all-zero row and no equivocation.
     ///
     /// # Errors
     /// [`SyncError::EpochKeyConflict`] on a conflicting offer.
@@ -3135,8 +3139,9 @@ impl SyncEngine {
 
     /// Fold-driven key adoption (#191 step 6). If `content` carries a
     /// `MemberKeyDistribution` payload, try to unwrap the local device's key,
-    /// verify the D5 commitment, and adopt it. Same-epoch conflicts poison the
-    /// epoch and retain candidates for deterministic resolution.
+    /// verify the D5 commitment, and adopt it. A same-epoch conflict poisons
+    /// the epoch and returns. Order-independent selection is #436
+    /// (Refs #429 #436).
     fn adopt_key_from_event(&mut self, event_id: EventId, content: &Content) {
         // Flag off: the event is already stored and the fold verdict stands;
         // the key itself does not enter the engine (Refs #429).
@@ -3155,7 +3160,7 @@ impl SyncEngine {
 
     /// Adopt a `MemberKeyDistribution` payload, whether it arrived in a DAG
     /// event or in a key-history chunk. Verifies the D5 commitment, unwraps for
-    /// the local device, and handles same-epoch conflicts deterministically.
+    /// the local device, and fail-closes a same-epoch conflict.
     ///
     /// The commitment is tracked independently of whether this device can
     /// unwrap: two same-epoch distributions with different commitments poison
@@ -3175,8 +3180,10 @@ impl SyncEngine {
         let room_id = self.room_id;
 
         // A seed-time multi-commitment poison, or a conflict already closed
-        // this epoch. Further offers stay refused; this path does not pick a
-        // winner after the fact (Refs #429).
+        // this epoch. Further offers stay refused. This return does not
+        // record candidates. #436 owns bringing back an order-independent
+        // resolve, live and on reopen, by rebuilding candidates from the
+        // store (Refs #429 #436).
         if self.room_keys.is_poisoned(epoch) {
             self.log(&format!(
                 "epoch_key_conflict epoch={epoch} event={event_id}"
@@ -3218,46 +3225,16 @@ impl SyncEngine {
         }
 
         // Track fold-visible commitments independently of unwrap ability. A
-        // second commitment for the same epoch with a different value is a
-        // conflict even when this device cannot unwrap either distribution.
-        let mut commitment_conflict = false;
+        // second commitment poisons the epoch and returns. No winner is
+        // chosen; #436 rebuilds candidates from the store (Refs #429 #436).
         match self.epoch_commitments.get(&epoch) {
-            Some((first_event_id, first_commitment)) => {
+            Some((_, first_commitment)) => {
                 if *first_commitment != distribution.key_commitment {
-                    // Conflicting commitments: poison the epoch and retain the
-                    // previously-held key as a candidate for deterministic
-                    // resolution. The current distribution's key is added below
-                    // if this device can unwrap it.
-                    commitment_conflict = true;
-                    // Retrieve the previously-held key (with its canonical —
-                    // minimum — source id) BEFORE poisoning, because `get`
-                    // returns None for a poisoned epoch. Attributing the
-                    // candidate by the held key's stored source (not the
-                    // commitment's first-seen id) keeps the resolution
-                    // arrival-order-independent when the same key was
-                    // re-offered under a smaller event id.
-                    let held_before = self
-                        .room_keys
-                        .get_with_source(epoch)
-                        .map(|(k, id)| (k.clone(), id));
                     self.room_keys.poison(epoch);
-                    if let Some((held, held_source_id)) = held_before {
-                        self.room_keys.add_conflict_candidate(
-                            epoch,
-                            ConflictCandidate {
-                                event_id: held_source_id,
-                                key: Some(held),
-                            },
-                        );
-                    } else {
-                        self.room_keys.add_conflict_candidate(
-                            epoch,
-                            ConflictCandidate {
-                                event_id: *first_event_id,
-                                key: None,
-                            },
-                        );
-                    }
+                    self.log(&format!(
+                        "epoch_key_conflict epoch={epoch} event={event_id}"
+                    ));
+                    return;
                 }
                 // Same commitment: idempotent. Continue to try to unwrap (the
                 // key may not be held yet if the first distribution did not
@@ -3308,57 +3285,36 @@ impl SyncEngine {
             return;
         }
 
-        // Clone once before the consuming insert so the candidate path still has
-        // a copy if a conflict poisons the epoch.
-        let key_for_conflict = key.clone();
-        if commitment_conflict {
-            // The epoch was already poisoned by the commitment conflict above.
-            // Add this distribution's key as a candidate and resolve.
+        // Already poisoned. The return at the top of this function normally
+        // prevents reaching here. If it was skipped, resolve adopts this offer
+        // alone, because no other candidate was recorded. That is the bug the
+        // return closes. #436 rebuilds the full candidate set from the store
+        // (Refs #429 #436).
+        if self.room_keys.is_poisoned(epoch) {
             self.room_keys.add_conflict_candidate(
                 epoch,
                 ConflictCandidate {
                     event_id,
-                    key: Some(key_for_conflict),
+                    key: Some(key.clone()),
                 },
             );
-            let resolved = self.room_keys.resolve(epoch);
-            if resolved {
+            if self.room_keys.resolve(epoch) {
                 self.persist_resolved_room_key(epoch);
-                self.log(&format!("epoch_key_resolved epoch={epoch}"));
-            } else {
-                self.log(&format!(
-                    "epoch_key_conflict epoch={epoch} event={event_id}"
-                ));
             }
             return;
         }
 
-        if let Err(EpochKeyConflict {
-            epoch: conflict_epoch,
-        }) = self.room_keys.insert(epoch, key, event_id)
-        {
-            // Conflict: retain this candidate and attempt deterministic resolution.
-            self.room_keys.add_conflict_candidate(
-                conflict_epoch,
-                ConflictCandidate {
-                    event_id,
-                    key: Some(key_for_conflict.clone()),
-                },
-            );
-            let resolved = self.room_keys.resolve(conflict_epoch);
-            if resolved {
-                self.persist_resolved_room_key(conflict_epoch);
-                self.log(&format!("epoch_key_resolved epoch={conflict_epoch}"));
-            } else {
-                self.log(&format!(
-                    "epoch_key_conflict epoch={conflict_epoch} event={event_id}"
-                ));
-            }
+        // A different key for a held epoch poisons and stops. Do not resolve
+        // a winner; #436 rebuilds candidates from the store (Refs #429 #436).
+        if self.room_keys.insert(epoch, key.clone(), event_id).is_err() {
+            self.log(&format!(
+                "epoch_key_conflict epoch={epoch} event={event_id}"
+            ));
             return;
         }
 
         // Fresh adoption: persist the derived key.
-        self.persist_room_key(epoch, &key_for_conflict, &event_id);
+        self.persist_room_key(epoch, &key, &event_id);
         self.log(&format!("epoch_key_adopted epoch={epoch} event={event_id}"));
     }
 
@@ -3621,10 +3577,10 @@ type EpochCommitmentMap = BTreeMap<u64, (EventId, [u8; 32])>;
 /// An epoch with more than one distinct admin `key_commitment` is returned
 /// in the third tuple element so open can poison it: neither key is adopted,
 /// a reloaded `room_keys` row for that epoch is not readable or served, and
-/// further offers are refused. That is fail-closed and deliberately stricter
-/// than the live session, which can still hold a key depending on which
-/// distribution arrived first. The live order-dependence is a Post-GA
-/// follow-up; this open path does not pick a winner.
+/// further offers are refused. Live adoption fail-closes the same way. #436
+/// owns bringing back an order-independent resolve, live and on reopen, by
+/// rebuilding candidates from the store. The early return in adoption does
+/// not record those candidates (Refs #429 #436).
 fn seed_epoch_watermark(
     store: &EventStore,
     room_id: &RoomId,

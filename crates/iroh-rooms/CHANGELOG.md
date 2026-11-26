@@ -22,7 +22,10 @@ where feasible); the **experimental** tier may change on any release.
   offers for that epoch are refused. Refs #429 #343 #286.
 - **Behaviour change:** `insert_room_key` still persists a row, but that row
   uses the all-zero event id and open does not reload it. An embedder must
-  call `insert_room_key` again after every open. Refs #429.
+  call `insert_room_key` again after every open. A conflicting
+  `insert_room_key` poisons the epoch in the current session; after reopen
+  the epoch is not poisoned, because the call writes no admin distribution
+  and there is no equivocation to seed. Refs #429.
 - **SDK façade (additive, CLI-named only).** Stable re-exports:
   `room::{RoomCreated, MemberInvited, MemberJoined, MemberLeft, MemberRemoved}`
   and `events::{MessageText, AgentStatus}`. Experimental re-exports:

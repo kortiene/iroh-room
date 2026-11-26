@@ -3876,30 +3876,16 @@ fn conflicting_distributions_converge_across_network_partition() {
     // Both nodes hold the same event set (the fork converges structurally)…
     net.assert_converged(&[NODE_A, NODE_B]);
 
-    // …and both adopt the *same* epoch-2 key: the candidate with the
-    // lexicographically smallest distribution event_id wins (D5a), independent
-    // of which side of the partition a node was on.
-    let expected_winner = if id_a.as_bytes() < id_b.as_bytes() {
-        &key_a
-    } else {
-        &key_b
-    };
+    // …and both poison epoch 2. A conflicting commitment adopts neither key.
+    // Order-independent selection is #436 (Refs #429 #436).
     for node in [NODE_A, NODE_B] {
         assert!(
-            net.engine(node).has_room_key(2),
-            "{node}: deterministic resolution must leave a usable epoch-2 key"
+            net.engine(node).is_room_key_poisoned(2),
+            "{node}: both commitments must poison epoch 2"
         );
         assert!(
-            !net.engine(node).is_room_key_poisoned(2),
-            "{node}: resolution must un-poison the epoch"
-        );
-        assert_eq!(
-            net.engine(node)
-                .room_key(2)
-                .expect("{node} epoch 2 key")
-                .as_bytes(),
-            expected_winner.as_bytes(),
-            "{node}: smallest-event-id candidate must win (D5a, arrival-order-independent)"
+            net.engine(node).room_key(2).is_none(),
+            "{node}: neither conflicting key is held"
         );
     }
 }
